@@ -392,7 +392,7 @@ async def run_discovery():
         await display.show_banner()
         
         # Validate MCP configuration
-        if not config.mcp.url or config.mcp.url == "https://splunk:8089/services/mcp":
+        if not config.mcp.url:
             display.error("❌ MCP Server URL not configured. Please configure your Splunk MCP server in Settings.")
             raise Exception("MCP Server URL not configured")
         
