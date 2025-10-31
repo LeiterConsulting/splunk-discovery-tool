@@ -472,7 +472,130 @@ async def run_discovery():
             display.info("🔄 Continuing with available analysis...")
             suggested_use_cases = []
         
-        # Phase 6: Complete Discovery
+        # Phase 6: Export Reports
+        display.phase("📝 Phase 6: Exporting Discovery Reports")
+        display.info("🔄 Generating report files...")
+        
+        # Generate timestamp for this session
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create output directory if it doesn't exist
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+        
+        report_paths = []
+        
+        # Export JSON data
+        try:
+            json_export_path = output_dir / f"discovery_export_{timestamp}.json"
+            with open(json_export_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "overview": overview.__dict__ if hasattr(overview, '__dict__') else overview,
+                    "classifications": classifications,
+                    "recommendations": recommendations,
+                    "suggested_use_cases": suggested_use_cases,
+                    "timestamp": timestamp
+                }, f, indent=2, default=str)
+            report_paths.append(str(json_export_path.name))
+            display.info(f"   ✓ {json_export_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export JSON: {str(e)}")
+        
+        # Export Executive Summary
+        try:
+            exec_summary_path = output_dir / f"executive_summary_{timestamp}.md"
+            with open(exec_summary_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Splunk Environment Discovery - Executive Summary\n\n")
+                f.write(f"**Discovery Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"## Environment Overview\n\n")
+                if hasattr(overview, 'total_indexes'):
+                    f.write(f"- **Total Indexes:** {overview.total_indexes}\n")
+                    f.write(f"- **Total Source Types:** {overview.total_sourcetypes}\n")
+                    f.write(f"- **Active Data Sources:** {overview.total_sourcetypes}\n\n")
+                f.write(f"## Key Findings\n\n")
+                f.write(f"Discovery completed successfully across {overview.estimated_discovery_steps if hasattr(overview, 'estimated_discovery_steps') else 'multiple'} analysis steps.\n\n")
+            report_paths.append(str(exec_summary_path.name))
+            display.info(f"   ✓ {exec_summary_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export executive summary: {str(e)}")
+        
+        # Export Detailed Discovery
+        try:
+            detailed_path = output_dir / f"detailed_discovery_{timestamp}.md"
+            with open(detailed_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Detailed Discovery Report\n\n")
+                f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"## Discovery Results\n\n")
+                f.write(json.dumps(discovery_engine.discovery_results, indent=2, default=str))
+            report_paths.append(str(detailed_path.name))
+            display.info(f"   ✓ {detailed_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export detailed discovery: {str(e)}")
+        
+        # Export Data Classification
+        try:
+            classification_path = output_dir / f"data_classification_{timestamp}.md"
+            with open(classification_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Data Classification Report\n\n")
+                f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(json.dumps(classifications, indent=2, default=str))
+            report_paths.append(str(classification_path.name))
+            display.info(f"   ✓ {classification_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export classifications: {str(e)}")
+        
+        # Export Recommendations
+        try:
+            recommendations_path = output_dir / f"recommendations_{timestamp}.md"
+            with open(recommendations_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Recommendations Report\n\n")
+                f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                for idx, rec in enumerate(recommendations[:10], 1):
+                    if isinstance(rec, dict):
+                        f.write(f"## {idx}. {rec.get('title', 'Recommendation')}\n\n")
+                        f.write(f"**Priority:** {rec.get('priority', 'N/A')}\n\n")
+                        f.write(f"{rec.get('description', '')}\n\n")
+            report_paths.append(str(recommendations_path.name))
+            display.info(f"   ✓ {recommendations_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export recommendations: {str(e)}")
+        
+        # Export Suggested Use Cases
+        try:
+            use_cases_path = output_dir / f"suggested_use_cases_{timestamp}.md"
+            with open(use_cases_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Suggested Use Cases\n\n")
+                f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                for idx, uc in enumerate(suggested_use_cases[:10], 1):
+                    if isinstance(uc, dict):
+                        f.write(f"## {idx}. {uc.get('title', 'Use Case')}\n\n")
+                        f.write(f"{uc.get('description', '')}\n\n")
+            report_paths.append(str(use_cases_path.name))
+            display.info(f"   ✓ {use_cases_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export use cases: {str(e)}")
+        
+        # Export Implementation Guide
+        try:
+            impl_guide_path = output_dir / f"implementation_guide_{timestamp}.md"
+            with open(impl_guide_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Implementation Guide\n\n")
+                f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"## Quick Start\n\n")
+                f.write(f"This guide provides implementation steps for the recommended use cases.\n\n")
+                f.write(f"## Priority Recommendations\n\n")
+                for idx, rec in enumerate([r for r in recommendations if isinstance(r, dict) and r.get('priority') == 'high'][:5], 1):
+                    f.write(f"### {idx}. {rec.get('title', 'Recommendation')}\n\n")
+                    f.write(f"{rec.get('description', '')}\n\n")
+            report_paths.append(str(impl_guide_path.name))
+            display.info(f"   ✓ {impl_guide_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export implementation guide: {str(e)}")
+        
+        display.success(f"✅ Generated {len(report_paths)} report files")
+        
+        # Phase 7: Complete Discovery
         display.phase("✅ Discovery Complete")
         display.success("✅ All discovery phases completed successfully")
         
@@ -482,7 +605,9 @@ async def run_discovery():
             "overview": overview,
             "classifications": classifications,
             "recommendations": recommendations,
-            "suggested_use_cases": suggested_use_cases
+            "suggested_use_cases": suggested_use_cases,
+            "report_paths": report_paths,
+            "timestamp": timestamp
         }
         
     except Exception as e:
