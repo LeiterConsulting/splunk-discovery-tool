@@ -165,7 +165,7 @@ function Start-Service {
     # Check if already running
     if (Test-Path $PID_FILE) {
         $processId = Get-Content $PID_FILE
-        if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+        if ($processId -and (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
             Write-ColorMsg $ColorYellow "⚠ Service already running (PID: $processId)"
             return
         }
@@ -179,7 +179,7 @@ function Start-Service {
     
     # Start in background
     $mainScript = Join-Path $INSTALL_DIR "src\main.py"
-    $process = Start-Process -FilePath "python" -ArgumentList $mainScript `
+    $process = Start-Process -FilePath "python" -ArgumentList "`"$mainScript`"" `
         -NoNewWindow -PassThru
     $process.Id | Out-File -FilePath $PID_FILE -Encoding UTF8
     
