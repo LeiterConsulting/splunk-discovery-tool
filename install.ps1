@@ -164,9 +164,9 @@ function Install-Dependencies {
 function Start-Service {
     # Check if already running
     if (Test-Path $PID_FILE) {
-        $pid = Get-Content $PID_FILE
-        if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
-            Write-ColorMsg $ColorYellow "⚠ Service already running (PID: $pid)"
+        $processId = Get-Content $PID_FILE
+        if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+            Write-ColorMsg $ColorYellow "⚠ Service already running (PID: $processId)"
             return
         }
     }
@@ -202,8 +202,8 @@ function Stop-Service {
         return
     }
     
-    $pid = Get-Content $PID_FILE
-    $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    $processId = Get-Content $PID_FILE
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
     
     if (-not $process) {
         Write-ColorMsg $ColorYellow "⚠ Service not running (stale PID file)"
@@ -212,7 +212,7 @@ function Stop-Service {
     }
     
     Write-ColorMsg $ColorBlue "🛑 Stopping $APP_SHORT..."
-    Stop-Process -Id $pid -Force
+    Stop-Process -Id $processId -Force
     
     Start-Sleep -Seconds 2
     Remove-Item $PID_FILE -Force -ErrorAction SilentlyContinue
@@ -226,9 +226,9 @@ function Get-ServiceStatus {
         return $false
     }
     
-    $pid = Get-Content $PID_FILE
-    if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
-        Write-ColorMsg $ColorGreen "✓ Service running (PID: $pid)"
+    $processId = Get-Content $PID_FILE
+    if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+        Write-ColorMsg $ColorGreen "✓ Service running (PID: $processId)"
         Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:8003"
         return $true
     } else {
