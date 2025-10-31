@@ -202,6 +202,12 @@ Uninstall removes:
 
 ## 🐛 Troubleshooting
 
+### Cannot run script in Windows
+
+Run the following PowerShell command:
+
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+
 ### Service Won't Start
 
 ```bash
@@ -265,7 +271,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Links
 
-- **GitHub**: [https://github.com/LeiterConsulting/splunk-discovery-tool](https://github.com/LeiterConsulting/splunk-discovery-tool)
 - **Issues**: [Report a bug or request a feature](https://github.com/LeiterConsulting/splunk-discovery-tool/issues)
 - **Leiter Consulting**: Professional Splunk services and consulting
 
@@ -279,11 +284,11 @@ Built with modern Python frameworks and AI technology to simplify Splunk adminis
 
 ## 🤝 Contributing
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md)
+Contributions welcome!
 
 ## 📄 License
 
-[Your License Here]
+MIT
 
 ## 🔗 Links
 
