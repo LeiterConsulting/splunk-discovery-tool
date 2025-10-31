@@ -391,6 +391,15 @@ async def run_discovery():
         display = WebSocketDisplayManager()
         await display.show_banner()
         
+        # Validate MCP configuration
+        if not config.mcp.url or config.mcp.url == "https://splunk:8089/services/mcp":
+            await display.error("❌ MCP Server URL not configured. Please configure your Splunk MCP server in Settings.")
+            raise Exception("MCP Server URL not configured")
+        
+        if not config.mcp.token:
+            await display.error("❌ MCP Server token not configured. Please configure your Splunk authentication token in Settings.")
+            raise Exception("MCP Server token not configured")
+        
         # Debug: Check if API key is loaded
         debug_log(f"Config loaded - provider: {config.llm.provider}, model: {config.llm.model}", "info")
         debug_log(f"API key present: {bool(config.llm.api_key)}, length: {len(config.llm.api_key) if config.llm.api_key else 0}", "info")
