@@ -79,8 +79,12 @@ class ConfigManager:
             self._key = Fernet.generate_key()
             with open(self.key_path, 'wb') as f:
                 f.write(self._key)
-            # Secure the key file
-            os.chmod(self.key_path, 0o600)
+            # Secure the key file (Unix only)
+            try:
+                if os.name != 'nt':  # Not Windows
+                    os.chmod(self.key_path, 0o600)
+            except Exception as chmod_error:
+                print(f"Warning: Could not set file permissions: {chmod_error}")
     
     def _create_default_config(self) -> AppConfig:
         """Create default configuration"""
@@ -141,13 +145,19 @@ class ConfigManager:
             with open(self.config_path, 'wb') as f:
                 f.write(encrypted_data)
             
-            # Secure the config file
-            os.chmod(self.config_path, 0o600)
+            # Secure the config file (Unix only)
+            try:
+                if os.name != 'nt':  # Not Windows
+                    os.chmod(self.config_path, 0o600)
+            except Exception as chmod_error:
+                print(f"Warning: Could not set file permissions: {chmod_error}")
             
             self._config = config
             return True
         except Exception as e:
             print(f"Error saving config: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def get(self) -> AppConfig:

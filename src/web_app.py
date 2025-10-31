@@ -638,8 +638,14 @@ async def update_config(config_update: ConfigUpdate):
                 if 'token' in update_data and not update_data['token']:
                     update_data.pop('token')
                 if update_data:
-                    config_manager.update_mcp(**update_data)
+                    success = config_manager.update_mcp(**update_data)
+                    if not success:
+                        raise HTTPException(status_code=500, detail="Failed to save MCP configuration")
+            except HTTPException:
+                raise
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"MCP config error: {str(e)}")
         
         # Update LLM settings
@@ -649,15 +655,27 @@ async def update_config(config_update: ConfigUpdate):
                 if 'api_key' in update_data and not update_data['api_key']:
                     update_data.pop('api_key')
                 if update_data:
-                    config_manager.update_llm(**update_data)
+                    success = config_manager.update_llm(**update_data)
+                    if not success:
+                        raise HTTPException(status_code=500, detail="Failed to save LLM configuration")
+            except HTTPException:
+                raise
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"LLM config error: {str(e)}")
         
         # Update server settings
         if config_update.server:
             try:
-                config_manager.update_server(**config_update.server.dict(exclude_unset=True))
+                success = config_manager.update_server(**config_update.server.dict(exclude_unset=True))
+                if not success:
+                    raise HTTPException(status_code=500, detail="Failed to save server configuration")
+            except HTTPException:
+                raise
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"Server config error: {str(e)}")
         
         # Reload config
@@ -668,6 +686,8 @@ async def update_config(config_update: ConfigUpdate):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to update configuration: {str(e)}")
 
 @app.get("/api/dependencies")
