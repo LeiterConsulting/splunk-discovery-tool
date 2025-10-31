@@ -599,6 +599,13 @@ async def run_discovery():
         display.phase("✅ Discovery Complete")
         display.success("✅ All discovery phases completed successfully")
         
+        # Send completion message to frontend
+        await display.send_to_clients("completion", {
+            "message": "Discovery completed successfully",
+            "report_count": len(report_paths),
+            "timestamp": timestamp
+        })
+        
         # Return completion status
         return {
             "status": "completed",
@@ -3607,7 +3614,7 @@ def get_frontend_html():
             };
             
             // Resizable panel state
-            const [discoveryLogHeight, setDiscoveryLogHeight] = useState(320); // 80 * 4 = 320px (h-80)
+            const [discoveryLogHeight, setDiscoveryLogHeight] = useState(480); // 50% taller than original 320px
             const [reportViewerHeight, setReportViewerHeight] = useState(560); // 70vh ≈ 560px
             const [isResizingLog, setIsResizingLog] = useState(false);
             const [isResizingReport, setIsResizingReport] = useState(false);
