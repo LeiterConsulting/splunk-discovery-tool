@@ -179,7 +179,10 @@ function Start-Service {
     
     # Start in background
     $mainScript = Join-Path $INSTALL_DIR "src\main.py"
-    $process = Start-Process -FilePath "python" -ArgumentList $mainScript -NoNewWindow -PassThru -RedirectStandardOutput $LOG_FILE -RedirectStandardError $LOG_FILE
+    $process = Start-Process -FilePath "python" -ArgumentList $mainScript `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $LOG_FILE `
+        -RedirectStandardError $LOG_FILE
     $process.Id | Out-File -FilePath $PID_FILE -Encoding UTF8
     
     Start-Sleep -Seconds 2
