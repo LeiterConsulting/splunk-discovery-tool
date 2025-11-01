@@ -968,11 +968,16 @@ class DiscoveryEngine:
                             if content and isinstance(content, list) and len(content) > 0:
                                 # Get the text content and parse it as JSON
                                 text_content = content[0].get("text", "{}")
+                                # Skip parsing if content is empty or whitespace
+                                if not text_content or not text_content.strip():
+                                    print(f"DEBUG: MCP returned empty content (may be processing/rate limit)")
+                                    return {"results": []}
                                 try:
                                     parsed_data = json.loads(text_content)
                                     return parsed_data
                                 except json.JSONDecodeError as e:
                                     print(f"WARNING: Failed to parse MCP response JSON: {e}")
+                                    print(f"DEBUG: Content was: {text_content[:200]}")
                                     return {"results": []}
                             else:
                                 return {"results": []}

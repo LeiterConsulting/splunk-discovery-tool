@@ -12,11 +12,16 @@ class SPLGenerator:
     def __init__(self, discovery_context):
         # Handle both list (discovery_results) and dict (analyzed context) formats
         if isinstance(discovery_context, list):
+            print(f"DEBUG: SPL Generator received {len(discovery_context)} discovery results")
             self.context = self._parse_discovery_results(discovery_context)
         else:
+            print(f"DEBUG: SPL Generator received dict context")
             self.context = discovery_context
         self.indexes = self._extract_indexes()
         self.sourcetypes = self._extract_sourcetypes()
+        print(f"DEBUG: SPL Generator extracted {len(self.indexes)} indexes and {len(self.sourcetypes)} sourcetypes")
+        if self.sourcetypes:
+            print(f"DEBUG: Sample sourcetypes: {[st.get('name', 'unknown') for st in self.sourcetypes[:5]]}")
     
     def _parse_discovery_results(self, discovery_results: List[Dict]) -> Dict[str, Any]:
         """Parse raw discovery_results into structured context."""

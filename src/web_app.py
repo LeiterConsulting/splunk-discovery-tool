@@ -1272,11 +1272,24 @@ Generate queries that are DIRECTLY based on the actual findings. Return ONLY the
     try:
         # Use 40% of configured max_tokens for query generation (needs more for detailed queries)
         query_max_tokens = min(6000, int(config.llm.max_tokens * 0.4))
+        
+        # Debug: Check what we're sending to LLM
+        print(f"DEBUG: Sending query generation prompt with:")
+        print(f"  - Security findings: {len(ai_findings.get('security_findings', []))}")
+        print(f"  - Performance findings: {len(ai_findings.get('performance_findings', []))}")
+        print(f"  - Data quality findings: {len(ai_findings.get('data_quality_findings', []))}")
+        print(f"  - Discovered indexes: {len(discovered_indexes)}")
+        print(f"  - Discovered sourcetypes: {len(discovered_sourcetypes)}")
+        print(f"  - Max tokens: {query_max_tokens}")
+        
         queries_response = await llm_client.generate_response(
             prompt=query_generation_prompt,
             max_tokens=query_max_tokens,
             temperature=0.75  # Higher temperature for creative, varied query generation
         )
+        
+        print(f"DEBUG: LLM response length: {len(queries_response)}")
+        print(f"DEBUG: Response preview: {queries_response[:500]}")
         
         # Parse JSON response
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', queries_response, re.DOTALL)
@@ -1286,12 +1299,14 @@ Generate queries that are DIRECTLY based on the actual findings. Return ONLY the
             json_match = re.search(r'(\[.*\])', queries_response, re.DOTALL)
             queries_json = json_match.group(1) if json_match else '[]'
         
+        print(f"DEBUG: Extracted JSON length: {len(queries_json)}")
+        
         # Validate before parsing
         if not queries_json.strip():
             raise ValueError("Empty JSON response")
         
         finding_based_queries = json.loads(queries_json)
-        print(f"AI generated {len(finding_based_queries)} finding-based queries")
+        print(f"✅ AI generated {len(finding_based_queries)} finding-based queries")
         
         # Mark as finding-based
         for q in finding_based_queries:
@@ -1320,22 +1335,27 @@ Generate queries that are DIRECTLY based on the actual findings. Return ONLY the
         finding_based_queries = []
     
     # Combine AI-generated queries with template queries
-    print(f"AI generated {len(finding_based_queries)} queries, have {len(template_queries)} template queries")
+    print(f"📊 Query Status: AI generated {len(finding_based_queries)}, Template generated {len(template_queries)}")
     
     if len(finding_based_queries) >= 8:
         # AI generated enough queries - use them, but keep some templates for variety
         queries = finding_based_queries + template_queries[:4]
-        print(f"Using {len(finding_based_queries)} AI queries + {len(template_queries[:4])} template queries")
+        print(f"✅ Using {len(finding_based_queries)} AI queries + {len(template_queries[:4])} template queries = {len(queries)} total")
     else:
         # AI didn't generate enough - prioritize what we have, supplement with templates
         queries = finding_based_queries + template_queries
-        print(f"Using {len(finding_based_queries)} AI queries + all {len(template_queries)} template queries")
+        print(f"⚠️  Using {len(finding_based_queries)} AI queries + all {len(template_queries)} template queries = {len(queries)} total")
     
     # Ensure we have at least some queries
     if len(queries) == 0:
-        print("WARNING: No queries generated at all! This shouldn't happen.")
+        print("❌ WARNING: No queries generated at all! This shouldn't happen.")
         # This should never happen since template_queries should always have content
         queries = []
+    
+    # Debug: Show query sources
+    ai_query_count = sum(1 for q in queries if q.get('query_source') == 'ai_finding')
+    template_query_count = sum(1 for q in queries if q.get('query_source') == 'template')
+    print(f"📝 Final query breakdown: {ai_query_count} AI-generated, {template_query_count} template-based")
     
     # Prioritize queries (AI findings first, then by priority)
     queries.sort(key=lambda q: (
