@@ -115,8 +115,9 @@ function Test-Installation {
             Write-ColorMsg $ColorGreen "✓ Installation up-to-date (v$VERSION)"
             return $true
         }
-    } catch [System.Exception] {
-        # Manifest doesn't exist or is corrupted
+    } catch {
+        # Manifest doesn't exist or is corrupted - PS 5.1 compatible
+        Write-Verbose "Manifest check failed" -ErrorAction SilentlyContinue
         return $false
     }
     
