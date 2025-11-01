@@ -199,7 +199,12 @@ class DiscoveryEngine:
             yield result
             
         # Phase 2: Source type deep dive
-        for sourcetype_info in await self._discover_sourcetypes():
+        sourcetypes_list = await self._discover_sourcetypes()
+        print(f"DEBUG: Retrieved {len(sourcetypes_list)} sourcetypes from MCP")
+        if len(sourcetypes_list) == 0:
+            print("WARNING: No sourcetypes returned from MCP - this will limit SPL query generation capabilities")
+        
+        for sourcetype_info in sourcetypes_list:
             step += 1
             result = DiscoveryResult(
                 step=step,
@@ -1008,8 +1013,25 @@ class DiscoveryEngine:
         """Discover detailed information about all sourcetypes."""
         try:
             result = await self._mcp_call("get_metadata", {"type": "sourcetypes", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 100})
-            return result.get("results", [])
+            
+            # Handle different response formats
+            if isinstance(result, dict):
+                sourcetypes = result.get("results", [])
+                print(f"DEBUG: MCP returned dict with {len(sourcetypes)} sourcetypes in 'results' key")
+            elif isinstance(result, list):
+                sourcetypes = result
+                print(f"DEBUG: MCP returned list with {len(sourcetypes)} sourcetypes directly")
+            else:
+                print(f"WARNING: Unexpected sourcetype response type: {type(result)}")
+                sourcetypes = []
+            
+            # Log sample for debugging
+            if sourcetypes:
+                print(f"DEBUG: First sourcetype sample: {list(sourcetypes[0].keys()) if sourcetypes else 'none'}")
+            
+            return sourcetypes
         except Exception as e:
+            print(f"ERROR discovering sourcetypes: {str(e)}")
             raise Exception(f"Failed to discover sourcetypes: {str(e)}")
         
     async def _discover_knowledge_objects(self) -> List[Dict[str, Any]]:
