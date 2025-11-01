@@ -1225,62 +1225,28 @@ Return ONLY the JSON object."""
     
     # ===== AI-POWERED QUERY GENERATION =====
     # Generate SPL queries based on actual findings
-    query_generation_prompt = f"""Based on these specific findings from a Splunk discovery, generate targeted SPL queries.
+    query_generation_prompt = f"""Generate 4 SPL queries based on these Splunk findings.
 
-**Findings Summary:**
-Security Issues: {len(ai_findings.get('security_findings', []))} found
-Performance Issues: {len(ai_findings.get('performance_findings', []))} found
-Data Quality Issues: {len(ai_findings.get('data_quality_findings', []))} found
-Optimization Opportunities: {len(ai_findings.get('optimization_findings', []))} found
+Findings: {json.dumps(ai_findings, indent=2)[:2000]}
 
-**Specific Findings:**
-{json.dumps(ai_findings, indent=2)[:3000]}
+Available: {len(discovered_indexes)} indexes, {len(discovered_sourcetypes)} sourcetypes
 
-**Available Resources:**
-Indexes: {', '.join(list(discovered_indexes)[:20])}
-Sourcetypes: {', '.join(list(discovered_sourcetypes)[:20])}
+Return JSON array with exactly 4 queries. Each query must have:
+- title: Clear, actionable title with emoji
+- description: 1 sentence explaining the query
+- use_case: Security Investigation, Performance Monitoring, Data Quality, or Capacity Planning
+- category: Security & Compliance, Infrastructure & Performance, Data Quality, or Capacity Planning
+- spl: Valid SPL query using actual indexes/sourcetypes from findings
+- finding_reference: Which finding this addresses
+- execution_time: Estimated time
+- business_value: Why this matters
+- priority: 🔴 HIGH, 🟠 MEDIUM, or 🟡 LOW
+- difficulty: Beginner, Intermediate, or Advanced
 
-Generate exactly 6 highly specific SPL queries that directly address the most critical findings. For each query provide:
+Example:
+[{{"title": "🔍 Investigation Title", "description": "What this does", "use_case": "Security Investigation", "category": "Security & Compliance", "spl": "index=main | stats count", "finding_reference": "Specific finding", "execution_time": "< 30s", "business_value": "Why it matters", "priority": "🔴 HIGH", "difficulty": "Beginner"}}]
 
-- **title**: Clear, specific title referencing the actual finding (e.g., "Investigate 47 Failed Login Attempts to admin Account")
-- **description**: 1-2 sentences explaining what this query does and why it matters
-- **use_case**: Business use case (Security Investigation, Performance Monitoring, etc.)
-- **category**: Security & Compliance | Infrastructure & Performance | Data Quality | Capacity Planning
-- **spl**: The actual SPL query using the specific indexes/sourcetypes mentioned in findings
-- **finding_reference**: Which finding this addresses (copy description)
-- **execution_time**: Estimated execution time
-- **business_value**: Why this matters - reference specific numbers from findings
-- **priority**: 🔴 HIGH | 🟠 MEDIUM | 🟡 LOW (based on severity)
-- **difficulty**: Beginner | Intermediate | Advanced
-
-**Requirements:**
-1. Use ACTUAL indexes and sourcetypes from the findings/discovery
-2. Reference SPECIFIC numbers from findings (e.g., "47 failed logins", "89% disk usage")
-3. Create queries that directly investigate or monitor the issues found
-4. Prioritize highest severity findings first
-5. Include both investigation queries (what happened?) and monitoring queries (prevent recurrence)
-6. **VARY YOUR APPROACH**: Use diverse investigation angles - time-based, user-based, host-based, correlation-based
-7. **MIX QUERY TYPES**: Include searches, stats, timecharts, rare commands, transactions, subsearches
-8. **DIFFERENT TIME RANGES**: Some recent (24h), some historical (7d-30d), some real-time
-9. **CREATIVE PERSPECTIVES**: Don't just repeat patterns - explore outliers, trends, anomalies, baselines
-
-**IMPORTANT:** Generate EXACTLY 6 queries (no more, no less). Return ONLY valid JSON array:
-[
-  {{
-    "title": "🔍 Investigate 47 Failed Admin Login Attempts",
-    "description": "Discovery found 47 failed login attempts to admin account. This query identifies source IPs and timing patterns.",
-    "use_case": "Security Investigation",
-    "category": "Security & Compliance",
-    "spl": "index=security sourcetype=windows:security EventCode=4625 user=admin earliest=-7d | stats count by src_ip, _time span=1h | where count > 3",
-    "finding_reference": "47 failed authentication attempts to administrative accounts detected",
-    "execution_time": "< 30 seconds",
-    "business_value": "Addresses the 47 failed admin logins found in discovery - potential security breach",
-    "priority": "🔴 HIGH",
-    "difficulty": "Beginner"
-  }}
-]
-
-Return EXACTLY 6 queries addressing the most critical findings. Return ONLY the complete JSON array."""
+Return ONLY the JSON array of 4 queries, nothing else."""
 
     finding_based_queries = []
     try:
@@ -1288,13 +1254,10 @@ Return EXACTLY 6 queries addressing the most critical findings. Return ONLY the 
         query_max_tokens = min(8000, int(config.llm.max_tokens * 0.5))
         
         # Debug: Check what we're sending to LLM
-        print(f"DEBUG: Sending query generation prompt with:")
-        print(f"  - Security findings: {len(ai_findings.get('security_findings', []))}")
-        print(f"  - Performance findings: {len(ai_findings.get('performance_findings', []))}")
-        print(f"  - Data quality findings: {len(ai_findings.get('data_quality_findings', []))}")
-        print(f"  - Discovered indexes: {len(discovered_indexes)}")
-        print(f"  - Discovered sourcetypes: {len(discovered_sourcetypes)}")
-        print(f"  - Max tokens: {query_max_tokens}")
+        print(f"DEBUG: Generating queries - {len(ai_findings.get('security_findings', []))} security, "
+              f"{len(ai_findings.get('data_quality_findings', []))} data quality findings")
+        print(f"DEBUG: Using {len(discovered_indexes)} indexes, {len(discovered_sourcetypes)} sourcetypes, "
+              f"max_tokens={query_max_tokens}")
         
         queries_response = await llm_client.generate_response(
             prompt=query_generation_prompt,
