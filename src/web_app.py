@@ -1303,25 +1303,34 @@ Generate queries that are DIRECTLY based on the actual findings. Return ONLY the
         )
         
         print(f"DEBUG: LLM response length: {len(queries_response)}")
-        print(f"DEBUG: Response preview: {queries_response[:500]}")
+        print(f"DEBUG: Response starts with: {queries_response[:100]}")
+        print(f"DEBUG: Response ends with: {queries_response[-100:]}")
         
-        # Parse JSON response - try code block first, then find JSON array
+        # Parse JSON response - try multiple extraction methods
+        queries_json = None
+        
+        # Method 1: Extract from code block
         json_match = re.search(r'```(?:json)?\s*(\[.*\])\s*```', queries_response, re.DOTALL)
         if json_match:
             queries_json = json_match.group(1)
-            print(f"DEBUG: Extracted from code block")
-        else:
-            # Find the JSON array - look for outermost brackets
-            json_match = re.search(r'(\[\s*\{.*\}\s*\])', queries_response, re.DOTALL)
-            if json_match:
-                queries_json = json_match.group(1)
-                print(f"DEBUG: Extracted from raw response")
-            else:
-                queries_json = '[]'
-                print(f"DEBUG: No JSON array found")
+            print(f"DEBUG: Extracted from code block (length: {len(queries_json)})")
         
-        print(f"DEBUG: Extracted JSON length: {len(queries_json)}")
-        print(f"DEBUG: JSON preview: {queries_json[:200]}")
+        # Method 2: Find JSON between first [ and last ]
+        if not queries_json:
+            first_bracket = queries_response.find('[')
+            last_bracket = queries_response.rfind(']')
+            if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+                queries_json = queries_response[first_bracket:last_bracket+1]
+                print(f"DEBUG: Extracted by finding brackets (length: {len(queries_json)})")
+        
+        # Method 3: Empty array fallback
+        if not queries_json:
+            queries_json = '[]'
+            print(f"DEBUG: No JSON array found, using empty array")
+        
+        print(f"DEBUG: Final JSON length: {len(queries_json)}")
+        print(f"DEBUG: JSON starts with: {queries_json[:200]}")
+        print(f"DEBUG: JSON ends with: {queries_json[-200:]}")
         
         # Validate before parsing
         if not queries_json.strip():
