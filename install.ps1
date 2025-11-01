@@ -41,6 +41,31 @@ if ($psVersion -lt 7) {
     exit 1
 }
 
+# Check for Python immediately
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Host ""
+    Write-Host "ERROR: Python 3.8+ is required but not found" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Please install Python 3.8+ using one of these methods:" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Option 1 - Install via Microsoft Store (easiest):" -ForegroundColor White
+    Write-Host "    1. Open Microsoft Store" -ForegroundColor Gray
+    Write-Host "    2. Search for 'Python 3.13' or 'Python 3.12'" -ForegroundColor Gray
+    Write-Host "    3. Click Install" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Option 2 - Install via winget:" -ForegroundColor White
+    Write-Host "    winget install Python.Python.3.13" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Option 3 - Download installer:" -ForegroundColor White
+    Write-Host "    https://www.python.org/downloads/" -ForegroundColor Gray
+    Write-Host "    (Make sure to check 'Add Python to PATH' during installation)" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "After installing Python, close and reopen this terminal, then run:" -ForegroundColor Yellow
+    Write-Host "    pwsh .\install.ps1 -Start" -ForegroundColor Gray
+    Write-Host ""
+    exit 1
+}
+
 # Version and metadata
 $VERSION = "1.0.0"
 $APP_NAME = "Discovery Tool for Splunk MCP Server"
@@ -154,31 +179,7 @@ function Test-Installation {
 function Install-Dependencies {
     Write-ColorMsg $ColorBlue "🔧 Installing dependencies..."
     
-    # Check for Python
-    if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-        Write-Host ""
-        Write-ColorMsg $ColorRed "✗ Python 3.8+ is required but not found"
-        Write-Host ""
-        Write-ColorMsg $ColorCyan "Please install Python 3.8+ using one of these methods:"
-        Write-Host ""
-        Write-Host "  Option 1 - Install via Microsoft Store (easiest):" -ForegroundColor White
-        Write-Host "    1. Open Microsoft Store" -ForegroundColor Gray
-        Write-Host "    2. Search for 'Python 3.13' or 'Python 3.12'" -ForegroundColor Gray
-        Write-Host "    3. Click Install" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host "  Option 2 - Install via winget:" -ForegroundColor White
-        Write-Host "    winget install Python.Python.3.13" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host "  Option 3 - Download installer:" -ForegroundColor White
-        Write-Host "    https://www.python.org/downloads/" -ForegroundColor Gray
-        Write-Host "    (Make sure to check 'Add Python to PATH' during installation)" -ForegroundColor Gray
-        Write-Host ""
-        Write-ColorMsg $ColorYellow "After installing Python, close and reopen this terminal, then run:"
-        Write-Host "    pwsh .\install.ps1 -Start" -ForegroundColor Gray
-        Write-Host ""
-        exit 1
-    }
-    
+    # Python already checked at script start, just show version
     $pythonVersion = (python --version 2>&1) -replace "Python ", ""
     Write-ColorMsg $ColorGreen "✓ Python $pythonVersion found"
     
