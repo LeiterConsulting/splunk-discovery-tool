@@ -488,6 +488,19 @@ async def run_discovery():
         
         # Export JSON data
         try:
+            # Get raw discovery results for SPL generation
+            discovery_results = discovery_engine.get_discovery_results()
+            discovery_results_dict = [
+                {
+                    "type": r.result_type,
+                    "description": r.description,
+                    "data": r.data,
+                    "interesting_findings": r.interesting_findings,
+                    "next_steps": r.next_steps
+                }
+                for r in discovery_results
+            ]
+            
             json_export_path = output_dir / f"discovery_export_{timestamp}.json"
             with open(json_export_path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -495,10 +508,11 @@ async def run_discovery():
                     "classifications": classifications,
                     "recommendations": recommendations,
                     "suggested_use_cases": suggested_use_cases,
+                    "discovery_results": discovery_results_dict,
                     "timestamp": timestamp
                 }, f, indent=2, default=str)
             report_paths.append(str(json_export_path.name))
-            display.info(f"   ✓ {json_export_path.name}")
+            display.info(f"   ✓ {json_export_path.name} (includes {len(discovery_results_dict)} discovery items)")
         except Exception as e:
             display.error(f"   ✗ Failed to export JSON: {str(e)}")
         
@@ -1291,15 +1305,23 @@ Generate queries that are DIRECTLY based on the actual findings. Return ONLY the
         print(f"DEBUG: LLM response length: {len(queries_response)}")
         print(f"DEBUG: Response preview: {queries_response[:500]}")
         
-        # Parse JSON response
-        json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', queries_response, re.DOTALL)
+        # Parse JSON response - try code block first, then find JSON array
+        json_match = re.search(r'```(?:json)?\s*(\[.*\])\s*```', queries_response, re.DOTALL)
         if json_match:
             queries_json = json_match.group(1)
+            print(f"DEBUG: Extracted from code block")
         else:
-            json_match = re.search(r'(\[.*\])', queries_response, re.DOTALL)
-            queries_json = json_match.group(1) if json_match else '[]'
+            # Find the JSON array - look for outermost brackets
+            json_match = re.search(r'(\[\s*\{.*\}\s*\])', queries_response, re.DOTALL)
+            if json_match:
+                queries_json = json_match.group(1)
+                print(f"DEBUG: Extracted from raw response")
+            else:
+                queries_json = '[]'
+                print(f"DEBUG: No JSON array found")
         
         print(f"DEBUG: Extracted JSON length: {len(queries_json)}")
+        print(f"DEBUG: JSON preview: {queries_json[:200]}")
         
         # Validate before parsing
         if not queries_json.strip():
