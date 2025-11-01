@@ -3423,6 +3423,54 @@ def get_frontend_html():
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
         
+        // Error Boundary to catch React rendering errors
+        class ErrorBoundary extends React.Component {
+            constructor(props) {
+                super(props);
+                this.state = { hasError: false, error: null, errorInfo: null };
+            }
+            
+            static getDerivedStateFromError(error) {
+                return { hasError: true };
+            }
+            
+            componentDidCatch(error, errorInfo) {
+                console.error('React Error Boundary caught:', error, errorInfo);
+                this.setState({ error, errorInfo });
+            }
+            
+            render() {
+                if (this.state.hasError) {
+                    return (
+                        <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                            <div className="bg-white rounded-lg shadow-xl p-8 max-w-2xl">
+                                <h1 className="text-2xl font-bold text-red-600 mb-4">
+                                    <i className="fas fa-exclamation-triangle mr-2"></i>
+                                    Application Error
+                                </h1>
+                                <p className="text-gray-700 mb-4">
+                                    Something went wrong. Please refresh the page to continue.
+                                </p>
+                                <div className="bg-gray-100 p-4 rounded mb-4 overflow-auto max-h-64">
+                                    <pre className="text-sm text-red-600">
+                                        {this.state.error && this.state.error.toString()}
+                                    </pre>
+                                </div>
+                                <button
+                                    onClick={() => window.location.reload()}
+                                    className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"
+                                >
+                                    <i className="fas fa-sync-alt mr-2"></i>
+                                    Reload Page
+                                </button>
+                            </div>
+                        </div>
+                    );
+                }
+                return this.props.children;
+            }
+        }
+        
         function App() {
             const [isConnected, setIsConnected] = useState(false);
             const [discoveryStatus, setDiscoveryStatus] = useState('idle');
@@ -3758,10 +3806,16 @@ def get_frontend_html():
             const loadReports = async () => {
                 try {
                     const response = await fetch('/reports');
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
                     const result = await response.json();
+                    console.log('Loaded reports:', result);
                     setReports(result.reports || []);
                 } catch (error) {
                     console.error('Failed to load reports:', error);
+                    // Don't crash the UI - just show empty reports
+                    setReports([]);
                 }
             };
             
@@ -6357,7 +6411,25 @@ def get_frontend_html():
             );
         }
         
-        ReactDOM.render(<App />, document.getElementById('root'));
+        // Global error handler to catch unhandled errors
+        window.addEventListener('error', (event) => {
+            console.error('Global error caught:', event.error);
+            // Prevent white screen by not letting the error propagate
+            event.preventDefault();
+        });
+        
+        window.addEventListener('unhandledrejection', (event) => {
+            console.error('Unhandled promise rejection:', event.reason);
+            // Prevent white screen
+            event.preventDefault();
+        });
+        
+        ReactDOM.render(
+            <ErrorBoundary>
+                <App />
+            </ErrorBoundary>,
+            document.getElementById('root')
+        );
     </script>
 </body>
 </html>
