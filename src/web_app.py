@@ -4455,8 +4455,8 @@ def get_frontend_html():
                                     <i className="fas fa-trophy mr-2"></i>
                                     <span className="font-semibold">Discovery Complete!</span>
                                 </div>
-                                <p className="text-sm text-green-600">Duration: {data.duration}</p>
-                                <p className="text-sm text-green-600">Generated {data.report_paths.length} reports</p>
+                                <p className="text-sm text-green-600">Duration: {data.duration || 'N/A'}</p>
+                                <p className="text-sm text-green-600">Generated {data.report_count || 0} reports</p>
                             </div>
                         );
                     
