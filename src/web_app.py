@@ -489,7 +489,7 @@ async def run_discovery():
         # Export JSON data
         try:
             # Get raw discovery results for SPL generation
-            discovery_results = discovery_engine.get_discovery_results()
+            discovery_results = discovery_engine.get_all_results()
             discovery_results_dict = [
                 {
                     "type": r.result_type,
