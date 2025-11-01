@@ -492,11 +492,11 @@ async def run_discovery():
             discovery_results = discovery_engine.get_all_results()
             discovery_results_dict = [
                 {
-                    "type": r.result_type,
+                    "step": r.step,
                     "description": r.description,
                     "data": r.data,
                     "interesting_findings": r.interesting_findings,
-                    "next_steps": r.next_steps
+                    "timestamp": r.timestamp.isoformat() if hasattr(r.timestamp, 'isoformat') else str(r.timestamp)
                 }
                 for r in discovery_results
             ]
