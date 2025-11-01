@@ -663,6 +663,19 @@ async def list_reports():
     return {"reports": sorted(reports, key=lambda x: x["modified"], reverse=True)}
 
 
+@app.get("/api/discovery/results")
+async def get_discovery_results():
+    """
+    Legacy endpoint stub - prevents 404 errors from cached frontend code.
+    Modern discovery results are now delivered via WebSocket real-time updates
+    and stored in discovery report files.
+    """
+    return {
+        "message": "Discovery results are now delivered via WebSocket. Check /reports for saved discovery sessions.",
+        "reports_endpoint": "/reports"
+    }
+
+
 @app.get("/reports/{filename}")
 async def get_report(filename: str):
     """Get a specific report file with security validation."""
