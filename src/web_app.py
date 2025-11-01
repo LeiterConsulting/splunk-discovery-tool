@@ -1012,37 +1012,43 @@ async def summarize_session(request: Dict[str, Any]):
         "message": "Generating SPL queries..."
     }
     
-    # Generate SPL queries
+    # Generate template SPL queries (used as fallback if AI generation fails)
     spl_gen = SPLGenerator(discovery_results)
-    queries = []
+    template_queries = []
     
     # Security queries
     security_queries = spl_gen.generate_security_queries()
-    queries.extend([{
+    template_queries.extend([{
         **q,
-        "category": "Security & Compliance"
+        "category": "Security & Compliance",
+        "query_source": "template"
     } for q in security_queries])
     
     # Infrastructure queries
     infra_queries = spl_gen.generate_infrastructure_queries()
-    queries.extend([{
+    template_queries.extend([{
         **q,
-        "category": "Infrastructure & Performance"
+        "category": "Infrastructure & Performance",
+        "query_source": "template"
     } for q in infra_queries])
     
     # Performance queries
     perf_queries = spl_gen.generate_performance_queries()
-    queries.extend([{
+    template_queries.extend([{
         **q,
-        "category": "Capacity Planning"
+        "category": "Capacity Planning",
+        "query_source": "template"
     } for q in perf_queries])
     
     # Exploratory queries
     explore_queries = spl_gen.generate_exploratory_queries()
-    queries.extend([{
+    template_queries.extend([{
         **q,
-        "category": "Data Exploration"
+        "category": "Data Exploration",
+        "query_source": "template"
     } for q in explore_queries])
+    
+    print(f"Generated {len(template_queries)} template queries as fallback")
     
     # Update progress
     summarization_progress[timestamp] = {
@@ -1300,27 +1306,23 @@ Generate queries that are DIRECTLY based on the actual findings. Return ONLY the
         print(f"Error generating finding-based queries with AI: {e}")
         finding_based_queries = []
     
-    # Combine with template queries (but prioritize AI findings)
-    queries = finding_based_queries  # Start with AI-generated queries
+    # Combine AI-generated queries with template queries
+    print(f"AI generated {len(finding_based_queries)} queries, have {len(template_queries)} template queries")
     
-    # Only add template queries if we have few AI queries
-    if len(finding_based_queries) < 8:
-        print("Adding template queries to supplement AI-generated queries...")
-        spl_gen = SPLGenerator(discovery_results)
-        
-        # Add a few template queries for coverage
-        template_security = spl_gen.generate_security_queries()[:3]
-        template_perf = spl_gen.generate_performance_queries()[:3]
-        
-        for q in template_security:
-            q['query_source'] = 'template'
-            q['category'] = 'Security & Compliance'
-            queries.append(q)
-        
-        for q in template_perf:
-            q['query_source'] = 'template'
-            q['category'] = 'Infrastructure & Performance'
-            queries.append(q)
+    if len(finding_based_queries) >= 8:
+        # AI generated enough queries - use them, but keep some templates for variety
+        queries = finding_based_queries + template_queries[:4]
+        print(f"Using {len(finding_based_queries)} AI queries + {len(template_queries[:4])} template queries")
+    else:
+        # AI didn't generate enough - prioritize what we have, supplement with templates
+        queries = finding_based_queries + template_queries
+        print(f"Using {len(finding_based_queries)} AI queries + all {len(template_queries)} template queries")
+    
+    # Ensure we have at least some queries
+    if len(queries) == 0:
+        print("WARNING: No queries generated at all! This shouldn't happen.")
+        # This should never happen since template_queries should always have content
+        queries = []
     
     # Prioritize queries (AI findings first, then by priority)
     queries.sort(key=lambda q: (
