@@ -15,12 +15,14 @@ param(
     [switch]$ForceYes
 )
 
-# Check PowerShell version
-if ($PSVersionTable.PSVersion.Major -lt 7) {
+# Check PowerShell version (must be compatible with PS 5.1 syntax)
+$psVersion = $PSVersionTable.PSVersion.Major
+if ($psVersion -lt 7) {
     Write-Host ""
     Write-Host "ERROR: PowerShell 7+ is required" -ForegroundColor Red
     Write-Host ""
-    Write-Host "You are running PowerShell $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)" -ForegroundColor Yellow
+    $versionString = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)"
+    Write-Host "You are running PowerShell $versionString" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Please install PowerShell 7+ using one of these methods:" -ForegroundColor Cyan
     Write-Host ""
