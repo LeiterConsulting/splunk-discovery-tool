@@ -155,7 +155,31 @@ Once started, access the web interface at:
 - ✅ **Dependencies Viewer**: Check installed package versions
 - ✅ **Version Display**: Current application version
 
-## 🔐 Security
+## � Python Dependencies
+
+The installer automatically installs these Python packages (from `requirements.txt`):
+
+### Core Framework
+- **fastapi** (>=0.104.0) - Modern web framework for building APIs
+- **uvicorn[standard]** (>=0.24.0) - ASGI server with WebSocket support
+- **python-multipart** (>=0.0.6) - Multipart form data parsing
+
+### Security & Encryption
+- **cryptography** (>=41.0.0) - Fernet encryption for configuration storage
+
+### LLM Integration
+- **openai** (>=1.0.0) - OpenAI API client (supports OpenAI-compatible endpoints)
+
+### Data & Configuration
+- **pyyaml** (>=6.0) - YAML configuration parsing
+
+### HTTP Clients
+- **httpx** (>=0.24.0) - Modern async HTTP client
+- **aiohttp** (>=3.9.0) - Async HTTP client/server framework
+
+> All dependencies are automatically installed in a virtual environment by the installer. You can view installed versions in the web UI settings panel.
+
+## �🔐 Security
 
 - **Encrypted Storage**: All credentials encrypted using Fernet
 - **No Plaintext**: Secrets never stored in plaintext
