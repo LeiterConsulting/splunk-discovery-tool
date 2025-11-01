@@ -31,21 +31,46 @@ Automatically discover your Splunk deployment, analyze configurations, generate 
 ## 📋 Prerequisites
 
 ### Required
-- **Python 3.8+** with pip (included in Python 3.8+)
-  - Windows: Install via Microsoft Store, winget, or [python.org](https://www.python.org/downloads/)
-  - Linux/macOS: Usually pre-installed, or use package manager
-- **PowerShell 7+** (Windows only - for install.ps1)
-  - Install: `winget install Microsoft.PowerShell`
-  - Alternative: Use `install.sh` with Git Bash
+
+#### Python 3.8+ with pip
+**Windows** (choose one method):
+1. **Microsoft Store** (Easiest):
+   - Open Microsoft Store, search "Python 3.13"
+   - Click "Get" to install (automatically adds to PATH)
+   
+2. **winget** (Command-line):
+   ```powershell
+   winget install Python.Python.3.13
+   ```
+   
+3. **Manual Download**:
+   - Download from [python.org](https://www.python.org/downloads/)
+   - Run installer, **check "Add Python to PATH"**
+
+**Linux/macOS**: Usually pre-installed, or use package manager (`apt`, `brew`, etc.)
+
+#### PowerShell 7+ (Windows only - for install.ps1)
+**Windows** (choose one method):
+1. **winget** (Easiest):
+   ```powershell
+   winget install Microsoft.PowerShell
+   ```
+   
+2. **Manual Download**:
+   - Download MSI from [Microsoft's GitHub](https://github.com/PowerShell/PowerShell/releases)
+   - Run installer
+   
+3. **Alternative**:
+   - Use `install.sh` with Git Bash (no PowerShell 7+ required)
 
 ### Configuration (via web UI after installation)
 - **MCP Server** for Splunk (URL configured in settings)
 - **LLM API Key** (OpenAI, Anthropic, or compatible endpoint)
 
 > **Windows Installation Notes**: 
-> - Install Python first, then PowerShell 7+
-> - Make sure to check "Add Python to PATH" during Python installation
-> - After installing either, close and reopen your terminal before running the installer
+> - Install Python **first**, then PowerShell 7+
+> - Close and reopen your terminal after installing prerequisites
+> - The installer will check for these requirements and provide detailed instructions if missing
 
 ## 🔧 Quick Start
 
