@@ -3511,6 +3511,7 @@ def get_frontend_html():
             const [isLoadingSummary, setIsLoadingSummary] = useState(false);
             const [currentSessionId, setCurrentSessionId] = useState(null);
             const [activeTab, setActiveTab] = useState('summary'); // 'summary', 'queries', 'tasks'
+            const [queryFilter, setQueryFilter] = useState('all'); // 'all', 'ai_finding', 'template'
             const [summaryProgress, setSummaryProgress] = useState({
                 stage: 'idle',
                 progress: 0,
@@ -5402,12 +5403,55 @@ def get_frontend_html():
                                             {/* SPL Queries Tab */}
                                             {activeTab === 'queries' && (
                                                 <div>
-                                                    <h3 className="text-xl font-semibold text-gray-900 mb-4 flex items-center">
-                                                        <i className="fas fa-code text-purple-600 mr-2"></i>
-                                                        Ready-to-Use SPL Queries ({summaryData.spl_queries.length})
-                                                    </h3>
+                                                    <div className="flex items-center justify-between mb-4">
+                                                        <h3 className="text-xl font-semibold text-gray-900 flex items-center">
+                                                            <i className="fas fa-code text-purple-600 mr-2"></i>
+                                                            Ready-to-Use SPL Queries ({summaryData.spl_queries.filter(q => 
+                                                                queryFilter === 'all' || q.query_source === queryFilter
+                                                            ).length})
+                                                        </h3>
+                                                        
+                                                        {/* Filter Toggle */}
+                                                        <div className="flex items-center space-x-2">
+                                                            <button
+                                                                onClick={() => setQueryFilter('all')}
+                                                                className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors ${
+                                                                    queryFilter === 'all' 
+                                                                        ? 'bg-indigo-600 text-white' 
+                                                                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                                }`}
+                                                            >
+                                                                All ({summaryData.spl_queries.length})
+                                                            </button>
+                                                            <button
+                                                                onClick={() => setQueryFilter('ai_finding')}
+                                                                className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors flex items-center space-x-1 ${
+                                                                    queryFilter === 'ai_finding' 
+                                                                        ? 'bg-purple-600 text-white' 
+                                                                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                                }`}
+                                                            >
+                                                                <span>⚡</span>
+                                                                <span>AI-Generated ({summaryData.spl_queries.filter(q => q.query_source === 'ai_finding').length})</span>
+                                                            </button>
+                                                            <button
+                                                                onClick={() => setQueryFilter('template')}
+                                                                className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors flex items-center space-x-1 ${
+                                                                    queryFilter === 'template' 
+                                                                        ? 'bg-blue-600 text-white' 
+                                                                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                                }`}
+                                                            >
+                                                                <span>📋</span>
+                                                                <span>Template-Based ({summaryData.spl_queries.filter(q => q.query_source === 'template').length})</span>
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                    
                                                     <div className="space-y-4">
-                                                        {summaryData.spl_queries.map((query, idx) => (
+                                                        {summaryData.spl_queries
+                                                            .filter(query => queryFilter === 'all' || query.query_source === queryFilter)
+                                                            .map((query, idx) => (
                                                             <div key={idx} className={`border rounded-lg p-5 hover:shadow-md transition-shadow ${
                                                                 query.priority?.startsWith('🔴') ? 'border-red-300 bg-red-50' :
                                                                 query.priority?.startsWith('🟠') ? 'border-orange-300 bg-orange-50' :
@@ -5425,9 +5469,14 @@ def get_frontend_html():
                                                                         }`}>
                                                                             {query.priority}
                                                                         </span>
-                                                                        {query.query_source === 'finding' && (
+                                                                        {query.query_source === 'ai_finding' && (
                                                                             <span className="ml-2 px-2 py-1 text-xs bg-purple-600 text-white rounded-full">
-                                                                                ⚡ Based on Discovery Finding
+                                                                                ⚡ AI-Generated
+                                                                            </span>
+                                                                        )}
+                                                                        {query.query_source === 'template' && (
+                                                                            <span className="ml-2 px-2 py-1 text-xs bg-blue-600 text-white rounded-full">
+                                                                                📋 Template
                                                                             </span>
                                                                         )}
                                                                     </div>
