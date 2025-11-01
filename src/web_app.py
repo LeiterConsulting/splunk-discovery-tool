@@ -1234,13 +1234,13 @@ Data Quality Issues: {len(ai_findings.get('data_quality_findings', []))} found
 Optimization Opportunities: {len(ai_findings.get('optimization_findings', []))} found
 
 **Specific Findings:**
-{json.dumps(ai_findings, indent=2)[:4000]}
+{json.dumps(ai_findings, indent=2)[:3000]}
 
 **Available Resources:**
 Indexes: {', '.join(list(discovered_indexes)[:20])}
-Sourcetypes: {', '.join(list(discovered_sourcetypes)[:30])}
+Sourcetypes: {', '.join(list(discovered_sourcetypes)[:20])}
 
-Generate 8-12 highly specific SPL queries that directly address these findings. For each query provide:
+Generate exactly 6 highly specific SPL queries that directly address the most critical findings. For each query provide:
 
 - **title**: Clear, specific title referencing the actual finding (e.g., "Investigate 47 Failed Login Attempts to admin Account")
 - **description**: 1-2 sentences explaining what this query does and why it matters
@@ -1264,7 +1264,7 @@ Generate 8-12 highly specific SPL queries that directly address these findings. 
 8. **DIFFERENT TIME RANGES**: Some recent (24h), some historical (7d-30d), some real-time
 9. **CREATIVE PERSPECTIVES**: Don't just repeat patterns - explore outliers, trends, anomalies, baselines
 
-Return as JSON array:
+**IMPORTANT:** Generate EXACTLY 6 queries (no more, no less). Return ONLY valid JSON array:
 [
   {{
     "title": "🔍 Investigate 47 Failed Admin Login Attempts",
@@ -1280,12 +1280,12 @@ Return as JSON array:
   }}
 ]
 
-Generate queries that are DIRECTLY based on the actual findings. Return ONLY the JSON array."""
+Return EXACTLY 6 queries addressing the most critical findings. Return ONLY the complete JSON array."""
 
     finding_based_queries = []
     try:
-        # Use 40% of configured max_tokens for query generation (needs more for detailed queries)
-        query_max_tokens = min(6000, int(config.llm.max_tokens * 0.4))
+        # Use 50% of configured max_tokens for query generation (needs more for detailed queries)
+        query_max_tokens = min(8000, int(config.llm.max_tokens * 0.5))
         
         # Debug: Check what we're sending to LLM
         print(f"DEBUG: Sending query generation prompt with:")
