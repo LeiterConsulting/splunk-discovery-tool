@@ -162,7 +162,7 @@ function Install-Dependencies {
 }
 
 # Start service
-function Start-Service {
+function Start-DT4SMSService {
     # Check if already running
     if (Test-Path $PID_FILE) {
         $processId = Get-Content $PID_FILE
@@ -198,7 +198,7 @@ function Start-Service {
 }
 
 # Stop service
-function Stop-Service {
+function Stop-DT4SMSService {
     if (-not (Test-Path $PID_FILE)) {
         Write-ColorMsg $ColorYellow "⚠ Service not running"
         return
@@ -254,7 +254,7 @@ function Uninstall-Application {
     Write-ColorMsg $ColorBlue "🗑️ Uninstalling $APP_SHORT..."
     
     # Stop service
-    Stop-Service
+    Stop-DT4SMSService
     
     # Remove virtual environment
     if (Test-Path $VENV_DIR) {
@@ -280,17 +280,17 @@ if ($Help) {
     Show-Help
 } elseif ($Start) {
     if (Test-Installation) {
-        Start-Service
+        Start-DT4SMSService
     } else {
         Install-Dependencies
-        Start-Service
+        Start-DT4SMSService
     }
 } elseif ($Stop) {
-    Stop-Service
+    Stop-DT4SMSService
 } elseif ($Restart) {
-    Stop-Service
+    Stop-DT4SMSService
     Start-Sleep -Seconds 1
-    Start-Service
+    Start-DT4SMSService
 } elseif ($Status) {
     Get-ServiceStatus
 } elseif ($Uninstall) {
@@ -304,10 +304,10 @@ if ($Help) {
     Write-Host ""
     
     if (Test-Installation) {
-        Start-Service
+        Start-DT4SMSService
     } else {
         Write-ColorMsg $ColorBlue "First run detected. Installing dependencies..."
         Install-Dependencies
-        Start-Service
+        Start-DT4SMSService
     }
 }
