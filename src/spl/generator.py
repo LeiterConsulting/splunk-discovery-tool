@@ -105,6 +105,37 @@ class SPLGenerator:
         """Generate security-focused SPL queries."""
         queries = []
         
+        # Always generate baseline security queries even if we don't have detailed sourcetype data
+        if not self.sourcetypes:
+            # Generate generic security queries that work with any index
+            queries.append({
+                "title": "Security Event Monitoring - Failed Authentications",
+                "description": "Monitor authentication failures across all security-related data sources",
+                "use_case": "Security Monitoring",
+                "category": "Security",
+                "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} (failed OR failure OR denied OR invalid) (login OR authentication OR logon OR auth) earliest=-24h | stats count by host, sourcetype, user | sort -count',
+                "execution_time": "< 1 minute",
+                "business_value": "Identify potential brute force attacks and unauthorized access attempts",
+                "indexes": self.indexes,
+                "difficulty": "Beginner",
+                "dashboard_type": "Table"
+            })
+            
+            queries.append({
+                "title": "Security Anomaly Detection - Unusual Activity Patterns",
+                "description": "Detect unusual patterns in security events that may indicate threats",
+                "use_case": "Threat Detection",
+                "category": "Security",
+                "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} (error OR warning OR alert OR critical OR suspicious) earliest=-24h | timechart span=1h count by sourcetype',
+                "execution_time": "< 30 seconds",
+                "business_value": "Early detection of security incidents and anomalous behavior",
+                "indexes": self.indexes,
+                "difficulty": "Beginner",
+                "dashboard_type": "Timechart"
+            })
+            
+            return queries
+        
         # Check for Windows Security logs
         winsec_sources = [st for st in self.sourcetypes if 'wineventlog:security' in st['name'].lower()]
         if winsec_sources:
@@ -169,6 +200,36 @@ class SPLGenerator:
         """Generate infrastructure monitoring SPL queries."""
         queries = []
         
+        # Always generate baseline infrastructure queries
+        if not self.sourcetypes:
+            queries.append({
+                "title": "System Health Overview - Event Volume Monitoring",
+                "description": "Monitor event ingestion rates across all systems to detect collection issues",
+                "use_case": "Infrastructure Health",
+                "category": "Infrastructure",
+                "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} earliest=-24h | timechart span=1h count by host | sort -count',
+                "execution_time": "< 1 minute",
+                "business_value": "Ensure continuous data collection and identify systems with collection issues",
+                "indexes": self.indexes,
+                "difficulty": "Beginner",
+                "dashboard_type": "Timechart"
+            })
+            
+            queries.append({
+                "title": "Data Source Health Check",
+                "description": "Verify all expected data sources are actively sending data",
+                "use_case": "Data Quality",
+                "category": "Infrastructure",
+                "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} earliest=-24h | stats count latest(_time) as latest by sourcetype, host | eval hours_since=round((now()-latest)/3600, 1) | where hours_since < 24 | sort -count',
+                "execution_time": "< 30 seconds",
+                "business_value": "Quickly identify gaps in monitoring coverage",
+                "indexes": self.indexes,
+                "difficulty": "Beginner",
+                "dashboard_type": "Table"
+            })
+            
+            return queries
+        
         # CPU monitoring
         cpu_sources = [st for st in self.sourcetypes if 'cpu' in st['name'].lower()]
         if cpu_sources:
@@ -223,6 +284,36 @@ class SPLGenerator:
         """Generate performance monitoring queries."""
         queries = []
         
+        # Always generate baseline performance queries
+        if not self.sourcetypes:
+            queries.append({
+                "title": "Performance Analysis - High Volume Events",
+                "description": "Identify sourcetypes with unusually high event volumes that may impact performance",
+                "use_case": "Capacity Planning",
+                "category": "Performance",
+                "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} earliest=-24h | stats count by sourcetype | where count > 10000 | sort -count',
+                "execution_time": "< 30 seconds",
+                "business_value": "Optimize data ingestion and identify potential storage concerns",
+                "indexes": self.indexes,
+                "difficulty": "Beginner",
+                "dashboard_type": "Table + Chart"
+            })
+            
+            queries.append({
+                "title": "Data Growth Trend Analysis",
+                "description": "Track data volume growth over time for capacity planning",
+                "use_case": "Capacity Planning",
+                "category": "Performance",
+                "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} earliest=-7d | bucket _time span=1d | stats count as events sum(eval(len(_raw))) as bytes by _time | eval MB=round(bytes/1024/1024, 2) | fields _time events MB',
+                "execution_time": "< 1 minute",
+                "business_value": "Forecast storage needs and budget for infrastructure growth",
+                "indexes": self.indexes,
+                "difficulty": "Intermediate",
+                "dashboard_type": "Timechart"
+            })
+            
+            return queries
+        
         # Memory monitoring
         memory_sources = [st for st in self.sourcetypes if any(term in st['name'].lower() for term in ['memory', 'mem', 'vmstat'])]
         if memory_sources:
@@ -261,7 +352,34 @@ class SPLGenerator:
         """Generate exploratory queries for unknown/custom data."""
         queries = []
         
-        # Generic data exploration query
+        # Always generate baseline exploratory queries
+        queries.append({
+            "title": "Data Source Discovery - All Active Sources",
+            "description": "Discover all data sources currently sending events to Splunk",
+            "use_case": "Data Exploration",
+            "category": "Analytics",
+            "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} earliest=-24h | stats count as events, latest(_time) as latest, earliest(_time) as earliest by sourcetype, source, host | eval hours_active=round((latest-earliest)/3600, 1) | sort -events',
+            "execution_time": "< 30 seconds",
+            "business_value": "Understand your complete data landscape and identify monitoring opportunities",
+            "indexes": self.indexes,
+            "difficulty": "Beginner",
+            "dashboard_type": "Table"
+        })
+        
+        queries.append({
+            "title": "Event Pattern Analysis - Time Distribution",
+            "description": "Analyze when events occur to understand usage patterns and peak times",
+            "use_case": "Data Exploration",
+            "category": "Analytics",
+            "spl": f'index={self.indexes[0] if self.indexes and self.indexes[0] != "*" else "*"} earliest=-7d | bucket _time span=1h | stats count by _time, sourcetype | sort -_time',
+            "execution_time": "< 1 minute",
+            "business_value": "Optimize monitoring windows and understand business activity patterns",
+            "indexes": self.indexes,
+            "difficulty": "Intermediate",
+            "dashboard_type": "Timechart + Heatmap"
+        })
+        
+        # Additional sourcetype-specific query if we have data
         if self.sourcetypes:
             queries.append({
                 "title": "Data Source Activity Overview",
@@ -270,7 +388,7 @@ class SPLGenerator:
                 "category": "Analytics",
                 "spl": self._generate_data_overview_spl(),
                 "execution_time": "< 30 seconds",
-                "business_value": "Understand your data landscape and identify high-value sources for monitoring",
+                "business_value": "Identify high-value sources for focused monitoring and analysis",
                 "indexes": self.indexes,
                 "difficulty": "Beginner",
                 "dashboard_type": "Bar Chart + Table"
