@@ -31,9 +31,12 @@ Automatically discover your Splunk deployment, analyze configurations, generate 
 ## 📋 Prerequisites
 
 - **Python 3.8+**
+- **PowerShell 7+** (Windows only - for install.ps1)
 - **pip** (Python package installer)
 - **MCP Server** for Splunk (connection configured via settings)
 - **LLM API Access** (OpenAI, Anthropic, or compatible endpoint)
+
+> **Note for Windows Users**: The PowerShell installer requires PowerShell 7+. Install via `winget install Microsoft.PowerShell` or use `install.sh` with Git Bash instead.
 
 ## 🔧 Quick Start
 

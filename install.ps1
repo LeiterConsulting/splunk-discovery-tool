@@ -15,6 +15,30 @@ param(
     [switch]$ForceYes
 )
 
+# Check PowerShell version
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Host ""
+    Write-Host "ERROR: PowerShell 7+ is required" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "You are running PowerShell $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Please install PowerShell 7+ using one of these methods:" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Option 1 - Install via winget (recommended):" -ForegroundColor White
+    Write-Host "    winget install Microsoft.PowerShell" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Option 2 - Install via MSI:" -ForegroundColor White
+    Write-Host "    Download from: https://github.com/PowerShell/PowerShell/releases" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Option 3 - Use install.sh with Git Bash (if Git for Windows is installed):" -ForegroundColor White
+    Write-Host "    Open Git Bash and run: chmod +x install.sh && ./install.sh" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "After installing PowerShell 7+, run this script with:" -ForegroundColor Cyan
+    Write-Host "    pwsh .\install.ps1 -Start" -ForegroundColor Gray
+    Write-Host ""
+    exit 1
+}
+
 # Version and metadata
 $VERSION = "1.0.0"
 $APP_NAME = "Discovery Tool for Splunk MCP Server"
