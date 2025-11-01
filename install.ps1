@@ -115,7 +115,8 @@ function Test-Installation {
             Write-ColorMsg $ColorGreen "✓ Installation up-to-date (v$VERSION)"
             return $true
         }
-    } catch {
+    } catch [System.Exception] {
+        # Manifest doesn't exist or is corrupted
         return $false
     }
     
