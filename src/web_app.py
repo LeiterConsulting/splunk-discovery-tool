@@ -965,10 +965,38 @@ async def test_llm_connection():
                 "suggestion": "Enter the endpoint URL (e.g., http://localhost:11434 for Ollama)"
             }
         
+        # Clean up endpoint URL if user included API paths
+        cleaned_endpoint = config.llm.endpoint_url if config.llm.provider == "custom" else None
+        url_cleaned = False
+        
+        if cleaned_endpoint:
+            original_url = cleaned_endpoint
+            cleaned_endpoint = cleaned_endpoint.rstrip('/')
+            
+            # Strip common API path suffixes to get base URL
+            paths_to_strip = [
+                '/v1/chat/completions',
+                '/chat/completions',
+                '/v1/completions',
+                '/completions',
+                '/api/chat',
+                '/api/generate',
+                '/v1',
+                '/api'
+            ]
+            
+            for path in paths_to_strip:
+                if cleaned_endpoint.endswith(path):
+                    cleaned_endpoint = cleaned_endpoint[:-len(path)].rstrip('/')
+                    url_cleaned = True
+                    break
+        
         # Test results
         results = {
             "status": "testing",
-            "endpoint": config.llm.endpoint_url if config.llm.provider == "custom" else "OpenAI API",
+            "endpoint": cleaned_endpoint if config.llm.provider == "custom" else "OpenAI API",
+            "original_endpoint": config.llm.endpoint_url if config.llm.provider == "custom" else None,
+            "url_cleaned": url_cleaned,
             "provider": config.llm.provider,
             "model": config.llm.model,
             "tests": {}
@@ -979,7 +1007,7 @@ async def test_llm_connection():
             if config.llm.provider == "custom":
                 # Test custom endpoint with multiple common paths
                 import httpx
-                endpoint_base = config.llm.endpoint_url.rstrip('/')
+                endpoint_base = cleaned_endpoint
                 detected_format = None
                 available_models = []
                 
@@ -6488,18 +6516,20 @@ def get_frontend_html():
                                                     <label className="block text-sm font-medium text-gray-700 mb-1">
                                                         Endpoint URL
                                                         <span className="ml-2 text-xs text-gray-500">
-                                                            (e.g., http://localhost:11434 for Ollama)
+                                                            (base URL only, without API paths)
                                                         </span>
                                                     </label>
                                                     <input 
                                                         type="text" 
                                                         defaultValue={config.llm.endpoint_url || ''}
-                                                        placeholder="http://localhost:11434"
+                                                        placeholder="http://localhost:8000"
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="llm-endpoint-url"
                                                     />
                                                     <p className="mt-1 text-xs text-gray-500">
-                                                        For OpenAI-compatible APIs (Ollama, LM Studio, vLLM, etc.)
+                                                        ✅ Good: <span className="font-mono">http://localhost:8000</span><br/>
+                                                        ❌ Bad: <span className="font-mono">http://localhost:8000/v1/chat/completions</span><br/>
+                                                        <span className="italic">Compatible with: Ollama, LM Studio, vLLM, LocalAI, etc.</span>
                                                     </p>
                                                 </div>
                                             )}
@@ -6611,6 +6641,19 @@ def get_frontend_html():
                                                             const result = await response.json();
                                                             
                                                             let html = '<div className="space-y-2">';
+                                                            
+                                                            // Show URL cleaning notification if applicable
+                                                            if (result.url_cleaned && result.original_endpoint) {
+                                                                html += '<div className="bg-blue-100 border border-blue-300 rounded-lg p-3 mb-2">';
+                                                                html += '<div className="font-semibold text-blue-800"><i className="fas fa-info-circle mr-2"></i>Endpoint URL Cleaned</div>';
+                                                                html += '<div className="text-xs text-blue-700 mt-1">';
+                                                                html += 'Removed API path from endpoint URL for proper testing.<br>';
+                                                                html += '<span className="font-mono">From: ' + result.original_endpoint + '</span><br>';
+                                                                html += '<span className="font-mono">To: ' + result.endpoint + '</span><br>';
+                                                                html += '<span className="italic mt-1">Tip: Enter only the base URL (e.g., http://localhost:8000)</span>';
+                                                                html += '</div>';
+                                                                html += '</div>';
+                                                            }
                                                             
                                                             // Overall status
                                                             if (result.status === 'success') {

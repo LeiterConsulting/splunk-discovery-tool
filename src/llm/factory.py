@@ -473,7 +473,32 @@ class CustomLLMClient:
     
     def __init__(self, endpoint_url: str, api_key: Optional[str] = None, model: str = "llama2", 
                  rate_limit_display_callback=None):
-        self.endpoint_url = endpoint_url.rstrip('/')
+        # Clean up endpoint URL - strip common API paths that users might include
+        cleaned_url = endpoint_url.rstrip('/')
+        
+        # Strip common API path suffixes to get base URL
+        paths_to_strip = [
+            '/v1/chat/completions',
+            '/chat/completions',
+            '/v1/completions',
+            '/completions',
+            '/api/chat',
+            '/api/generate',
+            '/v1',
+            '/api'
+        ]
+        
+        for path in paths_to_strip:
+            if cleaned_url.endswith(path):
+                cleaned_url = cleaned_url[:-len(path)]
+                if rate_limit_display_callback:
+                    rate_limit_display_callback({
+                        'type': 'info',
+                        'message': f"Cleaned endpoint URL: removed '{path}' suffix"
+                    })
+                break
+        
+        self.endpoint_url = cleaned_url.rstrip('/')
         self.api_key = api_key
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
