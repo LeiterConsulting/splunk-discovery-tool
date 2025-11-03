@@ -502,6 +502,7 @@ class CustomLLMClient:
         self.api_key = api_key
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
+        self._cached_endpoint_config = None  # Cache successful endpoint format
         
     async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """Generate response using custom LLM endpoint.
@@ -586,6 +587,37 @@ class CustomLLMClient:
         last_error = None
         
         async with aiohttp.ClientSession() as session:
+            # If we have a cached successful endpoint, try it first
+            if self._cached_endpoint_config:
+                try:
+                    url = f"{self.endpoint_url}{self._cached_endpoint_config['path']}"
+                    # Build payload dynamically with current parameters
+                    payload = self._build_payload(
+                        self._cached_endpoint_config['format'],
+                        messages,
+                        prompt_text,
+                        max_tokens,
+                        temperature
+                    )
+                    
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            content = self._cached_endpoint_config['response_key'](result)
+                            if content:
+                                return content
+                        # If cached endpoint fails, clear cache and try discovery
+                        self._cached_endpoint_config = None
+                except Exception:
+                    # Cached endpoint failed, clear cache and try discovery
+                    self._cached_endpoint_config = None
+            
+            # Try all endpoints to find one that works
             for endpoint_config in endpoints_to_try:
                 try:
                     url = f"{self.endpoint_url}{endpoint_config['path']}"
@@ -600,11 +632,17 @@ class CustomLLMClient:
                             result = await response.json()
                             content = endpoint_config['response_key'](result)
                             if content:
-                                # Success! Log which format worked for debugging
+                                # Cache this endpoint (path, format, response parser) for future requests
+                                self._cached_endpoint_config = {
+                                    'path': endpoint_config['path'],
+                                    'format': endpoint_config['format'],
+                                    'response_key': endpoint_config['response_key']
+                                }
+                                # Log which format worked (only on first discovery)
                                 if self.rate_limit_display_callback:
                                     self.rate_limit_display_callback({
                                         'type': 'info',
-                                        'message': f"Using {endpoint_config['format']} API format"
+                                        'message': f"Discovered {endpoint_config['format']} API format - will use this for future requests"
                                     })
                                 return content
                         elif response.status == 404:
@@ -636,6 +674,25 @@ class CustomLLMClient:
             return ""
         # Join all user messages
         return "\n\n".join([msg.get("content", "") for msg in messages if msg.get("role") in ["user", "system"]])
+    
+    def _build_payload(self, endpoint_format: str, messages: list, prompt_text: str, max_tokens: int, temperature: float) -> dict:
+        """Build request payload for specific endpoint format."""
+        if endpoint_format in ["OpenAI v1", "OpenAI", "LM Studio"]:
+            payload = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+            if endpoint_format == "LM Studio":
+                payload["stream"] = False
+            return payload
+        elif endpoint_format == "Ollama Chat":
+            return {"model": self.model, "messages": messages, "stream": False}
+        elif endpoint_format == "Ollama Generate":
+            return {"model": self.model, "prompt": prompt_text, "stream": False}
+        elif endpoint_format in ["vLLM Completions", "Generic Completions"]:
+            return {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature}
+        elif endpoint_format == "Generic Chat":
+            return {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+        else:
+            # Default to OpenAI format
+            return {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
     
     async def _try_alternative_format(self, prompt: str, max_tokens: int) -> str:
         """Try alternative API formats for custom LLMs."""
