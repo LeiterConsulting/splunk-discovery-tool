@@ -8,11 +8,13 @@ import os
 import json
 import asyncio
 import aiohttp
+import requests  # For custom endpoints (better Windows/vLLM compatibility)
 import time
 import re
 import random
-from typing import Optional, Protocol, Dict, Any
+from typing import Optional, Protocol, Dict, Any, Callable
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 
 class RateLimitManager:
@@ -469,10 +471,10 @@ Return insights as a JSON object with a 'patterns' array.
 
 
 class CustomLLMClient:
-    """Custom LLM endpoint client implementation."""
+    """Custom LLM endpoint client using requests library for better Windows/vLLM compatibility."""
     
     def __init__(self, endpoint_url: str, api_key: Optional[str] = None, model: str = "llama2", 
-                 rate_limit_display_callback=None):
+                 rate_limit_display_callback: Optional[Callable] = None):
         # Clean up endpoint URL - strip common API paths that users might include
         cleaned_url = endpoint_url.rstrip('/')
         
@@ -503,7 +505,21 @@ class CustomLLMClient:
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
         self._cached_endpoint_config = None  # Cache successful endpoint format
+        self._executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for sync requests
         
+    def _sync_request(self, url: str, headers: dict, payload: dict, timeout: int = 120) -> dict:
+        """Synchronous request using requests library (better Windows/vLLM compatibility)."""
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            response.raise_for_status()
+            return {"status": response.status_code, "data": response.json(), "error": None}
+        except requests.exceptions.Timeout:
+            return {"status": 0, "data": None, "error": "Timeout"}
+        except requests.exceptions.HTTPError as e:
+            return {"status": response.status_code, "data": None, "error": str(e)}
+        except Exception as e:
+            return {"status": 0, "data": None, "error": str(e)}
+    
     async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """Generate response using custom LLM endpoint.
         
@@ -578,90 +594,92 @@ class CustomLLMClient:
         ]
         
         last_error = None
+        loop = asyncio.get_event_loop()
         
-        # Configure connector for better Windows compatibility with vLLM
-        connector = aiohttp.TCPConnector(
-            force_close=True,  # Don't reuse connections (prevents WinError 64)
-            enable_cleanup_closed=True
-        )
+        # If we have a cached successful endpoint, try it first
+        if self._cached_endpoint_config:
+            try:
+                url = f"{self.endpoint_url}{self._cached_endpoint_config['path']}"
+                # Build payload dynamically with current parameters
+                payload = self._build_payload(
+                    self._cached_endpoint_config['format'],
+                    messages,
+                    prompt_text,
+                    max_tokens,
+                    temperature
+                )
+                
+                # Run sync request in thread pool
+                result = await loop.run_in_executor(
+                    self._executor,
+                    self._sync_request,
+                    url,
+                    headers,
+                    payload,
+                    120
+                )
+                
+                if result["status"] == 200 and result["data"]:
+                    content = self._extract_response_content(result["data"], self._cached_endpoint_config['format'])
+                    if content:
+                        return content
+                # If cached endpoint fails, clear cache and try discovery
+                self._cached_endpoint_config = None
+                if result["error"] and self.rate_limit_display_callback:
+                    self.rate_limit_display_callback({
+                        'type': 'warning',
+                        'message': f"Cached endpoint failed: {result['error'][:100]}, retrying discovery..."
+                    })
+            except Exception as e:
+                # Cached endpoint failed, clear cache and try discovery
+                if self.rate_limit_display_callback:
+                    self.rate_limit_display_callback({
+                        'type': 'warning',
+                        'message': f"Cached endpoint failed: {str(e)[:100]}, retrying discovery..."
+                    })
+                self._cached_endpoint_config = None
         
-        async with aiohttp.ClientSession(connector=connector) as session:
-            # If we have a cached successful endpoint, try it first
-            if self._cached_endpoint_config:
-                try:
-                    url = f"{self.endpoint_url}{self._cached_endpoint_config['path']}"
-                    # Build payload dynamically with current parameters
-                    payload = self._build_payload(
-                        self._cached_endpoint_config['format'],
-                        messages,
-                        prompt_text,
-                        max_tokens,
-                        temperature
-                    )
-                    
-                    async with session.post(
-                        url,
-                        headers=headers,
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=60)
-                    ) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            content = self._extract_response_content(result, self._cached_endpoint_config['format'])
-                            if content:
-                                return content
-                        # If cached endpoint fails, clear cache and try discovery
-                        self._cached_endpoint_config = None
-                except Exception as e:
-                    # Cached endpoint failed, clear cache and try discovery
-                    if self.rate_limit_display_callback:
-                        self.rate_limit_display_callback({
-                            'type': 'warning',
-                            'message': f"Cached endpoint failed: {str(e)[:100]}, retrying discovery..."
-                        })
-                    self._cached_endpoint_config = None
-            
-            # Try all endpoints to find one that works
-            for endpoint_config in endpoints_to_try:
-                try:
-                    url = f"{self.endpoint_url}{endpoint_config['path']}"
-                    
-                    async with session.post(
-                        url,
-                        headers=headers,
-                        json=endpoint_config['payload'],
-                        timeout=aiohttp.ClientTimeout(total=60)
-                    ) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            content = self._extract_response_content(result, endpoint_config['format'])
-                            if content:
-                                # Cache this endpoint (path and format only) for future requests
-                                self._cached_endpoint_config = {
-                                    'path': endpoint_config['path'],
-                                    'format': endpoint_config['format']
-                                }
-                                # Log which format worked (only on first discovery)
-                                if self.rate_limit_display_callback:
-                                    self.rate_limit_display_callback({
-                                        'type': 'info',
-                                        'message': f"Discovered {endpoint_config['format']} API format - will use this for future requests"
-                                    })
-                                return content
-                        elif response.status == 404:
-                            # Endpoint not found, try next
-                            continue
-                        else:
-                            # Non-404 error, might be auth or other issue
-                            error_text = await response.text()
-                            last_error = f"{endpoint_config['format']} returned {response.status}: {error_text[:200]}"
-                except asyncio.TimeoutError:
-                    last_error = f"{endpoint_config.get('format', 'Unknown')} timed out"
+        # Try all endpoints to find one that works
+        for endpoint_config in endpoints_to_try:
+            try:
+                url = f"{self.endpoint_url}{endpoint_config['path']}"
+                
+                # Run sync request in thread pool
+                result = await loop.run_in_executor(
+                    self._executor,
+                    self._sync_request,
+                    url,
+                    headers,
+                    endpoint_config['payload'],
+                    120
+                )
+                
+                if result["status"] == 200 and result["data"]:
+                    content = self._extract_response_content(result["data"], endpoint_config['format'])
+                    if content:
+                        # Cache this endpoint (path and format only) for future requests
+                        self._cached_endpoint_config = {
+                            'path': endpoint_config['path'],
+                            'format': endpoint_config['format']
+                        }
+                        # Log which format worked (only on first discovery)
+                        if self.rate_limit_display_callback:
+                            self.rate_limit_display_callback({
+                                'type': 'info',
+                                'message': f"Discovered {endpoint_config['format']} API format - will use this for future requests"
+                            })
+                        return content
+                elif result["status"] == 404:
+                    # Endpoint not found, try next
                     continue
-                except Exception as e:
-                    # Try next endpoint
-                    last_error = f"{endpoint_config.get('format', 'Unknown')}: {str(e)[:200]}"
-                    continue
+                else:
+                    # Non-404 error, might be auth or other issue
+                    if result["error"]:
+                        last_error = f"{endpoint_config['format']}: {result['error'][:200]}"
+            except Exception as e:
+                # Try next endpoint
+                last_error = f"{endpoint_config.get('format', 'Unknown')}: {str(e)[:200]}"
+                continue
         
         # If we got here, none of the endpoints worked
         error_msg = f"Could not connect to LLM at {self.endpoint_url}. "
