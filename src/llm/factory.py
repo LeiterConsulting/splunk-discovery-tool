@@ -527,16 +527,17 @@ class CustomLLMClient:
         prompt_text = self._messages_to_prompt(messages)
         
         # Try multiple endpoint formats in order of likelihood
+        # Note: These are only used during discovery; cached endpoint uses _build_payload()
         endpoints_to_try = [
-            # OpenAI-compatible variations
+            # OpenAI-compatible variations (explicitly disable streaming)
             {
                 "path": "/v1/chat/completions",
-                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
                 "format": "OpenAI v1"
             },
             {
                 "path": "/chat/completions",
-                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
                 "format": "OpenAI"
             },
             # Ollama format
@@ -553,7 +554,7 @@ class CustomLLMClient:
             # vLLM format
             {
                 "path": "/v1/completions",
-                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature},
+                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
                 "format": "vLLM Completions"
             },
             # LM Studio / LocalAI format
@@ -565,13 +566,13 @@ class CustomLLMClient:
             # Generic chat endpoint
             {
                 "path": "/chat",
-                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
                 "format": "Generic Chat"
             },
             # Generic completion endpoint
             {
                 "path": "/completions",
-                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature},
+                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
                 "format": "Generic Completions"
             }
         ]
@@ -673,22 +674,51 @@ class CustomLLMClient:
     
     def _build_payload(self, endpoint_format: str, messages: list, prompt_text: str, max_tokens: int, temperature: float) -> dict:
         """Build request payload for specific endpoint format."""
-        if endpoint_format in ["OpenAI v1", "OpenAI", "LM Studio"]:
-            payload = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
-            if endpoint_format == "LM Studio":
-                payload["stream"] = False
-            return payload
+        # Clean and format messages to ensure they're valid
+        formatted_messages = []
+        for msg in messages:
+            if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                # Ensure content is a string and clean it up
+                content = str(msg["content"]).strip()
+                formatted_messages.append({
+                    "role": msg["role"],
+                    "content": content
+                })
+        
+        if endpoint_format in ["OpenAI v1", "OpenAI"]:
+            # Always explicitly disable streaming for compatibility
+            return {
+                "model": self.model,
+                "messages": formatted_messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": False
+            }
+        elif endpoint_format == "LM Studio":
+            return {
+                "model": self.model,
+                "messages": formatted_messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": False
+            }
         elif endpoint_format == "Ollama Chat":
-            return {"model": self.model, "messages": messages, "stream": False}
+            return {"model": self.model, "messages": formatted_messages, "stream": False}
         elif endpoint_format == "Ollama Generate":
             return {"model": self.model, "prompt": prompt_text, "stream": False}
         elif endpoint_format in ["vLLM Completions", "Generic Completions"]:
-            return {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature}
+            return {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
         elif endpoint_format == "Generic Chat":
-            return {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+            return {"model": self.model, "messages": formatted_messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
         else:
-            # Default to OpenAI format
-            return {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+            # Default to OpenAI format with stream disabled
+            return {
+                "model": self.model,
+                "messages": formatted_messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": False
+            }
     
     def _extract_response_content(self, response_data: dict, endpoint_format: str) -> str:
         """Extract response content based on endpoint format."""
