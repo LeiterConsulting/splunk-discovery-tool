@@ -532,54 +532,46 @@ class CustomLLMClient:
             {
                 "path": "/v1/chat/completions",
                 "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-                "response_key": lambda r: r["choices"][0]["message"]["content"],
                 "format": "OpenAI v1"
             },
             {
                 "path": "/chat/completions",
                 "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-                "response_key": lambda r: r["choices"][0]["message"]["content"],
                 "format": "OpenAI"
             },
             # Ollama format
             {
                 "path": "/api/chat",
                 "payload": {"model": self.model, "messages": messages, "stream": False},
-                "response_key": lambda r: r["message"]["content"],
                 "format": "Ollama Chat"
             },
             {
                 "path": "/api/generate",
                 "payload": {"model": self.model, "prompt": prompt_text, "stream": False},
-                "response_key": lambda r: r.get("response", ""),
                 "format": "Ollama Generate"
             },
             # vLLM format
             {
                 "path": "/v1/completions",
                 "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature},
-                "response_key": lambda r: r["choices"][0]["text"],
                 "format": "vLLM Completions"
             },
             # LM Studio / LocalAI format
             {
                 "path": "/v1/chat/completions",
                 "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
-                "response_key": lambda r: r["choices"][0]["message"]["content"],
                 "format": "LM Studio"
             },
             # Generic chat endpoint
             {
                 "path": "/chat",
                 "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-                "response_key": lambda r: r.get("response") or r.get("content") or r.get("message", {}).get("content", ""),
                 "format": "Generic Chat"
             },
             # Generic completion endpoint
             {
                 "path": "/completions",
                 "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature},
-                "response_key": lambda r: r.get("text") or r.get("content") or r.get("response", ""),
                 "format": "Generic Completions"
             }
         ]
@@ -608,13 +600,18 @@ class CustomLLMClient:
                     ) as response:
                         if response.status == 200:
                             result = await response.json()
-                            content = self._cached_endpoint_config['response_key'](result)
+                            content = self._extract_response_content(result, self._cached_endpoint_config['format'])
                             if content:
                                 return content
                         # If cached endpoint fails, clear cache and try discovery
                         self._cached_endpoint_config = None
-                except Exception:
+                except Exception as e:
                     # Cached endpoint failed, clear cache and try discovery
+                    if self.rate_limit_display_callback:
+                        self.rate_limit_display_callback({
+                            'type': 'warning',
+                            'message': f"Cached endpoint failed: {str(e)[:100]}, retrying discovery..."
+                        })
                     self._cached_endpoint_config = None
             
             # Try all endpoints to find one that works
@@ -630,13 +627,12 @@ class CustomLLMClient:
                     ) as response:
                         if response.status == 200:
                             result = await response.json()
-                            content = endpoint_config['response_key'](result)
+                            content = self._extract_response_content(result, endpoint_config['format'])
                             if content:
-                                # Cache this endpoint (path, format, response parser) for future requests
+                                # Cache this endpoint (path and format only) for future requests
                                 self._cached_endpoint_config = {
                                     'path': endpoint_config['path'],
-                                    'format': endpoint_config['format'],
-                                    'response_key': endpoint_config['response_key']
+                                    'format': endpoint_config['format']
                                 }
                                 # Log which format worked (only on first discovery)
                                 if self.rate_limit_display_callback:
@@ -693,6 +689,27 @@ class CustomLLMClient:
         else:
             # Default to OpenAI format
             return {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+    
+    def _extract_response_content(self, response_data: dict, endpoint_format: str) -> str:
+        """Extract response content based on endpoint format."""
+        try:
+            if endpoint_format in ["OpenAI v1", "OpenAI", "LM Studio"]:
+                return response_data["choices"][0]["message"]["content"]
+            elif endpoint_format == "Ollama Chat":
+                return response_data["message"]["content"]
+            elif endpoint_format == "Ollama Generate":
+                return response_data.get("response", "")
+            elif endpoint_format == "vLLM Completions":
+                return response_data["choices"][0]["text"]
+            elif endpoint_format == "Generic Chat":
+                return response_data.get("response") or response_data.get("content") or response_data.get("message", {}).get("content", "")
+            elif endpoint_format == "Generic Completions":
+                return response_data.get("text") or response_data.get("content") or response_data.get("response", "")
+            else:
+                # Default to OpenAI format
+                return response_data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError(f"Failed to extract content from {endpoint_format} response: {str(e)}")
     
     async def _try_alternative_format(self, prompt: str, max_tokens: int) -> str:
         """Try alternative API formats for custom LLMs."""
