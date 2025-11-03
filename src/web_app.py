@@ -951,6 +951,189 @@ async def assess_max_tokens():
         raise HTTPException(status_code=500, detail=f"Assessment error: {str(e)}")
 
 
+@app.post("/api/llm/test-connection")
+async def test_llm_connection():
+    """Test LLM connection and auto-detect capabilities"""
+    try:
+        config = config_manager.get()
+        
+        # Validate configuration
+        if config.llm.provider == "custom" and not config.llm.endpoint_url:
+            return {
+                "status": "error",
+                "error": "Custom endpoint URL is required",
+                "suggestion": "Enter the endpoint URL (e.g., http://localhost:11434 for Ollama)"
+            }
+        
+        # Test results
+        results = {
+            "status": "testing",
+            "endpoint": config.llm.endpoint_url if config.llm.provider == "custom" else "OpenAI API",
+            "provider": config.llm.provider,
+            "model": config.llm.model,
+            "tests": {}
+        }
+        
+        # Test 1: Connection test
+        try:
+            if config.llm.provider == "custom":
+                # Test custom endpoint
+                import httpx
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    # Try OpenAI-compatible endpoint
+                    try:
+                        response = await client.get(f"{config.llm.endpoint_url.rstrip('/')}/v1/models")
+                        if response.status_code == 200:
+                            results["tests"]["connection"] = {
+                                "status": "success",
+                                "format": "OpenAI-compatible",
+                                "message": "Endpoint is reachable (OpenAI format)"
+                            }
+                        else:
+                            raise Exception("Not OpenAI format")
+                    except:
+                        # Try Ollama endpoint
+                        try:
+                            response = await client.get(f"{config.llm.endpoint_url.rstrip('/')}/api/tags")
+                            if response.status_code == 200:
+                                results["tests"]["connection"] = {
+                                    "status": "success",
+                                    "format": "Ollama",
+                                    "message": "Endpoint is reachable (Ollama format)",
+                                    "models": response.json().get("models", [])
+                                }
+                            else:
+                                raise Exception("Unknown format")
+                        except:
+                            results["tests"]["connection"] = {
+                                "status": "warning",
+                                "message": "Endpoint reachable but format unknown"
+                            }
+            else:
+                results["tests"]["connection"] = {
+                    "status": "success",
+                    "format": "OpenAI",
+                    "message": "Using OpenAI API"
+                }
+        except Exception as e:
+            results["tests"]["connection"] = {
+                "status": "error",
+                "error": str(e),
+                "message": f"Cannot reach endpoint: {str(e)}"
+            }
+            results["status"] = "error"
+            return results
+        
+        # Test 2: Model test with simple query
+        try:
+            llm_client = LLMClientFactory.create_client(
+                provider=config.llm.provider,
+                custom_endpoint=config.llm.endpoint_url if config.llm.provider == "custom" else None,
+                api_key=config.llm.api_key,
+                model=config.llm.model
+            )
+            
+            response = await llm_client.generate_response(
+                messages=[{"role": "user", "content": "Say 'test successful' and nothing else."}],
+                max_tokens=50,
+                temperature=0.0
+            )
+            
+            results["tests"]["model"] = {
+                "status": "success",
+                "message": "Model responded successfully",
+                "response_preview": response[:100]
+            }
+        except Exception as e:
+            results["tests"]["model"] = {
+                "status": "error",
+                "error": str(e),
+                "message": f"Model test failed: {str(e)}"
+            }
+            results["status"] = "error"
+            return results
+        
+        # Test 3: Auto-detect max_tokens
+        try:
+            if config.llm.provider == "openai":
+                # Use OpenAI client for accurate detection
+                from openai import OpenAI
+                client = OpenAI(api_key=config.llm.api_key)
+                
+                test_values = [128000, 64000, 32000, 16000, 8000, 4000]
+                detected_max = None
+                
+                for test_max in test_values:
+                    try:
+                        client.chat.completions.create(
+                            model=config.llm.model,
+                            messages=[{"role": "user", "content": "Hi"}],
+                            max_tokens=test_max,
+                            temperature=0.0
+                        )
+                        detected_max = test_max
+                        break
+                    except Exception as e:
+                        error_str = str(e)
+                        import re
+                        match = re.search(r'supports at most (\d+)', error_str)
+                        if match:
+                            actual_limit = int(match.group(1))
+                            detected_max = int(actual_limit * 0.9)
+                            break
+                        continue
+                
+                if detected_max:
+                    results["tests"]["max_tokens"] = {
+                        "status": "success",
+                        "detected_max": detected_max,
+                        "message": f"Detected max_tokens: {detected_max}"
+                    }
+                else:
+                    results["tests"]["max_tokens"] = {
+                        "status": "warning",
+                        "detected_max": 4000,
+                        "message": "Could not detect max_tokens, using 4000 as fallback"
+                    }
+            else:
+                # For custom endpoints, use conservative default
+                results["tests"]["max_tokens"] = {
+                    "status": "info",
+                    "detected_max": 4000,
+                    "message": "Using default 4000 tokens for custom endpoint (adjust manually if needed)"
+                }
+        except Exception as e:
+            results["tests"]["max_tokens"] = {
+                "status": "warning",
+                "detected_max": 4000,
+                "error": str(e),
+                "message": f"Max tokens detection failed, using 4000 as fallback"
+            }
+        
+        # Overall status
+        if all(test.get("status") in ["success", "info", "warning"] for test in results["tests"].values()):
+            results["status"] = "success"
+            results["message"] = "All tests passed! Configuration is working."
+            results["recommended_config"] = {
+                "max_tokens": results["tests"]["max_tokens"]["detected_max"],
+                "temperature": 0.7
+            }
+        else:
+            results["status"] = "partial"
+            results["message"] = "Some tests passed, check details"
+        
+        return results
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": f"Test failed: {str(e)}"
+        }
+
+
 @app.get("/summarize-progress/{session_id}")
 async def get_summarize_progress(session_id: str):
     """Get current progress of summarization with input validation."""
@@ -6355,6 +6538,111 @@ def get_frontend_html():
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                     id="llm-temperature"
                                                 />
+                                            </div>
+                                            
+                                            {/* Test Connection Button */}
+                                            <div className="pt-3 border-t border-gray-200">
+                                                <button
+                                                    onClick={async () => {
+                                                        const btn = event.target;
+                                                        const resultsDiv = document.getElementById('llm-test-results');
+                                                        
+                                                        btn.disabled = true;
+                                                        btn.innerHTML = '<i className="fas fa-spinner fa-spin mr-2"></i> Testing Connection...';
+                                                        resultsDiv.innerHTML = '<div className="text-blue-600"><i className="fas fa-spinner fa-spin mr-2"></i> Running tests...</div>';
+                                                        resultsDiv.style.display = 'block';
+                                                        
+                                                        try {
+                                                            // First save current settings
+                                                            const provider = document.getElementById('llm-provider').value;
+                                                            const endpointUrlInput = document.getElementById('llm-endpoint-url');
+                                                            
+                                                            await fetch('/api/config', {
+                                                                method: 'POST',
+                                                                headers: { 'Content-Type': 'application/json' },
+                                                                body: JSON.stringify({
+                                                                    llm: {
+                                                                        provider: provider,
+                                                                        api_key: document.getElementById('llm-api-key').value || undefined,
+                                                                        model: document.getElementById('llm-model').value,
+                                                                        endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : undefined,
+                                                                        max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
+                                                                        temperature: parseFloat(document.getElementById('llm-temperature').value)
+                                                                    }
+                                                                })
+                                                            });
+                                                            
+                                                            // Then test the connection
+                                                            const response = await fetch('/api/llm/test-connection', { method: 'POST' });
+                                                            const result = await response.json();
+                                                            
+                                                            let html = '<div className="space-y-2">';
+                                                            
+                                                            // Overall status
+                                                            if (result.status === 'success') {
+                                                                html += '<div className="bg-green-100 border border-green-300 rounded-lg p-3 mb-2">';
+                                                                html += '<div className="font-semibold text-green-800"><i className="fas fa-check-circle mr-2"></i>All Tests Passed!</div>';
+                                                                html += '<div className="text-sm text-green-700 mt-1">' + result.message + '</div>';
+                                                                html += '</div>';
+                                                                
+                                                                // Auto-apply recommended config
+                                                                if (result.recommended_config) {
+                                                                    document.getElementById('llm-max-tokens').value = result.recommended_config.max_tokens;
+                                                                }
+                                                            } else if (result.status === 'error') {
+                                                                html += '<div className="bg-red-100 border border-red-300 rounded-lg p-3 mb-2">';
+                                                                html += '<div className="font-semibold text-red-800"><i className="fas fa-times-circle mr-2"></i>Test Failed</div>';
+                                                                html += '<div className="text-sm text-red-700 mt-1">' + (result.message || result.error) + '</div>';
+                                                                html += '</div>';
+                                                            }
+                                                            
+                                                            // Individual test results
+                                                            html += '<div className="text-xs font-semibold text-gray-700 mb-1">Test Details:</div>';
+                                                            
+                                                            for (const [testName, testResult] of Object.entries(result.tests || {})) {
+                                                                const statusIcon = testResult.status === 'success' ? 'check' : 
+                                                                                 testResult.status === 'error' ? 'times' : 
+                                                                                 testResult.status === 'warning' ? 'exclamation-triangle' : 'info-circle';
+                                                                const statusColor = testResult.status === 'success' ? 'green' : 
+                                                                                  testResult.status === 'error' ? 'red' : 
+                                                                                  testResult.status === 'warning' ? 'yellow' : 'blue';
+                                                                
+                                                                html += `<div className="bg-${statusColor}-50 border border-${statusColor}-200 rounded p-2 mb-1">`;
+                                                                html += `<div className="text-xs font-medium text-${statusColor}-800">`;
+                                                                html += `<i className="fas fa-${statusIcon} mr-1"></i>${testName.charAt(0).toUpperCase() + testName.slice(1)}: ${testResult.message}`;
+                                                                html += '</div>';
+                                                                if (testResult.response_preview) {
+                                                                    html += `<div className="text-xs text-gray-600 mt-1 italic">"${testResult.response_preview}"</div>`;
+                                                                }
+                                                                html += '</div>';
+                                                            }
+                                                            
+                                                            html += '</div>';
+                                                            resultsDiv.innerHTML = html;
+                                                            
+                                                            btn.innerHTML = '<i className="fas fa-check mr-2"></i> Test Complete';
+                                                            setTimeout(() => {
+                                                                btn.disabled = false;
+                                                                btn.innerHTML = '<i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
+                                                            }, 3000);
+                                                            
+                                                        } catch (error) {
+                                                            resultsDiv.innerHTML = `<div className="bg-red-100 border border-red-300 rounded-lg p-3">
+                                                                <div className="font-semibold text-red-800"><i className="fas fa-times-circle mr-2"></i>Error</div>
+                                                                <div className="text-sm text-red-700 mt-1">${error.message}</div>
+                                                            </div>`;
+                                                            btn.innerHTML = '<i className="fas fa-times mr-2"></i> Test Failed';
+                                                            setTimeout(() => {
+                                                                btn.disabled = false;
+                                                                btn.innerHTML = '<i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
+                                                            }, 3000);
+                                                        }
+                                                    }}
+                                                    className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
+                                                >
+                                                    <i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure
+                                                </button>
+                                                <div id="llm-test-results" className="mt-3" style={{display: 'none'}}></div>
                                             </div>
                                         </div>
                                     </div>
