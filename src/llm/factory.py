@@ -810,7 +810,7 @@ class LLMClientFactory:
         elif provider == "custom":
             if not custom_endpoint:
                 raise ValueError("Custom endpoint URL required for custom LLM provider")
-            return CustomLLMClient(custom_endpoint, rate_limit_display_callback=rate_limit_display_callback)
+            return CustomLLMClient(custom_endpoint, api_key=api_key, model=model, rate_limit_display_callback=rate_limit_display_callback)
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
             
