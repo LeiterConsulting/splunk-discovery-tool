@@ -579,7 +579,13 @@ class CustomLLMClient:
         
         last_error = None
         
-        async with aiohttp.ClientSession() as session:
+        # Configure connector for better Windows compatibility with vLLM
+        connector = aiohttp.TCPConnector(
+            force_close=True,  # Don't reuse connections (prevents WinError 64)
+            enable_cleanup_closed=True
+        )
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
             # If we have a cached successful endpoint, try it first
             if self._cached_endpoint_config:
                 try:
