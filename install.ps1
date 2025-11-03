@@ -335,8 +335,11 @@ if ($Help) {
 } elseif ($Stop) {
     Stop-DT4SMSService
 } elseif ($Restart) {
+    Write-ColorMsg $ColorBlue "🔄 Restarting $APP_SHORT..."
     Stop-DT4SMSService
-    Start-Sleep -Seconds 1
+    Start-Sleep -Seconds 2
+    # Force a fresh start by removing PID file if it exists
+    Remove-Item $PID_FILE -Force -ErrorAction SilentlyContinue
     Start-DT4SMSService
 } elseif ($Status) {
     Get-ServiceStatus

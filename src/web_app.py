@@ -25,9 +25,44 @@ from pydantic import BaseModel
 from config_manager import ConfigManager
 from discovery.engine import DiscoveryEngine
 from llm.factory import LLMClientFactory
+from discovery.context_manager import get_context_manager
 
 # Initialize encrypted config manager
 config_manager = ConfigManager("config.encrypted")
+
+# Module-level LLM client cache for performance
+_cached_llm_client = None
+_cached_config_hash = None
+
+def get_or_create_llm_client(config):
+    """Get cached LLM client or create new one if config changed."""
+    global _cached_llm_client, _cached_config_hash
+    
+    # Generate hash from relevant config values
+    config_hash = hash(f"{config.llm.provider}{config.llm.endpoint_url}{config.llm.model}{config.llm.api_key}")
+    
+    # Return cached client if config hasn't changed
+    if _cached_llm_client is not None and _cached_config_hash == config_hash:
+        return _cached_llm_client
+    
+    # Create new client and cache it (match original logic exactly)
+    if config.llm.provider.lower() == "custom endpoint" or config.llm.endpoint_url:
+        _cached_llm_client = LLMClientFactory.create_client(
+            provider='custom',
+            custom_endpoint=config.llm.endpoint_url,
+            api_key=config.llm.api_key,
+            model=config.llm.model
+        )
+    else:
+        _cached_llm_client = LLMClientFactory.create_client(
+            provider='openai',
+            api_key=config.llm.api_key,
+            model=config.llm.model
+        )
+    
+    _cached_config_hash = config_hash
+    print(f"[LLM Cache] Created new client for {config.llm.provider} ({config.llm.model})")
+    return _cached_llm_client
 
 
 app = FastAPI(
@@ -404,14 +439,8 @@ async def run_discovery():
         debug_log(f"Config loaded - provider: {config.llm.provider}, model: {config.llm.model}", "info")
         debug_log(f"API key present: {bool(config.llm.api_key)}, length: {len(config.llm.api_key) if config.llm.api_key else 0}", "info")
         
-        # Initialize LLM client with display callback
-        llm_client = LLMClientFactory.create_client(
-            provider=config.llm.provider,
-            custom_endpoint=config.llm.endpoint_url if config.llm.endpoint_url else None,
-            api_key=config.llm.api_key,
-            model=config.llm.model,
-            rate_limit_display_callback=display.handle_rate_limit_callback
-        )
+        # Initialize LLM client (cached for performance)
+        llm_client = get_or_create_llm_client(config)
         display.success("✅ LLM client initialized")
         
         # Initialize discovery engine
@@ -858,6 +887,172 @@ async def update_config(config_update: ConfigUpdate):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to update configuration: {str(e)}")
 
+# ==================== Credential Vault API ====================
+
+class CredentialCreate(BaseModel):
+    """Request model for creating/updating a credential"""
+    name: str
+    provider: str
+    api_key: str
+    model: str
+    endpoint_url: Optional[str] = None
+    max_tokens: int = 16000
+    temperature: float = 0.7
+
+@app.get("/api/credentials")
+async def list_credentials():
+    """Get all saved credentials (with masked API keys)"""
+    credentials = config_manager.list_credentials()
+    return {
+        name: {
+            'name': cred.name,
+            'provider': cred.provider,
+            'api_key': '***' if cred.api_key else '',
+            'model': cred.model,
+            'endpoint_url': cred.endpoint_url,
+            'max_tokens': cred.max_tokens,
+            'temperature': cred.temperature
+        }
+        for name, cred in credentials.items()
+    }
+
+@app.post("/api/credentials")
+async def save_credential(credential: CredentialCreate):
+    """Save a new credential"""
+    try:
+        success = config_manager.save_credential(
+            name=credential.name,
+            provider=credential.provider,
+            api_key=credential.api_key,
+            model=credential.model,
+            endpoint_url=credential.endpoint_url,
+            max_tokens=credential.max_tokens,
+            temperature=credential.temperature
+        )
+        if success:
+            return {"status": "success", "message": f"Credential '{credential.name}' saved"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to save credential")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/credentials/{name}")
+async def get_credential(name: str):
+    """Get a specific credential (with masked API key)"""
+    cred = config_manager.get_credential(name)
+    if not cred:
+        raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
+    
+    return {
+        'name': cred.name,
+        'provider': cred.provider,
+        'api_key': '***' if cred.api_key else '',
+        'model': cred.model,
+        'endpoint_url': cred.endpoint_url,
+        'max_tokens': cred.max_tokens,
+        'temperature': cred.temperature
+    }
+
+@app.delete("/api/credentials/{name}")
+async def delete_credential(name: str):
+    """Delete a saved credential"""
+    success = config_manager.delete_credential(name)
+    if success:
+        return {"status": "success", "message": f"Credential '{name}' deleted"}
+    else:
+        raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
+
+@app.post("/api/credentials/{name}/load")
+async def load_credential(name: str):
+    """Load a saved credential into active configuration"""
+    success = config_manager.load_credential(name)
+    if success:
+        # Reload config
+        config_manager._config = config_manager.load()
+        return {
+            "status": "success", 
+            "message": f"Credential '{name}' loaded",
+            "config": config_manager.export_safe()
+        }
+    else:
+        raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
+
+@app.post("/api/llm/list-models")
+async def list_models(request: Request):
+    """Fetch available models from OpenAI or custom endpoint"""
+    try:
+        data = await request.json()
+        provider = data.get('provider', 'openai')
+        api_key = data.get('api_key')
+        endpoint_url = data.get('endpoint_url')
+        
+        if provider == 'openai':
+            # Fetch from OpenAI
+            if not api_key:
+                raise HTTPException(status_code=400, detail="API key required for OpenAI")
+            
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    'https://api.openai.com/v1/models',
+                    headers={'Authorization': f'Bearer {api_key}'},
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                models_data = response.json()
+                # Extract model IDs and filter for chat models
+                models = [m['id'] for m in models_data['data'] if 'gpt' in m['id'].lower()]
+                models.sort()
+                return {'models': models}
+                
+        elif provider == 'custom':
+            # Fetch from custom endpoint
+            if not endpoint_url:
+                raise HTTPException(status_code=400, detail="Endpoint URL required for custom provider")
+            
+            import httpx
+            async with httpx.AsyncClient() as client:
+                # Try common endpoints for model listing
+                endpoints_to_try = [
+                    f"{endpoint_url}/v1/models",  # OpenAI-compatible
+                    f"{endpoint_url}/api/tags",   # Ollama
+                    f"{endpoint_url}/models",     # Alternative
+                ]
+                
+                for url in endpoints_to_try:
+                    try:
+                        headers = {}
+                        if api_key:
+                            headers['Authorization'] = f'Bearer {api_key}'
+                        
+                        response = await client.get(url, headers=headers, timeout=10.0)
+                        response.raise_for_status()
+                        data = response.json()
+                        
+                        # Handle different response formats
+                        if 'data' in data:  # OpenAI format
+                            models = [m['id'] for m in data['data']]
+                        elif 'models' in data:  # Ollama format
+                            models = [m['name'] if isinstance(m, dict) else m for m in data['models']]
+                        elif isinstance(data, list):  # Direct list
+                            models = [m['id'] if isinstance(m, dict) else m for m in data]
+                        else:
+                            continue
+                        
+                        return {'models': models}
+                    except:
+                        continue
+                
+                raise HTTPException(status_code=400, detail="Could not fetch models from endpoint")
+        
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch models: {str(e)}")
+
 @app.get("/api/dependencies")
 async def get_dependencies():
     """Get installed Python packages and their versions"""
@@ -1088,12 +1283,7 @@ async def test_llm_connection():
         
         # Test 2: Model test with simple query
         try:
-            llm_client = LLMClientFactory.create_client(
-                provider=config.llm.provider,
-                custom_endpoint=config.llm.endpoint_url if config.llm.provider == "custom" else None,
-                api_key=config.llm.api_key,
-                model=config.llm.model
-            )
+            llm_client = get_or_create_llm_client(config)
             
             response = await llm_client.generate_response(
                 messages=[{"role": "user", "content": "Say 'test successful' and nothing else."}],
@@ -1122,17 +1312,28 @@ async def test_llm_connection():
                 from openai import OpenAI
                 client = OpenAI(api_key=config.llm.api_key)
                 
+                # Determine which parameter to use based on model
+                model_lower = config.llm.model.lower()
+                uses_new_param = any(x in model_lower for x in ['gpt-4o', 'gpt-4-turbo', 'o1-', 'o1', 'chatgpt-4o', 'gpt4o'])
+                
                 test_values = [128000, 64000, 32000, 16000, 8000, 4000]
                 detected_max = None
                 
                 for test_max in test_values:
                     try:
-                        client.chat.completions.create(
-                            model=config.llm.model,
-                            messages=[{"role": "user", "content": "Hi"}],
-                            max_tokens=test_max,
-                            temperature=0.0
-                        )
+                        # Build kwargs with appropriate parameter
+                        completion_kwargs = {
+                            "model": config.llm.model,
+                            "messages": [{"role": "user", "content": "Hi"}],
+                            "temperature": 0.0
+                        }
+                        
+                        if uses_new_param:
+                            completion_kwargs["max_completion_tokens"] = test_max
+                        else:
+                            completion_kwargs["max_tokens"] = test_max
+                        
+                        client.chat.completions.create(**completion_kwargs)
                         detected_max = test_max
                         break
                     except Exception as e:
@@ -1360,12 +1561,7 @@ async def summarize_session(request: Dict[str, Any]):
     # ===== AI-POWERED REPORT ANALYSIS =====
     # Use LLM to extract actual findings from reports
     config = config_manager.get()
-    llm_client = LLMClientFactory.create_client(
-        provider=config.llm.provider,
-        custom_endpoint=config.llm.endpoint_url if config.llm.endpoint_url else None,
-        api_key=config.llm.api_key,
-        model=config.llm.model
-    )
+    llm_client = get_or_create_llm_client(config)
     
     # Extract indexes and sourcetypes from discovery results
     discovered_indexes = set()
@@ -1614,12 +1810,7 @@ Return ONLY the JSON array of 4 queries, nothing else."""
     
     # Generate AI summary
     config = config_manager.get()
-    llm_client = LLMClientFactory.create_client(
-        provider=config.llm.provider,
-        custom_endpoint=config.llm.endpoint_url if config.llm.endpoint_url else None,
-        api_key=config.llm.api_key,
-        model=config.llm.model
-    )
+    llm_client = get_or_create_llm_client(config)
     
     # Get current date for temporal context
     from datetime import datetime
@@ -1938,12 +2129,7 @@ async def verify_task(request: Dict[str, Any]):
             }
         
         # Analyze results with AI
-        llm_client = LLMClientFactory.create_client(
-            provider=config.llm.provider,
-            custom_endpoint=config.llm.endpoint_url if config.llm.endpoint_url else None,
-            api_key=config.llm.api_key,
-            model=config.llm.model
-        )
+        llm_client = get_or_create_llm_client(config)
         
         analysis_prompt = f"""You are analyzing the results of a Splunk admin task verification.
 
@@ -2087,12 +2273,7 @@ async def get_remediation(request: Dict[str, Any]):
         config = config_manager.get()
         
         # Generate remediation with AI
-        llm_client = LLMClientFactory.create_client(
-            provider=config.llm.provider,
-            custom_endpoint=config.llm.endpoint_url if config.llm.endpoint_url else None,
-            api_key=config.llm.api_key,
-            model=config.llm.model
-        )
+        llm_client = get_or_create_llm_client(config)
         
         remediation_prompt = f"""You are a Splunk expert helping an administrator troubleshoot a failed task.
 
@@ -2387,6 +2568,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                         Signature: async def callback(action: str, iteration: int, time: float)
     """
     try:
+        print(f"🔵 [CHAT] Request received: {request.get('message', '')[:50]}")
         user_message = request.get('message', '')
         history = request.get('history', [])
         
@@ -2432,274 +2614,37 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                     days_old = int(discovery_age_seconds / 86400)
                     discovery_age_warning = f"⚠️ Discovery data is {days_old} days old. Consider running a new discovery for up-to-date information."
                 
-                with open(discovery_file, 'r', encoding='utf-8') as f:
-                    latest_discovery = json.load(f)
-                    
-                # Build comprehensive context summary
-                context_parts = [f"\n🔍 DISCOVERY CONTEXT (from {timestamp_str}):"]
+                # Use context manager for smart lazy-loading
+                ctx_mgr = get_context_manager()
                 
-                # Extract overview data
-                if 'overview' in latest_discovery:
-                    overview = latest_discovery['overview']
-                    context_parts.append(f"📊 Environment Overview:")
-                    
-                    # System information
-                    splunk_version = overview.get('splunk_version', 'unknown')
-                    splunk_build = overview.get('splunk_build', 'unknown')
-                    license_state = overview.get('license_state', 'unknown')
-                    server_roles = overview.get('server_roles', [])
-                    
-                    if splunk_version != 'unknown':
-                        context_parts.append(f"  - Splunk Version: {splunk_version} (build {splunk_build})")
-                    if license_state != 'unknown':
-                        context_parts.append(f"  - License State: {license_state}")
-                    if server_roles:
-                        context_parts.append(f"  - Server Roles: {', '.join(server_roles)}")
-                    
-                    # Environment metrics
-                    context_parts.append(f"  - Total Indexes: {overview.get('total_indexes', 'unknown')}")
-                    context_parts.append(f"  - Total Sourcetypes: {overview.get('total_sourcetypes', 'unknown')}")
-                    context_parts.append(f"  - Total Hosts: {overview.get('total_hosts', 'unknown')}")
-                    context_parts.append(f"  - Total Sources: {overview.get('total_sources', 'unknown')}")
-                    context_parts.append(f"  - Knowledge Objects: {overview.get('total_knowledge_objects', 'unknown')}")
-                    context_parts.append(f"  - Users: {overview.get('total_users', 'unknown')}")
-                    context_parts.append(f"  - KV Collections: {overview.get('total_kv_collections', 'unknown')}")
-                    context_parts.append(f"  - Data Volume (24h): {overview.get('data_volume_24h', 'unknown')}")
+                # Get lightweight metadata (avoids parsing full file for simple queries)
+                metadata = ctx_mgr.get_metadata()
                 
-                # Extract index information
-                active_indexes = []
-                disabled_indexes = []
-                index_details = {}
-                retention_warnings = []
+                # Analyze user query to determine if context is needed
+                query_lower = user_message.lower()
+                simple_greetings = any(word in query_lower for word in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'bye'])
                 
-                if 'discovery_results' in latest_discovery:
-                    for result in latest_discovery['discovery_results']:
-                        if isinstance(result, dict) and 'data' in result:
-                            data = result['data']
-                            if isinstance(data, dict) and 'title' in data:
-                                index_name = data['title']
-                                is_disabled = data.get('disabled') == '1'
-                                event_count = data.get('totalEventCount', '0')
-                                size_mb = data.get('currentDBSizeMB', '0')
-                                
-                                index_details[index_name] = {
-                                    'disabled': is_disabled,
-                                    'events': event_count,
-                                    'size_mb': size_mb
-                                }
-                                
-                                if is_disabled:
-                                    disabled_indexes.append(index_name)
-                                elif int(event_count) > 0:
-                                    active_indexes.append(f"{index_name} ({event_count} events, {size_mb}MB)")
+                # Get overview for all custom LLM requests (lightweight, fast)
+                overview = metadata.get('overview', {})
                 
-                if active_indexes:
-                    context_parts.append(f"\n📁 Active Indexes with Data:")
-                    for idx in active_indexes[:10]:  # Limit to top 10
-                        context_parts.append(f"  - {idx}")
+                if simple_greetings:
+                    # For greetings, just show counts
+                    discovery_context = f"\n🔍 Splunk Environment: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes"
+                else:
+                    # For real queries on custom LLMs, provide ONLY summary stats (no detailed context)
+                    # Local LLMs struggle with large contexts - let them use tool calls to get details
+                    discovery_context = f"""
+🔍 Splunk Environment Summary:
+- Indexes: {overview.get('total_indexes', 0)}
+- Sourcetypes: {overview.get('total_sourcetypes', 0)}
+- Hosts: {overview.get('total_hosts', 0)}
+- Users: {overview.get('total_users', 0)}
+- Data (24h): {overview.get('data_volume_24h', 'unknown')}
+- Version: {overview.get('splunk_version', 'unknown')}
+
+For detailed information, use tool calls to query Splunk directly."""
                 
-                # Extract host information
-                active_hosts = []
-                high_volume_hosts = []
-                
-                if 'discovery_results' in latest_discovery:
-                    for result in latest_discovery['discovery_results']:
-                        if isinstance(result, dict) and 'data' in result and 'description' in result:
-                            if 'Analyzing host:' in result.get('description', ''):
-                                data = result['data']
-                                if isinstance(data, dict) and 'host' in data:
-                                    host_name = data['host']
-                                    event_count = int(data.get('totalCount', '0'))
-                                    
-                                    if event_count > 10000:
-                                        high_volume_hosts.append(f"{host_name} ({event_count:,} events)")
-                                    elif event_count > 0:
-                                        active_hosts.append(f"{host_name} ({event_count:,} events)")
-                
-                if high_volume_hosts:
-                    context_parts.append(f"\n🖥️ High-Activity Hosts (>10k events):")
-                    for host in high_volume_hosts[:10]:  # Top 10
-                        context_parts.append(f"  - {host}")
-                
-                # Extract source information
-                active_sources = []
-                file_sources = []
-                network_sources = []
-                
-                if 'discovery_results' in latest_discovery:
-                    for result in latest_discovery['discovery_results']:
-                        if isinstance(result, dict) and 'data' in result and 'description' in result:
-                            if 'Analyzing source:' in result.get('description', ''):
-                                data = result['data']
-                                if isinstance(data, dict) and 'source' in data:
-                                    source_path = data['source']
-                                    event_count = int(data.get('totalCount', '0'))
-                                    
-                                    if event_count > 1000:
-                                        source_lower = source_path.lower()
-                                        if '.log' in source_lower or '/var/log' in source_lower:
-                                            file_sources.append(f"{source_path} ({event_count:,} events)")
-                                        elif 'udp:' in source_lower or 'tcp:' in source_lower or 'syslog' in source_lower:
-                                            network_sources.append(f"{source_path} ({event_count:,} events)")
-                                        else:
-                                            active_sources.append(f"{source_path} ({event_count:,} events)")
-                
-                if file_sources:
-                    context_parts.append(f"\n📄 Top File Sources (>1k events):")
-                    for src in file_sources[:5]:  # Top 5
-                        context_parts.append(f"  - {src}")
-                
-                if network_sources:
-                    context_parts.append(f"\n📡 Network Sources (>1k events):")
-                    for src in network_sources[:5]:  # Top 5
-                        context_parts.append(f"  - {src}")
-                
-                # Extract knowledge object information (alerts, dashboards, etc.)
-                alerts = []
-                dashboards = []
-                macros = []
-                
-                if 'discovery_results' in latest_discovery:
-                    for result in latest_discovery['discovery_results']:
-                        if isinstance(result, dict) and 'data' in result and 'description' in result:
-                            desc = result.get('description', '')
-                            data = result['data']
-                            
-                            if 'Analyzing alerts:' in desc and isinstance(data, dict):
-                                alert_name = data.get('name', data.get('title', ''))
-                                if alert_name and data.get('disabled', '0') != '1':
-                                    severity = data.get('alert.severity', 'medium')
-                                    alerts.append(f"{alert_name} (severity: {severity})")
-                            
-                            elif 'Analyzing dashboards:' in desc and isinstance(data, dict):
-                                dash_name = data.get('name', data.get('title', ''))
-                                if dash_name:
-                                    dashboards.append(dash_name)
-                            
-                            elif 'Analyzing macros:' in desc and isinstance(data, dict):
-                                macro_name = data.get('name', data.get('title', ''))
-                                if macro_name:
-                                    macros.append(macro_name)
-                
-                if alerts:
-                    context_parts.append(f"\n🚨 Active Alerts ({len(alerts)} total):")
-                    for alert in alerts[:5]:  # Top 5
-                        context_parts.append(f"  - {alert}")
-                    if len(alerts) > 5:
-                        context_parts.append(f"  ... and {len(alerts)-5} more")
-                
-                if dashboards:
-                    context_parts.append(f"\n📊 Dashboards ({len(dashboards)} total):")
-                    for dash in dashboards[:5]:  # Top 5
-                        context_parts.append(f"  - {dash}")
-                    if len(dashboards) > 5:
-                        context_parts.append(f"  ... and {len(dashboards)-5} more")
-                
-                # Extract user information
-                admin_users = []
-                total_users_count = 0
-                
-                if 'discovery_results' in latest_discovery:
-                    for result in latest_discovery['discovery_results']:
-                        if isinstance(result, dict) and 'data' in result and 'description' in result:
-                            if 'Analyzing user:' in result.get('description', ''):
-                                total_users_count += 1
-                                data = result['data']
-                                if isinstance(data, dict):
-                                    roles = data.get('roles', [])
-                                    if isinstance(roles, str):
-                                        roles = [r.strip() for r in roles.split(",")]
-                                    if 'admin' in roles:
-                                        user_name = data.get('name', data.get('username', 'unknown'))
-                                        admin_users.append(user_name)
-                
-                if total_users_count > 0:
-                    context_parts.append(f"\n👥 User Information:")
-                    context_parts.append(f"  - Total Users: {total_users_count}")
-                    if admin_users:
-                        context_parts.append(f"  - Admin Users: {len(admin_users)}")
-                        if len(admin_users) <= 5:
-                            for admin in admin_users:
-                                context_parts.append(f"    • {admin}")
-                
-                # Extract KV Store collections
-                threat_intel_collections = []
-                asset_collections = []
-                total_kv = 0
-                
-                if 'discovery_results' in latest_discovery:
-                    for result in latest_discovery['discovery_results']:
-                        if isinstance(result, dict) and 'data' in result and 'description' in result:
-                            if 'Analyzing KV collection:' in result.get('description', ''):
-                                total_kv += 1
-                                data = result['data']
-                                if isinstance(data, dict):
-                                    kv_name = data.get('name', data.get('title', ''))
-                                    if any(term in kv_name.lower() for term in ['threat', 'intel', 'ioc', 'malware']):
-                                        threat_intel_collections.append(kv_name)
-                                    elif any(term in kv_name.lower() for term in ['asset', 'inventory', 'cmdb']):
-                                        asset_collections.append(kv_name)
-                
-                if total_kv > 0:
-                    context_parts.append(f"\n🗄️  KV Store Collections ({total_kv} total):")
-                    if threat_intel_collections:
-                        context_parts.append(f"  - Threat Intelligence: {', '.join(threat_intel_collections[:3])}")
-                    if asset_collections:
-                        context_parts.append(f"  - Asset Inventory: {', '.join(asset_collections[:3])}")
-                
-                # Extract advanced analytics insights
-                analytics_insights = []
-                
-                if 'discovery_results' in latest_discovery:
-                    for result in latest_discovery['discovery_results']:
-                        if isinstance(result, dict) and 'description' in result:
-                            desc = result.get('description', '')
-                            if 'Advanced analysis' in desc or 'Data Quality' in desc or 'Temporal Analysis' in desc:
-                                findings = result.get('interesting_findings', [])
-                                analytics_insights.extend(findings[:2])  # Top 2 findings per analysis
-                
-                if analytics_insights:
-                    context_parts.append(f"\n📈 Analytics Insights:")
-                    for insight in analytics_insights[:5]:  # Top 5 insights
-                        context_parts.append(f"  - {insight}")
-                
-                # Extract sourcetype information from notable_patterns
-                if 'overview' in latest_discovery and 'notable_patterns' in latest_discovery['overview']:
-                    try:
-                        patterns_list = latest_discovery['overview']['notable_patterns']
-                        if patterns_list and len(patterns_list) > 0:
-                            patterns_str = patterns_list[0]
-                            # Check if it's already a dict or needs parsing
-                            if isinstance(patterns_str, dict):
-                                patterns_data = patterns_str
-                            elif isinstance(patterns_str, str) and patterns_str.strip():
-                                patterns_data = json.loads(patterns_str)
-                            else:
-                                patterns_data = None
-                            
-                            if patterns_data and 'patterns' in patterns_data:
-                                for pattern in patterns_data['patterns']:
-                                    if 'source_types_characteristics' in pattern:
-                                        st_char = pattern['source_types_characteristics']
-                                        context_parts.append(f"\n📋 Sourcetype Information:")
-                                        context_parts.append(f"  - Total: {st_char.get('total_source_types', 'unknown')}")
-                                        context_parts.append(f"  - Active: {st_char.get('active_source_types', 'unknown')}")
-                                        
-                                        if 'most_active_source_type' in st_char:
-                                            most_active = st_char['most_active_source_type']
-                                            context_parts.append(f"  - Most Active: {most_active.get('sourcetype')} ({most_active.get('total_count')} events)")
-                                    
-                                    if 'temporal_patterns' in pattern:
-                                        temp_pattern = pattern['temporal_patterns']
-                                        if 'recent_events' in temp_pattern:
-                                            recent = temp_pattern['recent_events']
-                                            context_parts.append(f"\n⏰ Temporal Information:")
-                                            context_parts.append(f"  - Data Span: {recent.get('event_span_days', 'unknown')} days")
-                                            context_parts.append(f"  - Latest Event: {recent.get('last_event_time', 'unknown')}")
-                    except (json.JSONDecodeError, IndexError, KeyError) as e:
-                        print(f"Could not parse notable_patterns: {e}")
-                
-                discovery_context = "\n".join(context_parts)
+
                 
             except Exception as e:
                 print(f"Could not load discovery context: {e}")
@@ -2708,16 +2653,21 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         else:
             discovery_age_warning = "⚠️ No discovery data found. Run a discovery first to get environment context."
         
-        # Initialize LLM client
-        llm_client = LLMClientFactory.create_client(
-            provider=config.llm.provider,
-            custom_endpoint=config.llm.endpoint_url,
-            api_key=config.llm.api_key,
-            model=config.llm.model
-        )
+        # Initialize LLM client (cached for performance)
+        print(f"🔵 [CHAT] Getting LLM client...")
+        llm_client = get_or_create_llm_client(config)
+        print(f"🔵 [CHAT] LLM client initialized, provider: {config.llm.provider}")
         
-        # Prepare system prompt for Splunk chat - AGENTIC WITH MULTI-TURN REASONING
-        system_prompt = f"""You are the world's greatest Splunk administrator - an expert with deep knowledge and autonomous problem-solving abilities.
+        # Use simplified prompt for custom endpoints (local LLMs have smaller context windows)
+        if config.llm.provider == "Custom Endpoint":
+            system_prompt = f"""You are a Splunk assistant. Answer from this context or use tools when needed.
+
+{discovery_context}
+
+Tool format: <TOOL_CALL>{{"tool": "run_splunk_query", "args": {{"query": "YOUR_SPL_HERE"}}}}</TOOL_CALL>"""
+        else:
+            # Full agentic prompt for OpenAI (larger context window, better instruction following)
+            system_prompt = f"""You are the world's greatest Splunk administrator - an expert with deep knowledge and autonomous problem-solving abilities.
 
 🌍 ENVIRONMENT CONTEXT:
 {discovery_context}
@@ -2736,6 +2686,11 @@ You are an AUTONOMOUS AGENT with the ability to:
 - get_index_info(index_name): Get details about a specific index
 - get_metadata(type, index): Get hosts, sources, or sourcetypes  
 - get_splunk_info(): Get general Splunk system information
+
+📚 REQUEST ADDITIONAL CONTEXT (On-Demand):
+If you need detailed information, request it dynamically:
+<CONTEXT_REQUEST>type</CONTEXT_REQUEST>
+Available types: indexes, sourcetypes, hosts, alerts, dashboards, users, kv_stores
 
 ⚡ AUTONOMOUS REASONING PROTOCOL:
 When you execute a tool and receive results, you can CONTINUE investigating by:
@@ -2832,27 +2787,40 @@ I'm querying all indexes for data during the 22:00-23:00 hour last Tuesday using
 The tstats approach had a WHERE clause issue, so I'm checking the wineventlog index first with a standard search approach. I'll iterate through other indexes based on results.
 
 Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Investigate thoroughly until you find the answer or exhaust all reasonable options."""
-
+        
         # Prepare messages
-        messages = [{"role": "system", "content": system_prompt}]
+        # For custom LLM with simple greetings, skip system prompt entirely for speed
+        query_lower = user_message.lower().strip()
+        is_greeting = any(phrase in query_lower for phrase in ['hi', 'hello', 'hey', 'how are you', 'thanks', 'thank you', 'bye', 'goodbye'])
         
-        # Add recent history for context (convert to proper format)
-        for msg in history[-6:]:  # Last 6 messages for context
-            if msg.get('type') == 'user':
-                messages.append({"role": "user", "content": msg['content']})
-            elif msg.get('type') == 'assistant':
-                messages.append({"role": "assistant", "content": msg['content']})
-        
-        # Add current user message
-        messages.append({"role": "user", "content": user_message})
+        if config.llm.provider == "custom" and is_greeting:
+            # Bare minimum for greetings - just the user message
+            messages = [{"role": "user", "content": user_message}]
+        else:
+            # Full context for real queries
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Add recent history for context (convert to proper format)
+            for msg in history[-6:]:  # Last 6 messages for context
+                if msg.get('type') == 'user':
+                    messages.append({"role": "user", "content": msg['content']})
+                elif msg.get('type') == 'assistant':
+                    messages.append({"role": "assistant", "content": msg['content']})
+            
+            # Add current user message
+            messages.append({"role": "user", "content": user_message})
         
         # Get LLM response - use 15% of configured max_tokens for chat responses
         chat_max_tokens = min(2000, int(config.llm.max_tokens * 0.15))
+        print(f"🔵 [CHAT] Calling LLM with {len(messages)} messages, max_tokens={chat_max_tokens}")
+        print(f"🔵 [CHAT] Client type: {type(llm_client)}, has generate_response: {hasattr(llm_client, 'generate_response')}")
+        print(f"🔵 [CHAT] About to await generate_response...")
         response = await llm_client.generate_response(
             messages=messages,
             max_tokens=chat_max_tokens,
             temperature=config.llm.temperature
         )
+        print(f"🔵 [CHAT] Got response: {len(response)} chars")
         
         # Check if response contains tool call or SPL
         tool_call = None
@@ -2861,6 +2829,33 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         
         try:
             import re
+            
+            # Extract context requests using <CONTEXT_REQUEST> tags
+            context_request_match = re.search(r'<CONTEXT_REQUEST>(.*?)</CONTEXT_REQUEST>', response, re.DOTALL)
+            if context_request_match:
+                requested_context_type = context_request_match.group(1).strip()
+                debug_log(f"LLM requested context: {requested_context_type}", "info")
+                
+                # Load the requested context
+                try:
+                    ctx_mgr = get_context_manager()
+                    specific_context = ctx_mgr.get_specific_context(requested_context_type)
+                    
+                    if specific_context:
+                        formatted_context = ctx_mgr.format_context_for_llm({requested_context_type: specific_context})
+                        
+                        # Inject context into conversation before next LLM call
+                        conversation_history.append({
+                            "role": "system",
+                            "content": f"[Context loaded: {requested_context_type}]\n{formatted_context}"
+                        })
+                        
+                        # Remove context request from response
+                        clean_response = re.sub(r'<CONTEXT_REQUEST>.*?</CONTEXT_REQUEST>', '', clean_response, flags=re.DOTALL).strip()
+                        
+                        debug_log(f"Injected {requested_context_type} context into conversation", "info")
+                except Exception as e:
+                    debug_log(f"Error loading requested context: {e}", "error")
             
             # Extract tool call using <TOOL_CALL> tags
             tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', response, re.DOTALL)
@@ -3096,6 +3091,21 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 
                 mcp_result = await execute_mcp_tool_call(tool_call, config)
                 
+                # Get relevant context after tool execution to help LLM interpret results
+                try:
+                    ctx_mgr = get_context_manager()
+                    post_tool_context = ctx_mgr.get_context_after_tool_call(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        tool_result=mcp_result
+                    )
+                    
+                    if post_tool_context:
+                        debug_log(f"Injecting post-tool context for {tool_name}", "info")
+                except Exception as e:
+                    debug_log(f"Error getting post-tool context: {e}", "error")
+                    post_tool_context = ""
+                
                 # Summarize result for efficient context
                 result_summary = summarize_result(mcp_result, tool_name)
                 action = f"📊 Analyzing {result_summary.get('row_count', 0)} results"
@@ -3132,6 +3142,9 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 # Build intelligent feedback with accumulated context
                 insights_summary = "\n".join([f"  • {ins}" for ins in accumulated_insights[-5:]])  # Last 5 insights
                 
+                # Add post-tool context if available
+                context_section = f"\n\nRELEVANT CONTEXT:\n{post_tool_context}" if post_tool_context else ""
+                
                 if has_error:
                     error_msg = result_summary.get('message', 'Unknown error')
                     system_feedback = f"""🔴 ITERATION {iteration} RESULT: ERROR
@@ -3139,7 +3152,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
 Error: {error_msg}
 
 ACCUMULATED INSIGHTS SO FAR:
-{insights_summary}
+{insights_summary}{context_section}
 
 REFINED USER INTENT: "{user_intent}"
 
@@ -3166,7 +3179,7 @@ If you need to clarify the user's intent, ask a clarifying question WITHOUT tool
 {result_summary.get('findings', [])}
 
 ACCUMULATED INSIGHTS:
-{insights_summary}
+{insights_summary}{context_section}
 
 Sample Data (first 2 results):
 {json.dumps(result_snippet.get('sample_data'), indent=2)[:800]}
@@ -3189,7 +3202,7 @@ Respond with final answer WITHOUT tool calls if complete, OR <TOOL_CALL>...</TOO
 The query executed successfully but returned no results.
 
 ACCUMULATED INSIGHTS:
-{insights_summary}
+{insights_summary}{context_section}
 
 STRATEGIC OPTIONS:
 1. 🔍 Try different index from discovery context
@@ -3747,7 +3760,7 @@ def get_frontend_html():
             const [chatInput, setChatInput] = useState('');
             const [isTyping, setIsTyping] = useState(false);
             const [chatStatus, setChatStatus] = useState(''); // Real-time status during investigation
-            const [isConnectionModalOpen, setIsConnectionModalOpen] = useState(false);
+
             const [connectionInfo, setConnectionInfo] = useState(null);
             
             // Summary modal state
@@ -3767,6 +3780,30 @@ def get_frontend_html():
             const [isSettingsOpen, setIsSettingsOpen] = useState(false);
             const [config, setConfig] = useState(null);
             const [selectedProvider, setSelectedProvider] = useState('openai');
+            const [isCredentialModalOpen, setIsCredentialModalOpen] = useState(false);
+            const [isConnectionModalOpen, setIsConnectionModalOpen] = useState(false);
+            const [credentialName, setCredentialName] = useState('');
+            const [savedCredentials, setSavedCredentials] = useState({});
+            const [loadedCredentialName, setLoadedCredentialName] = useState(null); // Track which credential is currently loaded
+            const [isUpdateMode, setIsUpdateMode] = useState(false); // Track if modal is in update mode
+            const [isLoadingCredential, setIsLoadingCredential] = useState(false); // Flag to prevent clearing during load
+            const [apiKeyPlaceholder, setApiKeyPlaceholder] = useState('Enter API key'); // Track placeholder state
+            const [showConfigForm, setShowConfigForm] = useState(false); // Show/hide configuration form
+            const [availableModels, setAvailableModels] = useState([]); // Available models from API
+            const [isLoadingModels, setIsLoadingModels] = useState(false); // Loading state for model fetch
+            const [selectedModel, setSelectedModel] = useState(''); // Currently selected model
+            
+            // Function to track when settings have been modified
+            const handleSettingsChange = () => {
+                // Don't clear the loaded credential name - we need it to show "Update Active Connection" button
+                // The button logic will handle whether it's an update or new save
+            };
+            
+            // Function specifically for API key changes
+            const handleApiKeyChange = () => {
+                setApiKeyPlaceholder('Enter API key');
+                handleSettingsChange();
+            };
             
             // Poll for summarization progress
             useEffect(() => {
@@ -3964,6 +4001,7 @@ def get_frontend_html():
             useEffect(() => {
                 connectWebSocket();
                 loadReports();
+                loadConfig(); // Load config to get active LLM connection info
                 
                 return () => {
                     if (wsRef.current) {
@@ -4094,6 +4132,8 @@ def get_frontend_html():
             const openSettings = async () => {
                 await loadConfig();
                 setIsSettingsOpen(true);
+                // Load credentials after modal opens
+                setTimeout(() => loadCredentials(), 100);
             };
             
             const closeSettings = () => {
@@ -4107,8 +4147,243 @@ def get_frontend_html():
                     setConfig(data);
                     // Initialize selected provider from config
                     setSelectedProvider(data.llm.provider || 'openai');
+                    // Set API key placeholder based on whether key exists
+                    setApiKeyPlaceholder(data.llm.api_key === '***' ? '(Already Configured)' : 'Enter API key');
+                    
+                    // Auto-load active credential if one is set
+                    if (data.active_credential_name) {
+                        await loadCredentialIntoSettings(data.active_credential_name);
+                    }
                 } catch (error) {
                     console.error('Failed to load config:', error);
+                }
+            };
+            
+            const loadCredentials = async () => {
+                try {
+                    const response = await fetch('/api/credentials');
+                    const credentials = await response.json();
+                    setSavedCredentials(credentials);
+                    
+                    const credList = document.getElementById('credentials-list');
+                    if (!credList) return;
+                    
+                    if (Object.keys(credentials).length === 0) {
+                        credList.innerHTML = `
+                            <div class="text-center py-12 bg-white rounded-lg border-2 border-dashed border-gray-300">
+                                <i class="fas fa-plug text-purple-300 text-5xl mb-4"></i>
+                                <p class="text-base font-bold text-gray-700 mb-2">No Connections Yet</p>
+                                <p class="text-sm text-gray-500 mb-4">Get started by creating your first AI model connection</p>
+                                <p class="text-xs text-gray-400 italic">Click "Create New Connection" above</p>
+                            </div>
+                        `;
+                        return;
+                    }
+                    
+                    // Sort credentials to show active one first
+                    const activeCredName = config?.active_credential_name;
+                    const credArray = Object.values(credentials).sort((a, b) => {
+                        if (a.name === activeCredName) return -1;
+                        if (b.name === activeCredName) return 1;
+                        return 0;
+                    });
+                    
+                    credList.innerHTML = credArray.map(cred => {
+                        const providerIcon = cred.provider === 'openai' ? 'fa-openai' : 
+                                           cred.provider === 'custom' ? 'fa-server' : 'fa-brain';
+                        const providerColor = cred.provider === 'openai' ? 'text-green-600' : 'text-purple-600';
+                        const isActive = cred.name === activeCredName;
+                        
+                        return `
+                            <div class="group bg-white rounded-lg p-4 border-2 ${isActive ? 'border-amber-500 shadow-lg' : 'border-gray-200 hover:border-purple-400'} hover:shadow-lg transition-all">
+                                <div class="flex items-start justify-between gap-4">
+                                    <div class="flex-1 min-w-0">
+                                        <div class="flex items-center gap-2 mb-2">
+                                            <i class="fab ${providerIcon} ${providerColor} text-lg"></i>
+                                            <h5 class="text-base font-bold text-gray-900 truncate">${cred.name}</h5>
+                                            ${isActive ? '<span class="ml-2 px-2 py-0.5 bg-amber-500 text-gray-900 text-xs font-bold rounded-full uppercase">Active</span>' : ''}
+                                        </div>
+                                        <div class="text-sm text-gray-600 space-y-1.5 pl-1">
+                                            <div class="flex items-center gap-2">
+                                                <i class="fas fa-cog w-4 text-gray-400"></i>
+                                                <span><span class="font-semibold text-gray-700">Provider:</span> ${cred.provider}</span>
+                                            </div>
+                                            <div class="flex items-center gap-2">
+                                                <i class="fas fa-brain w-4 text-gray-400"></i>
+                                                <span><span class="font-semibold text-gray-700">Model:</span> ${cred.model}</span>
+                                            </div>
+                                            ${cred.endpoint_url ? `
+                                            <div class="flex items-center gap-2">
+                                                <i class="fas fa-link w-4 text-gray-400"></i>
+                                                <span class="truncate"><span class="font-semibold text-gray-700">Endpoint:</span> <code class="text-xs bg-gray-100 px-1 rounded">${cred.endpoint_url}</code></span>
+                                            </div>` : ''}
+                                            <div class="flex items-center gap-2">
+                                                <i class="fas fa-sliders-h w-4 text-gray-400"></i>
+                                                <span><span class="font-semibold text-gray-700">Settings:</span> ${cred.max_tokens} tokens, ${cred.temperature} temp</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="flex flex-col gap-2 shrink-0">
+                                        <button
+                                            onclick="loadCredentialIntoSettings('${cred.name.replace(/'/g, "\\'")}')"
+                                            class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                            title="Load this credential into the settings form above"
+                                        >
+                                            <i class="fas fa-download mr-2"></i>Load
+                                        </button>
+                                        <button
+                                            onclick="deleteCredential('${cred.name.replace(/'/g, "\\'")}')"
+                                            class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                            title="Permanently delete this saved credential"
+                                        >
+                                            <i class="fas fa-trash-alt mr-2"></i>Delete
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                } catch (error) {
+                    console.error('Failed to load credentials:', error);
+                    const credList = document.getElementById('credentials-list');
+                    if (credList) {
+                        credList.innerHTML = `
+                            <div class="text-center py-10">
+                                <i class="fas fa-exclamation-triangle text-red-400 text-4xl mb-4"></i>
+                                <p class="text-base font-semibold text-red-700">Failed to load credentials</p>
+                                <p class="text-sm text-gray-600 mt-2">${error.message}</p>
+                            </div>
+                        `;
+                    }
+                }
+            };
+            
+            window.loadCredentialIntoSettings = async (name) => {
+                try {
+                    // Show loading indicator
+                    const credList = document.getElementById('credentials-list');
+                    const originalHTML = credList.innerHTML;
+                    credList.innerHTML = `
+                        <div class="text-center py-10">
+                            <i class="fas fa-spinner fa-spin text-purple-600 text-4xl mb-4"></i>
+                            <p class="text-base font-semibold text-gray-700">Loading credential...</p>
+                            <p class="text-sm text-gray-500 mt-2">${name}</p>
+                        </div>
+                    `;
+                    
+                    // Set flag to prevent clearing during load
+                    setIsLoadingCredential(true);
+                    
+                    const response = await fetch(`/api/credentials/${name}/load`, { method: 'POST' });
+                    const result = await response.json();
+                    
+                    if (response.ok) {
+                        // Update form fields with smooth transition
+                        const newConfig = result.config;
+                        
+                        // Update React state first to trigger re-render
+                        setConfig(newConfig);
+                        setSelectedProvider(newConfig.llm.provider);
+                        setLoadedCredentialName(name); // Track which credential is loaded
+                        setApiKeyPlaceholder('(Already Configured)'); // Update placeholder
+                        setShowConfigForm(true); // Show the config form when loading a credential
+                        setSelectedModel(newConfig.llm.model); // Set the selected model
+                        setAvailableModels([]); // Clear fetched models when loading credential
+                        
+                        // Then update form fields
+                        setTimeout(() => {
+                            document.getElementById('llm-provider').value = newConfig.llm.provider;
+                            const modelInput = document.getElementById('llm-model');
+                            if (modelInput) {
+                                modelInput.value = newConfig.llm.model;
+                            }
+                            document.getElementById('llm-max-tokens').value = newConfig.llm.max_tokens;
+                            document.getElementById('llm-temperature').value = newConfig.llm.temperature;
+                            
+                            // Update API Key field - force placeholder update
+                            const apiKeyInput = document.getElementById('llm-api-key');
+                            if (apiKeyInput) {
+                                apiKeyInput.value = '';
+                            }
+                            
+                            // Update endpoint URL if custom provider
+                            if (newConfig.llm.endpoint_url && document.getElementById('llm-endpoint-url')) {
+                                document.getElementById('llm-endpoint-url').value = newConfig.llm.endpoint_url;
+                            }
+                            
+                            // Clear loading flag after a short delay to allow onChange events to settle
+                            setTimeout(() => setIsLoadingCredential(false), 200);
+                        }, 50);
+                        
+                        // Reload config and credentials list to update active status
+                        await loadConfig();
+                        await loadCredentials();
+                        
+                        // Show success message
+                        const successDiv = document.createElement('div');
+                        successDiv.className = 'fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce';
+                        successDiv.innerHTML = `
+                            <div class="flex items-center gap-3">
+                                <i class="fas fa-check-circle text-2xl"></i>
+                                <div>
+                                    <p class="font-bold text-base">Credential Loaded!</p>
+                                    <p class="text-sm opacity-90">${name}</p>
+                                </div>
+                            </div>
+                        `;
+                        document.body.appendChild(successDiv);
+                        setTimeout(() => {
+                            successDiv.style.animation = 'none';
+                            successDiv.style.opacity = '0';
+                            successDiv.style.transition = 'opacity 0.3s';
+                            setTimeout(() => successDiv.remove(), 300);
+                        }, 2500);
+                    } else {
+                        credList.innerHTML = originalHTML;
+                        setIsLoadingCredential(false);
+                        alert(`Failed to load credential: ${result.detail}`);
+                    }
+                } catch (error) {
+                    setIsLoadingCredential(false);
+                    alert(`Error loading credential: ${error.message}`);
+                    await loadCredentials();
+                }
+            };
+            
+            window.deleteCredential = async (name) => {
+                // Custom confirmation dialog
+                const confirmed = confirm(`⚠️ Delete Credential\\n\\nAre you sure you want to delete '${name}'?\\n\\nThis action cannot be undone.`);
+                if (!confirmed) return;
+                
+                try {
+                    const response = await fetch(`/api/credentials/${name}`, { method: 'DELETE' });
+                    if (response.ok) {
+                        await loadCredentials();
+                        
+                        // Show success message
+                        const successDiv = document.createElement('div');
+                        successDiv.className = 'fixed top-6 right-6 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
+                        successDiv.innerHTML = `
+                            <div class="flex items-center gap-3">
+                                <i class="fas fa-trash-alt text-2xl"></i>
+                                <div>
+                                    <p class="font-bold text-base">Credential Deleted</p>
+                                    <p class="text-sm opacity-90">${name}</p>
+                                </div>
+                            </div>
+                        `;
+                        document.body.appendChild(successDiv);
+                        setTimeout(() => {
+                            successDiv.style.opacity = '0';
+                            successDiv.style.transition = 'opacity 0.3s';
+                            setTimeout(() => successDiv.remove(), 300);
+                        }, 2500);
+                    } else {
+                        const error = await response.json();
+                        alert(`Failed to delete: ${error.detail}`);
+                    }
+                } catch (error) {
+                    alert(`Error: ${error.message}`);
                 }
             };
             
@@ -4753,12 +5028,25 @@ def get_frontend_html():
                                     <div 
                                         className="flex items-center cursor-pointer hover:bg-gray-100 px-3 py-2 rounded-lg transition-colors"
                                         onClick={openConnectionModal}
-                                        title="View connection details"
+                                        title="View MCP connection details"
                                     >
                                         <div className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
                                         <span className="text-sm text-gray-600">
-                                            {isConnected ? 'Connected' : 'Disconnected'}
+                                            {isConnected ? 'MCP Connected' : 'MCP Disconnected'}
                                         </span>
+                                    </div>
+                                    <div 
+                                        className="flex items-center cursor-pointer hover:bg-purple-50 px-3 py-2 rounded-lg transition-colors border border-purple-200"
+                                        onClick={openSettings}
+                                        title="Click to change LLM connection"
+                                    >
+                                        <i className="fas fa-brain text-purple-600 mr-2"></i>
+                                        <div className="flex flex-col">
+                                            <span className="text-xs text-gray-500 leading-tight">LLM:</span>
+                                            <span className="text-sm font-medium text-gray-900 leading-tight">
+                                                {config?.active_credential_name || config?.llm?.model || 'Not configured'}
+                                            </span>
+                                        </div>
                                     </div>
                                     <button
                                         onClick={startDiscovery}
@@ -6440,23 +6728,21 @@ def get_frontend_html():
                     
                     {/* Settings Modal */}
                     {isSettingsOpen && config && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4" onClick={closeSettings}>
-                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
-                                {/* Fixed Header */}
-                                <div className="p-6 border-b border-gray-200 flex-shrink-0">
-                                    <div className="flex items-center justify-between">
-                                        <h2 className="text-2xl font-semibold text-gray-900">
-                                            <i className="fas fa-cog mr-2 text-indigo-600"></i>
-                                            Settings
-                                        </h2>
-                                        <button onClick={closeSettings} className="text-gray-500 hover:text-gray-700">
-                                            <i className="fas fa-times text-xl"></i>
-                                        </button>
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={closeSettings}>
+                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl h-5/6 flex flex-col" onClick={(e) => e.stopPropagation()}>
+                                {/* Header */}
+                                <div className="p-6 border-b border-gray-200 flex justify-between items-center">
+                                    <div className="flex items-center">
+                                        <i className="fas fa-cog text-2xl text-indigo-600 mr-3"></i>
+                                        <h2 className="text-xl font-semibold text-gray-900">Settings</h2>
                                     </div>
+                                    <button onClick={closeSettings} className="text-gray-500 hover:text-gray-700">
+                                        <i className="fas fa-times text-xl"></i>
+                                    </button>
                                 </div>
                                 
                                 {/* Scrollable Content */}
-                                <div className="p-6 space-y-6 overflow-y-auto flex-1">
+                                <div className="flex-1 overflow-y-auto p-6 space-y-6">
                                     {/* MCP Configuration */}
                                     <div>
                                         <h3 className="text-lg font-semibold text-gray-900 mb-3">
@@ -6494,44 +6780,120 @@ def get_frontend_html():
                                         </div>
                                     </div>
                                     
-                                    {/* LLM Configuration */}
+                                    {/* LLM Credential Vault - Show First */}
                                     <div>
-                                        <h3 className="text-lg font-semibold text-gray-900 mb-3">
-                                            <i className="fas fa-brain mr-2 text-purple-600"></i>
-                                            LLM Configuration
-                                        </h3>
-                                        <div className="space-y-3">
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">Provider</label>
-                                                <select 
-                                                    defaultValue={config.llm.provider}
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                    id="llm-provider"
-                                                    onChange={(e) => setSelectedProvider(e.target.value)}
-                                                >
-                                                    <option value="openai">OpenAI</option>
-                                                    <option value="custom">Custom Endpoint</option>
-                                                </select>
+                                        <div className="bg-gradient-to-r from-purple-50 to-indigo-50 rounded-lg p-6 border-2 border-purple-200">
+                                            {/* Header */}
+                                            <div className="mb-4">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                                                    <i className="fas fa-key mr-2 text-purple-600"></i>
+                                                    LLM Credentials
+                                                </h3>
+                                                <p className="text-sm text-gray-600">Manage your AI model connections</p>
                                             </div>
-                                            {(selectedProvider === 'custom' || config.llm.provider === 'custom') && (
+                                            
+                                            {/* Currently Loaded Indicator */}
+                                            {(loadedCredentialName || config?.active_credential_name) && (
+                                                <div className="mb-4 bg-amber-50 border-l-4 border-amber-500 rounded-r-lg p-3">
+                                                    <div className="flex items-center justify-between">
+                                                        <div className="flex items-center gap-2">
+                                                            <i className="fas fa-check-circle text-amber-600"></i>
+                                                            <div>
+                                                                <p className="text-sm font-semibold text-gray-900">Active Connection:</p>
+                                                                <p className="text-base font-bold text-gray-800">{loadedCredentialName || config?.active_credential_name}</p>
+                                                            </div>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => {
+                                                                setLoadedCredentialName(null);
+                                                                setShowConfigForm(false);
+                                                            }}
+                                                            className="text-amber-600 hover:text-amber-800 text-sm font-medium"
+                                                            title="Clear and close editor"
+                                                        >
+                                                            <i className="fas fa-times-circle mr-1"></i>Close
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            )}
+                                            
+                                            {/* Action Button - Create New Connection */}
+                                            {!showConfigForm && (
+                                                <div className="mb-4">
+                                                    <button
+                                                        onClick={() => {
+                                                            setShowConfigForm(true);
+                                                            setLoadedCredentialName(null);
+                                                            setApiKeyPlaceholder('Enter API key');
+                                                        }}
+                                                        className="w-full px-4 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
+                                                    >
+                                                        <i className="fas fa-plus-circle mr-2"></i>Create New Connection
+                                                    </button>
+                                                </div>
+                                            )}
+                                            
+                                            {/* Saved Credentials List */}
+                                            <div id="credentials-list" className="space-y-2 max-h-96 overflow-y-auto">
+                                                <div className="text-sm text-gray-500 text-center py-4 italic">Loading credentials...</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* LLM Configuration Form - Conditional */}
+                                    {showConfigForm && (
+                                        <div>
+                                            <div className="flex items-center justify-between mb-3">
+                                                <h3 className="text-lg font-semibold text-gray-900">
+                                                    <i className="fas fa-brain mr-2 text-purple-600"></i>
+                                                    {loadedCredentialName ? 'Edit Connection' : 'New Connection'}
+                                                </h3>
+                                                <button
+                                                    onClick={() => {
+                                                        setShowConfigForm(false);
+                                                        setLoadedCredentialName(null);
+                                                    }}
+                                                    className="px-3 py-1 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
+                                                >
+                                                    <i className="fas fa-times mr-1"></i>Cancel
+                                                </button>
+                                            </div>
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">Provider</label>
+                                                    <select 
+                                                        defaultValue={config.llm.provider}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        id="llm-provider"
+                                                        onChange={(e) => {
+                                                            setSelectedProvider(e.target.value);
+                                                            handleSettingsChange();
+                                                        }}
+                                                    >
+                                                        <option value="openai">OpenAI</option>
+                                                        <option value="custom">Custom Endpoint</option>
+                                                    </select>
+                                                </div>
+                                            {selectedProvider === 'custom' && (
                                                 <div>
                                                     <label className="block text-sm font-medium text-gray-700 mb-1">
                                                         Endpoint URL
                                                         <span className="ml-2 text-xs text-gray-500">
-                                                            (base URL only, without API paths)
+                                                            (used exactly as configured)
                                                         </span>
                                                     </label>
                                                     <input 
                                                         type="text" 
                                                         defaultValue={config.llm.endpoint_url || ''}
-                                                        placeholder="http://localhost:8000"
+                                                        placeholder="http://localhost:8000/v1/chat/completions"
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="llm-endpoint-url"
+                                                        onChange={handleSettingsChange}
                                                     />
                                                     <p className="mt-1 text-xs text-gray-500">
-                                                        ✅ Good: <span className="font-mono">http://localhost:8000</span><br/>
-                                                        ❌ Bad: <span className="font-mono">http://localhost:8000/v1/chat/completions</span><br/>
-                                                        <span className="italic">Compatible with: Ollama, LM Studio, vLLM, LocalAI, etc.</span>
+                                                        ✅ <strong>Full API Path (Recommended):</strong> <span className="font-mono">http://localhost:8000/v1/chat/completions</span><br/>
+                                                        ⚠️ <strong>Base URL (Slower):</strong> <span className="font-mono">http://localhost:8000</span> - requires auto-detection<br/>
+                                                        <span className="italic">URL is used exactly as entered. No automatic path manipulation.</span>
                                                     </p>
                                                 </div>
                                             )}
@@ -6544,19 +6906,85 @@ def get_frontend_html():
                                                 </label>
                                                 <input 
                                                     type="password" 
-                                                    placeholder={config.llm.api_key === '***' ? '(Already Configured)' : 'Enter API key'}
+                                                    placeholder={apiKeyPlaceholder}
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                     id="llm-api-key"
+                                                    onChange={handleApiKeyChange}
                                                 />
                                             </div>
                                             <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
-                                                <input 
-                                                    type="text" 
-                                                    defaultValue={config.llm.model}
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                    id="llm-model"
-                                                />
+                                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                    Model
+                                                    <button
+                                                        onClick={async () => {
+                                                            setIsLoadingModels(true);
+                                                            try {
+                                                                const provider = document.getElementById('llm-provider').value;
+                                                                const apiKey = document.getElementById('llm-api-key').value;
+                                                                const endpointUrl = document.getElementById('llm-endpoint-url')?.value;
+                                                                
+                                                                const response = await fetch('/api/llm/list-models', {
+                                                                    method: 'POST',
+                                                                    headers: { 'Content-Type': 'application/json' },
+                                                                    body: JSON.stringify({
+                                                                        provider: provider,
+                                                                        api_key: apiKey,
+                                                                        endpoint_url: endpointUrl
+                                                                    })
+                                                                });
+                                                                
+                                                                if (response.ok) {
+                                                                    const data = await response.json();
+                                                                    setAvailableModels(data.models);
+                                                                    if (data.models.length > 0) {
+                                                                        setSelectedModel(data.models[0]);
+                                                                    }
+                                                                } else {
+                                                                    const error = await response.json();
+                                                                    alert('Failed to fetch models: ' + error.detail);
+                                                                }
+                                                            } catch (error) {
+                                                                alert('Error fetching models: ' + error.message);
+                                                            } finally {
+                                                                setIsLoadingModels(false);
+                                                            }
+                                                        }}
+                                                        className="ml-2 px-2 py-1 text-xs bg-purple-100 hover:bg-purple-200 text-purple-700 rounded disabled:opacity-50"
+                                                        disabled={isLoadingModels}
+                                                        type="button"
+                                                    >
+                                                        <i className={`fas ${isLoadingModels ? 'fa-spinner fa-spin' : 'fa-download'}`}></i> {isLoadingModels ? 'Fetching...' : 'Fetch Models'}
+                                                    </button>
+                                                </label>
+                                                {availableModels.length > 0 ? (
+                                                    <select
+                                                        value={selectedModel}
+                                                        onChange={(e) => {
+                                                            setSelectedModel(e.target.value);
+                                                            handleSettingsChange();
+                                                        }}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        id="llm-model"
+                                                    >
+                                                        {availableModels.map(model => (
+                                                            <option key={model} value={model}>{model}</option>
+                                                        ))}
+                                                    </select>
+                                                ) : (
+                                                    <input 
+                                                        type="text" 
+                                                        defaultValue={config.llm.model}
+                                                        placeholder={selectedProvider === 'openai' ? 'gpt-4o' : 'e.g., llama3.2:3b'}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        id="llm-model"
+                                                        onChange={handleSettingsChange}
+                                                    />
+                                                )}
+                                                {selectedProvider === 'custom' && (
+                                                    <p className="mt-1 text-xs text-gray-500 italic">
+                                                        Tip: Click "Fetch Models" to auto-discover available models from your endpoint
+                                                    </p>
+                                                )}
                                             </div>
                                             <div>
                                                 <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -6593,6 +7021,7 @@ def get_frontend_html():
                                                     defaultValue={config.llm.max_tokens}
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                     id="llm-max-tokens"
+                                                    onChange={handleSettingsChange}
                                                 />
                                             </div>
                                             <div>
@@ -6603,6 +7032,7 @@ def get_frontend_html():
                                                     defaultValue={config.llm.temperature}
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                     id="llm-temperature"
+                                                    onChange={handleSettingsChange}
                                                 />
                                             </div>
                                             
@@ -6723,82 +7153,13 @@ def get_frontend_html():
                                                 </button>
                                                 <div id="llm-test-results" className="mt-3" style={{display: 'none'}}></div>
                                             </div>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* Server Configuration */}
-                                    <div>
-                                        <h3 className="text-lg font-semibold text-gray-900 mb-3">
-                                            <i className="fas fa-server mr-2 text-blue-600"></i>
-                                            Server Configuration
-                                        </h3>
-                                        <div className="space-y-3">
-                                            <div className="flex items-start">
-                                                <input 
-                                                    type="checkbox" 
-                                                    defaultChecked={config.server.debug_mode}
-                                                    className="mr-2 mt-1"
-                                                    id="server-debug-mode"
-                                                    onChange={(e) => {
-                                                        // Show/hide debug button based on checkbox
-                                                        const btn = document.getElementById('open-debug-btn');
-                                                        if (btn) btn.style.display = e.target.checked ? 'inline-block' : 'none';
-                                                    }}
-                                                />
-                                                <div>
-                                                    <label htmlFor="server-debug-mode" className="text-sm font-medium text-gray-700">
-                                                        Debug Mode
-                                                    </label>
-                                                    <p className="text-xs text-gray-500 mt-1">
-                                                        Stream debug logs to a popup window in real-time. No secrets will be shown.
-                                                    </p>
-                                                    <button
-                                                        id="open-debug-btn"
-                                                        style={{display: config.server.debug_mode ? 'inline-block' : 'none'}}
-                                                        onClick={() => {
-                                                                const debugWindow = window.open('', 'debug-logs', 'width=800,height=600,scrollbars=yes');
-                                                                if (debugWindow) {
-                                                                    const doc = debugWindow.document;
-                                                                    doc.open();
-                                                                    doc.write('<html><head><title>DT4SMS Debug Logs</title>');
-                                                                    doc.write('<style>body{font-family:monospace;background:#1e1e1e;color:#d4d4d4;padding:10px}');
-                                                                    doc.write('.log{margin:5px 0;padding:5px;border-left:3px solid #666}');
-                                                                    doc.write('.log.info{border-color:#4a9eff}.log.warning{border-color:#ffa500;color:#ffa500}');
-                                                                    doc.write('.log.error{border-color:#ff4444;color:#ff4444}.log.query{border-color:#00ff00;color:#00ff00}');
-                                                                    doc.write('.log.response{border-color:#ff69b4;color:#ff69b4}.timestamp{color:#888;font-size:0.9em}');
-                                                                    doc.write('pre{margin:5px 0;white-space:pre-wrap;word-wrap:break-word}</style></head>');
-                                                                    doc.write('<body><h2>🐛 DT4SMS Debug Logs</h2><div id="logs"></div></body></html>');
-                                                                    doc.close();
-                                                                    const script = doc.createElement('script');
-                                                                    script.textContent = 'const ws=new WebSocket("ws://"+location.hostname+":8003/ws/debug");' +
-                                                                        'const logsDiv=document.getElementById("logs");' +
-                                                                        'ws.onmessage=(e)=>{const d=JSON.parse(e.data);const l=document.createElement("div");' +
-                                                                        'l.className="log "+(d.category||"info");' +
-                                                                        'let c="<span class=\\\\"timestamp\\\\">["+ new Date(d.timestamp).toLocaleTimeString()+"]</span> ";' +
-                                                                        'c+=d.message;if(d.data){c+="<pre>"+JSON.stringify(d.data,null,2)+"</pre>";}' +
-                                                                        'l.innerHTML=c;logsDiv.appendChild(l);logsDiv.scrollTop=logsDiv.scrollHeight;};' +
-                                                                        'ws.onopen=()=>{const l=document.createElement("div");l.className="log info";' +
-                                                                        'l.textContent="✅ Connected";logsDiv.appendChild(l);};' +
-                                                                        'ws.onerror=()=>{const l=document.createElement("div");l.className="log error";' +
-                                                                        'l.textContent="❌ Error";logsDiv.appendChild(l);};';
-                                                                    doc.body.appendChild(script);
-                                                                } else {
-                                                                    alert('Please allow popups for this site to view debug logs');
-                                                                }
-                                                            }}
-                                                            className="mt-2 px-3 py-1 text-xs bg-blue-100 hover:bg-blue-200 text-blue-700 rounded"
-                                                        >
-                                                            <i className="fas fa-external-link-alt mr-1"></i>
-                                                            Open Debug Window
-                                                        </button>
-                                                </div>
                                             </div>
                                         </div>
-                                    </div>
+                                    )}
                                 </div>
                                 
-                                {/* Fixed Footer with Action Buttons */}
-                                <div className="p-6 border-t border-gray-200 bg-gray-50 flex-shrink-0">
+                                {/* Footer */}
+                                <div className="p-6 border-t border-gray-200 bg-gray-50">
                                     <div className="flex justify-between items-center">
                                         <button
                                             onClick={async () => {
@@ -6836,36 +7197,250 @@ def get_frontend_html():
                                             <i className="fas fa-list mr-2"></i>
                                             View Dependencies
                                         </button>
+                                        {showConfigForm ? (
+                                            /* Show connection save/update buttons when config form is visible */
+                                            loadedCredentialName ? (
+                                                <>
+                                                    <button
+                                                        onClick={() => {
+                                                            setIsUpdateMode(false);
+                                                            setCredentialName('');
+                                                            setIsCredentialModalOpen(true);
+                                                        }}
+                                                        className="px-6 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
+                                                    >
+                                                        <i className="fas fa-plus-circle mr-2"></i>Save as New
+                                                    </button>
+                                                    <button
+                                                        onClick={() => {
+                                                            setIsUpdateMode(true);
+                                                            setCredentialName(loadedCredentialName);
+                                                            setIsCredentialModalOpen(true);
+                                                        }}
+                                                        className="px-6 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600"
+                                                    >
+                                                        <i className="fas fa-sync-alt mr-2"></i>Update Active Connection
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <button
+                                                    onClick={() => {
+                                                        setIsUpdateMode(false);
+                                                        setCredentialName('');
+                                                        setIsCredentialModalOpen(true);
+                                                    }}
+                                                    className="px-6 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
+                                                >
+                                                    <i className="fas fa-save mr-2"></i>Save Connection
+                                                </button>
+                                            )
+                                        ) : (
+                                            /* Show regular Save Settings button when no config form */
+                                            <button
+                                                onClick={async () => {
+                                                    const providerEl = document.getElementById('llm-provider');
+                                                    const endpointUrlInput = document.getElementById('llm-endpoint-url');
+                                                    const modelInput = document.getElementById('llm-model');
+                                                    const apiKeyEl = document.getElementById('llm-api-key');
+                                                    const maxTokensEl = document.getElementById('llm-max-tokens');
+                                                    const tempEl = document.getElementById('llm-temperature');
+                                                    const mcpUrlEl = document.getElementById('mcp-url');
+                                                    const mcpTokenEl = document.getElementById('mcp-token');
+                                                    const mcpVerifyEl = document.getElementById('mcp-verify-ssl');
+                                                    
+                                                    const provider = providerEl ? providerEl.value : selectedProvider;
+                                                    
+                                                    const settings = {
+                                                        mcp: {
+                                                            url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
+                                                            token: (mcpTokenEl ? mcpTokenEl.value : config.mcp.token) || undefined,
+                                                            verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
+                                                        },
+                                                        llm: {
+                                                            provider: provider,
+                                                            api_key: (apiKeyEl ? apiKeyEl.value : config.llm.api_key) || undefined,
+                                                            model: (modelInput ? modelInput.value : selectedModel) || config.llm.model,
+                                                            endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : config.llm.endpoint_url,
+                                                            max_tokens: maxTokensEl ? parseInt(maxTokensEl.value) : config.llm.max_tokens,
+                                                            temperature: tempEl ? parseFloat(tempEl.value) : config.llm.temperature
+                                                        },
+                                                        server: {
+                                                            ...config.server
+                                                        }
+                                                    };
+                                                    await saveSettings(settings);
+                                                }}
+                                                className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
+                                            >
+                                                <i className="fas fa-save mr-2"></i>
+                                                Save Settings
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    
+                    {/* Credential Save Modal */}
+                    {isCredentialModalOpen && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
+                                {/* Header */}
+                                <div className={`px-6 py-4 rounded-t-xl ${isUpdateMode ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white'}`}>
+                                    <div className="flex items-center justify-between">
+                                        <div className="flex items-center gap-3">
+                                            <i className={`text-2xl ${isUpdateMode ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
+                                            <h2 className="text-xl font-bold">{isUpdateMode ? 'Update' : 'Save'} LLM Credential</h2>
+                                        </div>
+                                        <button
+                                            onClick={() => {
+                                                setIsCredentialModalOpen(false);
+                                                setCredentialName('');
+                                                setIsUpdateMode(false);
+                                            }}
+                                            className={`transition-colors ${isUpdateMode ? 'text-gray-900 hover:text-gray-600' : 'text-white hover:text-gray-200'}`}
+                                        >
+                                            <i className="fas fa-times text-xl"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                {/* Content */}
+                                <div className="p-6">
+                                    {isUpdateMode ? (
+                                        <div className="bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4">
+                                            <div className="flex items-start">
+                                                <i className="fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5"></i>
+                                                <div>
+                                                    <p className="text-sm font-bold text-gray-900 mb-1">⚠️ Update Warning</p>
+                                                    <p className="text-sm text-gray-800">
+                                                        You are about to overwrite the existing credential "<strong className="text-gray-900">{credentialName}</strong>". 
+                                                        This will replace all settings with your current configuration. This action cannot be undone.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <p className="text-sm text-gray-600 mb-4">
+                                            Save your current LLM settings as a named credential for quick access later.
+                                        </p>
+                                    )}
+                                    
+                                    <div className="mb-6">
+                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                            Credential Name <span className="text-red-500">*</span>
+                                        </label>
+                                        <input
+                                            type="text"
+                                            value={credentialName}
+                                            onChange={(e) => setCredentialName(e.target.value)}
+                                            placeholder="e.g., My OpenAI GPT-4, Local Llama Server"
+                                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                                            disabled={isUpdateMode}
+                                            autoFocus={!isUpdateMode}
+                                        />
+                                        {isUpdateMode && (
+                                            <p className="text-xs text-gray-500 mt-1 italic">Credential name cannot be changed when updating</p>
+                                        )}
+                                    </div>
+                                    
+                                    {/* Preview */}
+                                    <div className="bg-gray-50 rounded-lg p-4 mb-6 border border-gray-200">
+                                        <h4 className="text-xs font-semibold text-gray-700 mb-2 uppercase tracking-wide">Current Settings Preview</h4>
+                                        <div className="space-y-1 text-sm text-gray-600">
+                                            <div><span className="font-medium">Provider:</span> {selectedProvider}</div>
+                                            <div><span className="font-medium">Model:</span> {document.getElementById('llm-model')?.value || 'N/A'}</div>
+                                            <div><span className="font-medium">Max Tokens:</span> {document.getElementById('llm-max-tokens')?.value || 'N/A'}</div>
+                                            <div><span className="font-medium">Temperature:</span> {document.getElementById('llm-temperature')?.value || 'N/A'}</div>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* Actions */}
+                                    <div className="flex gap-3">
+                                        <button
+                                            onClick={() => {
+                                                setIsCredentialModalOpen(false);
+                                                setCredentialName('');
+                                                setIsUpdateMode(false);
+                                            }}
+                                            className="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium transition-colors"
+                                        >
+                                            Cancel
+                                        </button>
                                         <button
                                             onClick={async () => {
-                                                const provider = document.getElementById('llm-provider').value;
-                                                const endpointUrlInput = document.getElementById('llm-endpoint-url');
+                                                if (!credentialName.trim()) {
+                                                    alert('Please enter a credential name');
+                                                    return;
+                                                }
                                                 
-                                                const settings = {
-                                                    mcp: {
-                                                        url: document.getElementById('mcp-url').value,
-                                                        token: document.getElementById('mcp-token').value || undefined,
-                                                        verify_ssl: document.getElementById('mcp-verify-ssl').checked
-                                                    },
-                                                    llm: {
-                                                        provider: provider,
-                                                        api_key: document.getElementById('llm-api-key').value || undefined,
-                                                        model: document.getElementById('llm-model').value,
-                                                        endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : undefined,
-                                                        max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
-                                                        temperature: parseFloat(document.getElementById('llm-temperature').value)
-                                                    },
-                                                    server: {
-                                                        ...config.server,
-                                                        debug_mode: document.getElementById('server-debug-mode').checked
+                                                // Additional confirmation for updates
+                                                if (isUpdateMode) {
+                                                    const confirmed = confirm(`⚠️ Confirm Update\n\nAre you sure you want to overwrite "${credentialName}"?\n\nThis will replace:\n• Provider & Model\n• API Key\n• Endpoint URL\n• Max Tokens & Temperature\n\nThis action cannot be undone.`);
+                                                    if (!confirmed) return;
+                                                }
+                                                
+                                                try {
+                                                    const provider = document.getElementById('llm-provider').value;
+                                                    const endpointUrlInput = document.getElementById('llm-endpoint-url');
+                                                    
+                                                    const response = await fetch('/api/credentials', {
+                                                        method: 'POST',
+                                                        headers: { 'Content-Type': 'application/json' },
+                                                        body: JSON.stringify({
+                                                            name: credentialName.trim(),
+                                                            provider: provider,
+                                                            api_key: document.getElementById('llm-api-key').value,
+                                                            model: document.getElementById('llm-model').value,
+                                                            endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : null,
+                                                            max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
+                                                            temperature: parseFloat(document.getElementById('llm-temperature').value)
+                                                        })
+                                                    });
+                                                    
+                                                    if (response.ok) {
+                                                        // Close modal
+                                                        setIsCredentialModalOpen(false);
+                                                        setCredentialName('');
+                                                        const wasUpdate = isUpdateMode;
+                                                        setIsUpdateMode(false);
+                                                        
+                                                        // Refresh credential list
+                                                        await loadCredentials();
+                                                        
+                                                        // Show success message
+                                                        const successDiv = document.createElement('div');
+                                                        successDiv.className = `fixed top-6 right-6 ${wasUpdate ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600' : 'bg-green-600 text-white'} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
+                                                        successDiv.innerHTML = `
+                                                            <div class="flex items-center gap-3">
+                                                                <i class="fas ${wasUpdate ? 'fa-sync-alt' : 'fa-check-circle'} text-2xl"></i>
+                                                                <div>
+                                                                    <p class="font-bold text-base">Credential ${wasUpdate ? 'Updated' : 'Saved'}!</p>
+                                                                    <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${credentialName}</p>
+                                                                </div>
+                                                            </div>
+                                                        `;
+                                                        document.body.appendChild(successDiv);
+                                                        setTimeout(() => {
+                                                            successDiv.style.animation = 'none';
+                                                            successDiv.style.opacity = '0';
+                                                            successDiv.style.transition = 'opacity 0.3s';
+                                                            setTimeout(() => successDiv.remove(), 300);
+                                                        }, 2500);
+                                                    } else {
+                                                        const error = await response.json();
+                                                        alert('Failed to save credential: ' + (error.detail || 'Unknown error'));
                                                     }
-                                                };
-                                                await saveSettings(settings);
+                                                } catch (error) {
+                                                    alert('Error saving credential: ' + error.message);
+                                                }
                                             }}
-                                            className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
+                                            disabled={!credentialName.trim()}
+                                            className={`flex-1 px-4 py-2 ${isUpdateMode ? 'bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600' : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white'} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`}
                                         >
-                                            <i className="fas fa-save mr-2"></i>
-                                            Save Settings
+                                            <i className={`mr-2 ${isUpdateMode ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
+                                            {isUpdateMode ? 'Update Credential' : 'Save Credential'}
                                         </button>
                                     </div>
                                 </div>

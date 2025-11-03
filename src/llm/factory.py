@@ -12,9 +12,12 @@ import requests  # For custom endpoints (better Windows/vLLM compatibility)
 import time
 import re
 import random
+import logging
 from typing import Optional, Protocol, Dict, Any, Callable
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
 
 
 class RateLimitManager:
@@ -243,30 +246,44 @@ class OpenAIClient:
         
         while attempt < self.rate_limit_manager.max_retries:
             try:
-                # Adjust max_tokens based on current rate limit budget
-                budget_info = self.rate_limit_manager.update_request_budget(
-                    self.rate_limit_manager.current_limits
-                )
-                adjusted_max_tokens = min(max_tokens, budget_info.get('recommended_max_tokens', max_tokens))
+                # Only adjust max_tokens if we have actual rate limit data
+                # Skip budget calculation for normal requests (performance optimization)
+                adjusted_max_tokens = max_tokens
+                if self.rate_limit_manager.current_limits:
+                    budget_info = self.rate_limit_manager.update_request_budget(
+                        self.rate_limit_manager.current_limits
+                    )
+                    adjusted_max_tokens = min(max_tokens, budget_info.get('recommended_max_tokens', max_tokens))
                 
                 headers = {
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
                 }
                 
+                # Determine which parameter to use based on model
+                # Newer models (gpt-4o, gpt-4-turbo, etc.) use max_completion_tokens
+                # Older models use max_tokens
+                model_lower = self.model.lower()
+                uses_new_param = any(x in model_lower for x in ['gpt-4o', 'gpt-4-turbo', 'o1-', 'o1', 'chatgpt-4o', 'gpt4o'])
+                
                 payload = {
                     "model": self.model,
                     "messages": messages,
-                    "max_tokens": adjusted_max_tokens,
                     "temperature": temperature
                 }
+                
+                # Add the appropriate token limit parameter
+                if uses_new_param:
+                    payload["max_completion_tokens"] = adjusted_max_tokens
+                else:
+                    payload["max_tokens"] = adjusted_max_tokens
                 
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         f"{self.base_url}/chat/completions",
                         headers=headers,
                         json=payload,
-                        timeout=aiohttp.ClientTimeout(total=60)  # Increased timeout
+                        timeout=aiohttp.ClientTimeout(total=30)  # Faster timeout for quicker failures
                     ) as response:
                         if response.status == 200:
                             result = await response.json()
@@ -287,9 +304,29 @@ class OpenAIClient:
                             
                             attempt += 1
                             continue
-                        elif response.status == 400:  # Bad request - might be context length
+                        elif response.status == 400:  # Bad request - might be context length or parameter issue
                             error_text = await response.text()
-                            if "context length" in error_text.lower() or "maximum context" in error_text.lower():
+                            
+                            # Check for unsupported parameter error (max_tokens vs max_completion_tokens)
+                            if "unsupported parameter" in error_text.lower() and "'max_tokens'" in error_text.lower():
+                                # Wrong parameter used - retry with alternate parameter
+                                uses_new_param = not uses_new_param  # Flip the parameter choice
+                                
+                                # Rebuild payload with alternate parameter
+                                payload = {
+                                    "model": self.model,
+                                    "messages": messages,
+                                    "temperature": temperature
+                                }
+                                if uses_new_param:
+                                    payload["max_completion_tokens"] = adjusted_max_tokens
+                                else:
+                                    payload["max_tokens"] = adjusted_max_tokens
+                                
+                                # Retry immediately without incrementing attempt
+                                continue
+                            
+                            elif "context length" in error_text.lower() or "maximum context" in error_text.lower():
                                 # Context length exceeded
                                 truncation_info = self.rate_limit_manager.handle_context_length_error(error_text)
                                 
@@ -473,44 +510,81 @@ Return insights as a JSON object with a 'patterns' array.
 class CustomLLMClient:
     """Custom LLM endpoint client using requests library for better Windows/vLLM compatibility."""
     
+    # Class-level cache shared across all instances {endpoint_url: config_dict}
+    _endpoint_cache = {}
+    
     def __init__(self, endpoint_url: str, api_key: Optional[str] = None, model: str = "llama2", 
                  rate_limit_display_callback: Optional[Callable] = None):
-        # Clean up endpoint URL - strip common API paths that users might include
-        cleaned_url = endpoint_url.rstrip('/')
+        # Use the endpoint URL EXACTLY as configured by admin - no modifications
+        self.endpoint_url = endpoint_url.rstrip('/')  # Only remove trailing slash
+        self.api_key = api_key
+        self.model = model
+        self.rate_limit_display_callback = rate_limit_display_callback
         
-        # Strip common API path suffixes to get base URL
-        paths_to_strip = [
+        # Detect if this looks like a full API path or base URL (for format detection only)
+        full_path_indicators = [
             '/v1/chat/completions',
             '/chat/completions',
             '/v1/completions',
             '/completions',
             '/api/chat',
-            '/api/generate',
-            '/v1',
-            '/api'
+            '/api/generate'
         ]
+        self.is_full_path = any(self.endpoint_url.endswith(path) for path in full_path_indicators)
         
-        for path in paths_to_strip:
-            if cleaned_url.endswith(path):
-                cleaned_url = cleaned_url[:-len(path)]
-                if rate_limit_display_callback:
-                    rate_limit_display_callback({
-                        'type': 'info',
-                        'message': f"Cleaned endpoint URL: removed '{path}' suffix"
-                    })
-                break
+    def generate_response_sync(self, messages: list, max_tokens: int = 1000, temperature: float = 0.7) -> str:
+        """SYNCHRONOUS response generation - matches working script exactly."""
+        import requests
+        import time
+        import json
         
-        self.endpoint_url = cleaned_url.rstrip('/')
-        self.api_key = api_key
-        self.model = model
-        self.rate_limit_display_callback = rate_limit_display_callback
-        self._cached_endpoint_config = None  # Cache successful endpoint format
-        self._executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for sync requests
+        start_time = time.time()
         
-    def _sync_request(self, url: str, headers: dict, payload: dict, timeout: int = 120) -> requests.Response:
-        """Synchronous request using requests library - matches working script exactly."""
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        return response
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False
+        }
+        
+        try:
+            logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Starting request")
+            logger.info(f"[CustomLLM-SYNC] 📤 POST to {self.endpoint_url}")
+            logger.info(f"[CustomLLM-SYNC] 📝 Payload: {json.dumps(payload)}")
+            logger.info(f"[CustomLLM-SYNC] 📝 {len(messages)} messages, {sum(len(str(m.get('content',''))) for m in messages)} total chars")
+            
+            request_start = time.time()
+            logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Sending HTTP POST...")
+            response = requests.post(self.endpoint_url, headers=headers, json=payload, timeout=120)
+            request_time = time.time() - request_start
+            
+            logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - HTTP response received (took {request_time:.3f}s)")
+            logger.info(f"[CustomLLM-SYNC] 📥 Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                parse_start = time.time()
+                data = response.json()
+                parse_time = time.time() - parse_start
+                logger.info(f"[CustomLLM-SYNC] ⏱️  JSON parsed in {parse_time:.3f}s")
+                
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                total_time = time.time() - start_time
+                logger.info(f"[CustomLLM-SYNC] ✅ TOTAL TIME: {total_time:.3f}s (HTTP: {request_time:.3f}s, Parse: {parse_time:.3f}s)")
+                logger.info(f"[CustomLLM-SYNC] ✅ Response: {len(content)} chars")
+                return content
+            else:
+                error = f"HTTP {response.status_code}: {response.text[:200]}"
+                logger.error(f"[CustomLLM-SYNC] ❌ {error}")
+                raise Exception(error)
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[CustomLLM-SYNC] ❌ Exception after {elapsed:.3f}s: {e}")
+            raise
     
     async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """Generate response using custom LLM endpoint.
@@ -527,154 +601,9 @@ class CustomLLMClient:
         elif messages is None and prompt is None:
             raise ValueError("Either 'prompt' or 'messages' must be provided")
         
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        
-        # Extract text for simple prompt format
-        prompt_text = self._messages_to_prompt(messages)
-        
-        # Try multiple endpoint formats in order of likelihood
-        # Note: These are only used during discovery; cached endpoint uses _build_payload()
-        endpoints_to_try = [
-            # OpenAI-compatible variations (explicitly disable streaming)
-            {
-                "path": "/v1/chat/completions",
-                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
-                "format": "OpenAI v1"
-            },
-            {
-                "path": "/chat/completions",
-                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
-                "format": "OpenAI"
-            },
-            # Ollama format
-            {
-                "path": "/api/chat",
-                "payload": {"model": self.model, "messages": messages, "stream": False},
-                "format": "Ollama Chat"
-            },
-            {
-                "path": "/api/generate",
-                "payload": {"model": self.model, "prompt": prompt_text, "stream": False},
-                "format": "Ollama Generate"
-            },
-            # vLLM format
-            {
-                "path": "/v1/completions",
-                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
-                "format": "vLLM Completions"
-            },
-            # LM Studio / LocalAI format
-            {
-                "path": "/v1/chat/completions",
-                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
-                "format": "LM Studio"
-            },
-            # Generic chat endpoint
-            {
-                "path": "/chat",
-                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
-                "format": "Generic Chat"
-            },
-            # Generic completion endpoint
-            {
-                "path": "/completions",
-                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
-                "format": "Generic Completions"
-            }
-        ]
-        
-        last_error = None
-        loop = asyncio.get_event_loop()
-        
-        # If we have a cached successful endpoint, try it first
-        if self._cached_endpoint_config:
-            try:
-                url = f"{self.endpoint_url}{self._cached_endpoint_config['path']}"
-                payload = self._build_payload(
-                    self._cached_endpoint_config['format'],
-                    messages,
-                    prompt_text,
-                    max_tokens,
-                    temperature
-                )
-                
-                # Run sync request in thread pool - returns Response object
-                response = await loop.run_in_executor(
-                    self._executor,
-                    self._sync_request,
-                    url,
-                    headers,
-                    payload,
-                    120
-                )
-                
-                if response.status_code == 200:
-                    content = self._extract_response_content(response.json(), self._cached_endpoint_config['format'])
-                    if content:
-                        return content
-                # If cached endpoint fails, clear cache and try discovery
-                self._cached_endpoint_config = None
-            except Exception as e:
-                # Cached endpoint failed, clear cache and try discovery
-                if self.rate_limit_display_callback:
-                    self.rate_limit_display_callback({
-                        'type': 'warning',
-                        'message': f"Cached endpoint failed: {str(e)[:100]}, retrying discovery..."
-                    })
-                self._cached_endpoint_config = None
-        
-        # Try all endpoints to find one that works
-        for endpoint_config in endpoints_to_try:
-            try:
-                url = f"{self.endpoint_url}{endpoint_config['path']}"
-                
-                # Run sync request in thread pool - returns Response object
-                response = await loop.run_in_executor(
-                    self._executor,
-                    self._sync_request,
-                    url,
-                    headers,
-                    endpoint_config['payload'],
-                    120
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    content = self._extract_response_content(data, endpoint_config['format'])
-                    if content:
-                        # Cache this endpoint for future requests
-                        self._cached_endpoint_config = {
-                            'path': endpoint_config['path'],
-                            'format': endpoint_config['format']
-                        }
-                        if self.rate_limit_display_callback:
-                            self.rate_limit_display_callback({
-                                'type': 'info',
-                                'message': f"Discovered {endpoint_config['format']} API format - will use this for future requests"
-                            })
-                        return content
-                elif response.status_code == 404:
-                    # Endpoint not found, try next
-                    continue
-                else:
-                    # Non-404 error
-                    last_error = f"{endpoint_config['format']}: HTTP {response.status_code}"
-            except requests.exceptions.Timeout:
-                last_error = f"{endpoint_config.get('format', 'Unknown')}: Timeout after 120s"
-                continue
-            except Exception as e:
-                last_error = f"{endpoint_config.get('format', 'Unknown')}: {str(e)[:200]}"
-                continue
-        
-        # If we got here, none of the endpoints worked
-        error_msg = f"Could not connect to LLM at {self.endpoint_url}. "
-        if last_error:
-            error_msg += f"Last error: {last_error}"
-        else:
-            error_msg += "All common API paths returned 404. Please verify the endpoint URL."
-        raise Exception(error_msg)
+        # Call sync method directly - FastAPI will handle it in a thread pool automatically
+        # This avoids the overhead of asyncio.to_thread()
+        return self.generate_response_sync(messages, max_tokens, temperature)
     
     def _messages_to_prompt(self, messages: list) -> str:
         """Convert messages format to simple prompt text."""

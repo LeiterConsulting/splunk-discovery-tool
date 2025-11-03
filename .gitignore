@@ -61,6 +61,13 @@ logs/
 .coverage
 htmlcov/
 .tox/
+test_*.py
+test_*.sh
+
+# Development/Debugging
+DO NOT SENT TO GIT/
+*.backup*
+*.corrupted*
 
 # Environment
 .env

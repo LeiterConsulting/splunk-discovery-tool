@@ -19,8 +19,19 @@ class MCPConfig:
     ca_bundle_path: Optional[str] = None
 
 @dataclass
+class LLMCredential:
+    """Saved LLM credential configuration"""
+    name: str
+    provider: str
+    api_key: str
+    model: str
+    endpoint_url: Optional[str] = None
+    max_tokens: int = 16000
+    temperature: float = 0.7
+
+@dataclass
 class LLMConfig:
-    """LLM configuration"""
+    """LLM configuration (active settings)"""
     provider: str = "openai"  # openai, custom
     api_key: str = ""
     model: str = "gpt-4o-mini"
@@ -49,7 +60,13 @@ class AppConfig:
     mcp: MCPConfig
     llm: LLMConfig
     server: ServerConfig
+    saved_credentials: Dict[str, LLMCredential] = None  # name -> credential mapping
+    active_credential_name: Optional[str] = None  # Currently active credential
     version: str = "1.0.0"
+    
+    def __post_init__(self):
+        if self.saved_credentials is None:
+            self.saved_credentials = {}
 
 class ConfigManager:
     """Manages encrypted configuration storage"""
@@ -119,10 +136,18 @@ class ConfigManager:
             llm = LLMConfig(**config_dict.get('llm', {}))
             server = ServerConfig(**config_dict.get('server', {}))
             
+            # Reconstruct saved credentials
+            saved_creds_dict = config_dict.get('saved_credentials', {})
+            saved_credentials = {
+                name: LLMCredential(**cred_data) 
+                for name, cred_data in saved_creds_dict.items()
+            }
+            
             return AppConfig(
                 mcp=mcp,
                 llm=llm,
                 server=server,
+                saved_credentials=saved_credentials,
                 version=config_dict.get('version', '1.0.0')
             )
         except Exception as e:
@@ -133,10 +158,16 @@ class ConfigManager:
         """Encrypt and save configuration"""
         try:
             # Convert to dict
+            saved_creds_dict = {
+                name: asdict(cred) 
+                for name, cred in config.saved_credentials.items()
+            }
+            
             config_dict = {
                 'mcp': asdict(config.mcp),
                 'llm': asdict(config.llm),
                 'server': asdict(config.server),
+                'saved_credentials': saved_creds_dict,
                 'version': config.version
             }
             
@@ -185,9 +216,72 @@ class ConfigManager:
                 setattr(self._config.server, key, value)
         return self.save(self._config)
     
+    # Credential Vault Management
+    def save_credential(self, name: str, provider: str, api_key: str, model: str, 
+                       endpoint_url: Optional[str] = None, max_tokens: int = 16000, 
+                       temperature: float = 0.7) -> bool:
+        """Save a named LLM credential"""
+        credential = LLMCredential(
+            name=name,
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            endpoint_url=endpoint_url,
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
+        self._config.saved_credentials[name] = credential
+        return self.save(self._config)
+    
+    def get_credential(self, name: str) -> Optional[LLMCredential]:
+        """Get a saved credential by name"""
+        return self._config.saved_credentials.get(name)
+    
+    def list_credentials(self) -> Dict[str, LLMCredential]:
+        """List all saved credentials"""
+        return self._config.saved_credentials.copy()
+    
+    def delete_credential(self, name: str) -> bool:
+        """Delete a saved credential"""
+        if name in self._config.saved_credentials:
+            del self._config.saved_credentials[name]
+            # Clear active credential if it's the one being deleted
+            if self._config.active_credential_name == name:
+                self._config.active_credential_name = None
+            return self.save(self._config)
+        return False
+    
+    def load_credential(self, name: str) -> bool:
+        """Load a saved credential into active LLM config"""
+        credential = self.get_credential(name)
+        if credential:
+            self._config.llm.provider = credential.provider
+            self._config.llm.api_key = credential.api_key
+            self._config.llm.model = credential.model
+            self._config.llm.endpoint_url = credential.endpoint_url
+            self._config.llm.max_tokens = credential.max_tokens
+            self._config.llm.temperature = credential.temperature
+            self._config.active_credential_name = name  # Track active credential
+            return self.save(self._config)
+        return False
+    
     def export_safe(self) -> Dict[str, Any]:
         """Export configuration with sensitive data masked"""
         config = self.get()
+        
+        # Export saved credentials with masked API keys
+        safe_creds = {}
+        for name, cred in config.saved_credentials.items():
+            safe_creds[name] = {
+                'name': cred.name,
+                'provider': cred.provider,
+                'api_key': '***' if cred.api_key else '',
+                'model': cred.model,
+                'endpoint_url': cred.endpoint_url,
+                'max_tokens': cred.max_tokens,
+                'temperature': cred.temperature
+            }
+        
         return {
             'mcp': {
                 'url': config.mcp.url,
@@ -203,6 +297,8 @@ class ConfigManager:
                 'max_tokens': config.llm.max_tokens,
                 'temperature': config.llm.temperature
             },
+            'saved_credentials': safe_creds,
+            'active_credential_name': config.active_credential_name,
             'server': {
                 'port': config.server.port,
                 'host': config.server.host,

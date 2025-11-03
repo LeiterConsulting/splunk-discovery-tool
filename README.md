@@ -5,8 +5,8 @@
 [![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases)
 
 > **AI-powered Splunk environment discovery and admin assistant with MCP integration**
-> ** **
-> **NOTE: Custom LLM Endpoint is still in testing, not functional in this version**
+
+⚠️ **Known Issue - Local LLM Endpoints**: We are currently investigating timeout/connection issues with local LLM servers (vLLM, Ollama, LM Studio, etc.). Test scripts timeout while the same configuration works in other applications. This appears to be related to request queuing or networking behavior. OpenAI and cloud-based endpoints work without issues. We're actively working on a resolution.
 
 Automatically discover your Splunk deployment, analyze configurations, generate SPL queries, and get intelligent recommendations through an intuitive web interface powered by LLM technology.
 

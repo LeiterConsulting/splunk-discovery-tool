@@ -317,8 +317,11 @@ main() {
             stop_service
             ;;
         --restart)
+            echo -e "${BLUE}🔄 Restarting $APP_SHORT...${NC}"
             stop_service
-            sleep 1
+            sleep 2
+            # Force a fresh start by removing PID file if it exists
+            rm -f "$PID_FILE"
             start_service
             ;;
         --status)
