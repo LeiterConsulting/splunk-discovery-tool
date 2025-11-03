@@ -478,8 +478,21 @@ class CustomLLMClient:
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
         
-    async def generate_response(self, prompt: str, max_tokens: int = 1000) -> str:
-        """Generate response using custom LLM endpoint."""
+    async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
+        """Generate response using custom LLM endpoint.
+        
+        Args:
+            prompt: Simple text prompt (legacy support)
+            messages: List of message objects for chat format
+            max_tokens: Maximum tokens in response
+            temperature: Sampling temperature
+        """
+        # Convert prompt to messages format if needed
+        if messages is None and prompt is not None:
+            messages = [{"role": "user", "content": prompt}]
+        elif messages is None and prompt is None:
+            raise ValueError("Either 'prompt' or 'messages' must be provided")
+        
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -487,9 +500,9 @@ class CustomLLMClient:
         # Try OpenAI-compatible format first
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.7
+            "temperature": temperature
         }
         
         try:
@@ -505,9 +518,18 @@ class CustomLLMClient:
                         return result["choices"][0]["message"]["content"]
                     else:
                         # Try alternative formats (Ollama, etc.)
-                        return await self._try_alternative_format(prompt, max_tokens)
+                        # Extract text from messages for simple prompt format
+                        prompt_text = self._messages_to_prompt(messages)
+                        return await self._try_alternative_format(prompt_text, max_tokens)
         except Exception as e:
             raise Exception(f"Failed to generate custom LLM response: {e}")
+    
+    def _messages_to_prompt(self, messages: list) -> str:
+        """Convert messages format to simple prompt text."""
+        if not messages:
+            return ""
+        # Join all user messages
+        return "\n\n".join([msg.get("content", "") for msg in messages if msg.get("role") in ["user", "system"]])
     
     async def _try_alternative_format(self, prompt: str, max_tokens: int) -> str:
         """Try alternative API formats for custom LLMs."""
