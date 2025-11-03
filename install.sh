@@ -100,7 +100,8 @@ create_manifest() {
     "aiohttp",
     "python-multipart",
     "httpx",
-    "openai"
+    "openai",
+    "requests"
   ],
   "virtual_env": "${VENV_DIR}"
 }
@@ -164,7 +165,7 @@ install_deps() {
     
     # Install requirements
     print_msg "$BLUE" "Installing Python packages..."
-    pip install -q fastapi uvicorn[standard] cryptography pyyaml aiohttp python-multipart httpx openai
+    pip install -q -r requirements.txt
     print_msg "$GREEN" "✓ All dependencies installed"
     
     # Create manifest
