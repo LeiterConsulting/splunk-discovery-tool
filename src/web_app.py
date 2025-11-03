@@ -974,41 +974,75 @@ async def test_llm_connection():
             "tests": {}
         }
         
-        # Test 1: Connection test
+        # Test 1: Connection test with intelligent path detection
         try:
             if config.llm.provider == "custom":
-                # Test custom endpoint
+                # Test custom endpoint with multiple common paths
                 import httpx
+                endpoint_base = config.llm.endpoint_url.rstrip('/')
+                detected_format = None
+                available_models = []
+                
+                # Try various info/health endpoints to detect format
+                test_paths = [
+                    ("/v1/models", "OpenAI-compatible (v1)"),
+                    ("/models", "OpenAI-compatible"),
+                    ("/api/tags", "Ollama"),
+                    ("/api/version", "Ollama Version"),
+                    ("/v1/engines", "OpenAI Engines"),
+                    ("/health", "Generic Health"),
+                    ("/", "Root"),
+                ]
+                
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    # Try OpenAI-compatible endpoint
+                    # First try a simple connectivity test
                     try:
-                        response = await client.get(f"{config.llm.endpoint_url.rstrip('/')}/v1/models")
-                        if response.status_code == 200:
-                            results["tests"]["connection"] = {
-                                "status": "success",
-                                "format": "OpenAI-compatible",
-                                "message": "Endpoint is reachable (OpenAI format)"
-                            }
-                        else:
-                            raise Exception("Not OpenAI format")
-                    except:
-                        # Try Ollama endpoint
+                        base_response = await client.get(endpoint_base, follow_redirects=True)
+                        if base_response.status_code == 404:
+                            # 404 is ok, just means root doesn't have info
+                            pass
+                    except Exception as e:
+                        results["tests"]["connection"] = {
+                            "status": "error",
+                            "error": str(e),
+                            "message": f"Cannot reach endpoint: {str(e)}"
+                        }
+                        results["status"] = "error"
+                        return results
+                    
+                    # Now try to detect the API format
+                    for path, format_name in test_paths:
                         try:
-                            response = await client.get(f"{config.llm.endpoint_url.rstrip('/')}/api/tags")
+                            response = await client.get(f"{endpoint_base}{path}")
                             if response.status_code == 200:
-                                results["tests"]["connection"] = {
-                                    "status": "success",
-                                    "format": "Ollama",
-                                    "message": "Endpoint is reachable (Ollama format)",
-                                    "models": response.json().get("models", [])
-                                }
-                            else:
-                                raise Exception("Unknown format")
+                                detected_format = format_name
+                                try:
+                                    data = response.json()
+                                    # Extract available models if present
+                                    if "models" in data:
+                                        available_models = [m.get("id") or m.get("name") for m in data.get("models", [])]
+                                    elif "data" in data:
+                                        available_models = [m.get("id") for m in data.get("data", [])]
+                                except:
+                                    pass
+                                break
                         except:
-                            results["tests"]["connection"] = {
-                                "status": "warning",
-                                "message": "Endpoint reachable but format unknown"
-                            }
+                            continue
+                    
+                    if detected_format:
+                        results["tests"]["connection"] = {
+                            "status": "success",
+                            "format": detected_format,
+                            "message": f"Endpoint is reachable ({detected_format})",
+                            "available_models": available_models[:5] if available_models else None
+                        }
+                    else:
+                        # Endpoint is up but we couldn't detect format
+                        # This is OK - we'll try multiple formats when making requests
+                        results["tests"]["connection"] = {
+                            "status": "info",
+                            "message": "Endpoint reachable, will auto-detect API format on first request"
+                        }
             else:
                 results["tests"]["connection"] = {
                     "status": "success",

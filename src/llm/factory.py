@@ -497,32 +497,113 @@ class CustomLLMClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         
-        # Try OpenAI-compatible format first
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature
-        }
+        # Extract text for simple prompt format
+        prompt_text = self._messages_to_prompt(messages)
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.endpoint_url}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        return result["choices"][0]["message"]["content"]
-                    else:
-                        # Try alternative formats (Ollama, etc.)
-                        # Extract text from messages for simple prompt format
-                        prompt_text = self._messages_to_prompt(messages)
-                        return await self._try_alternative_format(prompt_text, max_tokens)
-        except Exception as e:
-            raise Exception(f"Failed to generate custom LLM response: {e}")
+        # Try multiple endpoint formats in order of likelihood
+        endpoints_to_try = [
+            # OpenAI-compatible variations
+            {
+                "path": "/v1/chat/completions",
+                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                "response_key": lambda r: r["choices"][0]["message"]["content"],
+                "format": "OpenAI v1"
+            },
+            {
+                "path": "/chat/completions",
+                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                "response_key": lambda r: r["choices"][0]["message"]["content"],
+                "format": "OpenAI"
+            },
+            # Ollama format
+            {
+                "path": "/api/chat",
+                "payload": {"model": self.model, "messages": messages, "stream": False},
+                "response_key": lambda r: r["message"]["content"],
+                "format": "Ollama Chat"
+            },
+            {
+                "path": "/api/generate",
+                "payload": {"model": self.model, "prompt": prompt_text, "stream": False},
+                "response_key": lambda r: r.get("response", ""),
+                "format": "Ollama Generate"
+            },
+            # vLLM format
+            {
+                "path": "/v1/completions",
+                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature},
+                "response_key": lambda r: r["choices"][0]["text"],
+                "format": "vLLM Completions"
+            },
+            # LM Studio / LocalAI format
+            {
+                "path": "/v1/chat/completions",
+                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False},
+                "response_key": lambda r: r["choices"][0]["message"]["content"],
+                "format": "LM Studio"
+            },
+            # Generic chat endpoint
+            {
+                "path": "/chat",
+                "payload": {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                "response_key": lambda r: r.get("response") or r.get("content") or r.get("message", {}).get("content", ""),
+                "format": "Generic Chat"
+            },
+            # Generic completion endpoint
+            {
+                "path": "/completions",
+                "payload": {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature},
+                "response_key": lambda r: r.get("text") or r.get("content") or r.get("response", ""),
+                "format": "Generic Completions"
+            }
+        ]
+        
+        last_error = None
+        
+        async with aiohttp.ClientSession() as session:
+            for endpoint_config in endpoints_to_try:
+                try:
+                    url = f"{self.endpoint_url}{endpoint_config['path']}"
+                    
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=endpoint_config['payload'],
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            content = endpoint_config['response_key'](result)
+                            if content:
+                                # Success! Log which format worked for debugging
+                                if self.rate_limit_display_callback:
+                                    self.rate_limit_display_callback({
+                                        'type': 'info',
+                                        'message': f"Using {endpoint_config['format']} API format"
+                                    })
+                                return content
+                        elif response.status == 404:
+                            # Endpoint not found, try next
+                            continue
+                        else:
+                            # Non-404 error, might be auth or other issue
+                            error_text = await response.text()
+                            last_error = f"{endpoint_config['format']} returned {response.status}: {error_text[:200]}"
+                except asyncio.TimeoutError:
+                    last_error = f"{endpoint_config.get('format', 'Unknown')} timed out"
+                    continue
+                except Exception as e:
+                    # Try next endpoint
+                    last_error = f"{endpoint_config.get('format', 'Unknown')}: {str(e)[:200]}"
+                    continue
+        
+        # If we got here, none of the endpoints worked
+        error_msg = f"Could not connect to LLM at {self.endpoint_url}. "
+        if last_error:
+            error_msg += f"Last error: {last_error}"
+        else:
+            error_msg += "All common API paths returned 404. Please verify the endpoint URL."
+        raise Exception(error_msg)
     
     def _messages_to_prompt(self, messages: list) -> str:
         """Convert messages format to simple prompt text."""
