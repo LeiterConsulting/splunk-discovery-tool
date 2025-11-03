@@ -507,18 +507,10 @@ class CustomLLMClient:
         self._cached_endpoint_config = None  # Cache successful endpoint format
         self._executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for sync requests
         
-    def _sync_request(self, url: str, headers: dict, payload: dict, timeout: int = 120) -> dict:
-        """Synchronous request using requests library (better Windows/vLLM compatibility)."""
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            response.raise_for_status()
-            return {"status": response.status_code, "data": response.json(), "error": None}
-        except requests.exceptions.Timeout:
-            return {"status": 0, "data": None, "error": "Timeout"}
-        except requests.exceptions.HTTPError as e:
-            return {"status": response.status_code, "data": None, "error": str(e)}
-        except Exception as e:
-            return {"status": 0, "data": None, "error": str(e)}
+    def _sync_request(self, url: str, headers: dict, payload: dict, timeout: int = 120) -> requests.Response:
+        """Synchronous request using requests library - matches working script exactly."""
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        return response
     
     async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """Generate response using custom LLM endpoint.
@@ -600,7 +592,6 @@ class CustomLLMClient:
         if self._cached_endpoint_config:
             try:
                 url = f"{self.endpoint_url}{self._cached_endpoint_config['path']}"
-                # Build payload dynamically with current parameters
                 payload = self._build_payload(
                     self._cached_endpoint_config['format'],
                     messages,
@@ -609,8 +600,8 @@ class CustomLLMClient:
                     temperature
                 )
                 
-                # Run sync request in thread pool
-                result = await loop.run_in_executor(
+                # Run sync request in thread pool - returns Response object
+                response = await loop.run_in_executor(
                     self._executor,
                     self._sync_request,
                     url,
@@ -619,17 +610,12 @@ class CustomLLMClient:
                     120
                 )
                 
-                if result["status"] == 200 and result["data"]:
-                    content = self._extract_response_content(result["data"], self._cached_endpoint_config['format'])
+                if response.status_code == 200:
+                    content = self._extract_response_content(response.json(), self._cached_endpoint_config['format'])
                     if content:
                         return content
                 # If cached endpoint fails, clear cache and try discovery
                 self._cached_endpoint_config = None
-                if result["error"] and self.rate_limit_display_callback:
-                    self.rate_limit_display_callback({
-                        'type': 'warning',
-                        'message': f"Cached endpoint failed: {result['error'][:100]}, retrying discovery..."
-                    })
             except Exception as e:
                 # Cached endpoint failed, clear cache and try discovery
                 if self.rate_limit_display_callback:
@@ -644,8 +630,8 @@ class CustomLLMClient:
             try:
                 url = f"{self.endpoint_url}{endpoint_config['path']}"
                 
-                # Run sync request in thread pool
-                result = await loop.run_in_executor(
+                # Run sync request in thread pool - returns Response object
+                response = await loop.run_in_executor(
                     self._executor,
                     self._sync_request,
                     url,
@@ -654,30 +640,31 @@ class CustomLLMClient:
                     120
                 )
                 
-                if result["status"] == 200 and result["data"]:
-                    content = self._extract_response_content(result["data"], endpoint_config['format'])
+                if response.status_code == 200:
+                    data = response.json()
+                    content = self._extract_response_content(data, endpoint_config['format'])
                     if content:
-                        # Cache this endpoint (path and format only) for future requests
+                        # Cache this endpoint for future requests
                         self._cached_endpoint_config = {
                             'path': endpoint_config['path'],
                             'format': endpoint_config['format']
                         }
-                        # Log which format worked (only on first discovery)
                         if self.rate_limit_display_callback:
                             self.rate_limit_display_callback({
                                 'type': 'info',
                                 'message': f"Discovered {endpoint_config['format']} API format - will use this for future requests"
                             })
                         return content
-                elif result["status"] == 404:
+                elif response.status_code == 404:
                     # Endpoint not found, try next
                     continue
                 else:
-                    # Non-404 error, might be auth or other issue
-                    if result["error"]:
-                        last_error = f"{endpoint_config['format']}: {result['error'][:200]}"
+                    # Non-404 error
+                    last_error = f"{endpoint_config['format']}: HTTP {response.status_code}"
+            except requests.exceptions.Timeout:
+                last_error = f"{endpoint_config.get('format', 'Unknown')}: Timeout after 120s"
+                continue
             except Exception as e:
-                # Try next endpoint
                 last_error = f"{endpoint_config.get('format', 'Unknown')}: {str(e)[:200]}"
                 continue
         
