@@ -3521,6 +3521,7 @@ def get_frontend_html():
             // Settings modal state
             const [isSettingsOpen, setIsSettingsOpen] = useState(false);
             const [config, setConfig] = useState(null);
+            const [selectedProvider, setSelectedProvider] = useState('openai');
             
             // Poll for summarization progress
             useEffect(() => {
@@ -3859,6 +3860,8 @@ def get_frontend_html():
                     const response = await fetch('/api/config');
                     const data = await response.json();
                     setConfig(data);
+                    // Initialize selected provider from config
+                    setSelectedProvider(data.llm.provider || 'openai');
                 } catch (error) {
                     console.error('Failed to load config:', error);
                 }
@@ -6257,13 +6260,39 @@ def get_frontend_html():
                                                     defaultValue={config.llm.provider}
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                     id="llm-provider"
+                                                    onChange={(e) => setSelectedProvider(e.target.value)}
                                                 >
                                                     <option value="openai">OpenAI</option>
                                                     <option value="custom">Custom Endpoint</option>
                                                 </select>
                                             </div>
+                                            {(selectedProvider === 'custom' || config.llm.provider === 'custom') && (
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                        Endpoint URL
+                                                        <span className="ml-2 text-xs text-gray-500">
+                                                            (e.g., http://localhost:11434 for Ollama)
+                                                        </span>
+                                                    </label>
+                                                    <input 
+                                                        type="text" 
+                                                        defaultValue={config.llm.endpoint_url || ''}
+                                                        placeholder="http://localhost:11434"
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        id="llm-endpoint-url"
+                                                    />
+                                                    <p className="mt-1 text-xs text-gray-500">
+                                                        For OpenAI-compatible APIs (Ollama, LM Studio, vLLM, etc.)
+                                                    </p>
+                                                </div>
+                                            )}
                                             <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">API Key</label>
+                                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                    API Key
+                                                    {selectedProvider === 'custom' && (
+                                                        <span className="ml-2 text-xs text-gray-500">(Optional for local LLMs)</span>
+                                                    )}
+                                                </label>
                                                 <input 
                                                     type="password" 
                                                     placeholder={config.llm.api_key === '***' ? '(Already Configured)' : 'Enter API key'}
@@ -6440,6 +6469,9 @@ def get_frontend_html():
                                         </button>
                                         <button
                                             onClick={async () => {
+                                                const provider = document.getElementById('llm-provider').value;
+                                                const endpointUrlInput = document.getElementById('llm-endpoint-url');
+                                                
                                                 const settings = {
                                                     mcp: {
                                                         url: document.getElementById('mcp-url').value,
@@ -6447,9 +6479,10 @@ def get_frontend_html():
                                                         verify_ssl: document.getElementById('mcp-verify-ssl').checked
                                                     },
                                                     llm: {
-                                                        provider: document.getElementById('llm-provider').value,
+                                                        provider: provider,
                                                         api_key: document.getElementById('llm-api-key').value || undefined,
                                                         model: document.getElementById('llm-model').value,
+                                                        endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : undefined,
                                                         max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
                                                         temperature: parseFloat(document.getElementById('llm-temperature').value)
                                                     },
