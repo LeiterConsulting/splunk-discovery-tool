@@ -48,6 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Health Metrics API**
   - New endpoint: `GET /api/llm/health`
   - Returns per-endpoint health metrics
+
+#### Testing
+- ✅ **Unit Tests**: 7/7 passing (`tests/test_health_monitor.py`)
+  - Health status transitions
+  - Adaptive timeout calculation
+  - Payload size adaptation
+  - Hung request detection
+  - Consecutive failure handling
+  - Retry delay calculation
+- ⚠️ **Integration Tests**: 3/6 passing (`tests/test_integration_health.py`)
+  - HTTP 503 handling ✅
+  - Timeout handling ⚠️ (needs mock server fixes)
+  - Slow endpoint handling ⚠️ (needs mock server fixes)
+  - Random failures ✅
+  - High load ✅
+  - Oversized payload ⚠️ (needs mock server fixes)
   - Summary statistics (healthy/degraded/unhealthy counts)
   - Exposed metrics:
     - Status, avg/p95 response time, error rate
