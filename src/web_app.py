@@ -3239,6 +3239,10 @@ When you execute a tool and receive results, you can CONTINUE investigating by:
 Do NOT say "I'll execute a query" or "Let me check" without actually providing the tool call.
 Either answer directly from your knowledge, OR include a <TOOL_CALL> block.
 
+⚠️ JSON FORMATTING: When writing SPL queries, use SINGLE quotes (') for string literals in your query, NOT double quotes (").
+Example: relative_time(now(), '-7d') NOT relative_time(now(), "-7d")
+This prevents JSON parsing errors.
+
 Always use this exact format for tool calls:
 
 <TOOL_CALL>
@@ -3429,21 +3433,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 end = response.find('</TOOL_CALL>')
                 raw_json = response[start:end].strip()
                 
-                print(f"🔍 Raw JSON length: {len(raw_json)} chars")
-                print(f"🔍 Checking for smart quotes or Unicode issues...")
+                print(f"🔍 Raw JSON: {repr(raw_json[:200])}")
                 
-                # Check for problematic characters
-                has_smart_quotes = any(c in raw_json for c in ['"', '"', ''', '''])
-                if has_smart_quotes:
-                    print(f"⚠️ Found smart quotes! Replacing with regular quotes...")
-                    raw_json = raw_json.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'")
-                
-                # Check for other Unicode quote characters
-                for i, c in enumerate(raw_json):
-                    if c in ['"', '"', ''', ''', '`', '´']:
-                        print(f"  Position {i}: {repr(c)} (Unicode {ord(c)})")
-                
-                print(f"🔍 Repr: {repr(raw_json[:200])}")
                 try:
                     tool_data = json.loads(raw_json)
                     tool_name = tool_data.get('tool')
