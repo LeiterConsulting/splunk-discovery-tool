@@ -3235,6 +3235,10 @@ When you execute a tool and receive results, you can CONTINUE investigating by:
    - Should you cross-reference with other data sources?
 
 🎨 TOOL EXECUTION FORMAT:
+⚠️ CRITICAL: If the user's question requires querying Splunk data, you MUST provide a <TOOL_CALL> in your response.
+Do NOT say "I'll execute a query" or "Let me check" without actually providing the tool call.
+Either answer directly from your knowledge, OR include a <TOOL_CALL> block.
+
 Always use this exact format for tool calls:
 
 <TOOL_CALL>
