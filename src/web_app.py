@@ -3423,12 +3423,14 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                     debug_log(f"Error loading requested context: {e}", "error")
             
             # Extract tool call using <TOOL_CALL> tags
-            # Use greedy matching to get the full JSON (including nested braces)
-            tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', response, re.DOTALL)
-            if tool_match:
+            # Extract everything between the tags (handles nested braces correctly)
+            if '<TOOL_CALL>' in response and '</TOOL_CALL>' in response:
+                start = response.find('<TOOL_CALL>') + len('<TOOL_CALL>')
+                end = response.find('</TOOL_CALL>')
+                raw_json = response[start:end].strip()
+                
+                print(f"🔍 Attempting to parse tool call JSON: {raw_json[:200]}...")
                 try:
-                    raw_json = tool_match.group(1)
-                    print(f"🔍 Attempting to parse tool call JSON: {raw_json[:200]}...")
                     tool_data = json.loads(raw_json)
                     tool_name = tool_data.get('tool')
                     tool_args = tool_data.get('args', {})
@@ -3448,7 +3450,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                     debug_log(f"Extracted tool call - {tool_name} with args: {tool_args}", "query", tool_args)
                 except json.JSONDecodeError as e:
                     print(f"❌ JSON Parse Error: {e}")
-                    print(f"❌ Raw JSON that failed: {raw_json if 'raw_json' in locals() else tool_match.group(1)}")
+                    print(f"❌ Raw JSON that failed: {raw_json}")
                     debug_log(f"Tool call JSON parse error: {e}", "error")
             
             # Extract SPL queries from code blocks
