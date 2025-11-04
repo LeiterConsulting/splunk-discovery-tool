@@ -4096,6 +4096,38 @@ async def get_status():
         return {"status": "running"}
 
 
+@app.get("/api/llm/health")
+async def get_llm_health():
+    """Get LLM endpoint health metrics (v1.1.0)"""
+    try:
+        from llm.health_monitor import get_all_health_metrics
+        
+        metrics = get_all_health_metrics()
+        
+        if not metrics:
+            return {
+                "status": "no_data",
+                "message": "No LLM requests made yet",
+                "endpoints": {}
+            }
+        
+        return {
+            "status": "success",
+            "endpoints": metrics,
+            "summary": {
+                "total_endpoints": len(metrics),
+                "healthy_count": sum(1 for m in metrics.values() if m["status"] == "healthy"),
+                "degraded_count": sum(1 for m in metrics.values() if m["status"] == "degraded"),
+                "unhealthy_count": sum(1 for m in metrics.values() if m["status"] == "unhealthy")
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
 @app.get("/")
 async def serve_frontend():
     """Serve the frontend HTML."""

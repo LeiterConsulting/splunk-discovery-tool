@@ -521,6 +521,18 @@ class CustomLLMClient:
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
         
+        # Health monitoring (v1.1.0)
+        from llm.health_monitor import (
+            get_health_monitor, 
+            AdaptiveTimeoutManager, 
+            HungRequestDetector,
+            PayloadAdapter
+        )
+        self.health_monitor = get_health_monitor(endpoint_url)
+        self.timeout_manager = AdaptiveTimeoutManager(self.health_monitor)
+        self.hung_detector = HungRequestDetector(no_progress_timeout=30)
+        self.payload_adapter = PayloadAdapter(self.health_monitor)
+        
         # Detect if this looks like a full API path or base URL (for format detection only)
         full_path_indicators = [
             '/v1/chat/completions',
@@ -533,12 +545,25 @@ class CustomLLMClient:
         self.is_full_path = any(self.endpoint_url.endswith(path) for path in full_path_indicators)
         
     def generate_response_sync(self, messages: list, max_tokens: int = 1000, temperature: float = 0.7) -> str:
-        """SYNCHRONOUS response generation - matches working script exactly."""
+        """SYNCHRONOUS response generation with health monitoring (v1.1.0)."""
         import requests
         import time
         import json
         
         start_time = time.time()
+        request_id = f"req_{int(start_time * 1000)}"
+        
+        # Check if we should attempt request
+        if not self.health_monitor.should_attempt_request():
+            logger.error(f"[CustomLLM-SYNC] ❌ Endpoint unhealthy (10+ consecutive failures), refusing request")
+            raise Exception("LLM endpoint is unhealthy - too many consecutive failures")
+        
+        # Adapt payload based on endpoint health
+        adapted_messages, adapted_max_tokens = self.payload_adapter.adapt_request(messages, max_tokens)
+        
+        # Calculate adaptive timeout
+        estimated_tokens = sum(len(str(m.get('content', ''))) for m in adapted_messages) // 4
+        adaptive_timeout = self.timeout_manager.calculate_timeout(estimated_tokens)
         
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -546,21 +571,33 @@ class CustomLLMClient:
         
         payload = {
             "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
+            "messages": adapted_messages,
+            "max_tokens": adapted_max_tokens,
             "temperature": temperature,
             "stream": False
         }
         
+        health_status = self.health_monitor.get_status()
+        logger.info(f"[CustomLLM-SYNC] 🏥 Endpoint Health: {health_status.value}")
+        logger.info(f"[CustomLLM-SYNC] ⏱️  Adaptive Timeout: {adaptive_timeout}s")
+        logger.info(f"[CustomLLM-SYNC] 📊 Messages: {len(messages)} → {len(adapted_messages)} (adapted)")
+        logger.info(f"[CustomLLM-SYNC] � Max Tokens: {max_tokens} → {adapted_max_tokens} (adapted)")
+        
         try:
-            logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Starting request")
-            logger.info(f"[CustomLLM-SYNC] 📤 POST to {self.endpoint_url}")
-            logger.info(f"[CustomLLM-SYNC] 📝 Payload: {json.dumps(payload)}")
-            logger.info(f"[CustomLLM-SYNC] 📝 {len(messages)} messages, {sum(len(str(m.get('content',''))) for m in messages)} total chars")
+            logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Starting request {request_id}")
+            logger.info(f"[CustomLLM-SYNC] � POST to {self.endpoint_url}")
+            logger.info(f"[CustomLLM-SYNC] 📝 {len(adapted_messages)} messages, {sum(len(str(m.get('content',''))) for m in adapted_messages)} total chars")
             
             request_start = time.time()
             logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Sending HTTP POST...")
-            response = requests.post(self.endpoint_url, headers=headers, json=payload, timeout=120)
+            
+            # Use adaptive timeout
+            response = requests.post(
+                self.endpoint_url, 
+                headers=headers, 
+                json=payload, 
+                timeout=adaptive_timeout
+            )
             request_time = time.time() - request_start
             
             logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - HTTP response received (took {request_time:.3f}s)")
@@ -574,16 +611,44 @@ class CustomLLMClient:
                 
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 total_time = time.time() - start_time
+                
+                # Record success in health monitor
+                self.health_monitor.record_request(success=True, response_time=total_time, is_timeout=False)
+                
                 logger.info(f"[CustomLLM-SYNC] ✅ TOTAL TIME: {total_time:.3f}s (HTTP: {request_time:.3f}s, Parse: {parse_time:.3f}s)")
                 logger.info(f"[CustomLLM-SYNC] ✅ Response: {len(content)} chars")
+                logger.info(f"[CustomLLM-SYNC] 🏥 Health updated: {self.health_monitor.get_metrics().to_dict()}")
                 return content
             else:
                 error = f"HTTP {response.status_code}: {response.text[:200]}"
+                elapsed = time.time() - start_time
+                
+                # Record failure
+                is_timeout = response.status_code in [408, 504]
+                self.health_monitor.record_request(success=False, response_time=elapsed, is_timeout=is_timeout)
+                
                 logger.error(f"[CustomLLM-SYNC] ❌ {error}")
+                logger.error(f"[CustomLLM-SYNC] 🏥 Health degraded: {self.health_monitor.get_metrics().to_dict()}")
                 raise Exception(error)
+                
+        except requests.exceptions.Timeout as e:
+            elapsed = time.time() - start_time
+            
+            # Record timeout failure
+            self.health_monitor.record_request(success=False, response_time=elapsed, is_timeout=True)
+            
+            logger.error(f"[CustomLLM-SYNC] ⏰ TIMEOUT after {elapsed:.3f}s (limit: {adaptive_timeout}s)")
+            logger.error(f"[CustomLLM-SYNC] 🏥 Health degraded: {self.health_monitor.get_metrics().to_dict()}")
+            raise Exception(f"Request timeout after {elapsed:.1f}s (adaptive limit: {adaptive_timeout}s)")
+            
         except Exception as e:
             elapsed = time.time() - start_time
+            
+            # Record failure
+            self.health_monitor.record_request(success=False, response_time=elapsed, is_timeout=False)
+            
             logger.error(f"[CustomLLM-SYNC] ❌ Exception after {elapsed:.3f}s: {e}")
+            logger.error(f"[CustomLLM-SYNC] 🏥 Health degraded: {self.health_monitor.get_metrics().to_dict()}")
             raise
     
     async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
