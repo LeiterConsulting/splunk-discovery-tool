@@ -3920,10 +3920,55 @@ If "no data" IS the answer, provide final response WITHOUT tool calls."""
                 # 5. If low quality but LLM says done - try to force one more attempt
                 
                 if quality_score >= quality_threshold:
-                    # HIGH QUALITY - Accept answer
-                    print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
-                    final_answer = next_response
-                    break
+                    # HIGH QUALITY - But check if it's a user-facing answer or just reasoning
+                    if has_actionable_data and not next_tool_match:
+                        # We have data and LLM stopped - but is the response user-facing?
+                        # Check if it's too short or contains internal reasoning keywords
+                        is_internal = (len(next_response.strip()) < 100 or 
+                                      any(kw in next_response.lower() for kw in 
+                                          ['iteration', 'i will', "i'll try", 'let me check', 'next step', 
+                                           'investigation', 'i should', 'perhaps i']))
+                        
+                        if is_internal:
+                            print(f"📝 [Iteration {iteration}] High quality but internal reasoning - requesting final user answer")
+                            
+                            final_prompt = f"""You successfully investigated the user's question: "{user_message}"
+
+ACCUMULATED FINDINGS:
+{insights_summary}
+
+Now provide a COMPLETE, USER-FACING answer that includes:
+1. Direct answer to their question with specific data/numbers
+2. Key findings and patterns you discovered  
+3. Any relevant context or recommendations
+
+Write as if speaking directly to the user (avoid phrases like "I investigated", "I found", etc.)."""
+                            
+                            conversation_history.append({"role": "system", "content": final_prompt})
+                            
+                            final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                            final_response = await llm_client.generate_response(
+                                messages=conversation_history,
+                                max_tokens=final_max_tokens,
+                                temperature=config.llm.temperature
+                            )
+                            final_answer = final_response
+                            print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
+                        else:
+                            # Response is already user-facing
+                            print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
+                            final_answer = next_response
+                    else:
+                        # Either no data or LLM wants to continue
+                        if next_tool_match:
+                            print(f"▶️  [Iteration {iteration}] High quality but continuing investigation")
+                            # Fall through to execute next tool
+                        else:
+                            print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
+                            final_answer = next_response
+                    
+                    if final_answer:
+                        break
                 
                 elif is_converged:
                     # STUCK IN LOOP - Stop to avoid wasting resources
