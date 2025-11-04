@@ -99,6 +99,28 @@ summarization_progress: Dict[str, Dict[str, Any]] = {}  # Track progress by sess
 debug_connections: List[WebSocket] = []  # WebSocket connections for debug log streaming
 debug_log_queue = asyncio.Queue()  # Queue for debug messages
 
+# Session-based chat settings (reset on server restart)
+chat_session_settings = {
+    # Discovery Settings
+    "max_execution_time": 90,        # seconds
+    "max_iterations": 5,             # count
+    "discovery_freshness_days": 7,   # days
+    
+    # LLM Behavior
+    "max_tokens": 16000,             # tokens per request
+    "temperature": 0.7,              # 0.0-2.0
+    "context_history": 6,            # messages
+    
+    # Performance Tuning
+    "max_retry_delay": 300,          # seconds
+    "max_retries": 5,                # count
+    "query_sample_size": 2,          # rows
+    
+    # Quality Control
+    "quality_threshold": 70,         # 0-100 score
+    "convergence_detection": 5,      # iterations
+}
+
 def debug_log(message: str, category: str = "info", data: Any = None):
     """
     Log debug message to terminal and optionally to debug WebSocket clients.
@@ -1064,6 +1086,147 @@ async def load_mcp_config(name: str):
         }
     else:
         raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
+
+@app.post("/api/mcp-configs/test")
+async def test_mcp_connection(request: dict):
+    """Test MCP connection with provided credentials"""
+    try:
+        import httpx
+        
+        url = request.get('url')
+        token = request.get('token')
+        verify_ssl = request.get('verify_ssl', False)
+        
+        if not url:
+            raise HTTPException(status_code=400, detail="URL is required")
+        
+        # Prepare headers
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        
+        # Simple test payload - just check if server responds
+        test_payload = {
+            "method": "tools/list",
+            "params": {}
+        }
+        
+        # Determine SSL verification
+        ssl_verify = False if not verify_ssl else True
+        
+        # Make the test request
+        async with httpx.AsyncClient(verify=ssl_verify, timeout=10.0) as client:
+            response = await client.post(
+                url,
+                json=test_payload,
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                return {
+                    "status": "success",
+                    "message": "Connection successful! MCP server is responding.",
+                    "server_response": response.status_code
+                }
+            elif response.status_code == 401:
+                return {
+                    "status": "error",
+                    "message": "Authentication failed. Please check your token.",
+                    "server_response": response.status_code
+                }
+            elif response.status_code == 403:
+                return {
+                    "status": "error",
+                    "message": "Access forbidden. Token may lack permissions.",
+                    "server_response": response.status_code
+                }
+            else:
+                return {
+                    "status": "warning",
+                    "message": f"Server responded with status {response.status_code}. Connection works but there may be issues.",
+                    "server_response": response.status_code
+                }
+                
+    except httpx.ConnectError:
+        return {
+            "status": "error",
+            "message": "Cannot connect to server. Check URL and network connectivity."
+        }
+    except httpx.TimeoutException:
+        return {
+            "status": "error",
+            "message": "Connection timeout. Server may be slow or unreachable."
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Connection test failed: {str(e)}"
+        }
+
+@app.post("/api/mcp-configs/{name}/test")
+async def test_saved_mcp_connection(name: str):
+    """Test a saved MCP configuration"""
+    mcp_config = config_manager.get_mcp_config(name)
+    if not mcp_config:
+        raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
+    
+    # Use the test endpoint with saved credentials
+    return await test_mcp_connection({
+        'url': mcp_config.url,
+        'token': mcp_config.token,
+        'verify_ssl': mcp_config.verify_ssl
+    })
+
+# ==================== Chat Settings API (Session-based) ====================
+
+@app.get("/api/chat/settings")
+async def get_chat_settings():
+    """Get current chat session settings"""
+    return chat_session_settings.copy()
+
+@app.post("/api/chat/settings")
+async def update_chat_settings(settings: Dict[str, Any]):
+    """Update chat session settings (not persisted, resets on restart)"""
+    global chat_session_settings
+    
+    # Validate and update only known settings
+    valid_keys = set(chat_session_settings.keys())
+    for key, value in settings.items():
+        if key in valid_keys:
+            chat_session_settings[key] = value
+    
+    return {"status": "success", "settings": chat_session_settings.copy()}
+
+@app.post("/api/chat/settings/reset")
+async def reset_chat_settings():
+    """Reset chat settings to defaults"""
+    global chat_session_settings
+    
+    chat_session_settings = {
+        # Discovery Settings
+        "max_execution_time": 90,
+        "max_iterations": 5,
+        "discovery_freshness_days": 7,
+        
+        # LLM Behavior
+        "max_tokens": 16000,
+        "temperature": 0.7,
+        "context_history": 6,
+        
+        # Performance Tuning
+        "max_retry_delay": 300,
+        "max_retries": 5,
+        "query_sample_size": 2,
+        
+        # Quality Control
+        "quality_threshold": 70,
+        "convergence_detection": 5,
+    }
+    
+    return {"status": "success", "settings": chat_session_settings.copy()}
 
 @app.post("/api/llm/list-models")
 async def list_models(request: Request):
@@ -2727,8 +2890,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         # Load configuration
         config = config_manager.get()
         
-        # Get discovery staleness threshold (default 1 week = 604800 seconds)
-        staleness_threshold = 604800
+        # Get discovery staleness threshold from session settings (days converted to seconds)
+        staleness_threshold = chat_session_settings["discovery_freshness_days"] * 86400
         
         # Load latest discovery context if available
         discovery_context = ""
@@ -3009,8 +3172,9 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             # Full context for real queries
             messages = [{"role": "system", "content": system_prompt}]
             
-            # Add recent history for context (convert to proper format)
-            for msg in history[-6:]:  # Last 6 messages for context
+            # Add recent history for context (use session setting)
+            context_limit = chat_session_settings["context_history"]
+            for msg in history[-context_limit:] if context_limit > 0 else []:
                 if msg.get('type') == 'user':
                     messages.append({"role": "user", "content": msg['content']})
                 elif msg.get('type') == 'assistant':
@@ -3019,8 +3183,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             # Add current user message
             messages.append({"role": "user", "content": user_message})
         
-        # Get LLM response - use 15% of configured max_tokens for chat responses
-        chat_max_tokens = min(2000, int(config.llm.max_tokens * 0.15))
+        # Get LLM response - use session max_tokens setting (with 15% limit for initial chat)
+        chat_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
         print(f"🔵 [CHAT] Calling LLM with {len(messages)} messages, max_tokens={chat_max_tokens}")
         print(f"🔵 [CHAT] Client type: {type(llm_client)}, has generate_response: {hasattr(llm_client, 'generate_response')}")
         print(f"🔵 [CHAT] About to await generate_response...")
@@ -3113,7 +3277,13 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             import time as time_module
             
             start_time = time_module.time()
-            max_execution_time = 90  # 90 seconds timeout as safety valve
+            # Use session settings (allow runtime tuning without restart)
+            max_execution_time = chat_session_settings["max_execution_time"]
+            max_iterations = chat_session_settings["max_iterations"]
+            quality_threshold = chat_session_settings["quality_threshold"]
+            convergence_threshold = chat_session_settings["convergence_detection"]
+            sample_size = chat_session_settings["query_sample_size"]
+            
             iteration = 0
             conversation_history = messages.copy()
             all_tool_calls = []
@@ -3253,8 +3423,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             # Helper to detect if we're stuck in a loop
             def detect_convergence(accumulated_insights, tool_history):
                 """Check if we're repeating similar queries without making progress"""
-                # Need at least 5 iterations before checking convergence (allow more exploration)
-                if len(tool_history) < 5:
+                # Need minimum iterations before checking convergence (use session setting)
+                if len(tool_history) < convergence_threshold:
                     return False
                 
                 # Check if data quality is IMPROVING - don't stop if getting better results
@@ -3277,23 +3447,23 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 # Check if last queries are TRULY identical (not just similar)
                 # Extract just the SPL query strings, normalize whitespace
                 recent_spl_queries = []
-                for call in tool_history[-5:]:
+                for call in tool_history[-convergence_threshold:]:
                     params = call.get('params', {})
                     if 'query' in params:
                         # Normalize: remove whitespace differences, lowercase for comparison
                         query = ' '.join(params['query'].lower().split())
                         recent_spl_queries.append(query)
                 
-                # If all 5 queries are EXACTLY the same, it's true convergence
-                if len(recent_spl_queries) == 5 and len(set(recent_spl_queries)) == 1:
-                    return True  # Exact same query 5 times in a row
+                # If all N queries are EXACTLY the same, it's true convergence
+                if len(recent_spl_queries) == convergence_threshold and len(set(recent_spl_queries)) == 1:
+                    return True  # Exact same query N times in a row
                 
                 # Check if we're stuck getting zero results consistently
-                if len(tool_history) >= 5:
-                    last_five_counts = [call.get('summary', {}).get('row_count', 0) for call in tool_history[-5:]]
-                    # If all 5 returned zero results, we're stuck
-                    if all(count == 0 for count in last_five_counts):
-                        return True  # Stuck finding nothing for 5 iterations
+                if len(tool_history) >= convergence_threshold:
+                    last_n_counts = [call.get('summary', {}).get('row_count', 0) for call in tool_history[-convergence_threshold:]]
+                    # If all N returned zero results, we're stuck
+                    if all(count == 0 for count in last_n_counts):
+                        return True  # Stuck finding nothing for N iterations
                 
                 return False
             
@@ -3460,8 +3630,8 @@ If you need to clarify the user's intent, ask a clarifying question WITHOUT tool
                         sample_data = actual_results  # Send all metadata
                         data_label = "Complete Data"
                     else:
-                        sample_data = actual_results[:2]  # Sample for large results
-                        data_label = "Sample Data (first 2 results)"
+                        sample_data = actual_results[:sample_size]  # Use session setting
+                        data_label = f"Sample Data (first {sample_size} results)"
                     
                     result_snippet = {
                         "summary": result_summary,
@@ -3519,7 +3689,7 @@ If "no data" IS the answer, provide final response WITHOUT tool calls."""
                 if status_callback:
                     await status_callback(action, iteration, elapsed)
                 
-                followup_max_tokens = min(2500, int(config.llm.max_tokens * 0.18))
+                followup_max_tokens = min(2500, int(chat_session_settings["max_tokens"] * 0.18))
                 next_response = await llm_client.generate_response(
                     messages=conversation_history,
                     max_tokens=followup_max_tokens,
@@ -3554,14 +3724,14 @@ If "no data" IS the answer, provide final response WITHOUT tool calls."""
                 if is_converged:
                     print(f"🔄 Convergence detected - investigation patterns repeating")
                 
-                # SMART DECISION LOGIC:
-                # 1. If high quality answer (>= 70) - we're done regardless
+                # SMART DECISION LOGIC (using session quality_threshold):
+                # 1. If high quality answer (>= threshold) - we're done regardless
                 # 2. If converged (stuck) BUT doing post-processing - allow one more response
                 # 3. If converged (stuck) - stop to avoid infinite loops  
-                # 4. If low quality (< 50) AND LLM wants to continue - proceed
+                # 4. If low quality (< threshold/2) AND LLM wants to continue - proceed
                 # 5. If low quality but LLM says done - try to force one more attempt
                 
-                if quality_score >= 70:
+                if quality_score >= quality_threshold:
                     # HIGH QUALITY - Accept answer
                     print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
                     final_answer = next_response
@@ -3573,7 +3743,7 @@ If "no data" IS the answer, provide final response WITHOUT tool calls."""
                     final_answer = next_response + f"\n\n_Note: Investigation stopped after {iteration} iterations due to pattern convergence._"
                     break
                 
-                elif quality_score < 50:
+                elif quality_score < (quality_threshold / 2):  # Use half of threshold as "low quality"
                     # LOW QUALITY - Need to continue
                     if next_tool_match:
                         # LLM wants to continue - excellent, let it
@@ -3589,9 +3759,9 @@ If "no data" IS the answer, provide final response WITHOUT tool calls."""
                                                  ["i'll proceed", "i will proceed", "let me try", "i'll check", 
                                                   "i will check", "next step", "let me search", "i'll search"])
                         
-                        if continuation_intent or quality_score < 40:
+                        if continuation_intent or quality_score < (quality_threshold / 3):
                             # Add strict format enforcement message
-                            format_enforcement = f"""❗ FORMAT ERROR: Your quality score is {quality_score}/100 (below threshold of 50).
+                            format_enforcement = f"""❗ FORMAT ERROR: Your quality score is {quality_score}/100 (below threshold of {quality_threshold}).
 
 You MUST continue investigating using the exact <TOOL_CALL> format:
 
@@ -3611,7 +3781,7 @@ Do not explain what you will do - DO IT with a tool call."""
                             if status_callback:
                                 await status_callback(action, iteration, elapsed)
                             
-                            retry_max_tokens = min(2000, int(config.llm.max_tokens * 0.15))
+                            retry_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
                             retry_response = await llm_client.generate_response(
                                 messages=conversation_history,
                                 max_tokens=retry_max_tokens,
@@ -3711,7 +3881,7 @@ Based on your previous response, provide your next query NOW using the proper fo
                             
                             conversation_history.append({"role": "system", "content": format_enforcement})
                             
-                            retry_max_tokens = min(2000, int(config.llm.max_tokens * 0.15))
+                            retry_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
                             retry_response = await llm_client.generate_response(
                                 messages=conversation_history,
                                 max_tokens=retry_max_tokens,
@@ -3799,19 +3969,28 @@ async def execute_mcp_tool_call(tool_call, config):
         import httpx
         import ssl
         
-        headers = {}
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
         if config.mcp.token:
             headers["Authorization"] = f"Bearer {config.mcp.token}"
+            print(f"🔑 MCP Token present: {config.mcp.token[:20]}..." if len(config.mcp.token) > 20 else f"🔑 MCP Token: {config.mcp.token}")
+        else:
+            print("⚠️ WARNING: No MCP token found in config!")
         
-        # Match discovery engine behavior: disable SSL verification by default for self-signed certificates
-        # Can be overridden with config.security.verify_ssl = true + optional ca_bundle
-        verify_ssl = getattr(config.security, 'verify_ssl', False) if hasattr(config, 'security') else False
+        print(f"🌐 MCP URL: {config.mcp.url}")
+        print(f"🔒 SSL Verify: {config.mcp.verify_ssl}")
+        
+        # Use MCP-specific SSL verification setting from config
+        verify_ssl = config.mcp.verify_ssl
         ca_bundle = getattr(config.security, 'ca_bundle_path', None) if hasattr(config, 'security') else None
         
-        # Determine SSL verification setting
+        # Determine SSL verification setting (match discovery engine behavior)
         if ca_bundle and verify_ssl:
             # Use custom CA bundle
             ssl_verify = ca_bundle
+            print(f"INFO: SSL verification enabled with custom CA bundle: {ca_bundle}")
         elif verify_ssl:
             # Use system CA bundle (may fail with self-signed certs)
             print("INFO: SSL verification enabled with system CA bundle")
@@ -3819,15 +3998,27 @@ async def execute_mcp_tool_call(tool_call, config):
         else:
             # Disable SSL verification (for self-signed certs)
             ssl_verify = False
-            if not hasattr(config, 'security') or not getattr(config.security, 'verify_ssl', None):
-                print("INFO: SSL verification disabled for MCP calls (self-signed certificates)")
+            print("INFO: SSL verification disabled for MCP calls (self-signed certificates)")
+        
+        # Debug: Log the tool call being sent
+        tool_name = tool_call.get('params', {}).get('name', 'unknown')
+        print(f"📤 Sending MCP tool call: {tool_name}")
+        print(f"   Method: {tool_call.get('method')}")
+        print(f"   Params: {tool_call.get('params', {}).keys()}")
+        print(f"   Arguments: {tool_call.get('params', {}).get('arguments', {})}")
+        print(f"   Headers: {list(headers.keys())}")
+        print(f"   Has Authorization: {'Authorization' in headers}")
+        print(f"   Full URL: {config.mcp.url}")
         
         async with httpx.AsyncClient(verify=ssl_verify, timeout=30.0) as client:
+            print(f"📡 Posting to: {config.mcp.url}")
             response = await client.post(
                 config.mcp.url,
                 json=tool_call,
                 headers=headers
             )
+            print(f"📨 Response Status: {response.status_code}")
+            print(f"📨 Response Content-Type: {response.headers.get('content-type', 'unknown')}")
             
             if response.status_code == 200:
                 mcp_response = response.json()
@@ -4064,6 +4255,8 @@ def get_frontend_html():
             const [chatInput, setChatInput] = useState('');
             const [isTyping, setIsTyping] = useState(false);
             const [chatStatus, setChatStatus] = useState(''); // Real-time status during investigation
+            const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
+            const [chatSettings, setChatSettings] = useState(null); // Loaded from API
 
             const [connectionInfo, setConnectionInfo] = useState(null);
             
@@ -4772,6 +4965,13 @@ def get_frontend_html():
                                 </div>
                                 <div class="flex flex-col gap-2 shrink-0">
                                     <button 
+                                        onclick="testMCPConfig('${mcp.name}')"
+                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                        title="Test connection to this MCP server"
+                                    >
+                                        <i class="fas fa-network-wired mr-2"></i>Test
+                                    </button>
+                                    <button 
                                         onclick="loadMCPConfigIntoSettings('${mcp.name}')"
                                         class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                         title="Load this configuration into active settings"
@@ -4831,11 +5031,10 @@ def get_frontend_html():
                         setTimeout(() => {
                             const mcpUrlInput = document.getElementById('mcp-url');
                             const mcpTokenInput = document.getElementById('mcp-token');
-                            const mcpVerifySslInput = document.getElementById('mcp-verify-ssl');
                             
                             if (mcpUrlInput) mcpUrlInput.value = newConfig.mcp.url;
                             if (mcpTokenInput) mcpTokenInput.value = ''; // Clear token field (masked in backend)
-                            if (mcpVerifySslInput) mcpVerifySslInput.checked = newConfig.mcp.verify_ssl;
+                            // verify_ssl checkbox is now controlled by React state
                         }, 50);
                         
                         await loadConfig();
@@ -4904,6 +5103,82 @@ def get_frontend_html():
                     }
                 } catch (error) {
                     alert(`Error: ${error.message}`);
+                }
+            };
+            
+            window.testMCPConfig = async (name) => {
+                const mcpList = document.getElementById('mcp-configs-list');
+                const originalHTML = mcpList.innerHTML;
+                
+                try {
+                    // Show testing state
+                    const testingDiv = document.createElement('div');
+                    testingDiv.className = 'fixed top-6 right-6 bg-blue-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
+                    testingDiv.innerHTML = `
+                        <div class="flex items-center gap-3">
+                            <i class="fas fa-spinner fa-spin text-2xl"></i>
+                            <div>
+                                <p class="font-bold text-base">Testing Connection...</p>
+                                <p class="text-sm opacity-90">${name}</p>
+                            </div>
+                        </div>
+                    `;
+                    document.body.appendChild(testingDiv);
+                    
+                    const response = await fetch(`/api/mcp-configs/${name}/test`, { method: 'POST' });
+                    const result = await response.json();
+                    
+                    // Remove testing notification
+                    testingDiv.remove();
+                    
+                    // Show result notification
+                    const resultDiv = document.createElement('div');
+                    let bgColor = 'bg-green-600';
+                    let icon = 'fa-check-circle';
+                    
+                    if (result.status === 'error') {
+                        bgColor = 'bg-red-600';
+                        icon = 'fa-times-circle';
+                    } else if (result.status === 'warning') {
+                        bgColor = 'bg-yellow-600';
+                        icon = 'fa-exclamation-triangle';
+                    }
+                    
+                    resultDiv.className = `fixed top-6 right-6 ${bgColor} text-white px-6 py-4 rounded-xl shadow-2xl z-50`;
+                    resultDiv.innerHTML = `
+                        <div class="flex items-center gap-3">
+                            <i class="fas ${icon} text-2xl"></i>
+                            <div>
+                                <p class="font-bold text-base">${result.status === 'success' ? 'Connection Successful!' : result.status === 'warning' ? 'Connection Warning' : 'Connection Failed'}</p>
+                                <p class="text-sm opacity-90">${result.message}</p>
+                            </div>
+                        </div>
+                    `;
+                    document.body.appendChild(resultDiv);
+                    setTimeout(() => {
+                        resultDiv.style.opacity = '0';
+                        resultDiv.style.transition = 'opacity 0.3s';
+                        setTimeout(() => resultDiv.remove(), 300);
+                    }, 4000);
+                    
+                } catch (error) {
+                    const errorDiv = document.createElement('div');
+                    errorDiv.className = 'fixed top-6 right-6 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
+                    errorDiv.innerHTML = `
+                        <div class="flex items-center gap-3">
+                            <i class="fas fa-times-circle text-2xl"></i>
+                            <div>
+                                <p class="font-bold text-base">Test Failed</p>
+                                <p class="text-sm opacity-90">${error.message}</p>
+                            </div>
+                        </div>
+                    `;
+                    document.body.appendChild(errorDiv);
+                    setTimeout(() => {
+                        errorDiv.style.opacity = '0';
+                        errorDiv.style.transition = 'opacity 0.3s';
+                        setTimeout(() => errorDiv.remove(), 300);
+                    }, 4000);
                 }
             };
             
@@ -5159,6 +5434,51 @@ def get_frontend_html():
                     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
                 }
             }, [chatMessages]);
+            
+            // Load chat settings when settings modal opens
+            useEffect(() => {
+                if (isChatSettingsOpen && !chatSettings) {
+                    loadChatSettings();
+                }
+            }, [isChatSettingsOpen]);
+            
+            const loadChatSettings = async () => {
+                try {
+                    const response = await fetch('/api/chat/settings');
+                    const data = await response.json();
+                    setChatSettings(data);
+                } catch (error) {
+                    console.error('Error loading chat settings:', error);
+                }
+            };
+            
+            const updateSetting = async (key, value) => {
+                const updatedSettings = { ...chatSettings, [key]: value };
+                setChatSettings(updatedSettings);
+                
+                // Save to backend immediately
+                try {
+                    await fetch('/api/chat/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ [key]: value })
+                    });
+                } catch (error) {
+                    console.error('Error updating setting:', error);
+                }
+            };
+            
+            const resetChatSettings = async () => {
+                try {
+                    const response = await fetch('/api/chat/settings/reset', {
+                        method: 'POST'
+                    });
+                    const data = await response.json();
+                    setChatSettings(data.settings);
+                } catch (error) {
+                    console.error('Error resetting settings:', error);
+                }
+            };
             
             const sendChatMessage = async () => {
                 if (!chatInput.trim() || isTyping) return;
@@ -5957,6 +6277,13 @@ def get_frontend_html():
                                     </div>
                                     <div className="flex items-center space-x-2">
                                         <button
+                                            onClick={() => setIsChatSettingsOpen(true)}
+                                            className="px-3 py-1 text-sm text-gray-600 hover:text-gray-800"
+                                            title="Chat settings"
+                                        >
+                                            <i className="fas fa-cog"></i>
+                                        </button>
+                                        <button
                                             onClick={() => setChatMessages([])}
                                             className="px-3 py-1 text-sm text-gray-600 hover:text-gray-800"
                                             title="Clear chat"
@@ -6187,6 +6514,281 @@ def get_frontend_html():
                                     </div>
                                     <p className="text-xs text-gray-500 mt-2">
                                         Press Enter to send, Shift+Enter for new line • Ask about indexes, searches, data sources, or get help with SPL queries
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    
+                    {/* Chat Settings Modal */}
+                    {isChatSettingsOpen && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col">
+                                {/* Header */}
+                                <div className="p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-t-xl">
+                                    <div className="flex items-center">
+                                        <i className="fas fa-cog text-2xl mr-3"></i>
+                                        <h2 className="text-2xl font-bold">Chat Settings</h2>
+                                    </div>
+                                    <div className="flex items-center space-x-3">
+                                        <button
+                                            onClick={resetChatSettings}
+                                            className="px-4 py-2 bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg text-sm font-medium transition-all"
+                                            title="Reset to defaults"
+                                        >
+                                            <i className="fas fa-undo mr-2"></i>
+                                            Reset
+                                        </button>
+                                        <button
+                                            onClick={() => setIsChatSettingsOpen(false)}
+                                            className="text-white hover:text-gray-200"
+                                        >
+                                            <i className="fas fa-times text-2xl"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                {/* Settings Content - Scrollable */}
+                                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                                    {chatSettings && (
+                                        <>
+                                            {/* Discovery Settings */}
+                                            <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg p-5 border-2 border-green-200">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                                                    <i className="fas fa-search text-green-600 mr-2"></i>
+                                                    Discovery Settings
+                                                </h3>
+                                                <div className="space-y-4">
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Max Execution Time: {chatSettings.max_execution_time}s
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="30"
+                                                            max="300"
+                                                            value={chatSettings.max_execution_time}
+                                                            onChange={(e) => updateSetting('max_execution_time', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>30s</span>
+                                                            <span>300s</span>
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Max Iterations: {chatSettings.max_iterations}
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="1"
+                                                            max="10"
+                                                            value={chatSettings.max_iterations}
+                                                            onChange={(e) => updateSetting('max_iterations', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>1</span>
+                                                            <span>10</span>
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Discovery Freshness: {chatSettings.discovery_freshness_days} days
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="1"
+                                                            max="30"
+                                                            value={chatSettings.discovery_freshness_days}
+                                                            onChange={(e) => updateSetting('discovery_freshness_days', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>1 day</span>
+                                                            <span>30 days</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            
+                                            {/* LLM Behavior */}
+                                            <div className="bg-gradient-to-r from-purple-50 to-indigo-50 rounded-lg p-5 border-2 border-purple-200">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                                                    <i className="fas fa-brain text-purple-600 mr-2"></i>
+                                                    LLM Behavior
+                                                </h3>
+                                                <div className="space-y-4">
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Max Tokens: {chatSettings.max_tokens}
+                                                            {config?.llm?.max_tokens && (
+                                                                <span className="ml-2 text-xs text-purple-600">
+                                                                    (Profile: {config.llm.max_tokens})
+                                                                </span>
+                                                            )}
+                                                        </label>
+                                                        <input
+                                                            type="number"
+                                                            min="1000"
+                                                            max="128000"
+                                                            value={chatSettings.max_tokens}
+                                                            onChange={(e) => updateSetting('max_tokens', parseInt(e.target.value))}
+                                                            className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Temperature: {chatSettings.temperature.toFixed(1)}
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="0"
+                                                            max="2"
+                                                            step="0.1"
+                                                            value={chatSettings.temperature}
+                                                            onChange={(e) => updateSetting('temperature', parseFloat(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>0.0 (Focused)</span>
+                                                            <span>2.0 (Creative)</span>
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Context History: {chatSettings.context_history} messages
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="0"
+                                                            max="20"
+                                                            value={chatSettings.context_history}
+                                                            onChange={(e) => updateSetting('context_history', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>0</span>
+                                                            <span>20</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            
+                                            {/* Performance Tuning */}
+                                            <div className="bg-gradient-to-r from-amber-50 to-yellow-50 rounded-lg p-5 border-2 border-amber-200">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                                                    <i className="fas fa-tachometer-alt text-amber-600 mr-2"></i>
+                                                    Performance Tuning
+                                                </h3>
+                                                <div className="space-y-4">
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Max Retry Delay: {chatSettings.max_retry_delay}s
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="10"
+                                                            max="600"
+                                                            value={chatSettings.max_retry_delay}
+                                                            onChange={(e) => updateSetting('max_retry_delay', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>10s</span>
+                                                            <span>600s</span>
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Max Retries: {chatSettings.max_retries}
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="1"
+                                                            max="10"
+                                                            value={chatSettings.max_retries}
+                                                            onChange={(e) => updateSetting('max_retries', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>1</span>
+                                                            <span>10</span>
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Query Sample Size: {chatSettings.query_sample_size} rows
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="1"
+                                                            max="10"
+                                                            value={chatSettings.query_sample_size}
+                                                            onChange={(e) => updateSetting('query_sample_size', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>1</span>
+                                                            <span>10</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            
+                                            {/* Quality Control */}
+                                            <div className="bg-gradient-to-r from-blue-50 to-cyan-50 rounded-lg p-5 border-2 border-blue-200">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                                                    <i className="fas fa-check-circle text-blue-600 mr-2"></i>
+                                                    Quality Control
+                                                </h3>
+                                                <div className="space-y-4">
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Quality Threshold: {chatSettings.quality_threshold}
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="0"
+                                                            max="100"
+                                                            value={chatSettings.quality_threshold}
+                                                            onChange={(e) => updateSetting('quality_threshold', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>0 (Permissive)</span>
+                                                            <span>100 (Strict)</span>
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            Convergence Detection: {chatSettings.convergence_detection} iterations
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="3"
+                                                            max="10"
+                                                            value={chatSettings.convergence_detection}
+                                                            onChange={(e) => updateSetting('convergence_detection', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>3</span>
+                                                            <span>10</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                                
+                                {/* Footer */}
+                                <div className="p-6 border-t border-gray-200 bg-gray-50 rounded-b-xl">
+                                    <p className="text-sm text-gray-600 text-center">
+                                        <i className="fas fa-info-circle mr-2"></i>
+                                        Settings apply immediately and reset to defaults on server restart
                                     </p>
                                 </div>
                             </div>
@@ -7364,27 +7966,99 @@ def get_frontend_html():
                                                 <div className="flex items-center">
                                                     <input 
                                                         type="checkbox" 
-                                                        defaultChecked={config.mcp.verify_ssl}
+                                                        checked={config.mcp.verify_ssl}
+                                                        onChange={(e) => setConfig({...config, mcp: {...config.mcp, verify_ssl: e.target.checked}})}
                                                         className="mr-2"
                                                         id="mcp-verify-ssl"
                                                     />
                                                     <label htmlFor="mcp-verify-ssl" className="text-sm text-gray-700">Verify SSL Certificate</label>
                                                 </div>
                                                 
-                                                {/* Save Button */}
-                                                <div className="pt-3 border-t border-gray-200">
+                                                {/* Test & Save Buttons */}
+                                                <div className="pt-3 border-t border-gray-200 space-y-2">
                                                     <button
-                                                        onClick={() => {
-                                                            if (loadedMCPConfigName) {
-                                                                setMCPConfigName(loadedMCPConfigName);
+                                                        onClick={async () => {
+                                                            const urlEl = document.getElementById('mcp-url');
+                                                            const tokenEl = document.getElementById('mcp-token');
+                                                            const verifySslEl = document.getElementById('mcp-verify-ssl');
+                                                            
+                                                            const testUrl = urlEl?.value || config.mcp.url;
+                                                            const testToken = tokenEl?.value || config.mcp.token;
+                                                            const testVerifySsl = verifySslEl?.checked ?? config.mcp.verify_ssl;
+                                                            
+                                                            if (!testUrl) {
+                                                                alert('Please enter an MCP URL');
+                                                                return;
                                                             }
-                                                            setIsMCPSaveModalOpen(true);
+                                                            
+                                                            const button = event.target.closest('button');
+                                                            const originalHTML = button.innerHTML;
+                                                            button.disabled = true;
+                                                            button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Testing...';
+                                                            
+                                                            try {
+                                                                const response = await fetch('/api/mcp-configs/test', {
+                                                                    method: 'POST',
+                                                                    headers: {'Content-Type': 'application/json'},
+                                                                    body: JSON.stringify({
+                                                                        url: testUrl,
+                                                                        token: testToken,
+                                                                        verify_ssl: testVerifySsl
+                                                                    })
+                                                                });
+                                                                
+                                                                const result = await response.json();
+                                                                
+                                                                if (result.status === 'success') {
+                                                                    alert('✅ ' + result.message);
+                                                                } else {
+                                                                    alert('⚠️ ' + result.message);
+                                                                }
+                                                            } catch (error) {
+                                                                alert('❌ Test failed: ' + error.message);
+                                                            } finally {
+                                                                button.disabled = false;
+                                                                button.innerHTML = originalHTML;
+                                                            }
                                                         }}
-                                                        className="w-full px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all"
+                                                        className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
                                                     >
-                                                        <i className="fas fa-save mr-2"></i>
-                                                        {loadedMCPConfigName ? 'Update Active Configuration' : 'Save as New Configuration'}
+                                                        <i className="fas fa-network-wired mr-2"></i>Test Connection
                                                     </button>
+                                                    
+                                                    {/* Save Buttons */}
+                                                    {loadedMCPConfigName ? (
+                                                        <>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setMCPConfigName('');
+                                                                    setIsMCPSaveModalOpen(true);
+                                                                }}
+                                                                className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
+                                                            >
+                                                                <i className="fas fa-plus-circle mr-2"></i>Save as New
+                                                            </button>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setMCPConfigName(loadedMCPConfigName);
+                                                                    setIsMCPSaveModalOpen(true);
+                                                                }}
+                                                                className="w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
+                                                            >
+                                                                <i className="fas fa-sync-alt mr-2"></i>Update Active Configuration
+                                                            </button>
+                                                        </>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => {
+                                                                setMCPConfigName('');
+                                                                setIsMCPSaveModalOpen(true);
+                                                            }}
+                                                            className="w-full px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all"
+                                                        >
+                                                            <i className="fas fa-save mr-2"></i>Save as New Configuration
+                                                        </button>
+                                                    )}
                                                 </div>
                                             </div>
                                         </div>
@@ -7762,6 +8436,45 @@ def get_frontend_html():
                                                     <i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure
                                                 </button>
                                                 <div id="llm-test-results" className="mt-3" style={{display: 'none'}}></div>
+                                                
+                                                {/* Save Buttons */}
+                                                <div className="mt-3 pt-3 border-t border-gray-200 space-y-2">
+                                                    {loadedCredentialName ? (
+                                                        <>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setIsUpdateMode(false);
+                                                                    setCredentialName('');
+                                                                    setIsCredentialModalOpen(true);
+                                                                }}
+                                                                className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
+                                                            >
+                                                                <i className="fas fa-plus-circle mr-2"></i>Save as New
+                                                            </button>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setIsUpdateMode(true);
+                                                                    setCredentialName(loadedCredentialName);
+                                                                    setIsCredentialModalOpen(true);
+                                                                }}
+                                                                className="w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
+                                                            >
+                                                                <i className="fas fa-sync-alt mr-2"></i>Update Active Connection
+                                                            </button>
+                                                        </>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => {
+                                                                setIsUpdateMode(false);
+                                                                setCredentialName('');
+                                                                setIsCredentialModalOpen(true);
+                                                            }}
+                                                            className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
+                                                        >
+                                                            <i className="fas fa-save mr-2"></i>Save Connection
+                                                        </button>
+                                                    )}
+                                                </div>
                                             </div>
                                             </div>
                                         </div>
@@ -7807,85 +8520,54 @@ def get_frontend_html():
                                             <i className="fas fa-list mr-2"></i>
                                             View Dependencies
                                         </button>
-                                        {showConfigForm ? (
-                                            /* Show connection save/update buttons when config form is visible */
-                                            loadedCredentialName ? (
-                                                <>
-                                                    <button
-                                                        onClick={() => {
-                                                            setIsUpdateMode(false);
-                                                            setCredentialName('');
-                                                            setIsCredentialModalOpen(true);
-                                                        }}
-                                                        className="px-6 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
-                                                    >
-                                                        <i className="fas fa-plus-circle mr-2"></i>Save as New
-                                                    </button>
-                                                    <button
-                                                        onClick={() => {
-                                                            setIsUpdateMode(true);
-                                                            setCredentialName(loadedCredentialName);
-                                                            setIsCredentialModalOpen(true);
-                                                        }}
-                                                        className="px-6 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600"
-                                                    >
-                                                        <i className="fas fa-sync-alt mr-2"></i>Update Active Connection
-                                                    </button>
-                                                </>
-                                            ) : (
-                                                <button
-                                                    onClick={() => {
-                                                        setIsUpdateMode(false);
-                                                        setCredentialName('');
-                                                        setIsCredentialModalOpen(true);
-                                                    }}
-                                                    className="px-6 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
-                                                >
-                                                    <i className="fas fa-save mr-2"></i>Save Connection
-                                                </button>
-                                            )
-                                        ) : (
-                                            /* Show regular Save Settings button when no config form */
-                                            <button
-                                                onClick={async () => {
-                                                    const providerEl = document.getElementById('llm-provider');
-                                                    const endpointUrlInput = document.getElementById('llm-endpoint-url');
-                                                    const modelInput = document.getElementById('llm-model');
-                                                    const apiKeyEl = document.getElementById('llm-api-key');
-                                                    const maxTokensEl = document.getElementById('llm-max-tokens');
-                                                    const tempEl = document.getElementById('llm-temperature');
-                                                    const mcpUrlEl = document.getElementById('mcp-url');
-                                                    const mcpTokenEl = document.getElementById('mcp-token');
-                                                    const mcpVerifyEl = document.getElementById('mcp-verify-ssl');
-                                                    
-                                                    const provider = providerEl ? providerEl.value : selectedProvider;
-                                                    
-                                                    const settings = {
-                                                        mcp: {
-                                                            url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
-                                                            token: (mcpTokenEl ? mcpTokenEl.value : config.mcp.token) || undefined,
-                                                            verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
-                                                        },
-                                                        llm: {
-                                                            provider: provider,
-                                                            api_key: (apiKeyEl ? apiKeyEl.value : config.llm.api_key) || undefined,
-                                                            model: (modelInput ? modelInput.value : selectedModel) || config.llm.model,
-                                                            endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : config.llm.endpoint_url,
-                                                            max_tokens: maxTokensEl ? parseInt(maxTokensEl.value) : config.llm.max_tokens,
-                                                            temperature: tempEl ? parseFloat(tempEl.value) : config.llm.temperature
-                                                        },
-                                                        server: {
-                                                            ...config.server
-                                                        }
-                                                    };
-                                                    await saveSettings(settings);
-                                                }}
-                                                className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
-                                            >
-                                                <i className="fas fa-save mr-2"></i>
-                                                Save Settings
-                                            </button>
-                                        )}
+                                        
+                                        {/* Always show Save Settings button */}
+                                        <button
+                                            onClick={async () => {
+                                                const providerEl = document.getElementById('llm-provider');
+                                                const endpointUrlInput = document.getElementById('llm-endpoint-url');
+                                                const modelInput = document.getElementById('llm-model');
+                                                const apiKeyEl = document.getElementById('llm-api-key');
+                                                const maxTokensEl = document.getElementById('llm-max-tokens');
+                                                const tempEl = document.getElementById('llm-temperature');
+                                                const mcpUrlEl = document.getElementById('mcp-url');
+                                                const mcpTokenEl = document.getElementById('mcp-token');
+                                                const mcpVerifyEl = document.getElementById('mcp-verify-ssl');
+                                                
+                                                const provider = providerEl ? providerEl.value : selectedProvider;
+                                                
+                                                // Only include token if it's actually changed (not empty)
+                                                const mcpToken = mcpTokenEl ? mcpTokenEl.value : '';
+                                                const mcpSettings = {
+                                                    url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
+                                                    verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
+                                                };
+                                                // Only include token if user entered a new one
+                                                if (mcpToken && mcpToken.trim()) {
+                                                    mcpSettings.token = mcpToken;
+                                                }
+                                                
+                                                const settings = {
+                                                    mcp: mcpSettings,
+                                                    llm: {
+                                                        provider: provider,
+                                                        api_key: (apiKeyEl ? apiKeyEl.value : config.llm.api_key) || undefined,
+                                                        model: (modelInput ? modelInput.value : selectedModel) || config.llm.model,
+                                                        endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : config.llm.endpoint_url,
+                                                        max_tokens: maxTokensEl ? parseInt(maxTokensEl.value) : config.llm.max_tokens,
+                                                        temperature: tempEl ? parseFloat(tempEl.value) : config.llm.temperature
+                                                    },
+                                                    server: {
+                                                        ...config.server
+                                                    }
+                                                };
+                                                await saveSettings(settings);
+                                            }}
+                                            className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
+                                        >
+                                            <i className="fas fa-save mr-2"></i>
+                                            Save Settings
+                                        </button>
                                     </div>
                                 </div>
                             </div>
