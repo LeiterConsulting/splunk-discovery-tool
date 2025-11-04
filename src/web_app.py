@@ -3962,17 +3962,27 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                             final_answer = final_response
                             print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
                         else:
-                            # Response is already user-facing
-                            print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
-                            final_answer = next_response
+                            # Response is already user-facing - but double-check for tool calls
+                            if '<TOOL_CALL>' in next_response:
+                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - continuing")
+                                # Extract and execute the tool call
+                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                            else:
+                                print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
+                                final_answer = next_response
                     else:
                         # Either no data or LLM wants to continue
                         if next_tool_match:
                             print(f"▶️  [Iteration {iteration}] High quality but continuing investigation")
                             # Fall through to execute next tool
                         else:
-                            print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
-                            final_answer = next_response
+                            # Double-check for tool calls that regex might have missed
+                            if '<TOOL_CALL>' in next_response:
+                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - continuing")
+                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                            else:
+                                print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
+                                final_answer = next_response
                     
                     if final_answer:
                         break
@@ -4191,14 +4201,34 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                     final_answer = final_response
                                     print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
                                 else:
-                                    # Response is already user-facing
+                                    # Response is already user-facing - but check for tool calls
+                                    if '<TOOL_CALL>' in next_response:
+                                        print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - continuing investigation")
+                                        next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                        # Don't break - let it continue to execute tool
+                                    else:
+                                        print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
+                                        final_answer = next_response
+                            else:
+                                # No data - accept response as-is, but check for tool calls
+                                if '<TOOL_CALL>' in next_response:
+                                    print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - continuing investigation")
+                                    next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                    # Don't break - let it continue to execute tool
+                                else:
                                     print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
                                     final_answer = next_response
-                            else:
-                                # No data - accept response as-is
-                                print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                                final_answer = next_response
                             break
+            
+            # CRITICAL SAFETY CHECK: If final_answer contains <TOOL_CALL>, the LLM isn't done
+            # This should never happen, but if it does, strip the tool call and force continuation
+            if final_answer and '<TOOL_CALL>' in final_answer:
+                print(f"⚠️ WARNING: final_answer contains <TOOL_CALL> tags - LLM finished prematurely!")
+                print(f"Response: {final_answer[:200]}...")
+                # Strip tool calls from response and return with warning
+                final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', final_answer, flags=re.DOTALL).strip()
+                if not final_answer:
+                    final_answer = "Investigation incomplete. The agent attempted to continue but reached response limits."
             
             # Return comprehensive response with status timeline
             # Include conversation_history so follow-up queries maintain context
