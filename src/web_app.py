@@ -3964,9 +3964,26 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                         else:
                             # Response is already user-facing - but double-check for tool calls
                             if '<TOOL_CALL>' in next_response:
-                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - continuing")
+                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - parsing and continuing")
                                 # Extract and execute the tool call
                                 next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                if next_tool_match:
+                                    try:
+                                        tool_data = json.loads(next_tool_match.group(1))
+                                        tool_name = tool_data.get('tool')
+                                        tool_args = tool_data.get('args', {})
+                                        tool_call = {
+                                            "method": "tools/call",
+                                            "params": {
+                                                "name": tool_name,
+                                                "arguments": tool_args
+                                            }
+                                        }
+                                        continue  # Execute this tool call in next iteration
+                                    except json.JSONDecodeError as e:
+                                        print(f"❌ Failed to parse tool call: {e}")
+                                        final_answer = next_response
+                                        break
                             else:
                                 print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
                                 final_answer = next_response
@@ -3978,8 +3995,25 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                         else:
                             # Double-check for tool calls that regex might have missed
                             if '<TOOL_CALL>' in next_response:
-                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - continuing")
+                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - parsing and continuing")
                                 next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                if next_tool_match:
+                                    try:
+                                        tool_data = json.loads(next_tool_match.group(1))
+                                        tool_name = tool_data.get('tool')
+                                        tool_args = tool_data.get('args', {})
+                                        tool_call = {
+                                            "method": "tools/call",
+                                            "params": {
+                                                "name": tool_name,
+                                                "arguments": tool_args
+                                            }
+                                        }
+                                        continue  # Execute this tool call in next iteration
+                                    except json.JSONDecodeError as e:
+                                        print(f"❌ Failed to parse tool call: {e}")
+                                        final_answer = next_response
+                                        break
                             else:
                                 print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
                                 final_answer = next_response
@@ -4203,18 +4237,50 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                 else:
                                     # Response is already user-facing - but check for tool calls
                                     if '<TOOL_CALL>' in next_response:
-                                        print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - continuing investigation")
+                                        print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - parsing and continuing")
                                         next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
-                                        # Don't break - let it continue to execute tool
+                                        if next_tool_match:
+                                            try:
+                                                tool_data = json.loads(next_tool_match.group(1))
+                                                tool_name = tool_data.get('tool')
+                                                tool_args = tool_data.get('args', {})
+                                                tool_call = {
+                                                    "method": "tools/call",
+                                                    "params": {
+                                                        "name": tool_name,
+                                                        "arguments": tool_args
+                                                    }
+                                                }
+                                                continue  # Execute this tool call in next iteration
+                                            except json.JSONDecodeError as e:
+                                                print(f"❌ Failed to parse tool call: {e}")
+                                                final_answer = next_response
+                                                break
                                     else:
                                         print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
                                         final_answer = next_response
                             else:
                                 # No data - accept response as-is, but check for tool calls
                                 if '<TOOL_CALL>' in next_response:
-                                    print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - continuing investigation")
+                                    print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - parsing and continuing")
                                     next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
-                                    # Don't break - let it continue to execute tool
+                                    if next_tool_match:
+                                        try:
+                                            tool_data = json.loads(next_tool_match.group(1))
+                                            tool_name = tool_data.get('tool')
+                                            tool_args = tool_data.get('args', {})
+                                            tool_call = {
+                                                "method": "tools/call",
+                                                "params": {
+                                                    "name": tool_name,
+                                                    "arguments": tool_args
+                                                }
+                                            }
+                                            continue  # Execute this tool call in next iteration
+                                        except json.JSONDecodeError as e:
+                                            print(f"❌ Failed to parse tool call: {e}")
+                                            final_answer = next_response
+                                            break
                                 else:
                                     print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
                                     final_answer = next_response
