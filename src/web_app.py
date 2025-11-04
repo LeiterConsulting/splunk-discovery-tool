@@ -3993,8 +3993,12 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                         }
                                         continue  # Execute this tool call in next iteration
                                     except json.JSONDecodeError as e:
-                                        print(f"❌ Failed to parse tool call: {e}")
-                                        final_answer = next_response
+                                        print(f"❌ Failed to parse tool call JSON (HIGH quality, first check): {e}")
+                                        print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
+                                        # Strip the malformed tool call and use the text explanation
+                                        final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                        if not final_answer:
+                                            final_answer = "Investigation incomplete due to malformed query format."
                                         break
                             else:
                                 print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
@@ -4023,8 +4027,12 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                         }
                                         continue  # Execute this tool call in next iteration
                                     except json.JSONDecodeError as e:
-                                        print(f"❌ Failed to parse tool call: {e}")
-                                        final_answer = next_response
+                                        print(f"❌ Failed to parse tool call JSON (HIGH quality, second check): {e}")
+                                        print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
+                                        # Strip the malformed tool call and use the text explanation
+                                        final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                        if not final_answer:
+                                            final_answer = "Investigation incomplete due to malformed query format."
                                         break
                             else:
                                 print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
@@ -4265,8 +4273,12 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                                 }
                                                 continue  # Execute this tool call in next iteration
                                             except json.JSONDecodeError as e:
-                                                print(f"❌ Failed to parse tool call: {e}")
-                                                final_answer = next_response
+                                                print(f"❌ Failed to parse tool call JSON: {e}")
+                                                print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
+                                                # Strip the malformed tool call and use the text explanation
+                                                final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                                if not final_answer:
+                                                    final_answer = "Investigation incomplete due to malformed query format."
                                                 break
                                     else:
                                         print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
@@ -4290,8 +4302,12 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                             }
                                             continue  # Execute this tool call in next iteration
                                         except json.JSONDecodeError as e:
-                                            print(f"❌ Failed to parse tool call: {e}")
-                                            final_answer = next_response
+                                            print(f"❌ Failed to parse tool call JSON: {e}")
+                                            print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
+                                            # Strip the malformed tool call and use the text explanation
+                                            final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                            if not final_answer:
+                                                final_answer = "Investigation incomplete due to malformed query format."
                                             break
                                 else:
                                     print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
