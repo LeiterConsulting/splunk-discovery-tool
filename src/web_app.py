@@ -617,13 +617,64 @@ async def run_discovery():
             with open(exec_summary_path, 'w', encoding='utf-8') as f:
                 f.write(f"# Splunk Environment Discovery - Executive Summary\n\n")
                 f.write(f"**Discovery Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                
+                # Environment Overview
                 f.write(f"## Environment Overview\n\n")
                 if hasattr(overview, 'total_indexes'):
                     f.write(f"- **Total Indexes:** {overview.total_indexes}\n")
                     f.write(f"- **Total Source Types:** {overview.total_sourcetypes}\n")
-                    f.write(f"- **Active Data Sources:** {overview.total_sourcetypes}\n\n")
-                f.write(f"## Key Findings\n\n")
-                f.write(f"Discovery completed successfully across {overview.estimated_discovery_steps if hasattr(overview, 'estimated_discovery_steps') else 'multiple'} analysis steps.\n\n")
+                    f.write(f"- **Total Hosts:** {overview.total_hosts}\n")
+                    f.write(f"- **Total Sources:** {overview.total_sources}\n")
+                    if overview.data_volume_24h:
+                        f.write(f"- **24h Data Volume:** {overview.data_volume_24h}\n")
+                    if overview.splunk_version:
+                        f.write(f"- **Splunk Version:** {overview.splunk_version} (Build: {overview.splunk_build})\n")
+                    if overview.license_state:
+                        f.write(f"- **License State:** {overview.license_state}\n")
+                    if overview.server_roles:
+                        f.write(f"- **Server Roles:** {', '.join(overview.server_roles)}\n")
+                    f.write(f"\n")
+                
+                # Top Priority Recommendations
+                f.write(f"## Top Priority Recommendations\n\n")
+                high_priority = [r for r in recommendations if isinstance(r, dict) and r.get('priority') == 'high'][:5]
+                if high_priority:
+                    for idx, rec in enumerate(high_priority, 1):
+                        f.write(f"### {idx}. {rec.get('title', 'Recommendation')}\n\n")
+                        f.write(f"**Priority:** {rec.get('priority', 'N/A')} | ")
+                        f.write(f"**Category:** {rec.get('category', 'N/A')} | ")
+                        f.write(f"**Complexity:** {rec.get('complexity', 'N/A')}\n\n")
+                        f.write(f"{rec.get('description', '')}\n\n")
+                else:
+                    f.write("_No high-priority recommendations identified._\n\n")
+                
+                # Data Classification Summary
+                f.write(f"## Data Classification Summary\n\n")
+                if isinstance(classifications, dict):
+                    for category, items in classifications.items():
+                        if items and len(items) > 0:
+                            f.write(f"**{category.replace('_', ' ').title()}:** {len(items)} items\n")
+                    f.write(f"\n")
+                
+                # Cross-Functional Use Cases
+                if suggested_use_cases:
+                    f.write(f"## Recommended Cross-Functional Use Cases\n\n")
+                    for idx, use_case in enumerate(suggested_use_cases[:3], 1):
+                        if isinstance(use_case, dict):
+                            f.write(f"### {idx}. {use_case.get('title', 'Use Case')}\n\n")
+                            f.write(f"**Category:** {use_case.get('category', 'N/A')} | ")
+                            f.write(f"**Complexity:** {use_case.get('complexity', 'N/A')}\n\n")
+                            f.write(f"{use_case.get('description', '')}\n\n")
+                            if use_case.get('data_sources'):
+                                f.write(f"**Data Sources:** {', '.join(use_case['data_sources'])}\n\n")
+                
+                # Discovery Statistics
+                discovery_results = discovery_engine.get_all_results()
+                f.write(f"## Discovery Statistics\n\n")
+                f.write(f"- **Total Discovery Steps:** {len(discovery_results)}\n")
+                f.write(f"- **Analysis Time:** {overview.estimated_time if hasattr(overview, 'estimated_time') else 'N/A'}\n")
+                f.write(f"- **Notable Patterns:** {len(overview.notable_patterns) if hasattr(overview, 'notable_patterns') else 0}\n\n")
+                
             report_paths.append(str(exec_summary_path.name))
             display.info(f"   ✓ {exec_summary_path.name}")
         except Exception as e:
@@ -635,8 +686,38 @@ async def run_discovery():
             with open(detailed_path, 'w', encoding='utf-8') as f:
                 f.write(f"# Detailed Discovery Report\n\n")
                 f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                f.write(f"## Discovery Results\n\n")
-                f.write(json.dumps(discovery_engine.discovery_results, indent=2, default=str))
+                
+                # Get discovery results
+                discovery_results = discovery_engine.get_all_results()
+                
+                f.write(f"## Discovery Overview\n\n")
+                f.write(f"Total discovery steps completed: {len(discovery_results)}\n\n")
+                
+                # Write each discovery step
+                for result in discovery_results:
+                    f.write(f"### Step {result.step}: {result.description}\n\n")
+                    f.write(f"**Timestamp:** {result.timestamp}\n\n")
+                    
+                    # Interesting findings
+                    if result.interesting_findings:
+                        f.write(f"**Key Findings:**\n")
+                        for finding in result.interesting_findings:
+                            f.write(f"- {finding}\n")
+                        f.write(f"\n")
+                    
+                    # Data details (formatted)
+                    if result.data:
+                        f.write(f"**Data Details:**\n\n")
+                        if isinstance(result.data, dict):
+                            for key, value in result.data.items():
+                                if isinstance(value, (list, dict)):
+                                    f.write(f"- **{key}:** {len(value)} items\n")
+                                else:
+                                    f.write(f"- **{key}:** {value}\n")
+                        f.write(f"\n")
+                    
+                    f.write(f"---\n\n")
+                
             report_paths.append(str(detailed_path.name))
             display.info(f"   ✓ {detailed_path.name}")
         except Exception as e:
@@ -648,7 +729,27 @@ async def run_discovery():
             with open(classification_path, 'w', encoding='utf-8') as f:
                 f.write(f"# Data Classification Report\n\n")
                 f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                f.write(json.dumps(classifications, indent=2, default=str))
+                
+                if isinstance(classifications, dict):
+                    for category, items in classifications.items():
+                        f.write(f"## {category.replace('_', ' ').title()}\n\n")
+                        if items and len(items) > 0:
+                            f.write(f"**Total Items:** {len(items)}\n\n")
+                            for item in items:
+                                if isinstance(item, dict):
+                                    f.write(f"### {item.get('name', item.get('title', 'Item'))}\n\n")
+                                    for key, value in item.items():
+                                        if key not in ['name', 'title'] and value:
+                                            f.write(f"- **{key.replace('_', ' ').title()}:** {value}\n")
+                                    f.write(f"\n")
+                                elif isinstance(item, str):
+                                    f.write(f"- {item}\n")
+                            f.write(f"\n")
+                        else:
+                            f.write("_No items classified in this category._\n\n")
+                else:
+                    f.write("_Classification data not available._\n\n")
+                    
             report_paths.append(str(classification_path.name))
             display.info(f"   ✓ {classification_path.name}")
         except Exception as e:
