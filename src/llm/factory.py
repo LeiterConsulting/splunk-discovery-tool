@@ -521,6 +521,22 @@ class CustomLLMClient:
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
         
+        # Detect LLM provider type for connection strategy
+        self.provider_type = self._detect_provider(endpoint_url)
+        
+        # Connection strategy: Some providers (vLLM) need fresh connections, others benefit from session reuse
+        import requests
+        if self.provider_type in ["vllm", "local-vllm"]:
+            # vLLM has issues with persistent connections - use fresh connections
+            self.session = None
+            self.use_session = False
+            logger.info(f"[CustomLLM] 🔧 Connection Strategy: FRESH (detected {self.provider_type})")
+        else:
+            # OpenAI, Anthropic, Ollama, etc. work well with persistent sessions
+            self.session = requests.Session()
+            self.use_session = True
+            logger.info(f"[CustomLLM] 🔧 Connection Strategy: PERSISTENT (detected {self.provider_type})")
+        
         # Health monitoring (v1.1.0)
         from llm.health_monitor import (
             get_health_monitor, 
@@ -543,7 +559,50 @@ class CustomLLMClient:
             '/api/generate'
         ]
         self.is_full_path = any(self.endpoint_url.endswith(path) for path in full_path_indicators)
+    
+    def _detect_provider(self, endpoint_url: str) -> str:
+        """
+        Detect LLM provider type from endpoint URL.
+        This determines the connection strategy and compatibility features.
         
+        Returns:
+            str: Provider type (vllm, ollama, openai, anthropic, cohere, local-vllm, generic)
+        """
+        url_lower = endpoint_url.lower()
+        
+        # vLLM detection (both cloud and local)
+        if any(indicator in url_lower for indicator in ["vllm", "localhost:8000", "127.0.0.1:8000"]):
+            if "localhost" in url_lower or "127.0.0.1" in url_lower:
+                return "local-vllm"
+            return "vllm"
+        
+        # Ollama detection
+        if "ollama" in url_lower or ":11434" in url_lower:
+            return "ollama"
+        
+        # OpenAI (official and compatible endpoints)
+        if any(indicator in url_lower for indicator in ["openai.com", "api.openai", "openai-compatible"]):
+            return "openai"
+        
+        # Anthropic
+        if "anthropic" in url_lower or "claude" in url_lower:
+            return "anthropic"
+        
+        # Cohere
+        if "cohere" in url_lower:
+            return "cohere"
+        
+        # HuggingFace Inference API
+        if "huggingface" in url_lower or "hf.space" in url_lower:
+            return "huggingface"
+        
+        # Replicate
+        if "replicate" in url_lower:
+            return "replicate"
+        
+        # Generic/Unknown
+        return "generic"
+    
     def generate_response_sync(self, messages: list, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """SYNCHRONOUS response generation with health monitoring (v1.1.0)."""
         import requests
@@ -559,11 +618,33 @@ class CustomLLMClient:
             raise Exception("LLM endpoint is unhealthy - too many consecutive failures")
         
         # Adapt payload based on endpoint health
-        adapted_messages, adapted_max_tokens = self.payload_adapter.adapt_request(messages, max_tokens)
-        
-        # Calculate adaptive timeout
-        estimated_tokens = sum(len(str(m.get('content', ''))) for m in adapted_messages) // 4
-        adaptive_timeout = self.timeout_manager.calculate_timeout(estimated_tokens)
+        # Provider-specific timeout and payload strategy
+        if self.provider_type in ["vllm", "local-vllm"]:
+            # vLLM/Local LLM: Users are warned about long wait times via UI
+            # Give generous 20-minute timeout - let LLM complete or fail naturally
+            # No payload adaptation - send full context for best quality results
+            
+            # Always use full payload (users warned about wait times)
+            adapted_messages = messages
+            adapted_max_tokens = max_tokens
+            
+            # Fixed 20-minute timeout for all local LLM requests
+            # User has been warned via UI and can abort if needed
+            request_timeout = 1200  # 20 minutes
+            
+            total_chars = sum(len(str(m.get('content', ''))) for m in adapted_messages)
+            estimated_input_tokens = total_chars // 4
+            estimated_total_tokens = estimated_input_tokens + adapted_max_tokens
+            
+            logger.info(f"[CustomLLM-SYNC] 🔧 vLLM/Local LLM Mode: Full payload, 20-minute timeout")
+            logger.info(f"[CustomLLM-SYNC] � Sending ~{estimated_total_tokens} tokens ({len(adapted_messages)} messages)")
+            logger.info(f"[CustomLLM-SYNC] ⏰ Timeout: {request_timeout}s (user warned via UI, can abort)")
+        else:
+            # Other providers use adaptive timeout and payload adaptation
+            adapted_messages, adapted_max_tokens = self.payload_adapter.adapt_request(messages, max_tokens)
+            estimated_tokens = sum(len(str(m.get('content', ''))) for m in adapted_messages) // 4
+            request_timeout = self.timeout_manager.calculate_timeout(estimated_tokens)
+            logger.info(f"[CustomLLM-SYNC] 🔧 Adaptive Mode: {request_timeout}s timeout")
         
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -577,11 +658,8 @@ class CustomLLMClient:
             "stream": False
         }
         
-        health_status = self.health_monitor.get_status()
-        logger.info(f"[CustomLLM-SYNC] 🏥 Endpoint Health: {health_status.value}")
-        logger.info(f"[CustomLLM-SYNC] ⏱️  Adaptive Timeout: {adaptive_timeout}s")
-        logger.info(f"[CustomLLM-SYNC] 📊 Messages: {len(messages)} → {len(adapted_messages)} (adapted)")
-        logger.info(f"[CustomLLM-SYNC] � Max Tokens: {max_tokens} → {adapted_max_tokens} (adapted)")
+        logger.info(f"[CustomLLM-SYNC] 📊 Messages: {len(messages)} → {len(adapted_messages)}")
+        logger.info(f"[CustomLLM-SYNC] � Max Tokens: {max_tokens} → {adapted_max_tokens}")
         
         try:
             logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Starting request {request_id}")
@@ -590,14 +668,24 @@ class CustomLLMClient:
             
             request_start = time.time()
             logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Sending HTTP POST...")
+            logger.info(f"[CustomLLM-SYNC] 🔧 Using {'PERSISTENT session' if self.use_session else 'FRESH connection'}")
             
-            # Use adaptive timeout
-            response = requests.post(
-                self.endpoint_url, 
-                headers=headers, 
-                json=payload, 
-                timeout=adaptive_timeout
-            )
+            # Adaptive connection strategy based on provider type
+            # vLLM needs fresh connections, others work better with persistent sessions
+            if self.use_session and self.session:
+                response = self.session.post(
+                    self.endpoint_url, 
+                    headers=headers, 
+                    json=payload, 
+                    timeout=request_timeout
+                )
+            else:
+                response = requests.post(
+                    self.endpoint_url, 
+                    headers=headers, 
+                    json=payload, 
+                    timeout=request_timeout
+                )
             request_time = time.time() - request_start
             
             logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - HTTP response received (took {request_time:.3f}s)")
@@ -637,9 +725,9 @@ class CustomLLMClient:
             # Record timeout failure
             self.health_monitor.record_request(success=False, response_time=elapsed, is_timeout=True)
             
-            logger.error(f"[CustomLLM-SYNC] ⏰ TIMEOUT after {elapsed:.3f}s (limit: {adaptive_timeout}s)")
+            logger.error(f"[CustomLLM-SYNC] ⏰ TIMEOUT after {elapsed:.3f}s (limit: {request_timeout}s)")
             logger.error(f"[CustomLLM-SYNC] 🏥 Health degraded: {self.health_monitor.get_metrics().to_dict()}")
-            raise Exception(f"Request timeout after {elapsed:.1f}s (adaptive limit: {adaptive_timeout}s)")
+            raise Exception(f"Request timeout after {elapsed:.1f}s (limit: {request_timeout}s)")
             
         except Exception as e:
             elapsed = time.time() - start_time
@@ -666,9 +754,11 @@ class CustomLLMClient:
         elif messages is None and prompt is None:
             raise ValueError("Either 'prompt' or 'messages' must be provided")
         
-        # Call sync method directly - FastAPI will handle it in a thread pool automatically
-        # This avoids the overhead of asyncio.to_thread()
-        return self.generate_response_sync(messages, max_tokens, temperature)
+        # Run in thread pool to allow cancellation via asyncio
+        # This allows the async task to be cancelled even though requests.post() is blocking
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.generate_response_sync, messages, max_tokens, temperature)
     
     def _messages_to_prompt(self, messages: list) -> str:
         """Convert messages format to simple prompt text."""

@@ -437,6 +437,39 @@ async def start_discovery(background_tasks: BackgroundTasks):
     return {"status": "Discovery started", "session_id": id(current_discovery_session)}
 
 
+@app.post("/abort-discovery")
+async def abort_discovery():
+    """Abort the current discovery process."""
+    global current_discovery_session
+    
+    if not current_discovery_session or current_discovery_session.done():
+        return {"error": "No discovery in progress"}
+    
+    # Cancel the task
+    current_discovery_session.cancel()
+    
+    # Notify via WebSocket
+    message = {
+        "type": "error",
+        "data": {"message": "⚠️ Discovery aborted by user"},
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    disconnected = []
+    for connection in active_connections:
+        try:
+            await connection.send_text(json.dumps(message))
+        except:
+            disconnected.append(connection)
+    
+    # Remove disconnected clients
+    for conn in disconnected:
+        if conn in active_connections:
+            active_connections.remove(conn)
+    
+    return {"status": "Discovery aborted"}
+
+
 async def run_discovery():
     """Run the complete discovery process with WebSocket updates."""
     display = None
@@ -684,6 +717,16 @@ async def run_discovery():
             "timestamp": timestamp
         }
         
+    except asyncio.CancelledError:
+        # User aborted the discovery
+        print("Discovery cancelled by user")
+        if display:
+            await display.send_to_clients("warning", {
+                "message": "⚠️ Discovery aborted by user",
+                "type": "user_abort"
+            })
+        raise  # Re-raise to properly cancel the task
+    
     except Exception as e:
         import traceback
         error_message = f"Discovery failed: {str(e)}"
@@ -1867,6 +1910,13 @@ Return as JSON:
 Focus on ACTUAL findings from the reports with SPECIFIC details. If no findings in a category, return empty array.
 Return ONLY the JSON object."""
 
+    # Update progress - starting AI analysis
+    summarization_progress[timestamp] = {
+        "stage": "ai_analysis",
+        "progress": 65,
+        "message": "AI analyzing findings (this may take 1-3 minutes)..."
+    }
+    
     try:
         # Use 25% of configured max_tokens for findings extraction
         findings_max_tokens = min(4000, int(config.llm.max_tokens * 0.25))
@@ -1914,6 +1964,13 @@ Return ONLY the JSON object."""
             "optimization_findings": [],
             "compliance_findings": []
         }
+    
+    # Update progress - findings extracted
+    summarization_progress[timestamp] = {
+        "stage": "generating_queries",
+        "progress": 75,
+        "message": "AI generating SPL queries (1-2 minutes)..."
+    }
     
     # ===== AI-POWERED QUERY GENERATION =====
     # Generate SPL queries based on actual findings
@@ -2088,6 +2145,13 @@ Please provide:
 
 Keep it concise and actionable. Focus on business value and ROI. Base all statements on actual data from the reports above."""
     
+    # Update progress - creating summary
+    summarization_progress[timestamp] = {
+        "stage": "creating_summary",
+        "progress": 82,
+        "message": "AI creating executive summary (30-60 seconds)..."
+    }
+    
     try:
         # Use 15% of configured max_tokens for executive summary (concise output)
         summary_max_tokens = min(2000, int(config.llm.max_tokens * 0.15))
@@ -2102,8 +2166,8 @@ Keep it concise and actionable. Focus on business value and ROI. Base all statem
     # Update progress - Admin tasks generation
     summarization_progress[timestamp] = {
         "stage": "generating_tasks",
-        "progress": 85,
-        "message": "Creating admin tasks..."
+        "progress": 88,
+        "message": "AI generating admin tasks (1-2 minutes)..."
     }
     
     # ===== ADMIN TASK GENERATION =====
@@ -2187,6 +2251,13 @@ Generate 3-5 prioritized tasks. Keep each task concise but actionable. Return ON
         
         admin_tasks = json.loads(tasks_json)
         print(f"Generated {len(admin_tasks)} admin tasks")
+        
+        # Update progress - Tasks generated successfully
+        summarization_progress[timestamp] = {
+            "stage": "finalizing",
+            "progress": 93,
+            "message": "Finalizing summary..."
+        }
         
     except json.JSONDecodeError as e:
         print(f"Error parsing admin tasks JSON: {e}")
@@ -4292,6 +4363,10 @@ def get_frontend_html():
 
             const [connectionInfo, setConnectionInfo] = useState(null);
             
+            // Discovery timer state
+            const [discoveryStartTime, setDiscoveryStartTime] = useState(null);
+            const [elapsedTime, setElapsedTime] = useState(0);
+            
             // Summary modal state
             const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
             const [summaryData, setSummaryData] = useState(null);
@@ -4548,6 +4623,20 @@ def get_frontend_html():
                 };
             }, []);
             
+            // Timer effect - updates elapsed time every second when discovery is running
+            useEffect(() => {
+                if (discoveryStatus === 'running' && discoveryStartTime) {
+                    const interval = setInterval(() => {
+                        const elapsed = Math.floor((Date.now() - discoveryStartTime) / 1000);
+                        setElapsedTime(elapsed);
+                    }, 1000);
+                    
+                    return () => clearInterval(interval);
+                } else if (discoveryStatus !== 'running') {
+                    setElapsedTime(0);
+                }
+            }, [discoveryStatus, discoveryStartTime]);
+            
             const connectWebSocket = () => {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -4602,6 +4691,8 @@ def get_frontend_html():
                     case 'completion':
                         addMessage('completion', message.data);
                         setDiscoveryStatus('completed');
+                        setDiscoveryStartTime(null);
+                        setElapsedTime(0);
                         loadReports();
                         break;
                     case 'rate_limit':
@@ -4620,9 +4711,38 @@ def get_frontend_html():
             };
             
             const startDiscovery = async () => {
+                // Check if using local LLM by examining endpoint URL
+                // Local = localhost, 127.0.0.1, or credential name hints
+                const endpointUrl = config?.llm?.endpoint_url?.toLowerCase() || '';
+                const credentialName = config?.active_credential_name?.toLowerCase() || '';
+                
+                const isLocalLLM = endpointUrl.includes('localhost') ||
+                                   endpointUrl.includes('127.0.0.1') ||
+                                   endpointUrl.includes(':8000') ||  // Common vLLM port
+                                   endpointUrl.includes(':11434') || // Common Ollama port
+                                   credentialName.includes('local') ||
+                                   credentialName.includes('vllm') ||
+                                   credentialName.includes('ollama');
+                
+                if (isLocalLLM) {
+                    const confirmed = window.confirm(
+                        '⚠️ Local LLM Detected\\n\\n' +
+                        'Discovery with local LLMs can take 5-10 minutes or more depending on your hardware. ' +
+                        'You can abort the operation at any time using the "Abort" button.\\n\\n' +
+                        'For faster results, consider using OpenAI or Anthropic.\\n\\n' +
+                        'Continue with discovery?'
+                    );
+                    
+                    if (!confirmed) {
+                        return;
+                    }
+                }
+                
                 setDiscoveryStatus('starting');
                 setMessages([]);
                 setProgress({ percentage: 0, description: 'Initializing...' });
+                setDiscoveryStartTime(Date.now());
+                setElapsedTime(0);
                 
                 try {
                     const response = await fetch('/start-discovery', { method: 'POST' });
@@ -4631,13 +4751,46 @@ def get_frontend_html():
                     if (result.error) {
                         addMessage('error', { message: result.error });
                         setDiscoveryStatus('error');
+                        setDiscoveryStartTime(null);
                     } else {
                         setDiscoveryStatus('running');
                     }
                 } catch (error) {
                     addMessage('error', { message: `Failed to start discovery: ${error.message}` });
                     setDiscoveryStatus('error');
+                    setDiscoveryStartTime(null);
                 }
+            };
+            
+            const abortDiscovery = async () => {
+                const confirmed = window.confirm('Are you sure you want to abort the discovery process?');
+                
+                if (!confirmed) {
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/abort-discovery', { method: 'POST' });
+                    const result = await response.json();
+                    
+                    if (result.error) {
+                        addMessage('error', { message: result.error });
+                    } else {
+                        addMessage('warning', { message: '⚠️ Discovery aborted by user' });
+                        setDiscoveryStatus('idle');
+                        setDiscoveryStartTime(null);
+                        setElapsedTime(0);
+                    }
+                } catch (error) {
+                    addMessage('error', { message: `Failed to abort discovery: ${error.message}` });
+                }
+            };
+            
+            // Format elapsed time as MM:SS
+            const formatElapsedTime = (seconds) => {
+                const mins = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+                return `${mins}:${secs.toString().padStart(2, '0')}`;
             };
             
             const loadReports = async () => {
@@ -5658,6 +5811,33 @@ def get_frontend_html():
             
             // Summary modal functions
             const openSummaryModal = async (sessionId) => {
+                // Check if using local LLM by examining endpoint URL
+                // Local = localhost, 127.0.0.1, or credential name hints
+                const endpointUrl = config?.llm?.endpoint_url?.toLowerCase() || '';
+                const credentialName = config?.active_credential_name?.toLowerCase() || '';
+                
+                const isLocalLLM = endpointUrl.includes('localhost') ||
+                                   endpointUrl.includes('127.0.0.1') ||
+                                   endpointUrl.includes(':8000') ||  // Common vLLM port
+                                   endpointUrl.includes(':11434') || // Common Ollama port
+                                   credentialName.includes('local') ||
+                                   credentialName.includes('vllm') ||
+                                   credentialName.includes('ollama');
+                
+                if (isLocalLLM) {
+                    const confirmed = window.confirm(
+                        '⚠️ Local LLM Detected\\n\\n' +
+                        'AI-powered summarization with local LLMs can take 3-5 minutes or more. ' +
+                        'Progress updates will show estimated times for each stage.\\n\\n' +
+                        'For faster results, consider using OpenAI or Anthropic.\\n\\n' +
+                        'Continue with summarization?'
+                    );
+                    
+                    if (!confirmed) {
+                        return;
+                    }
+                }
+                
                 setCurrentSessionId(sessionId);
                 setIsSummaryModalOpen(true);
                 setIsLoadingSummary(true);
@@ -5930,10 +6110,13 @@ def get_frontend_html():
                                         }`}
                                     >
                                         {discoveryStatus === 'running' ? (
-                                            <>
-                                                <i className="fas fa-spinner fa-spin mr-2"></i>
-                                                Running...
-                                            </>
+                                            <div className="flex flex-col items-center">
+                                                <div className="flex items-center">
+                                                    <i className="fas fa-spinner fa-spin mr-2"></i>
+                                                    <span>Running...</span>
+                                                </div>
+                                                <span className="text-xs mt-0.5">{formatElapsedTime(elapsedTime)}</span>
+                                            </div>
                                         ) : (
                                             <>
                                                 <i className="fas fa-play mr-2"></i>
@@ -5941,6 +6124,16 @@ def get_frontend_html():
                                             </>
                                         )}
                                     </button>
+                                    {discoveryStatus === 'running' && (
+                                        <button
+                                            onClick={abortDiscovery}
+                                            className="ml-3 px-4 py-2 rounded-lg font-medium bg-red-600 hover:bg-red-700 text-white"
+                                            title="Abort Discovery"
+                                        >
+                                            <i className="fas fa-stop mr-2"></i>
+                                            Abort
+                                        </button>
+                                    )}
                                     <button
                                         onClick={openSettings}
                                         className="ml-3 px-4 py-2 rounded-lg font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-300"
