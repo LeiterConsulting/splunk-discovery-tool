@@ -3429,7 +3429,9 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 end = response.find('</TOOL_CALL>')
                 raw_json = response[start:end].strip()
                 
-                print(f"🔍 Attempting to parse tool call JSON: {raw_json[:200]}...")
+                print(f"🔍 Raw JSON length: {len(raw_json)} chars")
+                print(f"🔍 First 200 chars: {raw_json[:200]}")
+                print(f"🔍 Repr (shows hidden chars): {repr(raw_json[:300])}")
                 try:
                     tool_data = json.loads(raw_json)
                     tool_name = tool_data.get('tool')
