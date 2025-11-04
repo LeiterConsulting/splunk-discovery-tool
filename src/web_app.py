@@ -4149,9 +4149,48 @@ Based on your previous response, provide your next query NOW using the proper fo
                                 final_answer = next_response
                                 break
                         else:
-                            # Moderate quality, no tool call, no continuation intent - good enough
-                            print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                            final_answer = next_response
+                            # Moderate quality, no tool call, no continuation intent
+                            # Check if we have data and if response is user-facing
+                            if has_actionable_data:
+                                # We have data - check if response is internal reasoning
+                                is_internal = (len(next_response.strip()) < 100 or 
+                                              any(kw in next_response.lower() for kw in 
+                                                  ['iteration', 'i will', "i'll try", 'let me check', 'next step', 
+                                                   'i will adjust', 'i will refine', "i'll refine", 'i should']))
+                                
+                                if is_internal:
+                                    print(f"📝 [Iteration {iteration}] Moderate quality with data but internal reasoning - requesting final answer")
+                                    
+                                    final_prompt = f"""You successfully investigated the user's question: "{user_message}"
+
+ACCUMULATED FINDINGS:
+{insights_summary}
+
+Now provide a COMPLETE, USER-FACING answer that includes:
+1. Direct answer to their question with specific data/numbers
+2. Key findings and patterns you discovered  
+3. Any relevant context or recommendations
+
+Write as if speaking directly to the user (avoid phrases like "I investigated", "I found", "I will", etc.)."""
+                                    
+                                    conversation_history.append({"role": "system", "content": final_prompt})
+                                    
+                                    final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                    final_response = await llm_client.generate_response(
+                                        messages=conversation_history,
+                                        max_tokens=final_max_tokens,
+                                        temperature=config.llm.temperature
+                                    )
+                                    final_answer = final_response
+                                    print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
+                                else:
+                                    # Response is already user-facing
+                                    print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
+                                    final_answer = next_response
+                            else:
+                                # No data - accept response as-is
+                                print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
+                                final_answer = next_response
                             break
             
             # Return comprehensive response with status timeline
