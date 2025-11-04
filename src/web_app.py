@@ -3426,7 +3426,9 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', response, re.DOTALL)
             if tool_match:
                 try:
-                    tool_data = json.loads(tool_match.group(1))
+                    raw_json = tool_match.group(1)
+                    print(f"🔍 Attempting to parse tool call JSON: {raw_json[:200]}...")
+                    tool_data = json.loads(raw_json)
                     tool_name = tool_data.get('tool')
                     tool_args = tool_data.get('args', {})
                     
@@ -3444,6 +3446,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                     
                     debug_log(f"Extracted tool call - {tool_name} with args: {tool_args}", "query", tool_args)
                 except json.JSONDecodeError as e:
+                    print(f"❌ JSON Parse Error: {e}")
+                    print(f"❌ Raw JSON that failed: {raw_json if 'raw_json' in locals() else tool_match.group(1)}")
                     debug_log(f"Tool call JSON parse error: {e}", "error")
             
             # Extract SPL queries from code blocks
