@@ -45,23 +45,32 @@ def get_or_create_llm_client(config):
     if _cached_llm_client is not None and _cached_config_hash == config_hash:
         return _cached_llm_client
     
-    # Create new client and cache it (match original logic exactly)
-    if config.llm.provider.lower() == "custom endpoint" or config.llm.endpoint_url:
+    # Create new client based on provider type
+    # OpenAI gets native client (no health monitoring restrictions)
+    # Custom/other providers get CustomLLMClient (with health monitoring)
+    provider_lower = config.llm.provider.lower()
+    
+    if provider_lower == "openai":
+        # Native OpenAI client - no payload restrictions
+        _cached_llm_client = LLMClientFactory.create_client(
+            provider='openai',
+            api_key=config.llm.api_key,
+            model=config.llm.model
+        )
+        print(f"[LLM Cache] Created OpenAI client ({config.llm.model}) - no restrictions")
+    else:
+        # Custom endpoint - uses health monitoring and payload adaptation
+        if not config.llm.endpoint_url:
+            raise ValueError(f"Custom provider '{config.llm.provider}' requires endpoint_url")
         _cached_llm_client = LLMClientFactory.create_client(
             provider='custom',
             custom_endpoint=config.llm.endpoint_url,
             api_key=config.llm.api_key,
             model=config.llm.model
         )
-    else:
-        _cached_llm_client = LLMClientFactory.create_client(
-            provider='openai',
-            api_key=config.llm.api_key,
-            model=config.llm.model
-        )
+        print(f"[LLM Cache] Created custom client for {config.llm.provider} ({config.llm.model}) - health monitoring enabled")
     
     _cached_config_hash = config_hash
-    print(f"[LLM Cache] Created new client for {config.llm.provider} ({config.llm.model})")
     return _cached_llm_client
 
 
