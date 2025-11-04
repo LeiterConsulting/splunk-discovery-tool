@@ -3430,8 +3430,20 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 raw_json = response[start:end].strip()
                 
                 print(f"🔍 Raw JSON length: {len(raw_json)} chars")
-                print(f"🔍 First 200 chars: {raw_json[:200]}")
-                print(f"🔍 Repr (shows hidden chars): {repr(raw_json[:300])}")
+                print(f"🔍 Checking for smart quotes or Unicode issues...")
+                
+                # Check for problematic characters
+                has_smart_quotes = any(c in raw_json for c in ['"', '"', ''', '''])
+                if has_smart_quotes:
+                    print(f"⚠️ Found smart quotes! Replacing with regular quotes...")
+                    raw_json = raw_json.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'")
+                
+                # Check for other Unicode quote characters
+                for i, c in enumerate(raw_json):
+                    if c in ['"', '"', ''', ''', '`', '´']:
+                        print(f"  Position {i}: {repr(c)} (Unicode {ord(c)})")
+                
+                print(f"🔍 Repr: {repr(raw_json[:200])}")
                 try:
                     tool_data = json.loads(raw_json)
                     tool_name = tool_data.get('tool')
