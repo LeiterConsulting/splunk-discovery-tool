@@ -3846,7 +3846,9 @@ OPTIONS:
 2. 🔍 Execute additional query to enrich the answer
 3. 📊 Aggregate/analyze these results with another query
 
-Respond with final answer WITHOUT tool calls if complete, OR <TOOL_CALL>...</TOOL_CALL> if more data needed."""
+⚠️ CRITICAL: If you want to investigate further, you MUST include a <TOOL_CALL> tag in your response.
+Do NOT say "I will execute" or "Let me try" without actually providing the <TOOL_CALL>.
+Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-between statements."""
                 
                 else:  # Success but no data
                     system_feedback = f"""⚠️ ITERATION {iteration} RESULT: NO DATA
@@ -3864,8 +3866,9 @@ STRATEGIC OPTIONS:
 
 Current user intent understanding: "{user_intent}"
 
-If you want to investigate further, use <TOOL_CALL>...</TOOL_CALL> with your strategy.
-If "no data" IS the answer, provide final response WITHOUT tool calls."""
+⚠️ CRITICAL: If you want to investigate further, you MUST include a <TOOL_CALL> tag in your response.
+Do NOT say "I will execute" or "Let me try" without actually providing the <TOOL_CALL>.
+Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-between statements."""
                 
                 conversation_history.append({"role": "system", "content": system_feedback})
                 
