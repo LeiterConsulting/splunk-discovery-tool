@@ -2038,7 +2038,7 @@ Return ONLY the JSON object."""
         
         # Parse JSON response
         import re
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', findings_response, re.DOTALL)
+        json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', findings_response, re.DOTALL)
         if json_match:
             findings_json = json_match.group(1)
         else:
@@ -2605,7 +2605,7 @@ Return ONLY the JSON object, no other text."""
             
             # Parse JSON response
             import re
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', analysis_response, re.DOTALL)
+            json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', analysis_response, re.DOTALL)
             if json_match:
                 analysis_json = json_match.group(1)
             else:
@@ -2759,7 +2759,7 @@ Return ONLY the JSON object."""
             
             # Parse JSON response
             import re
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', remediation_response, re.DOTALL)
+            json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', remediation_response, re.DOTALL)
             if json_match:
                 remediation_json = json_match.group(1)
             else:
@@ -3423,7 +3423,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                     debug_log(f"Error loading requested context: {e}", "error")
             
             # Extract tool call using <TOOL_CALL> tags
-            tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', response, re.DOTALL)
+            # Use greedy matching to get the full JSON (including nested braces)
+            tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', response, re.DOTALL)
             if tool_match:
                 try:
                     raw_json = tool_match.group(1)
@@ -3896,7 +3897,7 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
                 )
                 
                 # Parse LLM's response for tool call
-                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                 
                 # Assess answer quality (independent of whether LLM wants to continue)
                 has_actionable_data = result_summary.get('row_count', 0) > 0 and 'No data' not in str(result_summary.get('findings', []))
@@ -3970,7 +3971,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                             if '<TOOL_CALL>' in next_response:
                                 print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - parsing and continuing")
                                 # Extract and execute the tool call
-                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                 if next_tool_match:
                                     try:
                                         tool_data = json.loads(next_tool_match.group(1))
@@ -4000,7 +4001,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                             # Double-check for tool calls that regex might have missed
                             if '<TOOL_CALL>' in next_response:
                                 print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - parsing and continuing")
-                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                 if next_tool_match:
                                     try:
                                         tool_data = json.loads(next_tool_match.group(1))
@@ -4077,7 +4078,7 @@ Do not explain what you will do - DO IT with a tool call."""
                             )
                             
                             # Check if retry has proper format
-                            retry_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', retry_response, re.DOTALL)
+                            retry_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', retry_response, re.DOTALL)
                             if retry_tool_match:
                                 print(f"✅ Retry successful - proper tool call format obtained")
                                 next_response = retry_response
@@ -4176,7 +4177,7 @@ Based on your previous response, provide your next query NOW using the proper fo
                                 temperature=config.llm.temperature * 0.7
                             )
                             
-                            retry_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', retry_response, re.DOTALL)
+                            retry_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', retry_response, re.DOTALL)
                             if retry_tool_match:
                                 print(f"✅ Retry successful - proper tool call format obtained")
                                 next_response = retry_response
@@ -4242,7 +4243,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                     # Response is already user-facing - but check for tool calls
                                     if '<TOOL_CALL>' in next_response:
                                         print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - parsing and continuing")
-                                        next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                        next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                         if next_tool_match:
                                             try:
                                                 tool_data = json.loads(next_tool_match.group(1))
@@ -4267,7 +4268,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                 # No data - accept response as-is, but check for tool calls
                                 if '<TOOL_CALL>' in next_response:
                                     print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - parsing and continuing")
-                                    next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                                    next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                     if next_tool_match:
                                         try:
                                             tool_data = json.loads(next_tool_match.group(1))
@@ -9512,3 +9513,4 @@ if __name__ == "__main__":
         log_level="info",
         reload=False  # Set to True for development
     )
+
