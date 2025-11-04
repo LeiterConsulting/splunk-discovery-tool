@@ -3350,19 +3350,26 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             # Bare minimum for greetings - just the user message
             messages = [{"role": "user", "content": user_message}]
         else:
-            # Full context for real queries
-            messages = [{"role": "system", "content": system_prompt}]
-            
-            # Add recent history for context (use session setting)
-            context_limit = chat_session_settings["context_history"]
-            for msg in history[-context_limit:] if context_limit > 0 else []:
-                if msg.get('type') == 'user':
-                    messages.append({"role": "user", "content": msg['content']})
-                elif msg.get('type') == 'assistant':
-                    messages.append({"role": "assistant", "content": msg['content']})
-            
-            # Add current user message
-            messages.append({"role": "user", "content": user_message})
+            # Check if history is already in server format (has 'role' key) or UI format (has 'type' key)
+            if history and len(history) > 0 and 'role' in history[0]:
+                # Server conversation history - use directly (already has system messages and reasoning)
+                messages = history.copy()
+                # Add current user message
+                messages.append({"role": "user", "content": user_message})
+            else:
+                # UI history - needs conversion and system prompt
+                messages = [{"role": "system", "content": system_prompt}]
+                
+                # Add recent history for context (use session setting)
+                context_limit = chat_session_settings["context_history"]
+                for msg in history[-context_limit:] if context_limit > 0 else []:
+                    if msg.get('type') == 'user':
+                        messages.append({"role": "user", "content": msg['content']})
+                    elif msg.get('type') == 'assistant':
+                        messages.append({"role": "assistant", "content": msg['content']})
+                
+                # Add current user message
+                messages.append({"role": "user", "content": user_message})
         
         # Get LLM response - use session max_tokens setting (with 15% limit for initial chat)
         chat_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
@@ -4103,6 +4110,7 @@ Based on your previous response, provide your next query NOW using the proper fo
                             break
             
             # Return comprehensive response with status timeline
+            # Include conversation_history so follow-up queries maintain context
             return {
                 "response": final_answer or "Investigation complete. See findings above.",
                 "initial_response": user_message,
@@ -4120,6 +4128,7 @@ Based on your previous response, provide your next query NOW using the proper fo
                     } 
                     for i, tc in enumerate(all_tool_calls, 1)
                 ],
+                "conversation_history": conversation_history,  # FIX: Return full conversation for follow-up context
                 "discovery_age_warning": discovery_age_warning
             }
         
@@ -4470,6 +4479,7 @@ def get_frontend_html():
             const [chatStatus, setChatStatus] = useState(''); // Real-time status during investigation
             const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
             const [chatSettings, setChatSettings] = useState(null); // Loaded from API
+            const [serverConversationHistory, setServerConversationHistory] = useState(null); // Server's full conversation with reasoning
 
             const [connectionInfo, setConnectionInfo] = useState(null);
             
@@ -5792,12 +5802,19 @@ def get_frontend_html():
                 
                 try {
                     // Use streaming endpoint for real-time status updates
+                    // If we have server conversation history (includes reasoning), use that instead of UI messages
+                    const historyToSend = serverConversationHistory || 
+                                         chatMessages.slice(-10).map(msg => ({
+                                             type: msg.type,
+                                             content: msg.content
+                                         }));
+                    
                     const response = await fetch('/chat/stream', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
                             message: userMessage,
-                            history: chatMessages.slice(-10) // Send last 10 messages for context
+                            history: historyToSend
                         })
                     });
                     
@@ -5860,6 +5877,11 @@ def get_frontend_html():
                                             iterations: result.iterations,
                                             execution_time: result.execution_time
                                         });
+                                        
+                                        // Store server's conversation history for follow-up queries
+                                        if (result.conversation_history) {
+                                            setServerConversationHistory(result.conversation_history);
+                                        }
                                         
                                         setChatMessages(prev => [...prev, ...messages]);
                                     }
@@ -6619,7 +6641,10 @@ def get_frontend_html():
                                             <i className="fas fa-cog"></i>
                                         </button>
                                         <button
-                                            onClick={() => setChatMessages([])}
+                                            onClick={() => {
+                                                setChatMessages([]);
+                                                setServerConversationHistory(null);
+                                            }}
                                             className="px-3 py-1 text-sm text-gray-600 hover:text-gray-800"
                                             title="Clear chat"
                                         >
