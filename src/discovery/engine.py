@@ -66,10 +66,12 @@ class DiscoveryEngine:
     - Integration with LLM for intelligent insights
     """
     
-    def __init__(self, mcp_url: str, mcp_token: str, llm_client):
+    def __init__(self, mcp_url: str, mcp_token: str, llm_client, verify_ssl: bool = False, ca_bundle_path: Optional[str] = None):
         self.mcp_url = mcp_url
         self.mcp_token = mcp_token
         self.llm_client = llm_client
+        self.verify_ssl = verify_ssl
+        self.ca_bundle_path = ca_bundle_path
         self.discovery_results: List[DiscoveryResult] = []
         self.environment_overview: Optional[EnvironmentOverview] = None
         self.discovery_data: Dict[str, Any] = {}
@@ -951,13 +953,22 @@ class DiscoveryEngine:
         }
         
         try:
+            # Prepare SSL context based on configuration
+            ssl_context = None
+            if self.verify_ssl and self.ca_bundle_path:
+                import ssl
+                ssl_context = ssl.create_default_context(cafile=self.ca_bundle_path)
+            elif not self.verify_ssl:
+                ssl_context = False  # Disable SSL verification
+            # If verify_ssl is True but no ca_bundle, use default SSL context (None)
+            
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.mcp_url,
                     headers=headers,
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=30),
-                    ssl=False  # Disable SSL verification for self-signed certificates
+                    ssl=ssl_context
                 ) as response:
                     if response.status == 200:
                         result = await response.json()

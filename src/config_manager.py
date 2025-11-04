@@ -30,6 +30,16 @@ class LLMCredential:
     temperature: float = 0.7
 
 @dataclass
+class MCPCredential:
+    """Saved MCP server configuration"""
+    name: str
+    url: str
+    token: str
+    verify_ssl: bool = False
+    ca_bundle_path: Optional[str] = None
+    description: Optional[str] = None  # User-friendly description
+
+@dataclass
 class LLMConfig:
     """LLM configuration (active settings)"""
     provider: str = "openai"  # openai, custom
@@ -61,12 +71,16 @@ class AppConfig:
     llm: LLMConfig
     server: ServerConfig
     saved_credentials: Dict[str, LLMCredential] = None  # name -> credential mapping
+    saved_mcp_configs: Dict[str, MCPCredential] = None  # name -> MCP config mapping
     active_credential_name: Optional[str] = None  # Currently active credential
+    active_mcp_config_name: Optional[str] = None  # Currently active MCP config
     version: str = "1.0.0"
     
     def __post_init__(self):
         if self.saved_credentials is None:
             self.saved_credentials = {}
+        if self.saved_mcp_configs is None:
+            self.saved_mcp_configs = {}
 
 class ConfigManager:
     """Manages encrypted configuration storage"""
@@ -143,11 +157,21 @@ class ConfigManager:
                 for name, cred_data in saved_creds_dict.items()
             }
             
+            # Reconstruct saved MCP configs
+            saved_mcp_dict = config_dict.get('saved_mcp_configs', {})
+            saved_mcp_configs = {
+                name: MCPCredential(**mcp_data)
+                for name, mcp_data in saved_mcp_dict.items()
+            }
+            
             return AppConfig(
                 mcp=mcp,
                 llm=llm,
                 server=server,
                 saved_credentials=saved_credentials,
+                saved_mcp_configs=saved_mcp_configs,
+                active_credential_name=config_dict.get('active_credential_name'),
+                active_mcp_config_name=config_dict.get('active_mcp_config_name'),
                 version=config_dict.get('version', '1.0.0')
             )
         except Exception as e:
@@ -163,11 +187,19 @@ class ConfigManager:
                 for name, cred in config.saved_credentials.items()
             }
             
+            saved_mcp_dict = {
+                name: asdict(mcp_config)
+                for name, mcp_config in config.saved_mcp_configs.items()
+            }
+            
             config_dict = {
                 'mcp': asdict(config.mcp),
                 'llm': asdict(config.llm),
                 'server': asdict(config.server),
                 'saved_credentials': saved_creds_dict,
+                'saved_mcp_configs': saved_mcp_dict,
+                'active_credential_name': config.active_credential_name,
+                'active_mcp_config_name': config.active_mcp_config_name,
                 'version': config.version
             }
             
@@ -282,6 +314,18 @@ class ConfigManager:
                 'temperature': cred.temperature
             }
         
+        # Export saved MCP configs with masked tokens
+        safe_mcp_configs = {}
+        for name, mcp_config in config.saved_mcp_configs.items():
+            safe_mcp_configs[name] = {
+                'name': mcp_config.name,
+                'url': mcp_config.url,
+                'token': '***' if mcp_config.token else '',
+                'verify_ssl': mcp_config.verify_ssl,
+                'ca_bundle_path': mcp_config.ca_bundle_path,
+                'description': mcp_config.description
+            }
+        
         return {
             'mcp': {
                 'url': config.mcp.url,
@@ -298,7 +342,9 @@ class ConfigManager:
                 'temperature': config.llm.temperature
             },
             'saved_credentials': safe_creds,
+            'saved_mcp_configs': safe_mcp_configs,
             'active_credential_name': config.active_credential_name,
+            'active_mcp_config_name': config.active_mcp_config_name,
             'server': {
                 'port': config.server.port,
                 'host': config.server.host,
@@ -307,3 +353,49 @@ class ConfigManager:
             },
             'version': config.version
         }
+    
+    # MCP Configuration Vault Management
+    def save_mcp_config(self, name: str, url: str, token: str, 
+                       verify_ssl: bool = False, ca_bundle_path: Optional[str] = None,
+                       description: Optional[str] = None) -> bool:
+        """Save a named MCP configuration"""
+        mcp_config = MCPCredential(
+            name=name,
+            url=url,
+            token=token,
+            verify_ssl=verify_ssl,
+            ca_bundle_path=ca_bundle_path,
+            description=description
+        )
+        self._config.saved_mcp_configs[name] = mcp_config
+        return self.save(self._config)
+    
+    def get_mcp_config(self, name: str) -> Optional[MCPCredential]:
+        """Get a saved MCP configuration by name"""
+        return self._config.saved_mcp_configs.get(name)
+    
+    def list_mcp_configs(self) -> Dict[str, MCPCredential]:
+        """List all saved MCP configurations"""
+        return self._config.saved_mcp_configs.copy()
+    
+    def delete_mcp_config(self, name: str) -> bool:
+        """Delete a saved MCP configuration"""
+        if name in self._config.saved_mcp_configs:
+            del self._config.saved_mcp_configs[name]
+            # Clear active config if it's the one being deleted
+            if self._config.active_mcp_config_name == name:
+                self._config.active_mcp_config_name = None
+            return self.save(self._config)
+        return False
+    
+    def load_mcp_config(self, name: str) -> bool:
+        """Load a saved MCP configuration into active MCP config"""
+        mcp_config = self.get_mcp_config(name)
+        if mcp_config:
+            self._config.mcp.url = mcp_config.url
+            self._config.mcp.token = mcp_config.token
+            self._config.mcp.verify_ssl = mcp_config.verify_ssl
+            self._config.mcp.ca_bundle_path = mcp_config.ca_bundle_path
+            self._config.active_mcp_config_name = name  # Track active config
+            return self.save(self._config)
+        return False

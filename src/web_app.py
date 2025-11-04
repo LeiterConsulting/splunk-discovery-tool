@@ -447,7 +447,9 @@ async def run_discovery():
         discovery_engine = DiscoveryEngine(
             mcp_url=config.mcp.url,
             mcp_token=config.mcp.token,
-            llm_client=llm_client
+            llm_client=llm_client,
+            verify_ssl=config.mcp.verify_ssl,
+            ca_bundle_path=config.mcp.ca_bundle_path
         )
         display.success("✅ Discovery engine initialized")
         
@@ -976,6 +978,92 @@ async def load_credential(name: str):
         }
     else:
         raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
+
+# ==================== MCP Configuration Vault API ====================
+
+class MCPConfigCreate(BaseModel):
+    """Request model for creating/updating an MCP configuration"""
+    name: str
+    url: str
+    token: str
+    verify_ssl: bool = False
+    ca_bundle_path: Optional[str] = None
+    description: Optional[str] = None
+
+@app.get("/api/mcp-configs")
+async def list_mcp_configs():
+    """Get all saved MCP configurations (with masked tokens)"""
+    mcp_configs = config_manager.list_mcp_configs()
+    return {
+        name: {
+            'name': mcp_config.name,
+            'url': mcp_config.url,
+            'token': '***' if mcp_config.token else '',
+            'verify_ssl': mcp_config.verify_ssl,
+            'ca_bundle_path': mcp_config.ca_bundle_path,
+            'description': mcp_config.description
+        }
+        for name, mcp_config in mcp_configs.items()
+    }
+
+@app.post("/api/mcp-configs")
+async def save_mcp_config(mcp_config: MCPConfigCreate):
+    """Save a new MCP configuration"""
+    try:
+        success = config_manager.save_mcp_config(
+            name=mcp_config.name,
+            url=mcp_config.url,
+            token=mcp_config.token,
+            verify_ssl=mcp_config.verify_ssl,
+            ca_bundle_path=mcp_config.ca_bundle_path,
+            description=mcp_config.description
+        )
+        if success:
+            return {"status": "success", "message": f"MCP configuration '{mcp_config.name}' saved"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to save MCP configuration")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/mcp-configs/{name}")
+async def get_mcp_config(name: str):
+    """Get a specific MCP configuration (with masked token)"""
+    mcp_config = config_manager.get_mcp_config(name)
+    if not mcp_config:
+        raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
+    
+    return {
+        'name': mcp_config.name,
+        'url': mcp_config.url,
+        'token': '***' if mcp_config.token else '',
+        'verify_ssl': mcp_config.verify_ssl,
+        'ca_bundle_path': mcp_config.ca_bundle_path,
+        'description': mcp_config.description
+    }
+
+@app.delete("/api/mcp-configs/{name}")
+async def delete_mcp_config(name: str):
+    """Delete a saved MCP configuration"""
+    success = config_manager.delete_mcp_config(name)
+    if success:
+        return {"status": "success", "message": f"MCP configuration '{name}' deleted"}
+    else:
+        raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
+
+@app.post("/api/mcp-configs/{name}/load")
+async def load_mcp_config(name: str):
+    """Load a saved MCP configuration into active configuration"""
+    success = config_manager.load_mcp_config(name)
+    if success:
+        # Reload config
+        config_manager._config = config_manager.load()
+        return {
+            "status": "success", 
+            "message": f"MCP configuration '{name}' loaded",
+            "config": config_manager.export_safe()
+        }
+    else:
+        raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
 
 @app.post("/api/llm/list-models")
 async def list_models(request: Request):
@@ -2540,6 +2628,55 @@ async def chat_with_splunk_stream(request: dict):
     return StreamingResponse(generate_sse(), media_type="text/event-stream")
 
 
+def load_latest_discovery_insights():
+    """Load key insights from the latest discovery reports for agent context."""
+    try:
+        output_dir = Path("output")
+        if not output_dir.exists():
+            return None
+        
+        # Find latest executive summary
+        exec_summaries = list(output_dir.glob("executive_summary_*.md"))
+        if not exec_summaries:
+            return None
+        
+        latest_summary = max(exec_summaries, key=lambda p: p.stat().st_mtime)
+        
+        # Read first 2000 chars of summary for key findings
+        summary_text = latest_summary.read_text(encoding='utf-8')[:2000]
+        
+        # Also check for AI summary JSON for structured insights
+        timestamp = latest_summary.stem.split('_')[-1]
+        ai_summary_path = output_dir / f"ai_summary_{timestamp}.json"
+        
+        structured_insights = None
+        if ai_summary_path.exists():
+            try:
+                ai_data = json.loads(ai_summary_path.read_text(encoding='utf-8'))
+                structured_insights = {
+                    'key_findings': ai_data.get('key_findings', [])[:5],
+                    'recommendations': ai_data.get('recommendations', [])[:5],
+                    'data_patterns': ai_data.get('data_patterns', {})
+                }
+            except:
+                pass
+        
+        # Get file age
+        import time as time_module
+        age_seconds = time_module.time() - latest_summary.stat().st_mtime
+        age_days = int(age_seconds / 86400)
+        
+        return {
+            'summary_text': summary_text,
+            'structured': structured_insights,
+            'age_days': age_days,
+            'timestamp': timestamp
+        }
+    except Exception as e:
+        print(f"Error loading discovery insights: {e}")
+        return None
+
+
 async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue):
     """Process chat request and push status updates to queue."""
     try:
@@ -2624,6 +2761,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 query_lower = user_message.lower()
                 simple_greetings = any(word in query_lower for word in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'bye'])
                 
+                # Check if query needs discovery insights
+                needs_insights = any(keyword in query_lower for keyword in [
+                    'summary', 'overview', 'recommend', 'best practice', 'optimization',
+                    'use case', 'compliance', 'security', 'improve', 'assess'
+                ])
+                
                 # Get overview for all custom LLM requests (lightweight, fast)
                 overview = metadata.get('overview', {})
                 
@@ -2643,6 +2786,20 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
 - Version: {overview.get('splunk_version', 'unknown')}
 
 For detailed information, use tool calls to query Splunk directly."""
+                
+                # Load discovery insights if needed for strategic questions
+                if needs_insights:
+                    insights = load_latest_discovery_insights()
+                    if insights:
+                        discovery_context += f"\n\n📊 DISCOVERY INSIGHTS (from {insights['age_days']} days ago):\n"
+                        if insights.get('structured') and insights['structured'].get('key_findings'):
+                            discovery_context += "\nKey Findings:\n"
+                            for finding in insights['structured']['key_findings'][:3]:
+                                discovery_context += f"- {finding}\n"
+                        if insights.get('structured') and insights['structured'].get('recommendations'):
+                            discovery_context += "\nRecommendations:\n"
+                            for rec in insights['structured']['recommendations'][:3]:
+                                discovery_context += f"- {rec}\n"
                 
 
                 
@@ -2667,10 +2824,32 @@ For detailed information, use tool calls to query Splunk directly."""
 Tool format: <TOOL_CALL>{{"tool": "run_splunk_query", "args": {{"query": "YOUR_SPL_HERE"}}}}</TOOL_CALL>"""
         else:
             # Full agentic prompt for OpenAI (larger context window, better instruction following)
-            system_prompt = f"""You are the world's greatest Splunk administrator - an expert with deep knowledge and autonomous problem-solving abilities.
+            system_prompt = f"""You are an ELITE Splunk expert with 20+ years of experience across:
+- 🛡️ Cybersecurity (threat hunting, incident response, forensics)
+- 🌐 Networking (traffic analysis, firewall logs, network monitoring)
+- 🖥️ System Administration (Windows/Linux logs, performance monitoring)
+- 🔧 IT Operations (infrastructure monitoring, capacity planning)
+- 🚀 DevOps (CI/CD monitoring, application performance)
+- 💾 Database Administration (query optimization, audit logging)
+- ✅ Compliance & Auditing (PCI-DSS, HIPAA, SOX, GDPR)
 
 🌍 ENVIRONMENT CONTEXT:
 {discovery_context}
+{discovery_age_warning if 'discovery_age_warning' in locals() else ''}
+
+📊 DISCOVERY DATA AVAILABLE:
+Latest discovery reports are available in the output/ folder with comprehensive insights:
+- Executive Summary: High-level findings and recommendations
+- Detailed Discovery: Complete environment inventory
+- Data Classification: Data sensitivity and retention analysis
+- Implementation Guide: Best practices and optimization tips
+- Use Case Suggestions: Security, compliance, and ops recommendations
+
+💡 WHEN TO REFERENCE DISCOVERY DATA:
+- User asks about "overall environment", "summary", "recommendations"
+- Query returns insufficient data - check discovery for historical context
+- Need to understand data patterns, retention, or volume trends
+- Questions about best practices, optimization, or use cases
 
 🎯 YOUR SUPERPOWERS:
 You are an AUTONOMOUS AGENT with the ability to:
@@ -2727,13 +2906,43 @@ Always use this exact format for tool calls:
 
 I'm checking the top 10 event codes in the wineventlog index from the last 24 hours.
 
-💡 EXPERT BEHAVIORS:
-1. **Be Proactive**: Don't just answer - provide insights, context, and recommendations
-2. **Think Holistically**: Consider security, performance, compliance angles
-3. **Explain Clearly**: Translate technical results into business value
-4. **Show Your Work**: Let users see your reasoning process
-5. **Iterate Intelligently**: Use up to 5 query iterations to thoroughly answer questions
-6. **Leverage Context**: Use the discovery data above to inform your queries
+💡 EXPERT BEHAVIORS - BE THE SPLUNK GOD:
+
+**1. Think Like a Cybersecurity Expert:**
+- Identify security risks, anomalies, and indicators of compromise
+- Suggest correlation searches and threat hunting queries
+- Recommend security use cases (failed logins, privilege escalation, data exfiltration)
+
+**2. Think Like a Network Engineer:**
+- Analyze traffic patterns, bandwidth usage, and network performance
+- Identify network bottlenecks and connectivity issues
+- Suggest monitoring for DNS, firewall, and VPN logs
+
+**3. Think Like a System Administrator:**
+- Monitor system health, resource utilization, and errors
+- Identify performance degradation and capacity issues
+- Recommend alerting for critical system events
+
+**4. Think Like a Compliance Officer:**
+- Identify audit requirements and data retention policies
+- Suggest searches for compliance reporting (PCI-DSS, HIPAA, SOX)
+- Recommend data classification and access controls
+
+**5. Think Like a Data Scientist:**
+- Provide statistical analysis and trend identification
+- Suggest correlations and predictive insights
+- Visualize data patterns and anomalies
+
+**6. Be Proactive & Educate:**
+- Don't just answer - teach WHY and provide context
+- Suggest related investigations users should consider
+- Recommend best practices and optimization opportunities
+- Warn about potential security/performance issues you notice
+
+**7. Leverage Intelligence:**
+- Reference discovery insights for strategic recommendations
+- Cross-reference multiple data sources for complete picture
+- If discovery data is stale (>7 days), recommend re-running discovery
 
 📊 RESPONSE PATTERNS:
 
@@ -2974,10 +3183,32 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                             summary['findings'].append("⚠️ No results field found in response")
                     
                     elif tool_name in ['get_indexes', 'get_metadata']:
+                        # Check parsed results first, then fall back to direct structure
+                        results_array = None
                         if actual_results and 'results' in actual_results:
-                            summary['findings'].append(f"Found {len(actual_results['results'])} items")
+                            results_array = actual_results['results']
                         elif 'results' in result:
-                            summary['findings'].append(f"Found {len(result['results'])} items")
+                            results_array = result['results']
+                        
+                        if results_array is not None:
+                            result_count = len(results_array)
+                            summary['row_count'] = result_count
+                            summary['findings'].append(f"Found {result_count} items")
+                            
+                            if result_count > 0:
+                                # Store actual results for LLM context
+                                summary['actual_results'] = results_array
+                                
+                                # Extract sample fields from first item
+                                sample = results_array[0] if results_array else {}
+                                if isinstance(sample, dict):
+                                    summary['sample_fields'] = list(sample.keys())
+                                    summary['findings'].append(f"Fields: {', '.join(list(sample.keys())[:5])}")
+                            else:
+                                summary['findings'].append("❌ No items found")
+                        else:
+                            summary['row_count'] = 0
+                            summary['findings'].append("⚠️ No results field found in response")
                 
                 return summary
             
@@ -3091,6 +3322,53 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 
                 mcp_result = await execute_mcp_tool_call(tool_call, config)
                 
+                # Check for fatal errors - stop immediately, don't retry
+                if isinstance(mcp_result, dict) and mcp_result.get('fatal'):
+                    error_detail = mcp_result.get('detail', 'Fatal error occurred')
+                    status_code = mcp_result.get('status_code', 0)
+                    print(f"🛑 FATAL ERROR - Stopping discovery")
+                    print(f"   Status {status_code}: {error_detail}")
+                    
+                    # Provide helpful error messages based on status code
+                    if status_code == 401:
+                        error_type = "Authentication Failed"
+                        suggestions = """**Please check:**
+1. Your MCP Token is correct in the settings
+2. The token has not expired
+3. The token has proper permissions to access the Splunk instance"""
+                    elif status_code == 403:
+                        error_type = "Access Forbidden"
+                        suggestions = """**Please check:**
+1. Your MCP Token has proper permissions
+2. The Splunk user associated with the token has access to the required resources
+3. Network/firewall rules allow access"""
+                    elif status_code == 404:
+                        error_type = "MCP Endpoint Not Found"
+                        suggestions = """**Please check:**
+1. The MCP URL is correct in the settings
+2. The Splunk MCP server is running
+3. The endpoint path is correct (typically /services/mcp)"""
+                    else:
+                        error_type = "Connection Error"
+                        suggestions = """**Please check:**
+1. The MCP server is accessible
+2. Network connectivity is working
+3. Firewall/proxy settings allow the connection"""
+                    
+                    final_answer = f"""❌ **{error_type}**
+
+The Splunk MCP server returned a {status_code} error:
+
+```
+{error_detail}
+```
+
+{suggestions}
+
+Discovery has been stopped to avoid repeated failed attempts."""
+                    
+                    break  # Exit the main loop immediately
+                
                 # Get relevant context after tool execution to help LLM interpret results
                 try:
                     ctx_mgr = get_context_manager()
@@ -3134,7 +3412,13 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 
                 # Determine result status
                 has_error = result_summary.get('type') == 'error'
-                has_data = any('results returned' in f and '0 results' not in f for f in result_summary.get('findings', []))
+                # Check for data in findings (works for both queries and metadata tools)
+                findings = result_summary.get('findings', [])
+                has_data = any(
+                    ('results returned' in f and '0 results' not in f) or 
+                    ('Found' in f and 'items' in f and '0 items' not in f)
+                    for f in findings
+                ) or (result_summary.get('row_count', 0) > 0)
                 
                 # Add assistant's reasoning to conversation
                 conversation_history.append({"role": "assistant", "content": clean_response})
@@ -3168,10 +3452,20 @@ If you need to clarify the user's intent, ask a clarifying question WITHOUT tool
                 
                 elif has_data:
                     # Build compact result context using properly parsed results from summary
-                    sample_data = result_summary.get('actual_results', [])[:2] if result_summary.get('actual_results') else []
+                    actual_results = result_summary.get('actual_results', [])
+                    
+                    # For metadata queries (indexes, sourcetypes), send full data
+                    # For large query results, send sample only
+                    if tool_name in ['get_indexes', 'get_metadata']:
+                        sample_data = actual_results  # Send all metadata
+                        data_label = "Complete Data"
+                    else:
+                        sample_data = actual_results[:2]  # Sample for large results
+                        data_label = "Sample Data (first 2 results)"
+                    
                     result_snippet = {
                         "summary": result_summary,
-                        "sample_data": sample_data
+                        "data": sample_data
                     }
                     
                     system_feedback = f"""✅ ITERATION {iteration} RESULT: SUCCESS - DATA FOUND
@@ -3181,8 +3475,8 @@ If you need to clarify the user's intent, ask a clarifying question WITHOUT tool
 ACCUMULATED INSIGHTS:
 {insights_summary}{context_section}
 
-Sample Data (first 2 results):
-{json.dumps(result_snippet.get('sample_data'), indent=2)[:800]}
+{data_label}:
+{json.dumps(result_snippet.get('data'), indent=2)[:2000]}
 
 QUALITY CHECK:
 - Does this fully answer "{user_intent}"?
@@ -3573,7 +3867,17 @@ async def execute_mcp_tool_call(tool_call, config):
             else:
                 error_detail = response.text[:200] if response.text else "No error details"
                 print(f"❌ MCP ERROR: Status {response.status_code} - {error_detail}")
-                return {"error": f"MCP call failed: {response.status_code}", "detail": error_detail}
+                
+                # Mark fatal errors that won't be fixed by retrying
+                fatal_statuses = {401, 403, 404}  # Auth, forbidden, not found
+                is_fatal = response.status_code in fatal_statuses
+                
+                return {
+                    "error": f"MCP call failed: {response.status_code}", 
+                    "detail": error_detail,
+                    "status_code": response.status_code,
+                    "fatal": is_fatal  # Signal that retrying won't help
+                }
                 
     except httpx.HTTPError as e:
         print(f"❌ HTTP ERROR: {type(e).__name__} - {str(e)}")
@@ -3792,6 +4096,15 @@ def get_frontend_html():
             const [availableModels, setAvailableModels] = useState([]); // Available models from API
             const [isLoadingModels, setIsLoadingModels] = useState(false); // Loading state for model fetch
             const [selectedModel, setSelectedModel] = useState(''); // Currently selected model
+            
+            // MCP Configuration Vault State
+            const [savedMCPConfigs, setSavedMCPConfigs] = useState({});
+            const [loadedMCPConfigName, setLoadedMCPConfigName] = useState(null); // Track which MCP config is currently loaded
+            const [isMCPSaveModalOpen, setIsMCPSaveModalOpen] = useState(false); // MCP save modal visibility
+            const [mcpConfigName, setMCPConfigName] = useState(''); // MCP config name for saving
+            const [mcpConfigDescription, setMCPConfigDescription] = useState(''); // MCP config description
+            const [showMCPConfigForm, setShowMCPConfigForm] = useState(false); // Show/hide MCP configuration form
+            const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState('Enter token'); // Track token placeholder state
             
             // Function to track when settings have been modified
             const handleSettingsChange = () => {
@@ -4132,8 +4445,11 @@ def get_frontend_html():
             const openSettings = async () => {
                 await loadConfig();
                 setIsSettingsOpen(true);
-                // Load credentials after modal opens
-                setTimeout(() => loadCredentials(), 100);
+                // Load credentials and MCP configs after modal opens
+                setTimeout(() => {
+                    loadCredentials();
+                    loadMCPConfigs();
+                }, 100);
             };
             
             const closeSettings = () => {
@@ -4149,10 +4465,17 @@ def get_frontend_html():
                     setSelectedProvider(data.llm.provider || 'openai');
                     // Set API key placeholder based on whether key exists
                     setApiKeyPlaceholder(data.llm.api_key === '***' ? '(Already Configured)' : 'Enter API key');
+                    // Set MCP token placeholder based on whether token exists
+                    setMCPTokenPlaceholder(data.mcp.token === '***' ? '(Already Configured)' : 'Enter token');
                     
-                    // Auto-load active credential if one is set
-                    if (data.active_credential_name) {
+                    // Auto-load active credential if one is set (but prevent infinite loop)
+                    if (data.active_credential_name && !isLoadingCredential) {
                         await loadCredentialIntoSettings(data.active_credential_name);
+                    }
+                    
+                    // Auto-load active MCP config if one is set (just show it's active, don't auto-open form)
+                    if (data.active_mcp_config_name) {
+                        setLoadedMCPConfigName(data.active_mcp_config_name);
                     }
                 } catch (error) {
                     console.error('Failed to load config:', error);
@@ -4260,19 +4583,22 @@ def get_frontend_html():
             
             window.loadCredentialIntoSettings = async (name) => {
                 try {
-                    // Show loading indicator
-                    const credList = document.getElementById('credentials-list');
-                    const originalHTML = credList.innerHTML;
-                    credList.innerHTML = `
-                        <div class="text-center py-10">
-                            <i class="fas fa-spinner fa-spin text-purple-600 text-4xl mb-4"></i>
-                            <p class="text-base font-semibold text-gray-700">Loading credential...</p>
-                            <p class="text-sm text-gray-500 mt-2">${name}</p>
-                        </div>
-                    `;
-                    
                     // Set flag to prevent clearing during load
                     setIsLoadingCredential(true);
+                    
+                    // Show loading indicator only if credentials list is visible (settings panel open)
+                    const credList = document.getElementById('credentials-list');
+                    let originalHTML = '';
+                    if (credList) {
+                        originalHTML = credList.innerHTML;
+                        credList.innerHTML = `
+                            <div class="text-center py-10">
+                                <i class="fas fa-spinner fa-spin text-purple-600 text-4xl mb-4"></i>
+                                <p class="text-base font-semibold text-gray-700">Loading credential...</p>
+                                <p class="text-sm text-gray-500 mt-2">${name}</p>
+                            </div>
+                        `;
+                    }
                     
                     const response = await fetch(`/api/credentials/${name}/load`, { method: 'POST' });
                     const result = await response.json();
@@ -4311,13 +4637,14 @@ def get_frontend_html():
                                 document.getElementById('llm-endpoint-url').value = newConfig.llm.endpoint_url;
                             }
                             
-                            // Clear loading flag after a short delay to allow onChange events to settle
-                            setTimeout(() => setIsLoadingCredential(false), 200);
                         }, 50);
                         
                         // Reload config and credentials list to update active status
                         await loadConfig();
                         await loadCredentials();
+                        
+                        // Clear loading flag after config is reloaded to prevent infinite loop
+                        setIsLoadingCredential(false);
                         
                         // Show success message
                         const successDiv = document.createElement('div');
@@ -4339,11 +4666,16 @@ def get_frontend_html():
                             setTimeout(() => successDiv.remove(), 300);
                         }, 2500);
                     } else {
-                        credList.innerHTML = originalHTML;
+                        if (credList) {
+                            credList.innerHTML = originalHTML;
+                        }
                         setIsLoadingCredential(false);
                         alert(`Failed to load credential: ${result.detail}`);
                     }
                 } catch (error) {
+                    if (credList) {
+                        credList.innerHTML = originalHTML;
+                    }
                     setIsLoadingCredential(false);
                     alert(`Error loading credential: ${error.message}`);
                     await loadCredentials();
@@ -4368,6 +4700,194 @@ def get_frontend_html():
                                 <i class="fas fa-trash-alt text-2xl"></i>
                                 <div>
                                     <p class="font-bold text-base">Credential Deleted</p>
+                                    <p class="text-sm opacity-90">${name}</p>
+                                </div>
+                            </div>
+                        `;
+                        document.body.appendChild(successDiv);
+                        setTimeout(() => {
+                            successDiv.style.opacity = '0';
+                            successDiv.style.transition = 'opacity 0.3s';
+                            setTimeout(() => successDiv.remove(), 300);
+                        }, 2500);
+                    } else {
+                        const error = await response.json();
+                        alert(`Failed to delete: ${error.detail}`);
+                    }
+                } catch (error) {
+                    alert(`Error: ${error.message}`);
+                }
+            };
+            
+            // MCP Configuration Vault Functions
+            const loadMCPConfigs = async () => {
+                try {
+                    const response = await fetch('/api/mcp-configs');
+                    const mcpConfigs = await response.json();
+                    setSavedMCPConfigs(mcpConfigs);
+                    
+                    const mcpList = document.getElementById('mcp-configs-list');
+                    if (!mcpList) return;
+                    
+                    if (Object.keys(mcpConfigs).length === 0) {
+                        mcpList.innerHTML = `
+                            <div class="text-center py-12 bg-white rounded-lg border-2 border-dashed border-gray-300">
+                                <i class="fas fa-server text-green-300 text-5xl mb-4"></i>
+                                <p class="text-base font-bold text-gray-700 mb-2">No Saved Configurations</p>
+                                <p class="text-sm text-gray-500 mb-4">Save your current MCP server settings for quick access</p>
+                                <p class="text-xs text-gray-400 italic">Click "Save Current Config" above</p>
+                            </div>
+                        `;
+                        return;
+                    }
+                    
+                    // Sort configs to show active one first
+                    const activeMCPName = config?.active_mcp_config_name;
+                    const mcpArray = Object.values(mcpConfigs).sort((a, b) => {
+                        if (a.name === activeMCPName) return -1;
+                        if (b.name === activeMCPName) return 1;
+                        return a.name.localeCompare(b.name);
+                    });
+                    
+                    mcpList.innerHTML = mcpArray.map(mcp => `
+                        <div class="group bg-white rounded-lg p-4 border-2 ${mcp.name === activeMCPName ? 'border-green-400 shadow-lg' : 'border-gray-200'} hover:border-green-400 hover:shadow-lg transition-all">
+                            <div class="flex items-start justify-between gap-4">
+                                <div class="flex-1 min-w-0">
+                                    <div class="flex items-center gap-2 mb-2">
+                                        <i class="fas fa-server text-green-600 text-lg"></i>
+                                        <h5 class="text-base font-bold text-gray-900 truncate">${mcp.name}</h5>
+                                        ${mcp.name === activeMCPName ? '<span class="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-bold rounded-full">ACTIVE</span>' : ''}
+                                    </div>
+                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${mcp.description}</p>` : ''}
+                                    <div class="text-sm text-gray-600 space-y-1.5 pl-1">
+                                        <div class="flex items-center gap-2">
+                                            <i class="fas fa-link w-4 text-gray-400"></i>
+                                            <span><span class="font-semibold text-gray-700">URL:</span> ${mcp.url}</span>
+                                        </div>
+                                        <div class="flex items-center gap-2">
+                                            <i class="fas fa-shield-alt w-4 text-gray-400"></i>
+                                            <span><span class="font-semibold text-gray-700">SSL:</span> ${mcp.verify_ssl ? 'Enabled' : 'Disabled'}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="flex flex-col gap-2 shrink-0">
+                                    <button 
+                                        onclick="loadMCPConfigIntoSettings('${mcp.name}')"
+                                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                        title="Load this configuration into active settings"
+                                    >
+                                        <i class="fas fa-download mr-2"></i>Load
+                                    </button>
+                                    <button 
+                                        onclick="deleteMCPConfig('${mcp.name}')"
+                                        class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                        title="Permanently delete this saved configuration"
+                                    >
+                                        <i class="fas fa-trash-alt mr-2"></i>Delete
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                } catch (error) {
+                    console.error('Failed to load MCP configs:', error);
+                    const mcpList = document.getElementById('mcp-configs-list');
+                    if (mcpList) {
+                        mcpList.innerHTML = `
+                            <div class="text-center py-10">
+                                <i class="fas fa-exclamation-triangle text-red-400 text-4xl mb-4"></i>
+                                <p class="text-base font-semibold text-red-700">Failed to load MCP configurations</p>
+                                <p class="text-sm text-gray-600 mt-2">${error.message}</p>
+                            </div>
+                        `;
+                    }
+                }
+            };
+            
+            window.loadMCPConfigIntoSettings = async (name) => {
+                try {
+                    const mcpList = document.getElementById('mcp-configs-list');
+                    const originalHTML = mcpList.innerHTML;
+                    mcpList.innerHTML = `
+                        <div class="text-center py-10">
+                            <i class="fas fa-spinner fa-spin text-green-600 text-4xl mb-4"></i>
+                            <p class="text-base font-semibold text-gray-700">Loading configuration...</p>
+                            <p class="text-sm text-gray-500 mt-2">${name}</p>
+                        </div>
+                    `;
+                    
+                    const response = await fetch(`/api/mcp-configs/${name}/load`, { method: 'POST' });
+                    if (response.ok) {
+                        const result = await response.json();
+                        const newConfig = result.config;
+                        
+                        // Update React state first
+                        setConfig(newConfig);
+                        setLoadedMCPConfigName(name);
+                        setShowMCPConfigForm(true); // Show the form when loading a config
+                        setMCPTokenPlaceholder('(Already Configured)'); // Set placeholder for loaded config
+                        
+                        // Update form fields with the loaded config
+                        setTimeout(() => {
+                            const mcpUrlInput = document.getElementById('mcp-url');
+                            const mcpTokenInput = document.getElementById('mcp-token');
+                            const mcpVerifySslInput = document.getElementById('mcp-verify-ssl');
+                            
+                            if (mcpUrlInput) mcpUrlInput.value = newConfig.mcp.url;
+                            if (mcpTokenInput) mcpTokenInput.value = ''; // Clear token field (masked in backend)
+                            if (mcpVerifySslInput) mcpVerifySslInput.checked = newConfig.mcp.verify_ssl;
+                        }, 50);
+                        
+                        await loadConfig();
+                        await loadMCPConfigs();
+                        
+                        // Show success notification
+                        const successDiv = document.createElement('div');
+                        successDiv.className = 'fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce';
+                        successDiv.innerHTML = `
+                            <div class="flex items-center gap-3">
+                                <i class="fas fa-check-circle text-2xl"></i>
+                                <div>
+                                    <p class="font-bold text-base">Configuration Loaded!</p>
+                                    <p class="text-sm opacity-90">${name}</p>
+                                </div>
+                            </div>
+                        `;
+                        document.body.appendChild(successDiv);
+                        setTimeout(() => {
+                            successDiv.style.animation = 'none';
+                            successDiv.style.opacity = '0';
+                            successDiv.style.transition = 'opacity 0.3s';
+                            setTimeout(() => successDiv.remove(), 300);
+                        }, 2500);
+                    } else {
+                        mcpList.innerHTML = originalHTML;
+                        const result = await response.json();
+                        alert(`Failed to load configuration: ${result.detail}`);
+                    }
+                } catch (error) {
+                    alert(`Error loading configuration: ${error.message}`);
+                    await loadMCPConfigs();
+                }
+            };
+            
+            window.deleteMCPConfig = async (name) => {
+                const confirmed = confirm(`⚠️ Delete MCP Configuration\\n\\nAre you sure you want to delete '${name}'?\\n\\nThis action cannot be undone.`);
+                if (!confirmed) return;
+                
+                try {
+                    const response = await fetch(`/api/mcp-configs/${name}`, { method: 'DELETE' });
+                    if (response.ok) {
+                        await loadMCPConfigs();
+                        
+                        // Show success message
+                        const successDiv = document.createElement('div');
+                        successDiv.className = 'fixed top-6 right-6 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
+                        successDiv.innerHTML = `
+                            <div class="flex items-center gap-3">
+                                <i class="fas fa-trash-alt text-2xl"></i>
+                                <div>
+                                    <p class="font-bold text-base">Configuration Deleted</p>
                                     <p class="text-sm opacity-90">${name}</p>
                                 </div>
                             </div>
@@ -6743,42 +7263,132 @@ def get_frontend_html():
                                 
                                 {/* Scrollable Content */}
                                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                                    {/* MCP Configuration */}
+                                    {/* MCP Configuration Vault */}
                                     <div>
-                                        <h3 className="text-lg font-semibold text-gray-900 mb-3">
-                                            <i className="fas fa-server mr-2 text-green-600"></i>
-                                            MCP Server Configuration
-                                        </h3>
-                                        <div className="space-y-3">
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">MCP URL</label>
-                                                <input 
-                                                    type="text" 
-                                                    defaultValue={config.mcp.url}
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                    id="mcp-url"
-                                                />
+                                        <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg p-6 border-2 border-green-200">
+                                            {/* Header */}
+                                            <div className="mb-4">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                                                    <i className="fas fa-server mr-2 text-green-600"></i>
+                                                    MCP Server Configurations
+                                                </h3>
+                                                <p className="text-sm text-gray-600">Manage your Splunk MCP server connections</p>
                                             </div>
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">Token</label>
-                                                <input 
-                                                    type="password" 
-                                                    placeholder={config.mcp.token === '***' ? '(Already Configured)' : 'Enter token'}
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                    id="mcp-token"
-                                                />
-                                            </div>
-                                            <div className="flex items-center">
-                                                <input 
-                                                    type="checkbox" 
-                                                    defaultChecked={config.mcp.verify_ssl}
-                                                    className="mr-2"
-                                                    id="mcp-verify-ssl"
-                                                />
-                                                <label htmlFor="mcp-verify-ssl" className="text-sm text-gray-700">Verify SSL Certificate</label>
+                                            
+                                            {/* Currently Loaded Indicator */}
+                                            {(loadedMCPConfigName || config?.active_mcp_config_name) && (
+                                                <div className="mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3">
+                                                    <div className="flex items-center justify-between">
+                                                        <div className="flex items-center gap-2">
+                                                            <i className="fas fa-check-circle text-emerald-600"></i>
+                                                            <div>
+                                                                <p className="text-sm font-semibold text-gray-900">Active Configuration:</p>
+                                                                <p className="text-base font-bold text-gray-800">{loadedMCPConfigName || config?.active_mcp_config_name}</p>
+                                                            </div>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => {
+                                                                setLoadedMCPConfigName(null);
+                                                                setShowMCPConfigForm(false);
+                                                            }}
+                                                            className="text-emerald-600 hover:text-emerald-800 text-sm font-medium"
+                                                            title="Clear and close editor"
+                                                        >
+                                                            <i className="fas fa-times-circle mr-1"></i>Close
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            )}
+                                            
+                                            {/* Action Button - Create New Configuration */}
+                                            {!showMCPConfigForm && (
+                                                <div className="mb-4">
+                                                    <button
+                                                        onClick={() => {
+                                                            setShowMCPConfigForm(true);
+                                                            setLoadedMCPConfigName(null);
+                                                            setMCPTokenPlaceholder('Enter token');
+                                                        }}
+                                                        className="w-full px-4 py-3 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
+                                                    >
+                                                        <i className="fas fa-plus-circle mr-2"></i>Create New Configuration
+                                                    </button>
+                                                </div>
+                                            )}
+                                            
+                                            {/* Saved Configurations List */}
+                                            <div id="mcp-configs-list" className="space-y-2 max-h-96 overflow-y-auto">
+                                                <div className="text-sm text-gray-500 text-center py-4 italic">Loading configurations...</div>
                                             </div>
                                         </div>
                                     </div>
+                                    
+                                    {/* MCP Configuration Form - Conditional */}
+                                    {showMCPConfigForm && (
+                                        <div>
+                                            <div className="flex items-center justify-between mb-3">
+                                                <h3 className="text-lg font-semibold text-gray-900">
+                                                    <i className="fas fa-server mr-2 text-green-600"></i>
+                                                    {loadedMCPConfigName ? 'Edit Configuration' : 'New Configuration'}
+                                                </h3>
+                                                <button
+                                                    onClick={() => {
+                                                        setShowMCPConfigForm(false);
+                                                        setLoadedMCPConfigName(null);
+                                                    }}
+                                                    className="px-3 py-1 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
+                                                >
+                                                    <i className="fas fa-times mr-1"></i>Cancel
+                                                </button>
+                                            </div>
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">MCP URL</label>
+                                                    <input 
+                                                        type="text" 
+                                                        defaultValue={config.mcp.url}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        id="mcp-url"
+                                                    />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">Token</label>
+                                                    <input 
+                                                        type="password" 
+                                                        placeholder={mcpTokenPlaceholder}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        id="mcp-token"
+                                                        onChange={() => setMCPTokenPlaceholder('Enter token')}
+                                                    />
+                                                </div>
+                                                <div className="flex items-center">
+                                                    <input 
+                                                        type="checkbox" 
+                                                        defaultChecked={config.mcp.verify_ssl}
+                                                        className="mr-2"
+                                                        id="mcp-verify-ssl"
+                                                    />
+                                                    <label htmlFor="mcp-verify-ssl" className="text-sm text-gray-700">Verify SSL Certificate</label>
+                                                </div>
+                                                
+                                                {/* Save Button */}
+                                                <div className="pt-3 border-t border-gray-200">
+                                                    <button
+                                                        onClick={() => {
+                                                            if (loadedMCPConfigName) {
+                                                                setMCPConfigName(loadedMCPConfigName);
+                                                            }
+                                                            setIsMCPSaveModalOpen(true);
+                                                        }}
+                                                        className="w-full px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all"
+                                                    >
+                                                        <i className="fas fa-save mr-2"></i>
+                                                        {loadedMCPConfigName ? 'Update Active Configuration' : 'Save as New Configuration'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
                                     
                                     {/* LLM Credential Vault - Show First */}
                                     <div>
@@ -7441,6 +8051,180 @@ def get_frontend_html():
                                         >
                                             <i className={`mr-2 ${isUpdateMode ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
                                             {isUpdateMode ? 'Update Credential' : 'Save Credential'}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    
+                    {/* MCP Configuration Save Modal */}
+                    {isMCPSaveModalOpen && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
+                                {/* Header */}
+                                <div className={`px-6 py-4 rounded-t-xl ${loadedMCPConfigName ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 text-white'}`}>
+                                    <div className="flex items-center justify-between">
+                                        <div className="flex items-center gap-3">
+                                            <i className={`text-2xl ${loadedMCPConfigName ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
+                                            <h2 className="text-xl font-bold">{loadedMCPConfigName ? 'Update' : 'Save'} MCP Configuration</h2>
+                                        </div>
+                                        <button
+                                            onClick={() => {
+                                                setIsMCPSaveModalOpen(false);
+                                                setMCPConfigName('');
+                                                setMCPConfigDescription('');
+                                            }}
+                                            className={`transition-colors ${loadedMCPConfigName ? 'text-gray-900 hover:text-gray-600' : 'text-white hover:text-gray-200'}`}
+                                        >
+                                            <i className="fas fa-times text-xl"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                {/* Content */}
+                                <div className="p-6">
+                                    {loadedMCPConfigName ? (
+                                        <div className="bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4">
+                                            <div className="flex items-start">
+                                                <i className="fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5"></i>
+                                                <div>
+                                                    <p className="text-sm font-bold text-gray-900 mb-1">⚠️ Update Warning</p>
+                                                    <p className="text-sm text-gray-800">
+                                                        You are about to overwrite the existing configuration "<strong className="text-gray-900">{mcpConfigName}</strong>". 
+                                                        This will replace all settings with your current configuration. This action cannot be undone.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <p className="text-sm text-gray-600 mb-4">
+                                            Save your current MCP server settings as a named configuration for quick access later.
+                                        </p>
+                                    )}
+                                    
+                                    <div className="mb-4">
+                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                            Configuration Name <span className="text-red-500">*</span>
+                                        </label>
+                                        <input
+                                            type="text"
+                                            value={mcpConfigName}
+                                            onChange={(e) => setMCPConfigName(e.target.value)}
+                                            placeholder="e.g., Production Splunk, Dev Environment"
+                                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                            disabled={loadedMCPConfigName}
+                                            autoFocus={!loadedMCPConfigName}
+                                        />
+                                        {loadedMCPConfigName && (
+                                            <p className="text-xs text-gray-500 mt-1 italic">Configuration name cannot be changed when updating</p>
+                                        )}
+                                    </div>
+                                    
+                                    <div className="mb-6">
+                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                            Description (Optional)
+                                        </label>
+                                        <input
+                                            type="text"
+                                            value={mcpConfigDescription}
+                                            onChange={(e) => setMCPConfigDescription(e.target.value)}
+                                            placeholder="e.g., Main production Splunk server"
+                                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                        />
+                                    </div>
+                                    
+                                    {/* Preview */}
+                                    <div className="bg-gray-50 rounded-lg p-4 mb-6 border border-gray-200">
+                                        <h4 className="text-xs font-semibold text-gray-700 mb-2 uppercase tracking-wide">Current Settings Preview</h4>
+                                        <div className="space-y-1 text-sm text-gray-600">
+                                            <div><span className="font-medium">URL:</span> {config?.mcp?.url || 'N/A'}</div>
+                                            <div><span className="font-medium">Token:</span> {config?.mcp?.token ? '***' : 'Not set'}</div>
+                                            <div><span className="font-medium">Verify SSL:</span> {config?.mcp?.verify_ssl ? 'Yes' : 'No'}</div>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* Actions */}
+                                    <div className="flex gap-3">
+                                        <button
+                                            onClick={() => {
+                                                setIsMCPSaveModalOpen(false);
+                                                setMCPConfigName('');
+                                                setMCPConfigDescription('');
+                                            }}
+                                            className="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium transition-colors"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button
+                                            onClick={async () => {
+                                                if (!mcpConfigName.trim()) {
+                                                    alert('Please enter a configuration name');
+                                                    return;
+                                                }
+                                                
+                                                // Additional confirmation for updates
+                                                if (loadedMCPConfigName) {
+                                                    const confirmed = confirm(`⚠️ Confirm Update\n\nAre you sure you want to overwrite "${mcpConfigName}"?\n\nThis will replace:\n• MCP URL\n• Token\n• SSL Settings\n• Description\n\nThis action cannot be undone.`);
+                                                    if (!confirmed) return;
+                                                }
+                                                
+                                                try {
+                                                    const response = await fetch('/api/mcp-configs', {
+                                                        method: 'POST',
+                                                        headers: { 'Content-Type': 'application/json' },
+                                                        body: JSON.stringify({
+                                                            name: mcpConfigName.trim(),
+                                                            url: document.getElementById('mcp-url').value,
+                                                            token: document.getElementById('mcp-token').value || config.mcp.token,
+                                                            verify_ssl: document.getElementById('mcp-verify-ssl').checked,
+                                                            description: mcpConfigDescription.trim() || null
+                                                        })
+                                                    });
+                                                    
+                                                    if (response.ok) {
+                                                        // Close modal
+                                                        setIsMCPSaveModalOpen(false);
+                                                        const savedName = mcpConfigName.trim();
+                                                        const wasUpdate = loadedMCPConfigName;
+                                                        setMCPConfigName('');
+                                                        setMCPConfigDescription('');
+                                                        
+                                                        // Refresh MCP configs list
+                                                        await loadMCPConfigs();
+                                                        
+                                                        // Show success message
+                                                        const successDiv = document.createElement('div');
+                                                        successDiv.className = `fixed top-6 right-6 ${wasUpdate ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600' : 'bg-green-600 text-white'} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
+                                                        successDiv.innerHTML = `
+                                                            <div class="flex items-center gap-3">
+                                                                <i class="fas ${wasUpdate ? 'fa-sync-alt' : 'fa-check-circle'} text-2xl"></i>
+                                                                <div>
+                                                                    <p class="font-bold text-base">Configuration ${wasUpdate ? 'Updated' : 'Saved'}!</p>
+                                                                    <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${savedName}</p>
+                                                                </div>
+                                                            </div>
+                                                        `;
+                                                        document.body.appendChild(successDiv);
+                                                        setTimeout(() => {
+                                                            successDiv.style.animation = 'none';
+                                                            successDiv.style.opacity = '0';
+                                                            successDiv.style.transition = 'opacity 0.3s';
+                                                            setTimeout(() => successDiv.remove(), 300);
+                                                        }, 2500);
+                                                    } else {
+                                                        const error = await response.json();
+                                                        alert('Failed to save configuration: ' + (error.detail || 'Unknown error'));
+                                                    }
+                                                } catch (error) {
+                                                    alert('Error saving configuration: ' + error.message);
+                                                }
+                                            }}
+                                            disabled={!mcpConfigName.trim()}
+                                            className={`flex-1 px-4 py-2 ${loadedMCPConfigName ? 'bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white'} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`}
+                                        >
+                                            <i className={`mr-2 ${loadedMCPConfigName ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
+                                            {loadedMCPConfigName ? 'Update Configuration' : 'Save Configuration'}
                                         </button>
                                     </div>
                                 </div>
