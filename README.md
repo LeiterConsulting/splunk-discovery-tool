@@ -1,375 +1,132 @@
-# 🔍 Splunk Discovery Tool ('version 1.0.0' is very loosely used - this is very much a beta!)
+# 🔍 Splunk Discovery Tool (DT4SMS)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0--dev-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases)
 
-> **AI-powered Splunk environment discovery and admin assistant with MCP integration**
+> AI-powered Splunk environment discovery, intelligence reporting, and admin assistance with MCP integration.
 
-⚠️ **Known Issue - Local LLM Endpoints**: We are currently investigating timeout/connection issues with local LLM servers (vLLM, Ollama, LM Studio, etc.). Test scripts timeout while the same configuration works in other applications. This appears to be related to request queuing or networking behavior. OpenAI and cloud-based endpoints work without issues. We're actively working on a resolution.
+## ✨ What’s Included
 
-Automatically discover your Splunk deployment, analyze configurations, generate SPL queries, and get intelligent recommendations through an intuitive web interface powered by LLM technology.
-
-## ✨ Features
-
-### 🔍 **Discovery & Analysis**
-- Automated Splunk environment scanning via MCP protocol
-- Real-time configuration analysis and classification
-- Data source identification and relationship mapping
-
-### � **Intelligent Admin Chat**
-- Natural language Splunk admin assistance
-- Context-aware SPL query generation
-- Multi-turn reasoning with quality validation
-- Automatic query refinement and optimization
-
-### 🛠️ **Enterprise-Ready**
-- **Universal Cross-Platform Installer**: Single script for Windows/Unix/macOS
-- **Encrypted Configuration**: Fernet encryption for credentials (no plaintext storage)
-- **Web-Based Settings**: Complete configuration management via web UI
-- **Service Mode**: Background daemon with restart/shutdown capabilities
-- **Debug Mode**: Real-time debug streaming for troubleshooting
+- V2 discovery pipeline with intelligence artifacts (`v2_intelligence_blueprint_*`, `v2_insights_brief_*`, `v2_operator_runbook_*`, `v2_developer_handoff_*`)
+- Unified web workspace with static top bar and tabs for Mission, Intelligence, and Artifacts
+- AI summarization endpoint (`/summarize-session`) generating contextual SPL queries and admin tasks
+- Deterministic + agentic chat flows with MCP tool aliasing and robust tool-call parsing
+- Encrypted credential/config storage using Fernet (no plaintext secrets)
+- Universal installers for Windows (`install.ps1`) and Unix/macOS (`install.sh`)
 
 ## 📋 Prerequisites
 
 ### Required
 
-#### Python 3.8+ with pip
-**Windows** (choose one method):
-1. **Microsoft Store** (Easiest):
-   - Open Microsoft Store, search "Python 3.13"
-   - Click "Get" to install (automatically adds to PATH)
-   
-2. **winget** (Command-line):
-   ```powershell
-   winget install Python.Python.3.13
-   ```
-   
-3. **Manual Download**:
-   - Download from [python.org](https://www.python.org/downloads/)
-   - Run installer, **check "Add Python to PATH"**
+- Python 3.8+
+- pip
+- PowerShell 7+ (Windows only, if using `install.ps1`)
 
-**Linux/macOS**: Usually pre-installed, or use package manager (`apt`, `brew`, etc.)
+### External Services
 
-#### PowerShell 7+ (Windows only - for install.ps1)
-**Windows** (choose one method):
-1. **winget** (Easiest):
-   ```powershell
-   winget install Microsoft.PowerShell
-   ```
-   
-2. **Manual Download**:
-   - Download MSI from [Microsoft's GitHub](https://github.com/PowerShell/PowerShell/releases)
-   - Run installer
-   
-3. **Alternative**:
-   - Use `install.sh` with Git Bash (no PowerShell 7+ required)
+- Splunk MCP server endpoint + bearer token
+- LLM provider key for your selected backend (OpenAI, Azure OpenAI, Anthropic, Gemini, or Custom endpoint)
 
-### Configuration (via web UI after installation)
-- **MCP Server** for Splunk (URL configured in settings)
-- **LLM API Key** (OpenAI, Anthropic, or compatible endpoint)
+## 🚀 Quick Start
 
-> **Windows Installation Notes**: 
-> - Install Python **first**, then PowerShell 7+
-> - Close and reopen your terminal after installing prerequisites
-> - The installer will check for these requirements and provide detailed instructions if missing
-
-## 🔧 Quick Start
-
-### Windows (PowerShell)
+### Windows
 
 ```powershell
-# Install and start
 .\install.ps1
-
-# Show help
-.\install.ps1 -Help
-
-# Stop service
-.\install.ps1 -Stop
-
-# Restart service
-.\install.ps1 -Restart
-
-# Uninstall
-.\install.ps1 -Uninstall
 ```
 
-### Unix/Linux/macOS (Bash)
+### Unix/macOS
 
 ```bash
-# Make installer executable
 chmod +x install.sh
-
-# Install and start
 ./install.sh
-
-# Show help
-./install.sh --help
-
-# Stop service
-./install.sh --stop
-
-# Restart service
-./install.sh --restart
-
-# Uninstall
-./install.sh --uninstall
 ```
 
-## 🌐 Access
+After startup, open the URL printed in the console (typically **http://localhost:8003**).
 
-Once started, access the web interface at:
+## ⚙️ First-Time Configuration
 
-**http://localhost:8003**
+1. Open the app at the startup URL shown in console (default `http://localhost:8003`)
+2. Click Settings (gear icon)
+3. Configure:
+   - MCP URL / token / SSL settings
+   - LLM provider / API key / endpoint URL (if required) / model / token limits
+   - Web server options (port, debug mode)
+4. Save settings and restart service
 
-## ⚙️ Configuration
+### LLM Setup Notes
 
-### First-Time Setup
+- Providers supported: `openai`, `azure`, `anthropic`, `gemini`, `custom`
+- Endpoint URL required for: `azure`, `custom`
+- Endpoint URL optional override for: `anthropic`, `gemini`
+- For `custom`, you can use a base URL (for example `http://host:port/v1`); the app auto-resolves common completion paths.
+- Use **Test Connection & Auto-Configure** in Settings to run:
+  - connectivity probe,
+  - model generation test,
+  - provider-safe token recommendation.
 
-1. Open **http://localhost:8003**
-2. Click the **⚙️ Settings** icon (top-right)
-3. Configure your environment:
+## 🧠 Workspace Overview
 
-**MCP Server Configuration:**
-- Endpoint: Your Splunk MCP server URL
-- Bearer Token: Authentication token for MCP access
-- SSL Verification: Enable/disable certificate validation
+- **Mission**: Run discovery, monitor live progress/log, review generated sessions
+- **Intelligence**: View V2 blueprint KPIs, coverage gaps, capability graph, trends
+- **Artifacts**: Browse and open V2 outputs and generated summaries
 
-**LLM Provider:**
-- Provider: OpenAI (default) or custom endpoint
-- API Key: Your LLM provider API key
-- Model: `gpt-4o-mini` recommended for balance of speed/quality
-- Max Tokens: Token limit per request (default: 16000)
+## 🔐 Security
 
-**Server Settings:**
-- Port: Web interface port (default: 8003)
-- Debug Mode: Enable real-time debug streaming
+- Credentials encrypted at rest (`config.encrypted`, `.config.key`)
+- No plaintext secret persistence
+- Configurable SSL verification and CA bundle support
+- Host/CORS protections available via server settings
 
-4. Click **Save Settings**
-5. Restart the service
+## 📁 Key Paths
 
-### Settings Features
-
-- ✅ **Encrypted Storage**: All credentials encrypted at rest
-- ✅ **Live Validation**: Field validation with examples
-- ✅ **Debug Mode**: Real-time debug window with WebSocket streaming
-- ✅ **Dependencies Viewer**: Check installed package versions
-- ✅ **Version Display**: Current application version
-
-## � Python Dependencies
-
-The installer automatically installs these Python packages (from `requirements.txt`):
-
-### Core Framework
-- **fastapi** (>=0.104.0) - Modern web framework for building APIs
-- **uvicorn[standard]** (>=0.24.0) - ASGI server with WebSocket support
-- **python-multipart** (>=0.0.6) - Multipart form data parsing
-
-### Security & Encryption
-- **cryptography** (>=41.0.0) - Fernet encryption for configuration storage
-
-### LLM Integration
-- **openai** (>=1.0.0) - OpenAI API client (supports OpenAI-compatible endpoints)
-
-### Data & Configuration
-- **pyyaml** (>=6.0) - YAML configuration parsing
-
-### HTTP Clients
-- **httpx** (>=0.24.0) - Modern async HTTP client
-- **aiohttp** (>=3.9.0) - Async HTTP client/server framework
-
-> All dependencies are automatically installed in a virtual environment by the installer. You can view installed versions in the web UI settings panel.
-
-## �🔐 Security
-
-- **Encrypted Storage**: All credentials encrypted using Fernet
-- **No Plaintext**: Secrets never stored in plaintext
-- **Secure Permissions**: Config files set to 0600 (owner read/write only)
-- **SSL Support**: Configurable SSL verification for MCP connections
-- **CORS/Host Protection**: Configurable security policies
-
-## 📁 File Structure
-
-```
-Discovery Tool for Splunk MCP Server/
-├── install.sh              # Unix/macOS installer
-├── install.ps1             # Windows installer
-├── requirements.txt        # Python dependencies
-├── src/
-│   ├── main.py            # Application entry point
-│   ├── web_app.py         # FastAPI web application
-│   └── config_manager.py  # Encrypted configuration manager
-├── .config.key            # Encryption key (auto-generated, do not share)
-├── config.encrypted       # Encrypted configuration file
-└── .install_manifest.json # Installation metadata
-
+```text
+install.ps1 / install.sh       Installer + service control
+src/main.py                    Runtime entrypoint
+src/web_app.py                 FastAPI API + embedded React UI
+src/discovery/v2_pipeline.py   V2 discovery pipeline + artifact packaging
+src/config_manager.py          Encrypted config manager
+output/                        Discovery and summary artifacts
 ```
 
-## 🛠️ CLI Reference
-
-### Universal Installer Commands
+## 🛠️ Installer Commands
 
 | Command | Description |
 |---------|-------------|
 | `(no arguments)` | Install dependencies and start service |
-| `--help` / `-Help` | Show help message |
-| `--start` / `-Start` | Start the service |
-| `--stop` / `-Stop` | Stop the service |
-| `--restart` / `-Restart` | Restart the service |
-| `--status` / `-Status` | Check service status |
-| `--uninstall` / `-Uninstall` | Uninstall (with confirmation) |
-| `--force-yes` / `-ForceYes` | Skip confirmation prompts |
-
-### Examples
-
-```bash
-# Install and auto-start (first run)
-./install.sh
-
-# Check status
-./install.sh --status
-
-# Restart after config changes
-./install.sh --restart
-
-# Complete uninstall without prompts
-./install.sh --uninstall --force-yes
-```
-
-## 🔄 Update Process
-
-The installer performs quick version checking:
-
-1. **First Run**: Installs all dependencies, creates manifest
-2. **Subsequent Runs**: Quick version check (< 1 second)
-3. **Updates Detected**: Auto-reinstalls if version mismatch
-
-## 🗑️ Uninstallation
-
-```bash
-# Interactive uninstall (prompts for confirmation)
-./install.sh --uninstall
-
-# Automatic uninstall (no prompts)
-./install.sh --uninstall --force-yes
-```
-
-Uninstall removes:
-- Virtual environment (`.venv/`)
-- Installation manifest
-- Encrypted configuration
-- Log files
-
-**Note**: Source code remains intact for reinstallation.
+| `--start` / `-Start` | Start service |
+| `--stop` / `-Stop` | Stop service |
+| `--restart` / `-Restart` | Restart service |
+| `--status` / `-Status` | Show status |
+| `--uninstall` / `-Uninstall` | Uninstall |
+| `--help` / `-Help` | Show help |
 
 ## 🐛 Troubleshooting
 
-### Cannot run script in Windows
+### Port 8003 is already in use
 
-Run the following PowerShell command:
+The app now attempts safe port reclamation/fallback automatically. If needed, restart with installer commands:
 
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-
-### Service Won't Start
-
-```bash
-# Check logs
-tail -f dt4sms.log
-
-# Verify Python installation
-python --version  # Should be 3.8+
-
-# Reinstall dependencies
-./install.sh --stop
-rm -rf .venv .install_manifest.json
-./install.sh
+```powershell
+.\install.ps1 -Restart
 ```
 
-### Port Already in Use
+### Windows script execution blocked
 
-Change the port in Settings → Web Server → Port (default: 8003)
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
 
-### Cannot Access from Remote Machine
+### MCP connection errors
 
-1. Open Settings → Web Server
-2. Update **CORS Allowed Origins** and **Trusted Hosts**
-3. Add your IP or use `*` for development (not recommended for production)
-4. Restart server
-
-### SSL Certificate Errors (MCP Connection)
-
-1. Open Settings → MCP Server
-2. Uncheck "Verify SSL Certificate" for self-signed certificates
-3. Or provide CA bundle path for custom certificates
-
-## 📦 Dependencies
-
-Core dependencies (automatically installed):
-
-- **fastapi** - Modern web framework
-- **uvicorn[standard]** - High-performance ASGI server
-- **cryptography** - Encryption for secure configuration storage
-- **pyyaml** - Configuration file parsing
-- **httpx** - Modern HTTP client
-- **aiohttp** - Async HTTP operations
-- **openai** - LLM integration
-- **python-multipart** - File upload support
-
-View installed versions: **Settings → View Dependencies** button in web UI
+- Verify URL/token in Settings
+- Toggle SSL verification or set CA bundle for private cert chains
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+Contributions are welcome via pull requests.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🔗 Links
-
-- **Issues**: [Report a bug or request a feature](https://github.com/LeiterConsulting/splunk-discovery-tool/issues)
-- **Leiter Consulting**: Professional Splunk services and consulting
-
-## 🙏 Acknowledgments
-
-Built with modern Python frameworks and AI technology to simplify Splunk administration.
-
----
-
-**Made with ❤️ by Leiter Consulting** | Version 1.0.0
-
-## 🤝 Contributing
-
-Contributions welcome!
-
-## 📄 License
-
-MIT
-
-## 🔗 Links
-
-- **GitHub**: [https://github.com/yourusername/dt4sms](https://github.com/yourusername/dt4sms) *(coming soon)*
-- **Documentation**: [Wiki](https://github.com/yourusername/dt4sms/wiki) *(coming soon)*
-- **Issues**: [Report a bug](https://github.com/yourusername/dt4sms/issues) *(coming soon)*
-
-## 📊 Version History
-
-### 1.0.0 (2025-10-31)
-
-- ✅ Initial release
-- ✅ Universal cross-platform installer
-- ✅ Encrypted configuration management
-- ✅ Web-based settings panel
-- ✅ Service mode with restart/shutdown
-- ✅ Complete security implementation
-
----
-
-**Made with ❤️ for Splunk Administrators**
+MIT. See [LICENSE](LICENSE).

@@ -16,8 +16,49 @@ import logging
 from typing import Optional, Protocol, Dict, Any, Callable
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_provider_name(provider: Optional[str]) -> str:
+    """Normalize provider labels from UI/config into stable internal identifiers."""
+    value = (provider or "openai").strip().lower().replace("_", " ")
+    aliases = {
+        "openai": "openai",
+        "azure": "azure",
+        "azure openai": "azure",
+        "anthropic": "anthropic",
+        "claude": "anthropic",
+        "gemini": "gemini",
+        "google": "gemini",
+        "google ai": "gemini",
+        "custom": "custom",
+        "custom endpoint": "custom",
+    }
+    return aliases.get(value, value)
+
+
+def messages_to_plain_text(messages: list) -> str:
+    """Flatten chat messages to plain text (best-effort for providers without chat schema)."""
+    if not isinstance(messages, list):
+        return ""
+
+    lines = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "user")).strip().lower()
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "system":
+            lines.append(f"System: {content}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content}")
+        else:
+            lines.append(f"User: {content}")
+    return "\n\n".join(lines)
 
 
 class RateLimitManager:
@@ -513,13 +554,14 @@ class CustomLLMClient:
     # Class-level cache shared across all instances {endpoint_url: config_dict}
     _endpoint_cache = {}
     
-    def __init__(self, endpoint_url: str, api_key: Optional[str] = None, model: str = "llama2", 
-                 rate_limit_display_callback: Optional[Callable] = None):
+    def __init__(self, endpoint_url: str, api_key: Optional[str] = None, model: str = "llama2",
+                 rate_limit_display_callback: Optional[Callable] = None, provider: str = "custom"):
         # Use the endpoint URL EXACTLY as configured by admin - no modifications
         self.endpoint_url = endpoint_url.rstrip('/')  # Only remove trailing slash
         self.api_key = api_key
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
+        self.provider = normalize_provider_name(provider)
         
         # Detect LLM provider type for connection strategy
         self.provider_type = self._detect_provider(endpoint_url)
@@ -602,6 +644,48 @@ class CustomLLMClient:
         
         # Generic/Unknown
         return "generic"
+
+    def _build_candidate_urls(self) -> list[str]:
+        """Build candidate completion URLs from configured endpoint."""
+        base = (self.endpoint_url or "").rstrip('/')
+        if not base:
+            return []
+
+        full_path_indicators = [
+            '/v1/chat/completions',
+            '/chat/completions',
+            '/v1/completions',
+            '/completions',
+            '/api/chat',
+            '/api/generate'
+        ]
+        if any(base.endswith(path) for path in full_path_indicators):
+            return [base]
+
+        candidates = []
+
+        if base.endswith('/v1'):
+            candidates.extend([
+                f"{base}/chat/completions",
+                f"{base}/completions",
+                base,
+            ])
+        else:
+            candidates.extend([
+                f"{base}/v1/chat/completions",
+                f"{base}/chat/completions",
+                f"{base}/v1/completions",
+                f"{base}/completions",
+                base,
+            ])
+
+        deduped = []
+        seen = set()
+        for url in candidates:
+            if url not in seen:
+                seen.add(url)
+                deduped.append(url)
+        return deduped
     
     def generate_response_sync(self, messages: list, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """SYNCHRONOUS response generation with health monitoring (v1.1.0)."""
@@ -663,30 +747,56 @@ class CustomLLMClient:
         
         try:
             logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Starting request {request_id}")
-            logger.info(f"[CustomLLM-SYNC] � POST to {self.endpoint_url}")
+            candidate_urls = self._build_candidate_urls()
+            logger.info(f"[CustomLLM-SYNC] 🌐 Candidate endpoints: {candidate_urls}")
             logger.info(f"[CustomLLM-SYNC] 📝 {len(adapted_messages)} messages, {sum(len(str(m.get('content',''))) for m in adapted_messages)} total chars")
             
-            request_start = time.time()
-            logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Sending HTTP POST...")
-            logger.info(f"[CustomLLM-SYNC] 🔧 Using {'PERSISTENT session' if self.use_session else 'FRESH connection'}")
+            request_time = 0.0
+            response = None
+            last_error = None
             
-            # Adaptive connection strategy based on provider type
-            # vLLM needs fresh connections, others work better with persistent sessions
-            if self.use_session and self.session:
-                response = self.session.post(
-                    self.endpoint_url, 
-                    headers=headers, 
-                    json=payload, 
-                    timeout=request_timeout
-                )
-            else:
-                response = requests.post(
-                    self.endpoint_url, 
-                    headers=headers, 
-                    json=payload, 
-                    timeout=request_timeout
-                )
-            request_time = time.time() - request_start
+            for candidate_url in candidate_urls:
+                request_start = time.time()
+                logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Sending HTTP POST to {candidate_url}...")
+                logger.info(f"[CustomLLM-SYNC] 🔧 Using {'PERSISTENT session' if self.use_session else 'FRESH connection'}")
+
+                try:
+                    if self.use_session and self.session:
+                        candidate_response = self.session.post(
+                            candidate_url,
+                            headers=headers,
+                            json=payload,
+                            timeout=request_timeout
+                        )
+                    else:
+                        candidate_response = requests.post(
+                            candidate_url,
+                            headers=headers,
+                            json=payload,
+                            timeout=request_timeout
+                        )
+                    elapsed = time.time() - request_start
+                    request_time += elapsed
+
+                    if candidate_response.status_code == 404:
+                        logger.warning(f"[CustomLLM-SYNC] Endpoint not found: {candidate_url}")
+                        last_error = Exception(f"HTTP 404 at {candidate_url}")
+                        continue
+
+                    response = candidate_response
+                    if candidate_url != self.endpoint_url:
+                        logger.info(f"[CustomLLM-SYNC] ✅ Resolved custom LLM endpoint to {candidate_url}")
+                        self.endpoint_url = candidate_url
+                    break
+                except Exception as candidate_error:
+                    elapsed = time.time() - request_start
+                    request_time += elapsed
+                    last_error = candidate_error
+                    logger.warning(f"[CustomLLM-SYNC] Candidate failed ({candidate_url}): {candidate_error}")
+                    continue
+
+            if response is None:
+                raise Exception(f"All endpoint candidates failed. Last error: {last_error}")
             
             logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - HTTP response received (took {request_time:.3f}s)")
             logger.info(f"[CustomLLM-SYNC] 📥 Status: {response.status_code}")
@@ -983,6 +1093,192 @@ Return insights as a JSON object with a 'patterns' array.
 
 class LLMClientFactory:
     """Factory for creating LLM clients with rate limit support."""
+
+    @staticmethod
+    def _normalize_azure_chat_url(endpoint_url: Optional[str], deployment_or_model: str) -> str:
+        """Build an Azure OpenAI chat completions URL from base or full endpoint."""
+        if not endpoint_url:
+            raise ValueError("Azure provider requires endpoint_url")
+
+        cleaned = endpoint_url.rstrip('/')
+        if cleaned.endswith('/openai'):
+            cleaned = cleaned[:-len('/openai')]
+        if cleaned.endswith("/chat/completions"):
+            return cleaned
+
+        if "/openai/deployments/" in cleaned:
+            return f"{cleaned}/chat/completions"
+
+        deployment = deployment_or_model.strip()
+        if not deployment:
+            raise ValueError("Azure provider requires model/deployment name")
+        return f"{cleaned}/openai/deployments/{deployment}/chat/completions"
+
+    @staticmethod
+    def _append_api_version(url: str, api_version: str = "2024-02-15-preview") -> str:
+        if "api-version=" in url:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}api-version={api_version}"
+
+    @staticmethod
+    def _normalize_anthropic_url(endpoint_url: Optional[str]) -> str:
+        base = (endpoint_url or "https://api.anthropic.com").rstrip('/')
+        if base.endswith("/v1/messages"):
+            return base
+        return f"{base}/v1/messages"
+
+    @staticmethod
+    def _normalize_gemini_url(endpoint_url: Optional[str], model: str) -> str:
+        if endpoint_url and endpoint_url.strip():
+            base = endpoint_url.rstrip('/')
+            if ":generateContent" in base:
+                return base
+            if "/models/" in base:
+                return f"{base}:generateContent"
+            return f"{base}/v1beta/models/{quote(model)}:generateContent"
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}:generateContent"
+
+    @staticmethod
+    def _build_anthropic_messages(messages: list) -> tuple[str, list]:
+        system_lines = []
+        converted = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).strip().lower()
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system":
+                system_lines.append(content)
+                continue
+            anthropic_role = "assistant" if role == "assistant" else "user"
+            converted.append({"role": anthropic_role, "content": content})
+
+        if not converted:
+            converted = [{"role": "user", "content": "Hello"}]
+        return ("\n\n".join(system_lines), converted)
+
+    @staticmethod
+    def _build_gemini_contents(messages: list) -> list:
+        contents = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).strip().lower()
+            if role == "system":
+                role = "user"
+            gemini_role = "model" if role == "assistant" else "user"
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            contents.append({"role": gemini_role, "parts": [{"text": content}]})
+
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": "Hello"}]}]
+        return contents
+
+    @staticmethod
+    def _extract_gemini_text(response_data: dict) -> str:
+        candidates = response_data.get("candidates", []) if isinstance(response_data, dict) else []
+        if not candidates:
+            return ""
+        first = candidates[0] if isinstance(candidates[0], dict) else {}
+        content = first.get("content", {}) if isinstance(first, dict) else {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        texts = []
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part.get("text"))
+        return "\n".join([t for t in texts if t]).strip()
+
+    @staticmethod
+    async def _generate_azure_response(endpoint_url: str, api_key: str, model: str, messages: list,
+                                       max_tokens: int, temperature: float) -> str:
+        if not api_key:
+            raise ValueError("Azure provider requires api_key")
+        url = LLMClientFactory._append_api_version(
+            LLMClientFactory._normalize_azure_chat_url(endpoint_url, model)
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": api_key,
+        }
+        payload = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    raise Exception(f"Azure OpenAI error {response.status}: {body[:300]}")
+                data = await response.json()
+                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    @staticmethod
+    async def _generate_anthropic_response(endpoint_url: Optional[str], api_key: str, model: str, messages: list,
+                                           max_tokens: int, temperature: float) -> str:
+        if not api_key:
+            raise ValueError("Anthropic provider requires api_key")
+        url = LLMClientFactory._normalize_anthropic_url(endpoint_url)
+        system_prompt, anthropic_messages = LLMClientFactory._build_anthropic_messages(messages)
+        payload = {
+            "model": model,
+            "messages": anthropic_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    raise Exception(f"Anthropic error {response.status}: {body[:300]}")
+                data = await response.json()
+                content_items = data.get("content", []) if isinstance(data, dict) else []
+                text_parts = []
+                for item in content_items:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = item.get("text", "")
+                        if isinstance(text, str) and text.strip():
+                            text_parts.append(text)
+                return "\n".join(text_parts).strip()
+
+    @staticmethod
+    async def _generate_gemini_response(endpoint_url: Optional[str], api_key: str, model: str, messages: list,
+                                        max_tokens: int, temperature: float) -> str:
+        if not api_key:
+            raise ValueError("Gemini provider requires api_key")
+        base_url = LLMClientFactory._normalize_gemini_url(endpoint_url, model)
+        url = base_url if "?key=" in base_url else f"{base_url}?key={quote(api_key)}"
+        payload = {
+            "contents": LLMClientFactory._build_gemini_contents(messages),
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            }
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers={"Content-Type": "application/json"}, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    raise Exception(f"Gemini error {response.status}: {body[:300]}")
+                data = await response.json()
+                return LLMClientFactory._extract_gemini_text(data)
     
     @staticmethod
     def create_client(provider: str = "openai", custom_endpoint: Optional[str] = None, 
@@ -1004,16 +1300,84 @@ class LLMClientFactory:
         Raises:
             ValueError: If invalid provider or missing requirements
         """
-        if provider == "openai":
+        normalized_provider = normalize_provider_name(provider)
+
+        if normalized_provider == "openai":
             return OpenAIClient(api_key=api_key, model=model, rate_limit_display_callback=rate_limit_display_callback)
-        elif provider == "custom":
+
+        if normalized_provider == "custom":
             if not custom_endpoint:
                 raise ValueError("Custom endpoint URL required for custom LLM provider")
-            return CustomLLMClient(custom_endpoint, api_key=api_key, model=model, rate_limit_display_callback=rate_limit_display_callback)
-        else:
-            raise ValueError(f"Unsupported LLM provider: {provider}")
+            return CustomLLMClient(
+                custom_endpoint,
+                api_key=api_key,
+                model=model,
+                rate_limit_display_callback=rate_limit_display_callback,
+                provider="custom"
+            )
+
+        if normalized_provider in {"azure", "anthropic", "gemini"}:
+            class _ProviderAdapter:
+                def __init__(self, provider_name: str, endpoint: Optional[str], key: Optional[str], model_name: str):
+                    self.provider_name = provider_name
+                    self.endpoint = endpoint
+                    self.key = key
+                    self.model_name = model_name
+
+                async def generate_response(self, prompt: str = None, messages: list = None,
+                                            max_tokens: int = 1000, temperature: float = 0.7) -> str:
+                    if messages is None:
+                        if prompt is None:
+                            raise ValueError("Either 'prompt' or 'messages' must be provided")
+                        messages = [{"role": "user", "content": prompt}]
+
+                    if self.provider_name == "azure":
+                        return await LLMClientFactory._generate_azure_response(
+                            endpoint_url=self.endpoint or "",
+                            api_key=self.key or "",
+                            model=self.model_name,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        )
+
+                    if self.provider_name == "anthropic":
+                        return await LLMClientFactory._generate_anthropic_response(
+                            endpoint_url=self.endpoint,
+                            api_key=self.key or "",
+                            model=self.model_name,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        )
+
+                    return await LLMClientFactory._generate_gemini_response(
+                        endpoint_url=self.endpoint,
+                        api_key=self.key or "",
+                        model=self.model_name,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+
+                async def analyze_data(self, data: dict, analysis_type: str) -> dict:
+                    prompt = f"Analyze this Splunk data for {analysis_type}: {json.dumps(data, indent=2)}"
+                    response = await self.generate_response(prompt=prompt, max_tokens=2000)
+                    try:
+                        return json.loads(response)
+                    except json.JSONDecodeError:
+                        return {"analysis": response, "insights": ["Analysis completed"]}
+
+            return _ProviderAdapter(
+                provider_name=normalized_provider,
+                endpoint=custom_endpoint,
+                key=api_key,
+                model_name=model,
+            )
+
+        raise ValueError(f"Unsupported LLM provider: {provider}")
             
     @staticmethod
     def get_available_providers() -> list[str]:
         """Get list of available LLM providers."""
-        return ["openai", "custom"]
+        return ["openai", "azure", "anthropic", "gemini", "custom"]

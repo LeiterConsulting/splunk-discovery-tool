@@ -411,7 +411,7 @@ class DiscoveryContextManager:
         
         context_lines = []
         
-        if tool_name == 'run_splunk_query':
+        if tool_name in {'run_splunk_query', 'splunk_run_query'}:
             query = tool_args.get('query', '')
             
             # Extract index from query
@@ -429,11 +429,11 @@ class DiscoveryContextManager:
                 sourcetype_name = sourcetype_match.group(1)
                 context_lines.append(f"📋 Searching sourcetype: {sourcetype_name}")
         
-        elif tool_name == 'get_indexes':
+        elif tool_name in {'get_indexes', 'splunk_get_indexes'}:
             indexes = self._get_index_context()
             context_lines.append(f"📁 Total indexes with data: {len(indexes)}")
         
-        elif tool_name == 'get_metadata':
+        elif tool_name in {'get_metadata', 'splunk_get_metadata'}:
             metadata_type = tool_args.get('type', '')
             if metadata_type == 'hosts':
                 hosts = self._get_host_context()

@@ -70,7 +70,7 @@ ${BLUE}SERVICE INFO:${NC}
     Settings: Click gear icon in web UI
 
 ${BLUE}SUPPORT:${NC}
-    GitHub: https://github.com/yourusername/dt4sms (coming soon)
+    GitHub: https://github.com/LeiterConsulting/splunk-discovery-tool
     Version: ${VERSION}
 EOF
 }

@@ -94,7 +94,7 @@ Open http://localhost:8003 and test:
 ### 4. Verify Context Loading
 Check console output for:
 ```
-[LLM Cache] Created new client for custom (llama3.2:latest)
+[LLM Cache] Created <provider> client (<model>)
 ```
 This should only appear **once** per server restart.
 
@@ -128,7 +128,7 @@ System responds with formatted context dynamically injected.
 ## Troubleshooting
 
 ### Issue: Context not loading
-- Check `output/discovery_export_*.json` exists
+- Check `output/v2_intelligence_blueprint_*.json` exists
 - Verify file permissions on SDT001
 - Check console for error messages
 

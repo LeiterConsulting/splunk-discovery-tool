@@ -11,6 +11,7 @@ import aiohttp
 from typing import Dict, Any, List, AsyncGenerator, Optional
 from dataclasses import dataclass
 from datetime import datetime
+import time
 
 from llm.factory import LLMClientFactory
 from discovery.local_analyzer import LocalDataAnalyzer
@@ -76,6 +77,218 @@ class DiscoveryEngine:
         self.environment_overview: Optional[EnvironmentOverview] = None
         self.discovery_data: Dict[str, Any] = {}
         self.local_analyzer = LocalDataAnalyzer()
+        self._available_tools: set = set()
+        self._tool_last_refresh: float = 0.0
+        self._tool_aliases: Dict[str, List[str]] = {
+            "splunk_run_query": ["splunk_run_query", "run_splunk_query"],
+            "splunk_get_info": ["splunk_get_info", "get_splunk_info"],
+            "splunk_get_indexes": ["splunk_get_indexes", "get_indexes"],
+            "splunk_get_index_info": ["splunk_get_index_info", "get_index_info"],
+            "splunk_get_metadata": ["splunk_get_metadata", "get_metadata"],
+            "splunk_get_user_info": ["splunk_get_user_info", "splunk_get_user_list", "get_user_list"],
+            "splunk_get_kv_store_collections": ["splunk_get_kv_store_collections", "get_kv_store_collections"],
+            "splunk_get_knowledge_objects": ["splunk_get_knowledge_objects", "get_knowledge_objects"],
+            "saia_generate_spl": ["saia_generate_spl"],
+            "saia_optimize_spl": ["saia_optimize_spl"],
+            "saia_explain_spl": ["saia_explain_spl"],
+            "saia_ask_splunk_question": ["saia_ask_splunk_question"]
+        }
+
+    async def _refresh_available_tools(self, force: bool = False) -> set:
+        """Refresh and cache available MCP tools from Splunk MCP server."""
+        now = time.time()
+        if not force and self._available_tools and (now - self._tool_last_refresh) < 60:
+            return self._available_tools
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.mcp_token}"
+        }
+
+        payload = {
+            "method": "tools/list",
+            "params": {}
+        }
+
+        ssl_context = None
+        if self.verify_ssl and self.ca_bundle_path:
+            import ssl
+            ssl_context = ssl.create_default_context(cafile=self.ca_bundle_path)
+        elif not self.verify_ssl:
+            ssl_context = False
+
+        discovered = set()
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.mcp_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    ssl=ssl_context
+                ) as response:
+                    if response.status != 200:
+                        return self._available_tools
+
+                    result = await response.json()
+                    result_obj = result.get("result", {}) if isinstance(result, dict) else {}
+
+                    if isinstance(result_obj.get("tools"), list):
+                        for tool in result_obj.get("tools", []):
+                            if isinstance(tool, dict) and tool.get("name"):
+                                discovered.add(tool["name"])
+
+                    content = result_obj.get("content", []) if isinstance(result_obj, dict) else []
+                    if isinstance(content, list):
+                        for item in content:
+                            if not isinstance(item, dict):
+                                continue
+                            text = item.get("text")
+                            if not isinstance(text, str) or not text.strip():
+                                continue
+                            try:
+                                parsed = json.loads(text)
+                            except json.JSONDecodeError:
+                                continue
+
+                            if isinstance(parsed, dict) and isinstance(parsed.get("tools"), list):
+                                for tool in parsed["tools"]:
+                                    if isinstance(tool, dict) and tool.get("name"):
+                                        discovered.add(tool["name"])
+
+            if discovered:
+                self._available_tools = discovered
+                self._tool_last_refresh = now
+        except Exception:
+            return self._available_tools
+
+        return self._available_tools
+
+    async def _resolve_tool_name(self, requested_method: str, force_refresh: bool = False) -> str:
+        """Resolve logical or legacy tool name to an available MCP tool name."""
+        if force_refresh or not self._available_tools:
+            await self._refresh_available_tools(force=force_refresh)
+
+        available = self._available_tools
+        if requested_method in available:
+            return requested_method
+
+        for canonical, aliases in self._tool_aliases.items():
+            if requested_method == canonical or requested_method in aliases:
+                for candidate in aliases:
+                    if candidate in available:
+                        return candidate
+                if canonical in available:
+                    return canonical
+                # Prefer first alias as fallback when tool list is unavailable
+                return aliases[0]
+
+        return requested_method
+
+    async def _call_tool_raw(self, resolved_tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform raw tools/call request with a resolved tool name."""
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.mcp_token}"
+        }
+
+        normalized_params = self._normalize_tool_arguments(resolved_tool_name, params)
+
+        payload = {
+            "method": "tools/call",
+            "params": {
+                "name": resolved_tool_name,
+                "arguments": normalized_params
+            }
+        }
+
+        ssl_context = None
+        if self.verify_ssl and self.ca_bundle_path:
+            import ssl
+            ssl_context = ssl.create_default_context(cafile=self.ca_bundle_path)
+        elif not self.verify_ssl:
+            ssl_context = False
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.mcp_url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+                ssl=ssl_context
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"MCP server returned {response.status}: {error_text}")
+
+                result = await response.json()
+
+                if isinstance(result, dict) and "error" in result:
+                    raise Exception(f"MCP tool error: {result['error']}")
+
+                if isinstance(result, dict) and "result" in result:
+                    result_obj = result.get("result", {}) if isinstance(result, dict) else {}
+
+                    if isinstance(result_obj, dict):
+                        structured_content = result_obj.get("structuredContent", {})
+                        if isinstance(structured_content, dict):
+                            normalized = dict(structured_content)
+                            results_list = normalized.get("results", [])
+                            if isinstance(results_list, list) and len(results_list) == 1 and isinstance(results_list[0], dict):
+                                for key, value in results_list[0].items():
+                                    normalized.setdefault(key, value)
+                            return normalized
+
+                        if isinstance(result_obj.get("results"), list):
+                            normalized = {"results": result_obj.get("results", [])}
+                            if len(normalized["results"]) == 1 and isinstance(normalized["results"][0], dict):
+                                for key, value in normalized["results"][0].items():
+                                    normalized.setdefault(key, value)
+                            return normalized
+
+                        content = result_obj.get("content", [])
+                        if content and isinstance(content, list) and len(content) > 0:
+                            text_content = content[0].get("text", "{}") if isinstance(content[0], dict) else "{}"
+                            if not text_content or not text_content.strip():
+                                return {"results": []}
+                            try:
+                                parsed_data = json.loads(text_content)
+                                if isinstance(parsed_data, dict):
+                                    if isinstance(parsed_data.get("results"), list) and len(parsed_data["results"]) == 1 and isinstance(parsed_data["results"][0], dict):
+                                        for key, value in parsed_data["results"][0].items():
+                                            parsed_data.setdefault(key, value)
+                                    return parsed_data
+                                if isinstance(parsed_data, list):
+                                    return {"results": parsed_data}
+                            except json.JSONDecodeError:
+                                return {"results": []}
+
+                        if result_obj:
+                            return result_obj
+
+                    return {"results": []}
+
+                return result
+
+    def _normalize_tool_arguments(self, resolved_tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize legacy argument shapes to GA v1 Splunk MCP tool arguments."""
+        normalized = dict(params or {})
+
+        if resolved_tool_name in {"splunk_get_info", "get_splunk_info", "splunk_get_user_info", "splunk_get_user_list", "get_user_list"}:
+            return {}
+
+        if resolved_tool_name in {"splunk_get_index_info", "get_index_info"}:
+            if "index_name" in normalized and "index" not in normalized:
+                normalized["index"] = normalized.pop("index_name")
+
+        if resolved_tool_name in {"splunk_get_knowledge_objects", "get_knowledge_objects"}:
+            if "type" in normalized and "object_type" not in normalized:
+                normalized["object_type"] = normalized["type"]
+
+        return normalized
         
     async def get_quick_overview(self) -> EnvironmentOverview:
         """
@@ -89,14 +302,17 @@ class DiscoveryEngine:
         """
         # Get basic info through MCP calls using proper parameters
         try:
-            system_info = await self._mcp_call("get_splunk_info", {})
-            indexes_data = await self._mcp_call("get_indexes", {"row_limit": 100})
-            sourcetypes_data = await self._mcp_call("get_metadata", {"type": "sourcetypes", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 100})
-            hosts_data = await self._mcp_call("get_metadata", {"type": "hosts", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 500})
-            sources_data = await self._mcp_call("get_metadata", {"type": "sources", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 500})
-            ko_data = await self._mcp_call("get_knowledge_objects", {"type": "saved_searches", "row_limit": 100})
-            user_data = await self._mcp_call("get_user_list", {"row_limit": 100})
-            kv_data = await self._mcp_call("get_kv_store_collections", {"row_limit": 100})
+            system_info = await self._mcp_call("splunk_get_info", {})
+            indexes_data = await self._mcp_call("splunk_get_indexes", {"row_limit": 100})
+            sourcetypes_data = await self._mcp_call("splunk_get_metadata", {"type": "sourcetypes", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 100})
+            hosts_data = await self._mcp_call("splunk_get_metadata", {"type": "hosts", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 500})
+            sources_data = await self._mcp_call("splunk_get_metadata", {"type": "sources", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 500})
+            ko_data = await self._mcp_call("splunk_get_knowledge_objects", {"type": "saved_searches", "row_limit": 100})
+            user_data = await self._mcp_call("splunk_get_user_info", {})
+            try:
+                kv_data = await self._mcp_call("splunk_get_kv_store_collections", {"row_limit": 100})
+            except Exception:
+                kv_data = {"results": []}
         except Exception as e:
             raise Exception(f"Unable to retrieve environment information from Splunk. Please verify MCP server connection and credentials. Error: {str(e)}")
         
@@ -114,7 +330,15 @@ class DiscoveryEngine:
         hosts_list = hosts_data.get("results", []) if isinstance(hosts_data, dict) else (hosts_data if isinstance(hosts_data, list) else [])
         sources_list = sources_data.get("results", []) if isinstance(sources_data, dict) else (sources_data if isinstance(sources_data, list) else [])
         ko_list = ko_data.get("results", []) if isinstance(ko_data, dict) else (ko_data if isinstance(ko_data, list) else [])
-        user_list = user_data.get("results", []) if isinstance(user_data, dict) else (user_data if isinstance(user_data, list) else [])
+        if isinstance(user_data, dict):
+            if isinstance(user_data.get("results"), list):
+                user_list = user_data.get("results", [])
+            elif user_data:
+                user_list = [user_data]
+            else:
+                user_list = []
+        else:
+            user_list = user_data if isinstance(user_data, list) else []
         kv_list = kv_data.get("results", []) if isinstance(kv_data, dict) else (kv_data if isinstance(kv_data, list) else [])
         
         total_indexes = len(indexes_list)
@@ -936,67 +1160,27 @@ class DiscoveryEngine:
             return f"~{hours}h {remaining_minutes}m"
     
     async def _mcp_call(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Make actual MCP call to Splunk server using proper JSON-RPC format."""
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.mcp_token}"
-        }
-        
-        # Build proper MCP JSON-RPC payload
-        payload = {
-            "method": "tools/call",
-            "params": {
-                "name": method,
-                "arguments": params
-            }
-        }
-        
+        """Make MCP call with dynamic tool-name resolution and auto-refresh on unknown-tool errors."""
         try:
-            # Prepare SSL context based on configuration
-            ssl_context = None
-            if self.verify_ssl and self.ca_bundle_path:
-                import ssl
-                ssl_context = ssl.create_default_context(cafile=self.ca_bundle_path)
-            elif not self.verify_ssl:
-                ssl_context = False  # Disable SSL verification
-            # If verify_ssl is True but no ca_bundle, use default SSL context (None)
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.mcp_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    ssl=ssl_context
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        
-                        # Extract the actual data from MCP response structure
-                        if isinstance(result, dict) and "result" in result:
-                            content = result["result"].get("content", [])
-                            if content and isinstance(content, list) and len(content) > 0:
-                                # Get the text content and parse it as JSON
-                                text_content = content[0].get("text", "{}")
-                                # Skip parsing if content is empty or whitespace
-                                if not text_content or not text_content.strip():
-                                    print(f"DEBUG: MCP returned empty content (may be processing/rate limit)")
-                                    return {"results": []}
-                                try:
-                                    parsed_data = json.loads(text_content)
-                                    return parsed_data
-                                except json.JSONDecodeError as e:
-                                    print(f"WARNING: Failed to parse MCP response JSON: {e}")
-                                    print(f"DEBUG: Content was: {text_content[:200]}")
-                                    return {"results": []}
-                            else:
-                                return {"results": []}
-                        else:
-                            return result
-                    else:
-                        error_text = await response.text()
-                        raise Exception(f"MCP server returned {response.status}: {error_text}")
+            resolved_name = await self._resolve_tool_name(method)
+            try:
+                return await self._call_tool_raw(resolved_name, params)
+            except Exception as first_error:
+                error_text = str(first_error).lower()
+                unknown_tool_signals = [
+                    "tool not found",
+                    "unknown tool",
+                    "invalid tool",
+                    "no such tool",
+                    "method not found"
+                ]
+
+                if any(signal in error_text for signal in unknown_tool_signals):
+                    await self._refresh_available_tools(force=True)
+                    refreshed_name = await self._resolve_tool_name(method, force_refresh=True)
+                    return await self._call_tool_raw(refreshed_name, params)
+
+                raise first_error
         except Exception as e:
             raise Exception(f"MCP connection failed: {str(e)}")
             
@@ -1020,7 +1204,7 @@ class DiscoveryEngine:
     async def _discover_indexes(self) -> List[Dict[str, Any]]:
         """Discover detailed information about all indexes."""
         try:
-            result = await self._mcp_call("get_indexes", {"row_limit": 100})
+            result = await self._mcp_call("splunk_get_indexes", {"row_limit": 100})
             return result.get("results", [])
         except Exception as e:
             raise Exception(f"Failed to discover indexes: {str(e)}")
@@ -1028,7 +1212,7 @@ class DiscoveryEngine:
     async def _discover_sourcetypes(self) -> List[Dict[str, Any]]:
         """Discover detailed information about all sourcetypes."""
         try:
-            result = await self._mcp_call("get_metadata", {"type": "sourcetypes", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 100})
+            result = await self._mcp_call("splunk_get_metadata", {"type": "sourcetypes", "index": "*", "earliest_time": "-24h", "latest_time": "now", "row_limit": 100})
             
             # Handle different response formats
             if isinstance(result, dict):
@@ -1053,7 +1237,7 @@ class DiscoveryEngine:
     async def _discover_knowledge_objects(self) -> List[Dict[str, Any]]:
         """Discover knowledge objects like dashboards, saved searches, etc.""" 
         try:
-            result = await self._mcp_call("get_knowledge_objects", {"type": "saved_searches", "row_limit": 100})
+            result = await self._mcp_call("splunk_get_knowledge_objects", {"type": "saved_searches", "row_limit": 100})
             return result.get("results", [])
         except Exception as e:
             raise Exception(f"Failed to discover knowledge objects: {str(e)}")
@@ -1061,7 +1245,7 @@ class DiscoveryEngine:
     async def _discover_hosts(self) -> List[Dict[str, Any]]:
         """Discover detailed information about all hosts sending data."""
         try:
-            result = await self._mcp_call("get_metadata", {
+            result = await self._mcp_call("splunk_get_metadata", {
                 "type": "hosts",
                 "index": "*",
                 "earliest_time": "-24h",
@@ -1075,7 +1259,7 @@ class DiscoveryEngine:
     async def _discover_sources(self) -> List[Dict[str, Any]]:
         """Discover detailed information about all data sources."""
         try:
-            result = await self._mcp_call("get_metadata", {
+            result = await self._mcp_call("splunk_get_metadata", {
                 "type": "sources",
                 "index": "*",
                 "earliest_time": "-24h",
@@ -1089,7 +1273,7 @@ class DiscoveryEngine:
     async def _discover_knowledge_objects_by_type(self, ko_type: str) -> List[Dict[str, Any]]:
         """Discover knowledge objects of a specific type."""
         try:
-            result = await self._mcp_call("get_knowledge_objects", {
+            result = await self._mcp_call("splunk_get_knowledge_objects", {
                 "type": ko_type,
                 "row_limit": 100
             })
@@ -1106,7 +1290,7 @@ class DiscoveryEngine:
         """Get detailed information for each index."""
         detailed_info = []
         # Get list of indexes first
-        indexes_result = await self._mcp_call("get_indexes", {"row_limit": 100})
+        indexes_result = await self._mcp_call("splunk_get_indexes", {"row_limit": 100})
         indexes = indexes_result.get("results", [])
         
         # Get detailed info for top 10 indexes by size/events
@@ -1119,8 +1303,12 @@ class DiscoveryEngine:
         for idx in sorted_indexes:
             index_name = idx.get('title', idx.get('name', 'unknown'))
             try:
-                result = await self._mcp_call("get_index_info", {"index_name": index_name})
-                detailed_info.append(result.get("results", {}))
+                result = await self._mcp_call("splunk_get_index_info", {"index_name": index_name})
+                index_results = result.get("results", []) if isinstance(result, dict) else []
+                if isinstance(index_results, list) and index_results:
+                    detailed_info.append(index_results[0])
+                elif isinstance(result, dict) and result:
+                    detailed_info.append(result)
             except Exception:
                 # Skip if index info not available
                 pass
@@ -1130,18 +1318,24 @@ class DiscoveryEngine:
     async def _discover_users(self) -> List[Dict[str, Any]]:
         """Discover user accounts and roles."""
         try:
-            result = await self._mcp_call("get_user_list", {"row_limit": 100})
-            return result.get("results", [])
+            result = await self._mcp_call("splunk_get_user_info", {})
+            if isinstance(result, dict) and isinstance(result.get("results"), list):
+                return result.get("results", [])
+            if isinstance(result, dict) and result:
+                return [result]
+            if isinstance(result, list):
+                return result
+            return []
         except Exception as e:
             raise Exception(f"Failed to discover users: {str(e)}")
     
     async def _discover_kv_collections(self) -> List[Dict[str, Any]]:
         """Discover KV store collections."""
         try:
-            result = await self._mcp_call("get_kv_store_collections", {"row_limit": 100})
+            result = await self._mcp_call("splunk_get_kv_store_collections", {"row_limit": 100})
             return result.get("results", [])
-        except Exception as e:
-            raise Exception(f"Failed to discover KV collections: {str(e)}")
+        except Exception:
+            return []
     
     async def _run_advanced_analytics(self) -> List[Dict[str, Any]]:
         """Run advanced analytical queries for deeper insights."""
@@ -1150,7 +1344,7 @@ class DiscoveryEngine:
         # 1. Data quality analysis - find empty indexes
         try:
             query = "| tstats count WHERE index=* by index | where count=0"
-            result = await self._mcp_call("run_splunk_query", {
+            result = await self._mcp_call("splunk_run_query", {
                 "query": query,
                 "earliest_time": "-24h",
                 "latest_time": "now",
@@ -1169,7 +1363,7 @@ class DiscoveryEngine:
         # 2. Temporal pattern analysis - data volume by day
         try:
             query = "| tstats count WHERE index=* earliest=-7d latest=now by _time span=1d | eval day=strftime(_time, \"%Y-%m-%d\")"
-            result = await self._mcp_call("run_splunk_query", {
+            result = await self._mcp_call("splunk_run_query", {
                 "query": query,
                 "earliest_time": "-7d",
                 "latest_time": "now",
@@ -1194,7 +1388,7 @@ class DiscoveryEngine:
         # 3. Field diversity analysis - over-indexed indexes
         try:
             query = "| rest /services/data/indexes | stats count by title | where count > 0"
-            result = await self._mcp_call("run_splunk_query", {
+            result = await self._mcp_call("splunk_run_query", {
                 "query": query,
                 "earliest_time": "-24h",
                 "latest_time": "now",

@@ -75,6 +75,7 @@ $MANIFEST_FILE = Join-Path $INSTALL_DIR ".install_manifest.json"
 $PID_FILE = Join-Path $INSTALL_DIR ".dt4sms.pid"
 $VENV_DIR = Join-Path $INSTALL_DIR ".venv"
 $LOG_FILE = Join-Path $INSTALL_DIR "dt4sms.log"
+$ERR_LOG_FILE = Join-Path $INSTALL_DIR "dt4sms.err.log"
 
 # Colors
 $ColorGreen = "Green"
@@ -118,7 +119,7 @@ function Show-Help {
     Write-Host "    Settings: Click gear icon in web UI"
     Write-Host ""
     Write-ColorMsg $ColorBlue "SUPPORT:"
-    Write-Host "    GitHub: https://github.com/yourusername/dt4sms (coming soon)"
+    Write-Host "    GitHub: https://github.com/LeiterConsulting/splunk-discovery-tool"
     Write-Host "    Version: $VERSION"
 }
 
@@ -222,14 +223,42 @@ function Start-DT4SMSService {
     
     Write-ColorMsg $ColorBlue "🚀 Starting $APP_SHORT..."
     
-    # Activate virtual environment
-    $activateScript = Join-Path $VENV_DIR "Scripts\Activate.ps1"
-    & $activateScript
-    
-    # Start in background
+    # Resolve virtual environment python executable
+    $venvPython = Join-Path $VENV_DIR "Scripts\python.exe"
+    if (-not (Test-Path $venvPython)) {
+        Write-ColorMsg $ColorRed "✗ Virtual environment python not found: $venvPython"
+        Write-ColorMsg $ColorYellow "Run .\install.ps1 first to install dependencies."
+        exit 1
+    }
+
+    # Ensure log file exists
+    if (-not (Test-Path $LOG_FILE)) {
+        New-Item -Path $LOG_FILE -ItemType File -Force | Out-Null
+    }
+    if (-not (Test-Path $ERR_LOG_FILE)) {
+        New-Item -Path $ERR_LOG_FILE -ItemType File -Force | Out-Null
+    }
+
+    # Start in background with log redirection
     $mainScript = Join-Path $INSTALL_DIR "src\main.py"
-    $process = Start-Process -FilePath "python" -ArgumentList "`"$mainScript`"" `
-        -NoNewWindow -PassThru
+    try {
+        $process = Start-Process -FilePath $venvPython -ArgumentList "`"$mainScript`"" `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $LOG_FILE -RedirectStandardError $ERR_LOG_FILE `
+            -ErrorAction Stop
+    } catch {
+        Write-ColorMsg $ColorRed "✗ Failed to start service process: $($_.Exception.Message)"
+        Write-ColorMsg $ColorBlue "📋 Stdout log: $LOG_FILE"
+        Write-ColorMsg $ColorBlue "📋 Stderr log: $ERR_LOG_FILE"
+        exit 1
+    }
+
+    if (-not $process -or -not $process.Id) {
+        Write-ColorMsg $ColorRed "✗ Failed to start service. Process handle was not returned."
+        Write-ColorMsg $ColorBlue "📋 Stdout log: $LOG_FILE"
+        Write-ColorMsg $ColorBlue "📋 Stderr log: $ERR_LOG_FILE"
+        exit 1
+    }
     $process.Id | Out-File -FilePath $PID_FILE -Encoding UTF8
     
     Start-Sleep -Seconds 2
@@ -239,8 +268,10 @@ function Start-DT4SMSService {
         Write-ColorMsg $ColorGreen "✓ Service started successfully"
         Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:8003"
         Write-ColorMsg $ColorBlue "📋 Logs: Get-Content $LOG_FILE -Wait"
+        Write-ColorMsg $ColorBlue "📋 Errors: Get-Content $ERR_LOG_FILE -Wait"
     } else {
         Write-ColorMsg $ColorRed "✗ Failed to start service. Check logs: $LOG_FILE"
+        Write-ColorMsg $ColorBlue "📋 Error log: $ERR_LOG_FILE"
         exit 1
     }
 }
@@ -315,6 +346,7 @@ function Uninstall-Application {
     
     # Remove logs
     Remove-Item $LOG_FILE -Force -ErrorAction SilentlyContinue
+    Remove-Item $ERR_LOG_FILE -Force -ErrorAction SilentlyContinue
     
     # Remove encrypted config
     Remove-Item (Join-Path $INSTALL_DIR "config.encrypted") -Force -ErrorAction SilentlyContinue

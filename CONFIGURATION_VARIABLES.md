@@ -9,11 +9,18 @@ Comprehensive enumeration of all configurable parameters, thresholds, and consta
 ### 1.1 Default Values (src/config_manager.py)
 ```python
 class LLMConfig:
-    provider: str = "openai"           # Default LLM provider
+    provider: str = "openai"           # Supported: openai, azure, anthropic, gemini, custom
     model: str = "gpt-4o-mini"         # Default model
     max_tokens: int = 16000            # Default max tokens per request
     temperature: float = 0.7           # Default temperature for responses
 ```
+
+Provider endpoint requirements:
+- `openai`: endpoint optional (defaults to OpenAI public API)
+- `azure`: endpoint required (Azure OpenAI resource/deployment URL)
+- `anthropic`: endpoint optional (defaults to `https://api.anthropic.com`)
+- `gemini`: endpoint optional (defaults to `https://generativelanguage.googleapis.com`)
+- `custom`: endpoint required
 
 ### 1.2 Rate Limiting (src/llm/factory.py)
 ```python
@@ -104,7 +111,7 @@ no_data_repetitions: int = 5           # Stop after 5 iterations with no data
 ### 4.1 Discovery Freshness (src/web_app.py)
 ```python
 staleness_threshold: int = 604800      # 7 days in seconds (when to recommend re-discovery)
-discovery_summary_preview: int = 2000  # Characters to read from executive summary
+discovery_summary_preview: int = 2000  # Characters to read from V2 insights brief
 max_key_findings: int = 5              # Maximum findings to inject into context
 max_recommendations: int = 5           # Maximum recommendations to inject
 ```
@@ -158,6 +165,15 @@ web_app_port = 8003
 api_prefix = "/api"
 websocket_endpoint = "/ws"
 debug_websocket_endpoint = "/ws/debug"
+
+# V2 Workspace Routes
+v2_intelligence_endpoint = "/api/v2/intelligence"
+v2_artifacts_endpoint = "/api/v2/artifacts"
+discovery_dashboard_endpoint = "/api/discovery/dashboard"
+discovery_compare_endpoint = "/api/discovery/compare"
+discovery_runbook_endpoint = "/api/discovery/runbook"
+summarize_session_endpoint = "/summarize-session"
+summarize_progress_endpoint = "/summarize-progress/{session_id}"
 ```
 
 ---
@@ -174,6 +190,13 @@ config_key_file = ".config.key"        # Encryption key
 ```python
 output_directory = "output/"           # Discovery reports output
 log_directory = "logs/"                # Application logs (if enabled)
+
+# V2 Artifact Naming
+v2_blueprint_pattern = "v2_intelligence_blueprint_<timestamp>.json"
+v2_insights_pattern = "v2_insights_brief_<timestamp>.md"
+v2_runbook_pattern = "v2_operator_runbook_<timestamp>.md"
+v2_handoff_pattern = "v2_developer_handoff_<timestamp>.md"
+v2_summary_pattern = "v2_ai_summary_<timestamp>.json"
 ```
 
 ### 8.3 Ignored Patterns (.gitignore)
@@ -190,7 +213,7 @@ config.encrypted
 output/
 
 # Development
-DO NOT SENT TO GIT/
+DO NOT SEND TO GIT/
 *.backup*
 *.corrupted*
 test_*.py
@@ -207,10 +230,42 @@ default_model = "gpt-4o-mini"
 max_context_window = 128000            # Model-specific (varies by model)
 ```
 
-### 9.2 Custom Endpoints
+### 9.2 Azure OpenAI
 ```python
+endpoint_pattern = "https://<resource>.openai.azure.com"
+api_version = "2024-02-15-preview"   # Used for deployment/model probes
+```
+
+### 9.3 Anthropic
+```python
+default_endpoint = "https://api.anthropic.com"
+header_anthropic_version = "2023-06-01"
+```
+
+### 9.4 Gemini
+```python
+default_endpoint = "https://generativelanguage.googleapis.com"
+request_shape = "models/{model}:generateContent"
+```
+
+### 9.5 Custom Endpoints
+```python
+endpoint_base_example = "http://<host>:<port>/v1"
+auto_candidate_paths = ["/v1/chat/completions", "/chat/completions", "/v1/completions", "/completions"]
+
 # Simple prompt for greetings (no heavy context)
 greeting_keywords = ['hi', 'hello', 'hey', 'how are you', 'thanks', 'thank you', 'bye', 'goodbye']
+```
+
+Notes:
+- Custom provider accepts either a full completion URL or a base endpoint.
+- When a base endpoint is provided, the client automatically tries common OpenAI-compatible completion paths.
+
+### 9.6 LLM Utility API Endpoints
+```python
+llm_list_models_endpoint = "/api/llm/list-models"          # Provider-aware model/deployment fetch
+llm_test_connection_endpoint = "/api/llm/test-connection"  # Provider-aware connectivity + generation test
+llm_assess_max_tokens_endpoint = "/api/llm/assess-max-tokens"
 ```
 
 ---
@@ -296,5 +351,5 @@ masked_placeholder = "***"             # Placeholder for masked secrets in UI
 
 ---
 
-*Last Updated: 2025-11-03*
-*Version: 1.0.0*
+*Last Updated: 2026-02-18*
+*Version: 1.1.0-dev*

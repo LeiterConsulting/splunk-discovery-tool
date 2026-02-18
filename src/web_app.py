@@ -14,9 +14,14 @@ import asyncio
 import json
 import os
 import re
+import time
+import sys
+import socket
+import subprocess
+from urllib.parse import quote
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import uvicorn
 import httpx
 from pydantic import BaseModel
@@ -24,8 +29,18 @@ from pydantic import BaseModel
 # DT4SMS: Use encrypted config manager instead of YAML
 from config_manager import ConfigManager
 from discovery.engine import DiscoveryEngine
-from llm.factory import LLMClientFactory
+from discovery.v2_pipeline import DiscoveryV2Pipeline
+from llm.factory import LLMClientFactory, normalize_provider_name
 from discovery.context_manager import get_context_manager
+
+# Ensure console/log prints do not crash on Windows code pages (cp1252, etc.)
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # Initialize encrypted config manager
 config_manager = ConfigManager("config.encrypted")
@@ -45,30 +60,19 @@ def get_or_create_llm_client(config):
     if _cached_llm_client is not None and _cached_config_hash == config_hash:
         return _cached_llm_client
     
-    # Create new client based on provider type
-    # OpenAI gets native client (no health monitoring restrictions)
-    # Custom/other providers get CustomLLMClient (with health monitoring)
-    provider_lower = config.llm.provider.lower()
-    
-    if provider_lower == "openai":
-        # Native OpenAI client - no payload restrictions
-        _cached_llm_client = LLMClientFactory.create_client(
-            provider='openai',
-            api_key=config.llm.api_key,
-            model=config.llm.model
-        )
-        print(f"[LLM Cache] Created OpenAI client ({config.llm.model}) - no restrictions")
-    else:
-        # Custom endpoint - uses health monitoring and payload adaptation
-        if not config.llm.endpoint_url:
-            raise ValueError(f"Custom provider '{config.llm.provider}' requires endpoint_url")
-        _cached_llm_client = LLMClientFactory.create_client(
-            provider='custom',
-            custom_endpoint=config.llm.endpoint_url,
-            api_key=config.llm.api_key,
-            model=config.llm.model
-        )
-        print(f"[LLM Cache] Created custom client for {config.llm.provider} ({config.llm.model}) - health monitoring enabled")
+    provider_name = normalize_provider_name(config.llm.provider)
+    endpoint_url = config.llm.endpoint_url
+
+    if provider_name in {"azure", "custom"} and not endpoint_url:
+        raise ValueError(f"Provider '{config.llm.provider}' requires endpoint_url")
+
+    _cached_llm_client = LLMClientFactory.create_client(
+        provider=provider_name,
+        custom_endpoint=endpoint_url,
+        api_key=config.llm.api_key,
+        model=config.llm.model
+    )
+    print(f"[LLM Cache] Created {provider_name} client ({config.llm.model})")
     
     _cached_config_hash = config_hash
     return _cached_llm_client
@@ -128,7 +132,1312 @@ chat_session_settings = {
     # Quality Control
     "quality_threshold": 70,         # 0-100 score
     "convergence_detection": 5,      # iterations
+
+    # Demo Augmentation
+    "enable_splunk_augmentation": True,
+    "enable_rag_context": False,
+    "rag_max_chunks": 3,
 }
+
+MCP_TOOL_ALIASES = {
+    "splunk_run_query": ["splunk_run_query", "run_splunk_query"],
+    "splunk_get_info": ["splunk_get_info", "get_splunk_info"],
+    "splunk_get_indexes": ["splunk_get_indexes", "get_indexes"],
+    "splunk_get_index_info": ["splunk_get_index_info", "get_index_info"],
+    "splunk_get_metadata": ["splunk_get_metadata", "get_metadata"],
+    "splunk_get_user_info": ["splunk_get_user_info", "splunk_get_user_list", "get_user_list"],
+    "splunk_get_kv_store_collections": ["splunk_get_kv_store_collections", "get_kv_store_collections"],
+    "splunk_get_knowledge_objects": ["splunk_get_knowledge_objects", "get_knowledge_objects"],
+    "saia_generate_spl": ["saia_generate_spl"],
+    "saia_optimize_spl": ["saia_optimize_spl"],
+    "saia_explain_spl": ["saia_explain_spl"],
+    "saia_ask_splunk_question": ["saia_ask_splunk_question"]
+}
+
+MCP_TOOL_DESCRIPTIONS = {
+    "splunk_run_query": "Run a query and return results.",
+    "splunk_get_info": "Get Splunk instance version and server information.",
+    "splunk_get_indexes": "List Splunk indexes you can access.",
+    "splunk_get_index_info": "Get detailed information about a specific index.",
+    "splunk_get_metadata": "Get hosts, sources, or sourcetypes for query building.",
+    "splunk_get_user_info": "Get information about the authenticated user.",
+    "splunk_get_kv_store_collections": "List KV store collections.",
+    "splunk_get_knowledge_objects": "List knowledge objects (saved searches, data models, macros, etc.).",
+    "saia_generate_spl": "Generate SPL from natural language.",
+    "saia_optimize_spl": "Optimize existing SPL.",
+    "saia_explain_spl": "Explain SPL in natural language.",
+    "saia_ask_splunk_question": "Ask Splunk AI Assistant a natural language question."
+}
+
+_cached_mcp_tools = {
+    "url": None,
+    "tools": set(),
+    "timestamp": 0.0
+}
+
+DISCOVERY_PIPELINE_VERSION = "v2"
+
+chat_agent_memory: Dict[str, Dict[str, Any]] = {}
+
+
+def sanitize_chat_session_id(chat_session_id: str) -> str:
+    """Sanitize chat session ID for safe in-memory and file usage."""
+    if not isinstance(chat_session_id, str) or not chat_session_id.strip():
+        return "default"
+    cleaned = re.sub(r'[^a-zA-Z0-9_\-]', '_', chat_session_id.strip())
+    return cleaned[:64] if cleaned else "default"
+
+
+def _get_memory_store_path(chat_session_id: str) -> Path:
+    """Get per-chat memory persistence path."""
+    project_root = Path(__file__).resolve().parent.parent
+    memory_dir = project_root / "output" / "chat_memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    return memory_dir / f"chat_memory_{sanitize_chat_session_id(chat_session_id)}.json"
+
+
+def _default_chat_memory(chat_session_id: str) -> Dict[str, Any]:
+    """Default chat memory payload."""
+    now = datetime.now().isoformat()
+    return {
+        "chat_session_id": sanitize_chat_session_id(chat_session_id),
+        "created_at": now,
+        "updated_at": now,
+        "primary_intent": "",
+        "recent_intents": [],
+        "tracked_terms": [],
+        "locations": [],
+        "entities": {
+            "indexes": [],
+            "sourcetypes": [],
+            "hosts": [],
+            "sources": []
+        },
+        "time_preferences": [],
+        "last_tools_used": []
+    }
+
+
+def load_chat_memory(chat_session_id: str) -> Dict[str, Any]:
+    """Load chat memory from cache or disk."""
+    session_key = sanitize_chat_session_id(chat_session_id)
+    if session_key in chat_agent_memory:
+        return chat_agent_memory[session_key]
+
+    memory = _default_chat_memory(session_key)
+    path = _get_memory_store_path(session_key)
+    if path.exists():
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    memory.update(loaded)
+        except Exception:
+            pass
+
+    chat_agent_memory[session_key] = memory
+    return memory
+
+
+def save_chat_memory(chat_session_id: str, memory: Dict[str, Any]) -> None:
+    """Persist chat memory in cache and on disk."""
+    session_key = sanitize_chat_session_id(chat_session_id)
+    memory["chat_session_id"] = session_key
+    memory["updated_at"] = datetime.now().isoformat()
+    chat_agent_memory[session_key] = memory
+
+    try:
+        path = _get_memory_store_path(session_key)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(memory, f, indent=2)
+    except Exception:
+        pass
+
+
+def _append_unique(target_list: List[str], values: List[str], limit: int = 25) -> List[str]:
+    """Append unique non-empty string values with max length enforcement."""
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        cleaned = value.strip()
+        if cleaned and cleaned not in target_list:
+            target_list.append(cleaned)
+    if len(target_list) > limit:
+        del target_list[:-limit]
+    return target_list
+
+
+def _extract_memory_signals(text: str) -> Dict[str, List[str]]:
+    """Extract intent and entity candidates from natural language or SPL text."""
+    if not text:
+        return {
+            "terms": [],
+            "indexes": [],
+            "sourcetypes": [],
+            "hosts": [],
+            "sources": [],
+            "time_preferences": [],
+            "intent": ""
+        }
+
+    lower_text = text.lower()
+    terms = []
+    terms.extend(re.findall(r'"([^"\n]{2,80})"', text))
+    terms.extend(re.findall(r"'([^'\n]{2,80})'", text))
+
+    indexes = re.findall(r'index=([\w\*\-\.]+)', text, flags=re.IGNORECASE)
+    sourcetypes = re.findall(r'sourcetype=([\w\*\-:\.]+)', text, flags=re.IGNORECASE)
+    hosts = re.findall(r'host=([\w\*\-\.]+)', text, flags=re.IGNORECASE)
+    sources = re.findall(r'source=([^\s\|]+)', text, flags=re.IGNORECASE)
+
+    time_preferences = []
+    for token in ["-24h", "-7d", "-30d", "today", "yesterday", "last week", "last month", "now"]:
+        if token in lower_text:
+            time_preferences.append(token)
+
+    intent = ""
+    intent_patterns = [
+        ("security investigation", ["security", "threat", "incident", "attack"]),
+        ("performance monitoring", ["performance", "latency", "cpu", "memory", "slow"]),
+        ("index discovery", ["index", "indexes", "sourcetype", "metadata"]),
+        ("compliance reporting", ["compliance", "audit", "pci", "hipaa", "sox"]),
+        ("spl optimization", ["optimize", "improve query", "explain spl", "generate spl"])
+    ]
+    for label, keywords in intent_patterns:
+        if any(keyword in lower_text for keyword in keywords):
+            intent = label
+            break
+
+    return {
+        "terms": terms,
+        "indexes": indexes,
+        "sourcetypes": sourcetypes,
+        "hosts": hosts,
+        "sources": sources,
+        "time_preferences": time_preferences,
+        "intent": intent
+    }
+
+
+def update_chat_memory(chat_session_id: str, user_message: str, tool_calls: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Update chat memory with latest user message and optional tool activity."""
+    memory = load_chat_memory(chat_session_id)
+    signals = _extract_memory_signals(user_message)
+
+    if signals.get("intent"):
+        memory["primary_intent"] = signals["intent"]
+        _append_unique(memory["recent_intents"], [signals["intent"]], limit=8)
+
+    _append_unique(memory["tracked_terms"], signals.get("terms", []), limit=30)
+    _append_unique(memory["time_preferences"], signals.get("time_preferences", []), limit=10)
+
+    entities = memory.get("entities", {})
+    _append_unique(entities.setdefault("indexes", []), signals.get("indexes", []), limit=25)
+    _append_unique(entities.setdefault("sourcetypes", []), signals.get("sourcetypes", []), limit=25)
+    _append_unique(entities.setdefault("hosts", []), signals.get("hosts", []), limit=25)
+    _append_unique(entities.setdefault("sources", []), signals.get("sources", []), limit=25)
+
+    _append_unique(memory["locations"], signals.get("indexes", []) + signals.get("hosts", []) + signals.get("sources", []), limit=25)
+
+    if tool_calls:
+        recent_tools = [tc.get("tool", "") for tc in tool_calls if isinstance(tc, dict) and tc.get("tool")]
+        _append_unique(memory["last_tools_used"], recent_tools, limit=15)
+
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            args = tc.get("args", {}) or {}
+            if isinstance(args, dict) and args.get("query"):
+                query_signals = _extract_memory_signals(args.get("query", ""))
+                _append_unique(entities.setdefault("indexes", []), query_signals.get("indexes", []), limit=25)
+                _append_unique(entities.setdefault("sourcetypes", []), query_signals.get("sourcetypes", []), limit=25)
+                _append_unique(entities.setdefault("hosts", []), query_signals.get("hosts", []), limit=25)
+                _append_unique(entities.setdefault("sources", []), query_signals.get("sources", []), limit=25)
+
+    memory["entities"] = entities
+    save_chat_memory(chat_session_id, memory)
+    return memory
+
+
+def build_chat_memory_context(memory: Dict[str, Any]) -> str:
+    """Render concise memory context for system prompt injection."""
+    if not memory:
+        return ""
+
+    entities = memory.get("entities", {})
+    lines = ["🧠 SESSION MEMORY:"]
+    if memory.get("primary_intent"):
+        lines.append(f"- Primary intent: {memory['primary_intent']}")
+    if memory.get("recent_intents"):
+        lines.append(f"- Recent intents: {', '.join(memory['recent_intents'][-3:])}")
+    if memory.get("tracked_terms"):
+        lines.append(f"- Tracked terms: {', '.join(memory['tracked_terms'][-6:])}")
+    if entities.get("indexes"):
+        lines.append(f"- Remembered indexes: {', '.join(entities['indexes'][-6:])}")
+    if entities.get("hosts"):
+        lines.append(f"- Remembered hosts: {', '.join(entities['hosts'][-4:])}")
+    if entities.get("sourcetypes"):
+        lines.append(f"- Remembered sourcetypes: {', '.join(entities['sourcetypes'][-4:])}")
+    if memory.get("time_preferences"):
+        lines.append(f"- Preferred time ranges: {', '.join(memory['time_preferences'][-4:])}")
+    if memory.get("last_tools_used"):
+        lines.append(f"- Last tools used: {', '.join(memory['last_tools_used'][-5:])}")
+
+    return "\n".join(lines)
+
+
+def build_follow_on_actions(user_message: str, memory: Dict[str, Any], tool_calls: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """Generate concise follow-on action suggestions for the next interaction step."""
+    actions: List[str] = []
+    entities = memory.get("entities", {}) if isinstance(memory, dict) else {}
+    remembered_index = (entities.get("indexes") or [None])[-1]
+    remembered_host = (entities.get("hosts") or [None])[-1]
+
+    if tool_calls:
+        last_call = tool_calls[-1] if tool_calls else {}
+        summary = last_call.get("summary", {}) if isinstance(last_call, dict) else {}
+        row_count = summary.get("row_count", 0)
+
+        if row_count == 0:
+            actions.append("Retry with a broader time range, such as earliest=-7d latest=now.")
+            if remembered_index:
+                actions.append(f"Run a baseline count check on index={remembered_index} to confirm data availability.")
+        elif row_count > 0:
+            actions.append("Add a timechart view to evaluate trend changes over time.")
+            if remembered_index:
+                actions.append(f"Drill into index={remembered_index} with top sourcetype and host breakdown.")
+            if remembered_host:
+                actions.append(f"Pivot on host={remembered_host} to identify related anomalies.")
+
+    if not actions:
+        actions.append("Ask a focused plain-language question about one index, host, or sourcetype for deeper analysis.")
+        if remembered_index:
+            actions.append(f"Try: 'Show me unusual events in index={remembered_index} over the last 24h'.")
+
+    return actions[:3]
+
+
+def resolve_tool_name(tool_name: str, available_tools: Optional[set] = None) -> str:
+    """Resolve a logical/legacy tool name to the best available MCP tool name."""
+    available = available_tools or set()
+    if tool_name in available:
+        return tool_name
+
+    for canonical_name, aliases in MCP_TOOL_ALIASES.items():
+        if tool_name == canonical_name or tool_name in aliases:
+            for candidate in aliases:
+                if candidate in available:
+                    return candidate
+            return aliases[0]
+
+    return tool_name
+
+
+def normalize_tool_arguments(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize tool arguments for GA tool signatures while preserving compatibility."""
+    normalized = dict(args or {})
+
+    if tool_name in {"splunk_get_info", "get_splunk_info", "splunk_get_user_info", "splunk_get_user_list", "get_user_list"}:
+        return {}
+
+    if tool_name in {"splunk_get_index_info", "get_index_info"}:
+        if "index_name" in normalized and "index" not in normalized:
+            normalized["index"] = normalized.pop("index_name")
+
+    if tool_name in {"splunk_get_knowledge_objects", "get_knowledge_objects"}:
+        if "type" in normalized and "object_type" not in normalized:
+            normalized["object_type"] = normalized["type"]
+
+    return normalized
+
+
+def extract_results_from_mcp_response(tool_response: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract normalized result payload from MCP response across GA and legacy shapes."""
+    normalized = {
+        "results": [],
+        "status_code": None,
+        "error_message": ""
+    }
+
+    if not isinstance(tool_response, dict):
+        return normalized
+
+    result_obj = tool_response.get("result", {})
+    if not isinstance(result_obj, dict):
+        return normalized
+
+    structured = result_obj.get("structuredContent", {})
+    if isinstance(structured, dict):
+        status_code = structured.get("status_code")
+        if isinstance(status_code, int):
+            normalized["status_code"] = status_code
+        if isinstance(structured.get("content"), str):
+            normalized["error_message"] = structured.get("content", "")
+        if isinstance(structured.get("results"), list):
+            normalized["results"] = structured.get("results", [])
+            return normalized
+
+    if isinstance(result_obj.get("results"), list):
+        normalized["results"] = result_obj.get("results", [])
+        return normalized
+
+    content_items = result_obj.get("content", []) if isinstance(result_obj.get("content", []), list) else []
+    if content_items:
+        first_item = content_items[0]
+        if isinstance(first_item, dict) and isinstance(first_item.get("text"), str):
+            text = first_item.get("text", "")
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                    normalized["results"] = parsed.get("results", [])
+                elif isinstance(parsed, list):
+                    normalized["results"] = parsed
+            except json.JSONDecodeError:
+                pass
+
+    return normalized
+
+
+def detect_latest_entry_index_request(user_message: str) -> Optional[str]:
+    """Detect user intent asking for latest/newest entry in a specific index."""
+    if not isinstance(user_message, str):
+        return None
+
+    message = user_message.strip().lower()
+    patterns = [
+        r"latest\s+(?:entry|event|record|log\s*entry)\s+(?:in|from)\s+the\s+([a-zA-Z0-9_\-\.]+)\s+index",
+        r"latest\s+(?:entry|event|record|log\s*entry)\s+(?:in|from)\s+([a-zA-Z0-9_\-\.]+)\s+index",
+        r"newest\s+(?:entry|event|record)\s+(?:in|from)\s+the\s+([a-zA-Z0-9_\-\.]+)\s+index",
+        r"what\s+is\s+the\s+latest\s+(?:entry|event|record)\s+(?:in|from)\s+([a-zA-Z0-9_\-\.]+)\s+index"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    return None
+
+
+def detect_edge_processor_template_request(user_message: str) -> bool:
+    """Detect user intent asking for edge processor templates."""
+    if not isinstance(user_message, str):
+        return False
+    message = user_message.lower()
+    has_template_intent = any(token in message for token in ["template", "templates"])
+    has_edge_processor_intent = (
+        "edge processor" in message
+        or "edge_processor" in message
+        or ("edge" in message and "processor" in message)
+    )
+    return has_template_intent and has_edge_processor_intent
+
+
+def detect_last_offline_target(user_message: str) -> Optional[str]:
+    """Detect user intent asking when an entity (IP/host) was last offline."""
+    if not isinstance(user_message, str):
+        return None
+
+    message = user_message.strip().lower()
+    if "offline" not in message and "down" not in message:
+        return None
+
+    patterns = [
+        r"last\s+time\s+that\s+([a-zA-Z0-9_\-\.]+)\s+was\s+reported\s+offline",
+        r"when\s+was\s+the\s+last\s+time\s+([a-zA-Z0-9_\-\.]+)\s+was\s+offline",
+        r"when\s+was\s+([a-zA-Z0-9_\-\.]+)\s+last\s+(?:reported\s+)?offline",
+        r"last\s+offline\s+(?:event|time)\s+for\s+([a-zA-Z0-9_\-\.]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", message)
+    if ip_match and ("offline" in message or "down" in message):
+        return ip_match.group(1)
+
+    return None
+
+
+def _extract_query_terms_for_rag(user_message: str) -> List[str]:
+    tokens = re.findall(r"[a-zA-Z0-9_\-\.]{3,}", user_message.lower())
+    stopwords = {
+        "what", "when", "where", "which", "that", "this", "with", "from", "have", "used",
+        "show", "list", "last", "time", "were", "been", "into", "does", "about", "splunk"
+    }
+    unique = []
+    seen = set()
+    for token in tokens:
+        if token in stopwords:
+            continue
+        if token not in seen:
+            seen.add(token)
+            unique.append(token)
+    return unique[:10]
+
+
+def build_lightweight_rag_context(user_message: str, max_chunks: int = 3) -> str:
+    """Return compact local retrieval snippets from recent output reports for demo-mode RAG."""
+    output_dir = Path("output")
+    if not output_dir.exists():
+        return ""
+
+    query_terms = _extract_query_terms_for_rag(user_message)
+    if not query_terms:
+        return ""
+
+    candidate_files = sorted(
+        [p for p in output_dir.glob("*") if p.is_file() and p.suffix.lower() in {".md", ".txt", ".json"}],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )[:8]
+
+    scored_chunks: List[Dict[str, Any]] = []
+    for file_path in candidate_files:
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="ignore")[:12000]
+        except Exception:
+            continue
+
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+        for block in blocks:
+            lower_block = block.lower()
+            hits = sum(1 for term in query_terms if term in lower_block)
+            if hits <= 0:
+                continue
+            scored_chunks.append({
+                "file": file_path.name,
+                "score": hits,
+                "snippet": block[:420]
+            })
+
+    if not scored_chunks:
+        return ""
+
+    top_chunks = sorted(scored_chunks, key=lambda item: item["score"], reverse=True)[:max(1, min(max_chunks, 6))]
+    lines = ["📚 OPTIONAL LOCAL RAG CONTEXT:"]
+    for idx, chunk in enumerate(top_chunks, 1):
+        lines.append(f"{idx}. [{chunk['file']}] {chunk['snippet']}")
+    return "\n".join(lines)
+
+
+def detect_basic_inventory_intent(user_message: str) -> Optional[str]:
+    """Detect common simple inventory intents that should not rely on LLM tool formatting."""
+    if not isinstance(user_message, str):
+        return None
+    message = user_message.lower()
+
+    if any(token in message for token in ["list indexes", "show indexes", "what indexes", "available indexes"]):
+        return "list_indexes"
+    if any(token in message for token in ["top indexes", "largest indexes", "most active indexes", "indexes by volume"]):
+        return "top_indexes"
+    if any(token in message for token in ["events by index", "event count by index", "count by index"]):
+        return "top_indexes"
+    if any(token in message for token in ["top errors", "most errors", "error summary", "error breakdown"]):
+        return "top_errors"
+    if any(token in message for token in ["auth failures", "authentication failures", "failed logins", "login failures"]):
+        return "latest_auth_failures"
+    if any(token in message for token in ["how many events in index", "event count for index", "count events in index", "events in index"]):
+        if extract_index_from_message(user_message):
+            return "count_index_events"
+    if any(token in message for token in ["list sourcetypes", "show sourcetypes", "what sourcetypes"]):
+        return "list_sourcetypes"
+    if any(token in message for token in ["list hosts", "show hosts", "what hosts", "active hosts"]):
+        return "list_hosts"
+    if any(token in message for token in ["last seen", "latest heartbeat", "last heartbeat", "last event for host", "latest event for host"]):
+        if extract_host_or_ip_from_message(user_message):
+            return "latest_host_heartbeat"
+    if "template" in message and "splunk" in message and "edge processor" not in message:
+        return "list_templates"
+    return None
+
+
+def extract_index_from_message(user_message: str) -> Optional[str]:
+    """Extract index target from natural language."""
+    if not isinstance(user_message, str):
+        return None
+    patterns = [
+        r"index\s*[=:]?\s*([a-zA-Z0-9_\-.]+)",
+        r"in\s+index\s+([a-zA-Z0-9_\-.]+)",
+        r"for\s+index\s+([a-zA-Z0-9_\-.]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, user_message, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def extract_host_or_ip_from_message(user_message: str) -> Optional[str]:
+    """Extract host or IPv4 target from natural language."""
+    if not isinstance(user_message, str):
+        return None
+    ip_match = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", user_message)
+    if ip_match:
+        return ip_match.group(0)
+    host_match = re.search(r"host\s*[=:]?\s*([a-zA-Z0-9_\-.]+)", user_message, flags=re.IGNORECASE)
+    if host_match:
+        return host_match.group(1).strip()
+    return None
+
+
+def parse_tool_call_payload(raw_json: str) -> Optional[Dict[str, Any]]:
+    """Parse tool-call payload robustly across JSON and python-like dict styles."""
+    if not isinstance(raw_json, str) or not raw_json.strip():
+        return None
+
+    payload = raw_json.strip()
+    try:
+        parsed = json.loads(payload)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    try:
+        import ast
+        parsed = ast.literal_eval(payload)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    cleaned = re.sub(r",\s*([}\]])", r"\1", payload)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+
+    return None
+
+
+def build_compact_chat_prompt(
+    query_tool_name: str,
+    discovery_context: str,
+    rag_context: str,
+    memory_context: str,
+    available_tools_text: str,
+    discovery_age_warning: Optional[str]
+) -> str:
+    """Compact, deterministic-first prompt for reliable Splunk chat behavior."""
+    return f"""You are a precise Splunk assistant. Prioritize correctness over creativity.
+
+Context:
+{discovery_context}
+{rag_context}
+{discovery_age_warning or ''}
+{memory_context}
+
+Available tools:
+{available_tools_text}
+
+Rules:
+1) For data requests, execute tools rather than guessing.
+2) If one query returns no data, broaden time range once and try a nearby index.
+3) If still no data, explicitly say no data found and show what was tried.
+4) Keep answers concise and factual.
+
+Tool call format (required when querying):
+<TOOL_CALL>{{"tool": "{query_tool_name}", "args": {{"query": "search index=main | head 5", "earliest_time": "-24h", "latest_time": "now"}}}}</TOOL_CALL>
+"""
+
+
+def _discovery_session_manifest_path() -> Path:
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+    return output_dir / "discovery_sessions.json"
+
+
+def load_discovery_sessions() -> List[Dict[str, Any]]:
+    """Load persisted discovery session catalog."""
+    manifest_path = _discovery_session_manifest_path()
+    if not manifest_path.exists():
+        # Backfill from existing report files for legacy runs
+        output_dir = Path("output")
+        if not output_dir.exists():
+            return []
+
+        sessions_by_timestamp: Dict[str, Dict[str, Any]] = {}
+        for file_path in output_dir.glob("*"):
+            if not file_path.is_file():
+                continue
+            match = re.search(r"_(\d{8}_\d{6})\.", file_path.name)
+            if not match:
+                continue
+            timestamp = match.group(1)
+            entry = sessions_by_timestamp.setdefault(timestamp, {
+                "timestamp": timestamp,
+                "created_at": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+                "overview": {},
+                "report_paths": [],
+                "mcp_capabilities": {},
+                "stats": {
+                    "discovery_steps": 0,
+                    "classification_groups": 0,
+                    "recommendation_count": 0,
+                    "suggested_use_case_count": 0
+                }
+            })
+            entry["report_paths"].append(file_path.name)
+
+        reconstructed = sorted(sessions_by_timestamp.values(), key=lambda x: x.get("timestamp", ""), reverse=True)
+        if reconstructed:
+            save_discovery_sessions(reconstructed)
+        return reconstructed
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+
+    return []
+
+
+def save_discovery_sessions(sessions: List[Dict[str, Any]]) -> None:
+    """Persist discovery session catalog."""
+    manifest_path = _discovery_session_manifest_path()
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(sessions, f, indent=2)
+    except Exception:
+        pass
+
+
+def register_discovery_session(
+    timestamp: str,
+    overview: Any,
+    report_paths: List[str],
+    mcp_capabilities: Dict[str, Any],
+    classifications: Dict[str, Any],
+    recommendations: List[Dict[str, Any]],
+    suggested_use_cases: List[Dict[str, Any]],
+    discovery_step_count: int,
+    personas: Optional[Dict[str, Any]] = None,
+    readiness_score: Optional[int] = None
+) -> Dict[str, Any]:
+    """Register a discovery session in manifest for retrieval and UI history."""
+    sessions = load_discovery_sessions()
+
+    session_record = {
+        "timestamp": timestamp,
+        "created_at": datetime.now().isoformat(),
+        "overview": {
+            "total_indexes": getattr(overview, "total_indexes", 0),
+            "total_sourcetypes": getattr(overview, "total_sourcetypes", 0),
+            "total_hosts": getattr(overview, "total_hosts", 0),
+            "total_users": getattr(overview, "total_users", 0),
+            "data_volume_24h": getattr(overview, "data_volume_24h", "unknown"),
+            "splunk_version": getattr(overview, "splunk_version", "unknown")
+        },
+        "report_paths": report_paths,
+        "mcp_capabilities": mcp_capabilities,
+        "personas": personas or {},
+        "readiness_score": readiness_score if isinstance(readiness_score, int) else 0,
+        "stats": {
+            "discovery_steps": discovery_step_count,
+            "classification_groups": len(classifications) if isinstance(classifications, dict) else 0,
+            "recommendation_count": len(recommendations) if isinstance(recommendations, list) else 0,
+            "suggested_use_case_count": len(suggested_use_cases) if isinstance(suggested_use_cases, list) else 0
+        }
+    }
+
+    # Replace if same timestamp exists
+    sessions = [s for s in sessions if s.get("timestamp") != timestamp]
+    sessions.insert(0, session_record)
+    sessions = sorted(sessions, key=lambda x: x.get("timestamp", ""), reverse=True)
+    save_discovery_sessions(sessions[:100])
+    return session_record
+
+
+def _safe_int(value: Any) -> int:
+    """Convert scalar-like values to int without raising."""
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            cleaned = value.replace(",", "").strip()
+            return int(float(cleaned))
+    except Exception:
+        pass
+    return 0
+
+
+def compute_discovery_readiness_score(
+    overview: Any,
+    recommendations: List[Dict[str, Any]],
+    suggested_use_cases: List[Dict[str, Any]],
+    mcp_capabilities: Dict[str, Any]
+) -> int:
+    """Compute a practical readiness score for platform maturity (0-100)."""
+    score = 0
+    total_indexes = _safe_int(getattr(overview, "total_indexes", 0))
+    total_sourcetypes = _safe_int(getattr(overview, "total_sourcetypes", 0))
+    total_hosts = _safe_int(getattr(overview, "total_hosts", 0))
+    tool_count = _safe_int((mcp_capabilities or {}).get("tool_count", 0))
+    recommendation_count = len(recommendations) if isinstance(recommendations, list) else 0
+    use_case_count = len(suggested_use_cases) if isinstance(suggested_use_cases, list) else 0
+
+    score += min(25, total_indexes)
+    score += min(20, total_sourcetypes // 2)
+    score += min(10, total_hosts // 2)
+    score += min(20, tool_count * 2)
+    score += min(15, recommendation_count * 2)
+    score += min(10, use_case_count * 2)
+    return max(0, min(100, score))
+
+
+def build_persona_playbooks(
+    overview: Any,
+    recommendations: List[Dict[str, Any]],
+    suggested_use_cases: List[Dict[str, Any]],
+    mcp_capabilities: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Build persona-specific outputs for admins, analysts, and executives."""
+    recs = recommendations if isinstance(recommendations, list) else []
+    use_cases = suggested_use_cases if isinstance(suggested_use_cases, list) else []
+
+    high_priority = [r for r in recs if isinstance(r, dict) and str(r.get("priority", "")).lower() == "high"]
+    top_recs = (high_priority or recs)[:5]
+    top_use_cases = [u for u in use_cases if isinstance(u, dict)][:4]
+
+    admin_actions = []
+    for rec in top_recs:
+        title = rec.get("title", "Recommendation")
+        complexity = rec.get("complexity", "unknown")
+        admin_actions.append({
+            "title": title,
+            "why": rec.get("description", "No description"),
+            "effort": complexity,
+            "owner": "Splunk Admin",
+            "next_step": f"Create implementation task for: {title}"
+        })
+
+    analyst_hypotheses = []
+    for use_case in top_use_cases:
+        analyst_hypotheses.append({
+            "title": use_case.get("title", "Use Case"),
+            "question": use_case.get("description", ""),
+            "data_sources": use_case.get("data_sources", []),
+            "success_metric": (use_case.get("success_metrics", ["Actionable detection uplift"]) or ["Actionable detection uplift"])[0]
+        })
+
+    readiness_score = compute_discovery_readiness_score(overview, recs, use_cases, mcp_capabilities)
+    exec_brief = {
+        "platform_readiness_score": readiness_score,
+        "headline": "Splunk discovery indicates strong baseline with clear optimization opportunities.",
+        "business_value_themes": [
+            "Risk reduction through improved coverage and detection fidelity",
+            "Operational efficiency via standardization and automation",
+            "Faster decision-making with cross-functional analytics"
+        ],
+        "next_90_day_focus": [
+            "Execute top high-priority recommendations",
+            "Productize at least 2 cross-functional use cases",
+            "Track measurable KPIs for detection quality and MTTR"
+        ],
+        "environment_snapshot": {
+            "indexes": _safe_int(getattr(overview, "total_indexes", 0)),
+            "sourcetypes": _safe_int(getattr(overview, "total_sourcetypes", 0)),
+            "hosts": _safe_int(getattr(overview, "total_hosts", 0)),
+            "tooling_capability_count": _safe_int((mcp_capabilities or {}).get("tool_count", 0))
+        }
+    }
+
+    return {
+        "admin": {
+            "title": "Admin Action Queue",
+            "actions": admin_actions[:6]
+        },
+        "analyst": {
+            "title": "Analyst Investigation Tracks",
+            "hypotheses": analyst_hypotheses[:6]
+        },
+        "executive": exec_brief
+    }
+
+
+def hydrate_discovery_session(session: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Hydrate a session with readiness/personas when legacy records are missing those fields."""
+    if not isinstance(session, dict):
+        return session
+
+    hydrated = dict(session)
+    if hydrated.get("readiness_score") and hydrated.get("personas"):
+        return hydrated
+
+    timestamp = hydrated.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return hydrated
+
+    export_path = Path("output") / f"discovery_export_{timestamp}.json"
+    if not export_path.exists():
+        return hydrated
+
+    try:
+        with open(export_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        overview_data = payload.get("overview", {}) if isinstance(payload, dict) else {}
+        recommendations_data = payload.get("recommendations", []) if isinstance(payload, dict) else []
+        use_cases_data = payload.get("suggested_use_cases", []) if isinstance(payload, dict) else []
+        mcp_data = payload.get("mcp_capabilities", {}) if isinstance(payload, dict) else {}
+
+        class _OverviewProxy:
+            def __init__(self, values: Dict[str, Any]):
+                for k, v in values.items():
+                    setattr(self, k, v)
+
+        overview_proxy = _OverviewProxy(overview_data if isinstance(overview_data, dict) else {})
+        hydrated["readiness_score"] = compute_discovery_readiness_score(
+            overview_proxy,
+            recommendations_data if isinstance(recommendations_data, list) else [],
+            use_cases_data if isinstance(use_cases_data, list) else [],
+            mcp_data if isinstance(mcp_data, dict) else {}
+        )
+        hydrated["personas"] = build_persona_playbooks(
+            overview_proxy,
+            recommendations_data if isinstance(recommendations_data, list) else [],
+            use_cases_data if isinstance(use_cases_data, list) else [],
+            mcp_data if isinstance(mcp_data, dict) else {}
+        )
+    except Exception:
+        return hydrated
+
+    return hydrated
+
+
+def _resolve_session_selection(
+    sessions: List[Dict[str, Any]],
+    selection: Optional[str],
+    default_index: int
+) -> Optional[Dict[str, Any]]:
+    """Resolve a session selector (latest/previous/timestamp) to a concrete session."""
+    if not sessions:
+        return None
+
+    token = (selection or "").strip().lower()
+    if token in {"", "latest"}:
+        return sessions[0]
+    if token == "previous":
+        return sessions[1] if len(sessions) > 1 else None
+
+    matched = next((s for s in sessions if s.get("timestamp") == selection), None)
+    if matched:
+        return matched
+
+    return sessions[default_index] if len(sessions) > default_index else sessions[0]
+
+
+def build_discovery_compare_payload(
+    current_selection: Optional[str] = None,
+    baseline_selection: Optional[str] = None
+) -> Dict[str, Any]:
+    """Build compare payload across two discovery sessions."""
+    sessions = load_discovery_sessions()
+    if len(sessions) < 2:
+        return {
+            "has_data": False,
+            "message": "At least two discovery sessions are required for compare.",
+            "sessions": sessions[:20]
+        }
+
+    current = hydrate_discovery_session(_resolve_session_selection(sessions, current_selection, 0))
+    baseline = hydrate_discovery_session(_resolve_session_selection(sessions, baseline_selection, 1))
+
+    if not current or not baseline:
+        return {
+            "has_data": False,
+            "message": "Unable to resolve selected sessions for compare.",
+            "sessions": sessions[:20]
+        }
+
+    if current.get("timestamp") == baseline.get("timestamp"):
+        return {
+            "has_data": False,
+            "message": "Choose two different sessions to compare.",
+            "sessions": sessions[:20],
+            "current": current,
+            "baseline": baseline
+        }
+
+    def _metric(session: Dict[str, Any], path: List[str]) -> int:
+        value: Any = session
+        for key in path:
+            value = value.get(key, {}) if isinstance(value, dict) else {}
+        return _safe_int(value)
+
+    metrics = {
+        "readiness": {
+            "current": _metric(current, ["readiness_score"]),
+            "baseline": _metric(baseline, ["readiness_score"])
+        },
+        "indexes": {
+            "current": _metric(current, ["overview", "total_indexes"]),
+            "baseline": _metric(baseline, ["overview", "total_indexes"])
+        },
+        "sourcetypes": {
+            "current": _metric(current, ["overview", "total_sourcetypes"]),
+            "baseline": _metric(baseline, ["overview", "total_sourcetypes"])
+        },
+        "recommendations": {
+            "current": _metric(current, ["stats", "recommendation_count"]),
+            "baseline": _metric(baseline, ["stats", "recommendation_count"])
+        },
+        "tools": {
+            "current": _metric(current, ["mcp_capabilities", "tool_count"]),
+            "baseline": _metric(baseline, ["mcp_capabilities", "tool_count"])
+        }
+    }
+
+    for metric in metrics.values():
+        metric["delta"] = metric["current"] - metric["baseline"]
+
+    admin_current = (current.get("personas", {}).get("admin", {}).get("actions", [])
+                     if isinstance(current.get("personas", {}), dict) else [])
+    admin_baseline = (baseline.get("personas", {}).get("admin", {}).get("actions", [])
+                      if isinstance(baseline.get("personas", {}), dict) else [])
+
+    analyst_current = (current.get("personas", {}).get("analyst", {}).get("hypotheses", [])
+                       if isinstance(current.get("personas", {}), dict) else [])
+    analyst_baseline = (baseline.get("personas", {}).get("analyst", {}).get("hypotheses", [])
+                        if isinstance(baseline.get("personas", {}), dict) else [])
+
+    return {
+        "has_data": True,
+        "current": current,
+        "baseline": baseline,
+        "metrics": metrics,
+        "persona_deltas": {
+            "admin_actions_delta": len(admin_current) - len(admin_baseline),
+            "analyst_tracks_delta": len(analyst_current) - len(analyst_baseline)
+        },
+        "sessions": sessions[:20]
+    }
+
+
+def build_session_runbook_payload(
+    timestamp: Optional[str] = None,
+    persona: str = "admin"
+) -> Dict[str, Any]:
+    """Build one-click operational runbook payload for a selected persona and session."""
+    sessions = load_discovery_sessions()
+    if not sessions:
+        return {
+            "has_data": False,
+            "message": "No discovery sessions available.",
+            "sessions": []
+        }
+
+    selected = hydrate_discovery_session(_resolve_session_selection(sessions, timestamp, 0))
+    if not selected:
+        return {
+            "has_data": False,
+            "message": "Discovery session not found.",
+            "sessions": sessions[:20]
+        }
+
+    persona_key = str(persona or "admin").strip().lower()
+    if persona_key not in {"admin", "analyst", "executive"}:
+        persona_key = "admin"
+
+    ts = selected.get("timestamp", "unknown")
+    personas = selected.get("personas", {}) if isinstance(selected.get("personas", {}), dict) else {}
+    steps: List[Dict[str, Any]] = []
+    markdown_lines = [
+        "# Discovery Operational Runbook",
+        "",
+        f"**Session:** {ts}",
+        f"**Persona:** {persona_key.title()}",
+        f"**Readiness Score:** {_safe_int(selected.get('readiness_score', 0))}/100",
+        ""
+    ]
+
+    if persona_key == "admin":
+        actions = personas.get("admin", {}).get("actions", []) if isinstance(personas.get("admin", {}), dict) else []
+        for idx, action in enumerate(actions[:8], 1):
+            title = action.get("title", f"Admin Action {idx}") if isinstance(action, dict) else f"Admin Action {idx}"
+            why = action.get("why", "") if isinstance(action, dict) else ""
+            effort = action.get("effort", "unknown") if isinstance(action, dict) else "unknown"
+            next_step = action.get("next_step", "") if isinstance(action, dict) else ""
+            steps.append({
+                "step": idx,
+                "title": title,
+                "owner": "Splunk Admin",
+                "effort": effort,
+                "details": why,
+                "next_step": next_step
+            })
+            markdown_lines.extend([
+                f"## {idx}. {title}",
+                f"- Owner: Splunk Admin",
+                f"- Effort: {effort}",
+                f"- Why: {why}",
+                f"- Next Step: {next_step}",
+                ""
+            ])
+
+    elif persona_key == "analyst":
+        tracks = personas.get("analyst", {}).get("hypotheses", []) if isinstance(personas.get("analyst", {}), dict) else []
+        for idx, track in enumerate(tracks[:8], 1):
+            title = track.get("title", f"Investigation Track {idx}") if isinstance(track, dict) else f"Investigation Track {idx}"
+            question = track.get("question", "") if isinstance(track, dict) else ""
+            metric = track.get("success_metric", "") if isinstance(track, dict) else ""
+            sources = track.get("data_sources", []) if isinstance(track, dict) else []
+            source_text = ", ".join([str(s) for s in sources[:6]]) if isinstance(sources, list) else ""
+            steps.append({
+                "step": idx,
+                "title": title,
+                "owner": "Security Analyst",
+                "effort": "medium",
+                "details": question,
+                "next_step": f"Validate with metric: {metric}"
+            })
+            markdown_lines.extend([
+                f"## {idx}. {title}",
+                f"- Owner: Security Analyst",
+                f"- Question: {question}",
+                f"- Success Metric: {metric}",
+                f"- Data Sources: {source_text}",
+                ""
+            ])
+
+    else:
+        executive = personas.get("executive", {}) if isinstance(personas.get("executive", {}), dict) else {}
+        headline = executive.get("headline", "")
+        themes = executive.get("business_value_themes", []) if isinstance(executive.get("business_value_themes", []), list) else []
+        focus_items = executive.get("next_90_day_focus", []) if isinstance(executive.get("next_90_day_focus", []), list) else []
+
+        for idx, item in enumerate(focus_items[:8], 1):
+            steps.append({
+                "step": idx,
+                "title": f"90-Day Focus {idx}",
+                "owner": "Leadership",
+                "effort": "strategic",
+                "details": item,
+                "next_step": "Assign sponsor and KPI"
+            })
+
+        markdown_lines.extend([
+            "## Executive Headline",
+            f"{headline}",
+            "",
+            "## Business Value Themes"
+        ])
+        for theme in themes[:6]:
+            markdown_lines.append(f"- {theme}")
+        markdown_lines.extend(["", "## Next 90 Days"])
+        for item in focus_items[:8]:
+            markdown_lines.append(f"- {item}")
+        markdown_lines.append("")
+
+    filename = f"runbook_{persona_key}_{ts}.md"
+    return {
+        "has_data": True,
+        "session": selected,
+        "persona": persona_key,
+        "title": f"{persona_key.title()} Operational Runbook",
+        "filename": filename,
+        "markdown": "\n".join(markdown_lines),
+        "steps": steps,
+        "sessions": sessions[:20]
+    }
+
+
+def build_discovery_dashboard_payload() -> Dict[str, Any]:
+    """Build dashboard payload from persisted discovery sessions with simple trend analysis."""
+    sessions = load_discovery_sessions()
+    latest = sessions[0] if sessions else None
+    previous = sessions[1] if len(sessions) > 1 else None
+
+    latest = hydrate_discovery_session(latest)
+    previous = hydrate_discovery_session(previous)
+
+    if not latest:
+        return {
+            "has_data": False,
+            "message": "No discovery sessions available yet.",
+            "sessions": []
+        }
+
+    def _delta(path: List[str]) -> int:
+        if not previous:
+            return 0
+        current = latest
+        prior = previous
+        for key in path:
+            current = current.get(key, {}) if isinstance(current, dict) else {}
+            prior = prior.get(key, {}) if isinstance(prior, dict) else {}
+        return _safe_int(current) - _safe_int(prior)
+
+    kpis = {
+        "readiness_score": latest.get("readiness_score", 0),
+        "total_indexes": _safe_int(latest.get("overview", {}).get("total_indexes", 0)),
+        "total_sourcetypes": _safe_int(latest.get("overview", {}).get("total_sourcetypes", 0)),
+        "recommendation_count": _safe_int(latest.get("stats", {}).get("recommendation_count", 0)),
+        "tool_count": _safe_int(latest.get("mcp_capabilities", {}).get("tool_count", 0))
+    }
+
+    trends = {
+        "indexes_delta": _delta(["overview", "total_indexes"]),
+        "sourcetypes_delta": _delta(["overview", "total_sourcetypes"]),
+        "recommendations_delta": _delta(["stats", "recommendation_count"]),
+        "readiness_delta": _delta(["readiness_score"])
+    }
+
+    return {
+        "has_data": True,
+        "latest": latest,
+        "previous": previous,
+        "kpis": kpis,
+        "trends": trends,
+        "sessions": sessions[:20]
+    }
+
+
+def load_latest_v2_blueprint() -> Optional[Dict[str, Any]]:
+    """Load latest v2 intelligence blueprint artifact if available."""
+    output_dir = Path("output")
+    if not output_dir.exists():
+        return None
+
+    candidates = sorted(output_dir.glob("v2_intelligence_blueprint_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        return None
+
+    latest = candidates[0]
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload["_artifact"] = {
+                "name": latest.name,
+                "modified": datetime.fromtimestamp(latest.stat().st_mtime).isoformat(),
+                "size": latest.stat().st_size
+            }
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def build_v2_artifact_catalog() -> Dict[str, Any]:
+    """Build catalog for V2 artifacts for the Artifacts workspace tab."""
+    output_dir = Path("output")
+    if not output_dir.exists():
+        return {"has_data": False, "artifacts": []}
+
+    artifacts = []
+    for file_path in sorted(output_dir.glob("v2_*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not file_path.is_file():
+            continue
+        modified_iso = datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+        size_bytes = file_path.stat().st_size
+        artifacts.append({
+            "name": file_path.name,
+            "type": file_path.suffix[1:] if file_path.suffix else "unknown",
+            "size": size_bytes,
+            "size_bytes": size_bytes,
+            "modified": modified_iso,
+            "modified_at": modified_iso,
+            "path": str(file_path)
+        })
+
+    return {
+        "has_data": len(artifacts) > 0,
+        "artifacts": artifacts,
+        "count": len(artifacts)
+    }
+
+
+async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
+    """Discover and cache available MCP tools from the connected Splunk MCP server."""
+    cache_ttl_seconds = 60
+    now = time.time()
+    current_url = getattr(config.mcp, "url", None)
+
+    if (
+        not force_refresh
+        and _cached_mcp_tools["tools"]
+        and _cached_mcp_tools["url"] == current_url
+        and (now - _cached_mcp_tools["timestamp"]) < cache_ttl_seconds
+    ):
+        return _cached_mcp_tools["tools"]
+
+    if not current_url:
+        return _cached_mcp_tools["tools"]
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    if config.mcp.token:
+        headers["Authorization"] = f"Bearer {config.mcp.token}"
+
+    verify_ssl = config.mcp.verify_ssl
+    ca_bundle = getattr(config.mcp, 'ca_bundle_path', None)
+    if ca_bundle and verify_ssl:
+        ssl_verify = ca_bundle
+    elif verify_ssl:
+        ssl_verify = True
+    else:
+        ssl_verify = False
+
+    payload = {
+        "method": "tools/list",
+        "params": {}
+    }
+
+    discovered = set()
+
+    try:
+        async with httpx.AsyncClient(verify=ssl_verify, timeout=15.0) as client:
+            response = await client.post(current_url, json=payload, headers=headers)
+            if response.status_code != 200:
+                return _cached_mcp_tools["tools"]
+
+            data = response.json()
+            result_obj = data.get("result", {}) if isinstance(data, dict) else {}
+
+            if isinstance(result_obj.get("tools"), list):
+                for tool in result_obj.get("tools", []):
+                    if isinstance(tool, dict) and tool.get("name"):
+                        discovered.add(tool["name"])
+
+            content = result_obj.get("content", []) if isinstance(result_obj, dict) else []
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    try:
+                        parsed = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if isinstance(parsed, dict) and isinstance(parsed.get("tools"), list):
+                        for tool in parsed["tools"]:
+                            if isinstance(tool, dict) and tool.get("name"):
+                                discovered.add(tool["name"])
+
+        if discovered:
+            _cached_mcp_tools["url"] = current_url
+            _cached_mcp_tools["tools"] = discovered
+            _cached_mcp_tools["timestamp"] = now
+
+        return _cached_mcp_tools["tools"]
+    except Exception as e:
+        debug_log(f"MCP tool discovery failed: {str(e)}", "warning")
+        return _cached_mcp_tools["tools"]
 
 def debug_log(message: str, category: str = "info", data: Any = None):
     """
@@ -502,6 +1811,19 @@ async def run_discovery():
         # Debug: Check if API key is loaded
         debug_log(f"Config loaded - provider: {config.llm.provider}, model: {config.llm.model}", "info")
         debug_log(f"API key present: {bool(config.llm.api_key)}, length: {len(config.llm.api_key) if config.llm.api_key else 0}", "info")
+
+        available_mcp_tools = await discover_mcp_tools(config)
+        if not available_mcp_tools:
+            available_mcp_tools = {
+                "splunk_run_query",
+                "splunk_get_info",
+                "splunk_get_indexes",
+                "splunk_get_index_info",
+                "splunk_get_metadata",
+                "splunk_get_user_info",
+                "splunk_get_knowledge_objects"
+            }
+        available_mcp_tools_sorted = sorted(list(available_mcp_tools))
         
         # Initialize LLM client (cached for performance)
         llm_client = get_or_create_llm_client(config)
@@ -519,6 +1841,74 @@ async def run_discovery():
         
         # Initialize progress tracker
         progress = ProgressTracker()
+
+        if DISCOVERY_PIPELINE_VERSION == "v2":
+            display.phase("🚀 V2 Discovery Pipeline")
+            v2_pipeline = DiscoveryV2Pipeline(discovery_engine)
+            v2_result = await v2_pipeline.run(display, progress)
+
+            overview = v2_result.get("overview")
+            classifications = v2_result.get("classifications", {})
+            recommendations = v2_result.get("recommendations", [])
+            suggested_use_cases = v2_result.get("suggested_use_cases", [])
+            report_paths = v2_result.get("report_paths", [])
+            timestamp = v2_result.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
+            discovery_step_count = _safe_int(v2_result.get("discovery_step_count", 0))
+
+            readiness_score = compute_discovery_readiness_score(
+                overview,
+                recommendations if isinstance(recommendations, list) else [],
+                suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+                {
+                    "tool_count": len(available_mcp_tools_sorted),
+                    "tools": available_mcp_tools_sorted
+                }
+            )
+            persona_playbooks = build_persona_playbooks(
+                overview,
+                recommendations if isinstance(recommendations, list) else [],
+                suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+                {
+                    "tool_count": len(available_mcp_tools_sorted),
+                    "tools": available_mcp_tools_sorted
+                }
+            )
+
+            session_record = register_discovery_session(
+                timestamp=timestamp,
+                overview=overview,
+                report_paths=report_paths,
+                mcp_capabilities={
+                    "tool_count": len(available_mcp_tools_sorted),
+                    "tools": available_mcp_tools_sorted
+                },
+                classifications=classifications if isinstance(classifications, dict) else {},
+                recommendations=recommendations if isinstance(recommendations, list) else [],
+                suggested_use_cases=suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+                discovery_step_count=discovery_step_count,
+                personas=persona_playbooks,
+                readiness_score=readiness_score
+            )
+
+            display.success("✅ V2 discovery artifact bundle generated")
+            display.show_final_summary(report_paths)
+
+            return {
+                "status": "success",
+                "overview": overview.__dict__ if hasattr(overview, '__dict__') else overview,
+                "classifications": classifications,
+                "recommendations": recommendations,
+                "suggested_use_cases": suggested_use_cases,
+                "session": session_record,
+                "readiness_score": readiness_score,
+                "persona_playbooks": persona_playbooks,
+                "mcp_capabilities": {
+                    "tool_count": len(available_mcp_tools_sorted),
+                    "tools": available_mcp_tools_sorted
+                },
+                "report_paths": report_paths,
+                "timestamp": timestamp
+            }
         
         # Phase 1: Quick Overview
         display.phase("🔍 Phase 1: Quick Architecture Overview")
@@ -580,6 +1970,24 @@ async def run_discovery():
         output_dir.mkdir(exist_ok=True)
         
         report_paths = []
+        readiness_score = compute_discovery_readiness_score(
+            overview,
+            recommendations if isinstance(recommendations, list) else [],
+            suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+            {
+                "tool_count": len(available_mcp_tools_sorted),
+                "tools": available_mcp_tools_sorted
+            }
+        )
+        persona_playbooks = build_persona_playbooks(
+            overview,
+            recommendations if isinstance(recommendations, list) else [],
+            suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+            {
+                "tool_count": len(available_mcp_tools_sorted),
+                "tools": available_mcp_tools_sorted
+            }
+        )
         
         # Export JSON data
         try:
@@ -603,6 +2011,12 @@ async def run_discovery():
                     "classifications": classifications,
                     "recommendations": recommendations,
                     "suggested_use_cases": suggested_use_cases,
+                    "readiness_score": readiness_score,
+                    "persona_playbooks": persona_playbooks,
+                    "mcp_capabilities": {
+                        "tool_count": len(available_mcp_tools_sorted),
+                        "tools": available_mcp_tools_sorted
+                    },
                     "discovery_results": discovery_results_dict,
                     "timestamp": timestamp
                 }, f, indent=2, default=str)
@@ -613,10 +2027,81 @@ async def run_discovery():
         
         # Export Executive Summary
         try:
+            mcp_capability_path = output_dir / f"mcp_capabilities_{timestamp}.md"
+            with open(mcp_capability_path, 'w', encoding='utf-8') as f:
+                f.write(f"# MCP Capability Snapshot\n\n")
+                f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"**Discovered Tool Count:** {len(available_mcp_tools_sorted)}\n\n")
+                f.write("## Available Tools\n\n")
+                for tool_name in available_mcp_tools_sorted:
+                    description = MCP_TOOL_DESCRIPTIONS.get(tool_name, "MCP tool available for Splunk operations.")
+                    f.write(f"- **{tool_name}**: {description}\n")
+            report_paths.append(str(mcp_capability_path.name))
+            display.info(f"   ✓ {mcp_capability_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export MCP capabilities snapshot: {str(e)}")
+
+        # Export persona playbooks for admins/analysts/executives
+        try:
+            persona_json_path = output_dir / f"persona_playbooks_{timestamp}.json"
+            with open(persona_json_path, 'w', encoding='utf-8') as f:
+                json.dump(persona_playbooks, f, indent=2, default=str)
+            report_paths.append(str(persona_json_path.name))
+            display.info(f"   ✓ {persona_json_path.name}")
+
+            persona_md_path = output_dir / f"persona_playbooks_{timestamp}.md"
+            with open(persona_md_path, 'w', encoding='utf-8') as f:
+                f.write("# Persona Playbooks\n\n")
+                f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"**Readiness Score:** {readiness_score}/100\n\n")
+
+                admin_actions = persona_playbooks.get("admin", {}).get("actions", [])
+                analyst_hypotheses = persona_playbooks.get("analyst", {}).get("hypotheses", [])
+                executive = persona_playbooks.get("executive", {})
+
+                f.write("## Admin Action Queue\n\n")
+                for idx, action in enumerate(admin_actions[:6], 1):
+                    f.write(f"{idx}. **{action.get('title', 'Action')}**\n")
+                    f.write(f"   - Why: {action.get('why', '')}\n")
+                    f.write(f"   - Effort: {action.get('effort', 'unknown')}\n")
+                    f.write(f"   - Next Step: {action.get('next_step', '')}\n\n")
+
+                f.write("## Analyst Investigation Tracks\n\n")
+                for idx, hypothesis in enumerate(analyst_hypotheses[:6], 1):
+                    f.write(f"{idx}. **{hypothesis.get('title', 'Track')}**\n")
+                    f.write(f"   - Question: {hypothesis.get('question', '')}\n")
+                    f.write(f"   - Metric: {hypothesis.get('success_metric', '')}\n")
+                    data_sources = hypothesis.get('data_sources', [])
+                    if isinstance(data_sources, list) and data_sources:
+                        f.write(f"   - Data Sources: {', '.join(str(s) for s in data_sources[:6])}\n")
+                    f.write("\n")
+
+                f.write("## Executive Brief\n\n")
+                f.write(f"- **Readiness Score:** {executive.get('platform_readiness_score', readiness_score)}/100\n")
+                f.write(f"- **Headline:** {executive.get('headline', '')}\n")
+                for theme in executive.get('business_value_themes', []):
+                    f.write(f"  - Value Theme: {theme}\n")
+                f.write("\n")
+                f.write("### Next 90 Days\n\n")
+                for item in executive.get('next_90_day_focus', []):
+                    f.write(f"- {item}\n")
+            report_paths.append(str(persona_md_path.name))
+            display.info(f"   ✓ {persona_md_path.name}")
+        except Exception as e:
+            display.error(f"   ✗ Failed to export persona playbooks: {str(e)}")
+
+        # Export Executive Summary
+        try:
             exec_summary_path = output_dir / f"executive_summary_{timestamp}.md"
             with open(exec_summary_path, 'w', encoding='utf-8') as f:
                 f.write(f"# Splunk Environment Discovery - Executive Summary\n\n")
                 f.write(f"**Discovery Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+                f.write(f"## MCP Capability Snapshot\n\n")
+                f.write(f"- **Discovered Tools:** {len(available_mcp_tools_sorted)}\n")
+                for tool_name in available_mcp_tools_sorted:
+                    f.write(f"  - `{tool_name}`\n")
+                f.write(f"\n")
                 
                 # Environment Overview
                 f.write(f"## Environment Overview\n\n")
@@ -804,6 +2289,23 @@ async def run_discovery():
             display.error(f"   ✗ Failed to export implementation guide: {str(e)}")
         
         display.success(f"✅ Generated {len(report_paths)} report files")
+
+        discovery_results = discovery_engine.get_all_results()
+        session_record = register_discovery_session(
+            timestamp=timestamp,
+            overview=overview,
+            report_paths=report_paths,
+            mcp_capabilities={
+                "tool_count": len(available_mcp_tools_sorted),
+                "tools": available_mcp_tools_sorted
+            },
+            classifications=classifications if isinstance(classifications, dict) else {},
+            recommendations=recommendations if isinstance(recommendations, list) else [],
+            suggested_use_cases=suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+            discovery_step_count=len(discovery_results),
+            personas=persona_playbooks,
+            readiness_score=readiness_score
+        )
         
         # Phase 7: Complete Discovery
         display.phase("✅ Discovery Complete")
@@ -823,6 +2325,13 @@ async def run_discovery():
             "classifications": classifications,
             "recommendations": recommendations,
             "suggested_use_cases": suggested_use_cases,
+            "session": session_record,
+            "readiness_score": readiness_score,
+            "persona_playbooks": persona_playbooks,
+            "mcp_capabilities": {
+                "tool_count": len(available_mcp_tools_sorted),
+                "tools": available_mcp_tools_sorted
+            },
             "report_paths": report_paths,
             "timestamp": timestamp
         }
@@ -864,13 +2373,13 @@ async def run_discovery():
 
 @app.get("/reports")
 async def list_reports():
-    """Get list of available reports."""
+    """Get list of available V2 reports only."""
     output_dir = Path("output")
     if not output_dir.exists():
-        return {"reports": []}
+        return {"reports": [], "sessions": []}
     
     reports = []
-    for file_path in output_dir.glob("*"):
+    for file_path in output_dir.glob("v2_*"):
         if file_path.is_file():
             reports.append({
                 "name": file_path.name,
@@ -880,19 +2389,97 @@ async def list_reports():
                 "type": file_path.suffix[1:] if file_path.suffix else "unknown"
             })
     
-    return {"reports": sorted(reports, key=lambda x: x["modified"], reverse=True)}
+    sessions = load_discovery_sessions()
+    return {
+        "reports": sorted(reports, key=lambda x: x["modified"], reverse=True),
+        "sessions": sessions
+    }
+
+
+@app.get("/api/discovery/sessions")
+async def get_discovery_sessions():
+    """Return persisted discovery sessions for history UI and retrieval."""
+    sessions = load_discovery_sessions()
+    return {
+        "sessions": sessions,
+        "count": len(sessions)
+    }
+
+
+@app.get("/api/discovery/sessions/{timestamp}")
+async def get_discovery_session(timestamp: str):
+    """Return a specific discovery session and resolved report metadata."""
+    sessions = load_discovery_sessions()
+    session = next((s for s in sessions if s.get("timestamp") == timestamp), None)
+    if not session:
+        raise HTTPException(status_code=404, detail="Discovery session not found")
+
+    output_dir = Path("output")
+    files = []
+    for report_name in session.get("report_paths", []):
+        report_path = output_dir / report_name
+        files.append({
+            "name": report_name,
+            "exists": report_path.exists(),
+            "size": report_path.stat().st_size if report_path.exists() else 0,
+            "modified": datetime.fromtimestamp(report_path.stat().st_mtime).isoformat() if report_path.exists() else None
+        })
+
+    return {
+        "session": session,
+        "files": files
+    }
+
+
+@app.get("/api/discovery/dashboard")
+async def get_discovery_dashboard():
+    """Return latest discovery intelligence dashboard payload for UI hub."""
+    return build_discovery_dashboard_payload()
+
+
+@app.get("/api/v2/intelligence")
+async def get_v2_intelligence():
+    """Return latest V2 intelligence blueprint for V2 workspace UI."""
+    payload = load_latest_v2_blueprint()
+    if not payload:
+        return {"has_data": False, "message": "No V2 intelligence blueprint found."}
+    return {
+        "has_data": True,
+        "blueprint": payload,
+        "artifact": payload.get("_artifact", {})
+    }
+
+
+@app.get("/api/v2/artifacts")
+async def get_v2_artifacts():
+    """Return V2 artifact catalog for artifact workspace view."""
+    return build_v2_artifact_catalog()
+
+
+@app.get("/api/discovery/compare")
+async def get_discovery_compare(current: Optional[str] = None, baseline: Optional[str] = None):
+    """Return comparative metrics between two discovery sessions."""
+    return build_discovery_compare_payload(current, baseline)
+
+
+@app.get("/api/discovery/runbook")
+async def get_discovery_runbook(timestamp: Optional[str] = None, persona: str = "admin"):
+    """Return persona-scoped operational runbook for a selected discovery session."""
+    return build_session_runbook_payload(timestamp, persona)
 
 
 @app.get("/api/discovery/results")
 async def get_discovery_results():
     """
-    Legacy endpoint stub - prevents 404 errors from cached frontend code.
-    Modern discovery results are now delivered via WebSocket real-time updates
-    and stored in discovery report files.
+    Discovery results summary endpoint for latest session.
     """
+    sessions = load_discovery_sessions()
+    latest = sessions[0] if sessions else None
     return {
-        "message": "Discovery results are now delivered via WebSocket. Check /reports for saved discovery sessions.",
-        "reports_endpoint": "/reports"
+        "message": "V2 discovery sessions are persisted and available via /api/discovery/sessions.",
+        "reports_endpoint": "/reports",
+        "sessions_endpoint": "/api/discovery/sessions",
+        "latest_session": latest
     }
 
 
@@ -933,13 +2520,19 @@ async def get_connection_info():
         config = config_manager.get()
         
         # Get LLM info (no sensitive data)
-        llm_provider = config.llm.provider
+        llm_provider = normalize_provider_name(config.llm.provider)
         
         # Determine endpoint display based on provider
-        if llm_provider == "custom" and config.llm.endpoint_url:
-            llm_endpoint = config.llm.endpoint_url
-        elif llm_provider == "openai":
+        if llm_provider == "openai":
             llm_endpoint = "OpenAI API (api.openai.com)"
+        elif llm_provider == "anthropic":
+            llm_endpoint = config.llm.endpoint_url or "Anthropic API (api.anthropic.com)"
+        elif llm_provider == "gemini":
+            llm_endpoint = config.llm.endpoint_url or "Gemini API (generativelanguage.googleapis.com)"
+        elif llm_provider == "azure":
+            llm_endpoint = config.llm.endpoint_url or "Azure OpenAI endpoint"
+        elif config.llm.endpoint_url:
+            llm_endpoint = config.llm.endpoint_url
         else:
             llm_endpoint = f"{llm_provider} API"
         
@@ -1377,79 +2970,168 @@ async def reset_chat_settings():
         # Quality Control
         "quality_threshold": 70,
         "convergence_detection": 5,
+
+        # Demo Augmentation
+        "enable_splunk_augmentation": True,
+        "enable_rag_context": False,
+        "rag_max_chunks": 3,
     }
     
     return {"status": "success", "settings": chat_session_settings.copy()}
 
 @app.post("/api/llm/list-models")
 async def list_models(request: Request):
-    """Fetch available models from OpenAI or custom endpoint"""
+    """Fetch available models from OpenAI/Azure/Anthropic/Gemini/Custom endpoints."""
     try:
         data = await request.json()
-        provider = data.get('provider', 'openai')
+        provider = normalize_provider_name(data.get('provider', 'openai'))
         api_key = data.get('api_key')
-        endpoint_url = data.get('endpoint_url')
-        
-        if provider == 'openai':
-            # Fetch from OpenAI
-            if not api_key:
-                raise HTTPException(status_code=400, detail="API key required for OpenAI")
-            
-            import httpx
-            async with httpx.AsyncClient() as client:
+        endpoint_url = (data.get('endpoint_url') or '').strip() or None
+
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            if provider == 'openai':
+                if not api_key:
+                    raise HTTPException(status_code=400, detail="API key required for OpenAI")
                 response = await client.get(
                     'https://api.openai.com/v1/models',
                     headers={'Authorization': f'Bearer {api_key}'},
-                    timeout=10.0
                 )
                 response.raise_for_status()
                 models_data = response.json()
-                # Extract model IDs and filter for chat models
-                models = [m['id'] for m in models_data['data'] if 'gpt' in m['id'].lower()]
-                models.sort()
-                return {'models': models}
-                
-        elif provider == 'custom':
-            # Fetch from custom endpoint
-            if not endpoint_url:
-                raise HTTPException(status_code=400, detail="Endpoint URL required for custom provider")
-            
-            import httpx
-            async with httpx.AsyncClient() as client:
-                # Try common endpoints for model listing
+                models = sorted({m.get('id') for m in models_data.get('data', []) if isinstance(m, dict) and m.get('id')})
+                return {'models': [m for m in models if isinstance(m, str)]}
+
+            if provider == 'azure':
+                if not endpoint_url:
+                    raise HTTPException(status_code=400, detail="Endpoint URL required for Azure provider")
+                if not api_key:
+                    raise HTTPException(status_code=400, detail="API key required for Azure provider")
+
+                base = endpoint_url.rstrip('/')
+                if '/openai/deployments/' in base:
+                    base = base.split('/openai/deployments/')[0]
+                if base.endswith('/openai'):
+                    base = base[:-len('/openai')]
+
+                deployment_url = f"{base}/openai/deployments?api-version=2024-02-15-preview"
+                models_url = f"{base}/openai/models?api-version=2024-02-15-preview"
+                headers = {'api-key': api_key}
+
+                deployments = []
+                try:
+                    response = await client.get(deployment_url, headers=headers)
+                    if response.status_code == 200:
+                        payload = response.json()
+                        deployments = [
+                            item.get('id')
+                            for item in payload.get('data', [])
+                            if isinstance(item, dict) and item.get('id')
+                        ]
+                except Exception:
+                    deployments = []
+
+                model_ids = []
+                try:
+                    response = await client.get(models_url, headers=headers)
+                    if response.status_code == 200:
+                        payload = response.json()
+                        model_ids = [
+                            item.get('id')
+                            for item in payload.get('data', [])
+                            if isinstance(item, dict) and item.get('id')
+                        ]
+                except Exception:
+                    model_ids = []
+
+                merged = sorted({m for m in deployments + model_ids if isinstance(m, str) and m.strip()})
+                if not merged:
+                    raise HTTPException(status_code=400, detail="Could not fetch Azure deployments/models from endpoint")
+                return {'models': merged}
+
+            if provider == 'anthropic':
+                if not api_key:
+                    raise HTTPException(status_code=400, detail="API key required for Anthropic")
+                base = (endpoint_url or 'https://api.anthropic.com').rstrip('/')
+                response = await client.get(
+                    f"{base}/v1/models",
+                    headers={
+                        'x-api-key': api_key,
+                        'anthropic-version': '2023-06-01'
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+                models = sorted({item.get('id') for item in payload.get('data', []) if isinstance(item, dict) and item.get('id')})
+                return {'models': [m for m in models if isinstance(m, str)]}
+
+            if provider == 'gemini':
+                if not api_key:
+                    raise HTTPException(status_code=400, detail="API key required for Gemini")
+                base = (endpoint_url or 'https://generativelanguage.googleapis.com').rstrip('/')
+                response = await client.get(f"{base}/v1beta/models?key={quote(api_key)}")
+                response.raise_for_status()
+                payload = response.json()
+                models = []
+                for item in payload.get('models', []):
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get('name')
+                    if isinstance(name, str) and name.startswith('models/'):
+                        name = name.split('/', 1)[1]
+                    if isinstance(name, str) and name.strip():
+                        models.append(name)
+                return {'models': sorted({m for m in models if isinstance(m, str)})}
+
+            if provider == 'custom':
+                if not endpoint_url:
+                    raise HTTPException(status_code=400, detail="Endpoint URL required for custom provider")
+
+                base = endpoint_url.rstrip('/')
                 endpoints_to_try = [
-                    f"{endpoint_url}/v1/models",  # OpenAI-compatible
-                    f"{endpoint_url}/api/tags",   # Ollama
-                    f"{endpoint_url}/models",     # Alternative
+                    base if base.endswith('/v1/models') else f"{base}/v1/models",
+                    base if base.endswith('/models') else f"{base}/models",
+                    base if base.endswith('/api/tags') else f"{base}/api/tags",
                 ]
-                
+
                 for url in endpoints_to_try:
                     try:
                         headers = {}
                         if api_key:
                             headers['Authorization'] = f'Bearer {api_key}'
-                        
-                        response = await client.get(url, headers=headers, timeout=10.0)
+                        response = await client.get(url, headers=headers)
                         response.raise_for_status()
-                        data = response.json()
-                        
-                        # Handle different response formats
-                        if 'data' in data:  # OpenAI format
-                            models = [m['id'] for m in data['data']]
-                        elif 'models' in data:  # Ollama format
-                            models = [m['name'] if isinstance(m, dict) else m for m in data['models']]
-                        elif isinstance(data, list):  # Direct list
-                            models = [m['id'] if isinstance(m, dict) else m for m in data]
-                        else:
-                            continue
-                        
-                        return {'models': models}
-                    except:
+                        payload = response.json()
+
+                        if isinstance(payload, dict) and isinstance(payload.get('data'), list):
+                            models = [m.get('id') for m in payload.get('data', []) if isinstance(m, dict) and m.get('id')]
+                            return {'models': sorted({m for m in models if isinstance(m, str)})}
+
+                        if isinstance(payload, dict) and isinstance(payload.get('models'), list):
+                            models = []
+                            for item in payload.get('models', []):
+                                if isinstance(item, dict):
+                                    model_name = item.get('name') or item.get('id')
+                                else:
+                                    model_name = item
+                                if isinstance(model_name, str) and model_name.strip():
+                                    models.append(model_name)
+                            return {'models': sorted({m for m in models if isinstance(m, str)})}
+
+                        if isinstance(payload, list):
+                            models = []
+                            for item in payload:
+                                if isinstance(item, dict):
+                                    model_name = item.get('id') or item.get('name')
+                                else:
+                                    model_name = item
+                                if isinstance(model_name, str) and model_name.strip():
+                                    models.append(model_name)
+                            return {'models': sorted({m for m in models if isinstance(m, str)})}
+                    except Exception:
                         continue
-                
-                raise HTTPException(status_code=400, detail="Could not fetch models from endpoint")
-        
-        else:
+
+                raise HTTPException(status_code=400, detail="Could not fetch models from custom endpoint")
+
             raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
             
     except HTTPException:
@@ -1490,9 +3172,24 @@ async def assess_max_tokens():
     """Assess the actual max_tokens limit by testing the LLM API"""
     try:
         config = config_manager.get()
+        provider = normalize_provider_name(config.llm.provider)
         
-        if not config.llm.api_key:
+        if provider in {"openai", "azure", "anthropic", "gemini"} and not config.llm.api_key:
             raise HTTPException(status_code=400, detail="LLM API key not configured")
+
+        if provider != "openai":
+            defaults = {
+                "azure": 8000,
+                "anthropic": 8192,
+                "gemini": 8192,
+                "custom": 4000,
+            }
+            fallback = defaults.get(provider, 4000)
+            return {
+                "recommended_max_tokens": fallback,
+                "status": "info",
+                "message": f"Automatic max token probing is optimized for OpenAI. Using provider-safe default for {provider}: {fallback}"
+            }
         
         from openai import OpenAI
         client = OpenAI(
@@ -1551,246 +3248,187 @@ async def assess_max_tokens():
 
 
 @app.post("/api/llm/test-connection")
-async def test_llm_connection():
-    """Test LLM connection and auto-detect capabilities"""
+async def test_llm_connection(request: Request):
+    """Test provider-specific LLM connectivity and generation using current or supplied settings."""
     try:
-        config = config_manager.get()
-        
-        # Validate configuration
-        if config.llm.provider == "custom" and not config.llm.endpoint_url:
+        payload = {}
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+
+        current_config = config_manager.get()
+        llm_payload = payload.get("llm", {}) if isinstance(payload.get("llm"), dict) else payload
+
+        provider = normalize_provider_name(llm_payload.get("provider", current_config.llm.provider))
+        api_key = llm_payload.get("api_key", current_config.llm.api_key)
+        model = llm_payload.get("model", current_config.llm.model)
+        endpoint_url = llm_payload.get("endpoint_url", current_config.llm.endpoint_url)
+        max_tokens = int(llm_payload.get("max_tokens", current_config.llm.max_tokens or 1000))
+        temperature = float(llm_payload.get("temperature", current_config.llm.temperature or 0.7))
+
+        if provider in {"azure", "custom"} and not endpoint_url:
             return {
                 "status": "error",
-                "error": "Custom endpoint URL is required",
-                "suggestion": "Enter the endpoint URL (e.g., http://localhost:11434 for Ollama)"
+                "message": f"Provider '{provider}' requires endpoint_url",
+                "tests": {
+                    "connection": {
+                        "status": "error",
+                        "message": "Missing endpoint_url"
+                    }
+                }
             }
-        
-        # Clean up endpoint URL if user included API paths
-        cleaned_endpoint = config.llm.endpoint_url if config.llm.provider == "custom" else None
-        url_cleaned = False
-        
-        if cleaned_endpoint:
-            original_url = cleaned_endpoint
-            cleaned_endpoint = cleaned_endpoint.rstrip('/')
-            
-            # Strip common API path suffixes to get base URL
-            paths_to_strip = [
-                '/v1/chat/completions',
-                '/chat/completions',
-                '/v1/completions',
-                '/completions',
-                '/api/chat',
-                '/api/generate',
-                '/v1',
-                '/api'
-            ]
-            
-            for path in paths_to_strip:
-                if cleaned_endpoint.endswith(path):
-                    cleaned_endpoint = cleaned_endpoint[:-len(path)].rstrip('/')
-                    url_cleaned = True
-                    break
-        
-        # Test results
+
+        if provider in {"openai", "azure", "anthropic", "gemini"} and not api_key:
+            return {
+                "status": "error",
+                "message": f"Provider '{provider}' requires api_key",
+                "tests": {
+                    "connection": {
+                        "status": "error",
+                        "message": "Missing api_key"
+                    }
+                }
+            }
+
         results = {
             "status": "testing",
-            "endpoint": cleaned_endpoint if config.llm.provider == "custom" else "OpenAI API",
-            "original_endpoint": config.llm.endpoint_url if config.llm.provider == "custom" else None,
-            "url_cleaned": url_cleaned,
-            "provider": config.llm.provider,
-            "model": config.llm.model,
+            "provider": provider,
+            "model": model,
+            "endpoint": endpoint_url or {
+                "openai": "https://api.openai.com",
+                "anthropic": "https://api.anthropic.com",
+                "gemini": "https://generativelanguage.googleapis.com",
+            }.get(provider, "n/a"),
             "tests": {}
         }
-        
-        # Test 1: Connection test with intelligent path detection
+
+        # Test 1: Connectivity probe
         try:
-            if config.llm.provider == "custom":
-                # Test custom endpoint with multiple common paths
-                import httpx
-                endpoint_base = cleaned_endpoint
-                detected_format = None
-                available_models = []
-                
-                # Try various info/health endpoints to detect format
-                test_paths = [
-                    ("/v1/models", "OpenAI-compatible (v1)"),
-                    ("/models", "OpenAI-compatible"),
-                    ("/api/tags", "Ollama"),
-                    ("/api/version", "Ollama Version"),
-                    ("/v1/engines", "OpenAI Engines"),
-                    ("/health", "Generic Health"),
-                    ("/", "Root"),
-                ]
-                
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    # First try a simple connectivity test
-                    try:
-                        base_response = await client.get(endpoint_base, follow_redirects=True)
-                        if base_response.status_code == 404:
-                            # 404 is ok, just means root doesn't have info
-                            pass
-                    except Exception as e:
-                        results["tests"]["connection"] = {
-                            "status": "error",
-                            "error": str(e),
-                            "message": f"Cannot reach endpoint: {str(e)}"
-                        }
-                        results["status"] = "error"
-                        return results
-                    
-                    # Now try to detect the API format
-                    for path, format_name in test_paths:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                if provider == "openai":
+                    probe = await client.get(
+                        "https://api.openai.com/v1/models",
+                        headers={"Authorization": f"Bearer {api_key}"}
+                    )
+                    probe.raise_for_status()
+                    results["tests"]["connection"] = {"status": "success", "message": "OpenAI models endpoint reachable"}
+
+                elif provider == "azure":
+                    base = endpoint_url.rstrip('/')
+                    if '/openai/deployments/' in base:
+                        base = base.split('/openai/deployments/')[0]
+                    if base.endswith('/openai'):
+                        base = base[:-len('/openai')]
+                    probe = await client.get(
+                        f"{base}/openai/deployments?api-version=2024-02-15-preview",
+                        headers={"api-key": api_key}
+                    )
+                    if probe.status_code not in {200, 401, 403}:
+                        probe.raise_for_status()
+                    if probe.status_code in {401, 403}:
+                        raise Exception("Azure endpoint reachable but API key/auth failed")
+                    results["tests"]["connection"] = {"status": "success", "message": "Azure OpenAI endpoint reachable"}
+
+                elif provider == "anthropic":
+                    base = (endpoint_url or "https://api.anthropic.com").rstrip('/')
+                    probe = await client.get(
+                        f"{base}/v1/models",
+                        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+                    )
+                    probe.raise_for_status()
+                    results["tests"]["connection"] = {"status": "success", "message": "Anthropic models endpoint reachable"}
+
+                elif provider == "gemini":
+                    base = (endpoint_url or "https://generativelanguage.googleapis.com").rstrip('/')
+                    probe = await client.get(f"{base}/v1beta/models?key={quote(api_key)}")
+                    probe.raise_for_status()
+                    results["tests"]["connection"] = {"status": "success", "message": "Gemini models endpoint reachable"}
+
+                else:  # custom
+                    base = endpoint_url.rstrip('/')
+                    checks = [
+                        base,
+                        f"{base}/v1/models",
+                        f"{base}/models",
+                        f"{base}/api/tags",
+                        f"{base}/health",
+                    ]
+                    reachable = False
+                    for url in checks:
                         try:
-                            response = await client.get(f"{endpoint_base}{path}")
-                            if response.status_code == 200:
-                                detected_format = format_name
-                                try:
-                                    data = response.json()
-                                    # Extract available models if present
-                                    if "models" in data:
-                                        available_models = [m.get("id") or m.get("name") for m in data.get("models", [])]
-                                    elif "data" in data:
-                                        available_models = [m.get("id") for m in data.get("data", [])]
-                                except:
-                                    pass
+                            resp = await client.get(url)
+                            if resp.status_code < 500:
+                                reachable = True
                                 break
-                        except:
+                        except Exception:
                             continue
-                    
-                    if detected_format:
-                        results["tests"]["connection"] = {
-                            "status": "success",
-                            "format": detected_format,
-                            "message": f"Endpoint is reachable ({detected_format})",
-                            "available_models": available_models[:5] if available_models else None
-                        }
-                    else:
-                        # Endpoint is up but we couldn't detect format
-                        # This is OK - we'll try multiple formats when making requests
-                        results["tests"]["connection"] = {
-                            "status": "info",
-                            "message": "Endpoint reachable, will auto-detect API format on first request"
-                        }
-            else:
-                results["tests"]["connection"] = {
-                    "status": "success",
-                    "format": "OpenAI",
-                    "message": "Using OpenAI API"
-                }
-        except Exception as e:
+                    if not reachable:
+                        raise Exception("Custom endpoint not reachable or not responding with usable API shape")
+                    results["tests"]["connection"] = {"status": "success", "message": "Custom endpoint reachable"}
+
+        except Exception as connection_error:
             results["tests"]["connection"] = {
                 "status": "error",
-                "error": str(e),
-                "message": f"Cannot reach endpoint: {str(e)}"
+                "message": f"Connection probe failed: {connection_error}",
+                "error": str(connection_error)
             }
             results["status"] = "error"
             return results
-        
-        # Test 2: Model test with simple query
+
+        # Test 2: Model generation
         try:
-            llm_client = get_or_create_llm_client(config)
-            
-            response = await llm_client.generate_response(
-                messages=[{"role": "user", "content": "Say 'test successful' and nothing else."}],
-                max_tokens=50,
-                temperature=0.0
+            llm_client = LLMClientFactory.create_client(
+                provider=provider,
+                custom_endpoint=endpoint_url,
+                api_key=api_key,
+                model=model
             )
-            
+
+            model_response = await llm_client.generate_response(
+                messages=[{"role": "user", "content": "Reply with exactly: test successful"}],
+                max_tokens=min(max_tokens, 64),
+                temperature=0.0,
+            )
             results["tests"]["model"] = {
                 "status": "success",
                 "message": "Model responded successfully",
-                "response_preview": response[:100]
+                "response_preview": str(model_response)[:120]
             }
-        except Exception as e:
+        except Exception as model_error:
             results["tests"]["model"] = {
                 "status": "error",
-                "error": str(e),
-                "message": f"Model test failed: {str(e)}"
+                "message": f"Model test failed: {model_error}",
+                "error": str(model_error)
             }
             results["status"] = "error"
             return results
-        
-        # Test 3: Auto-detect max_tokens
-        try:
-            if config.llm.provider == "openai":
-                # Use OpenAI client for accurate detection
-                from openai import OpenAI
-                client = OpenAI(api_key=config.llm.api_key)
-                
-                # Determine which parameter to use based on model
-                model_lower = config.llm.model.lower()
-                uses_new_param = any(x in model_lower for x in ['gpt-4o', 'gpt-4-turbo', 'o1-', 'o1', 'chatgpt-4o', 'gpt4o'])
-                
-                test_values = [128000, 64000, 32000, 16000, 8000, 4000]
-                detected_max = None
-                
-                for test_max in test_values:
-                    try:
-                        # Build kwargs with appropriate parameter
-                        completion_kwargs = {
-                            "model": config.llm.model,
-                            "messages": [{"role": "user", "content": "Hi"}],
-                            "temperature": 0.0
-                        }
-                        
-                        if uses_new_param:
-                            completion_kwargs["max_completion_tokens"] = test_max
-                        else:
-                            completion_kwargs["max_tokens"] = test_max
-                        
-                        client.chat.completions.create(**completion_kwargs)
-                        detected_max = test_max
-                        break
-                    except Exception as e:
-                        error_str = str(e)
-                        import re
-                        match = re.search(r'supports at most (\d+)', error_str)
-                        if match:
-                            actual_limit = int(match.group(1))
-                            detected_max = int(actual_limit * 0.9)
-                            break
-                        continue
-                
-                if detected_max:
-                    results["tests"]["max_tokens"] = {
-                        "status": "success",
-                        "detected_max": detected_max,
-                        "message": f"Detected max_tokens: {detected_max}"
-                    }
-                else:
-                    results["tests"]["max_tokens"] = {
-                        "status": "warning",
-                        "detected_max": 4000,
-                        "message": "Could not detect max_tokens, using 4000 as fallback"
-                    }
-            else:
-                # For custom endpoints, use conservative default
-                results["tests"]["max_tokens"] = {
-                    "status": "info",
-                    "detected_max": 4000,
-                    "message": "Using default 4000 tokens for custom endpoint (adjust manually if needed)"
-                }
-        except Exception as e:
-            results["tests"]["max_tokens"] = {
-                "status": "warning",
-                "detected_max": 4000,
-                "error": str(e),
-                "message": f"Max tokens detection failed, using 4000 as fallback"
-            }
-        
-        # Overall status
-        if all(test.get("status") in ["success", "info", "warning"] for test in results["tests"].values()):
-            results["status"] = "success"
-            results["message"] = "All tests passed! Configuration is working."
-            results["recommended_config"] = {
-                "max_tokens": results["tests"]["max_tokens"]["detected_max"],
-                "temperature": 0.7
-            }
-        else:
-            results["status"] = "partial"
-            results["message"] = "Some tests passed, check details"
-        
+
+        # Test 3: Recommended token configuration
+        recommended_max = max(512, min(max_tokens, 16000))
+        if provider == "gemini":
+            recommended_max = max(512, min(max_tokens, 8192))
+        elif provider == "anthropic":
+            recommended_max = max(512, min(max_tokens, 8192))
+        elif provider == "custom":
+            recommended_max = max(512, min(max_tokens, 4096))
+
+        results["tests"]["max_tokens"] = {
+            "status": "info",
+            "detected_max": recommended_max,
+            "message": f"Using provider-safe recommended max_tokens={recommended_max}"
+        }
+
+        results["status"] = "success"
+        results["message"] = "All provider tests passed"
+        results["recommended_config"] = {
+            "max_tokens": recommended_max,
+            "temperature": temperature
+        }
         return results
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1843,30 +3481,39 @@ async def summarize_session(request: Dict[str, Any]):
         safe_timestamp = validate_session_id(timestamp)
     except HTTPException:
         raise HTTPException(status_code=400, detail="Invalid timestamp format")
+
+    # Normalize to validated timestamp for all downstream file operations
+    timestamp = safe_timestamp
     
     # Check if summary already exists
     output_dir = Path("output")
-    summary_file = output_dir / f"ai_summary_{safe_timestamp}.json"
+    summary_file = output_dir / f"v2_ai_summary_{safe_timestamp}.json"
     
     if summary_file.exists():
         # Load and return existing summary
         try:
             with open(summary_file, 'r', encoding='utf-8') as f:
                 existing_summary = json.load(f)
-            existing_summary['from_cache'] = True
-            return existing_summary
+            has_v2_panels = all(
+                key in existing_summary
+                for key in ["schema_version", "trend_signals", "risk_register", "recursive_investigations"]
+            )
+            if has_v2_panels:
+                existing_summary['from_cache'] = True
+                return existing_summary
+            print(f"Cached summary {summary_file.name} missing V2 fields; regenerating...")
         except Exception as e:
             print(f"Error loading cached summary: {e}")
             # Continue to regenerate
     
-    # Load session reports
-    json_file = output_dir / f"discovery_export_{timestamp}.json"
-    detailed_file = output_dir / f"detailed_discovery_{timestamp}.md"
-    classification_file = output_dir / f"data_classification_{timestamp}.md"
-    executive_file = output_dir / f"executive_summary_{timestamp}.md"
-    
+    # Load V2 session artifacts only (legacy artifacts intentionally ignored)
+    json_file = output_dir / f"v2_intelligence_blueprint_{timestamp}.json"
+    detailed_file = output_dir / f"v2_operator_runbook_{timestamp}.md"
+    classification_file = output_dir / f"v2_developer_handoff_{timestamp}.md"
+    executive_file = output_dir / f"v2_insights_brief_{timestamp}.md"
+
     if not json_file.exists():
-        return {"error": "Session data not found"}
+        return {"error": "V2 session data not found"}
     
     # Initialize progress tracking
     summarization_progress[timestamp] = {
@@ -1875,12 +3522,72 @@ async def summarize_session(request: Dict[str, Any]):
         "message": "Loading discovery reports..."
     }
     
-    # Load discovery data
+    # Load V2 discovery data
     with open(json_file, 'r', encoding='utf-8') as f:
         discovery_data = json.load(f)
     
-    # Extract discovery results
-    discovery_results = discovery_data.get('discovery_results', [])
+    # Extract discovery results from V2 finding ledger
+    finding_ledger = discovery_data.get('finding_ledger', []) if isinstance(discovery_data, dict) else []
+    discovery_results = [entry for entry in finding_ledger if isinstance(entry, dict)]
+    discovery_entities = []
+    for entry in discovery_results:
+        data_obj = entry.get('data', {})
+        if isinstance(data_obj, dict) and data_obj:
+            discovery_entities.append(data_obj)
+        else:
+            discovery_entities.append(entry)
+
+    coverage_gaps = discovery_data.get("coverage_gaps", []) if isinstance(discovery_data.get("coverage_gaps", []), list) else []
+    trend_signals = discovery_data.get("trend_signals", {}) if isinstance(discovery_data.get("trend_signals", {}), dict) else {}
+    if not trend_signals:
+        trend_signals = {
+            "evidence_steps": len(discovery_results),
+            "high_priority_recommendations": len([
+                r for r in (discovery_data.get("recommendations", []) or [])
+                if isinstance(r, dict) and str(r.get("priority", "")).lower() == "high"
+            ]),
+            "coverage_gap_count": len(coverage_gaps),
+            "recommendation_by_domain": {
+                "security": len([r for r in (discovery_data.get("recommendations", []) or []) if isinstance(r, dict) and "security" in str(r.get("category", "")).lower()]),
+                "performance": len([r for r in (discovery_data.get("recommendations", []) or []) if isinstance(r, dict) and "performance" in str(r.get("category", "")).lower()]),
+                "data_quality": len([r for r in (discovery_data.get("recommendations", []) or []) if isinstance(r, dict) and ("data" in str(r.get("category", "")).lower() or "quality" in str(r.get("category", "")).lower())]),
+                "compliance": len([r for r in (discovery_data.get("recommendations", []) or []) if isinstance(r, dict) and "compliance" in str(r.get("category", "")).lower()]),
+            }
+        }
+
+    risk_register = discovery_data.get("risk_register", []) if isinstance(discovery_data.get("risk_register", []), list) else []
+    if not risk_register:
+        risk_register = [
+            {
+                "risk": gap.get("gap", "Coverage risk"),
+                "severity": str(gap.get("priority", "medium")).lower(),
+                "domain": "coverage",
+                "impact": gap.get("why_it_matters", ""),
+                "mitigation": "Convert this gap into verification + remediation SPL workflows."
+            }
+            for gap in coverage_gaps[:10]
+            if isinstance(gap, dict)
+        ]
+
+    recursive_investigations = discovery_data.get("recursive_investigations", []) if isinstance(discovery_data.get("recursive_investigations", []), list) else []
+    if not recursive_investigations:
+        recursive_investigations = [
+            {
+                "loop": "Trend Baseline Expansion",
+                "objective": "Re-run discovery weekly and compare high-priority recommendations over time.",
+                "next_iteration_trigger": "Recommendation volume or severity increases.",
+                "output": "Delta report with priority shifts and anomaly candidates."
+            },
+            {
+                "loop": "Risk Verification Loop",
+                "objective": "Validate each high-severity risk with focused SPL and record closure evidence.",
+                "next_iteration_trigger": "Any high risk remains unresolved after runbook execution.",
+                "output": "Residual risk register with owners and due dates."
+            }
+        ]
+
+    vulnerability_hypotheses = discovery_data.get("vulnerability_hypotheses", []) if isinstance(discovery_data.get("vulnerability_hypotheses", []), list) else []
+    readiness_score = discovery_data.get("readiness_score")
     
     # Update progress
     summarization_progress[timestamp] = {
@@ -1935,7 +3642,7 @@ async def summarize_session(request: Dict[str, Any]):
     }
     
     # Identify unknown data sources
-    unknown_id = UnknownDataIdentifier(discovery_results)
+    unknown_id = UnknownDataIdentifier(discovery_entities)
     unknown_items = unknown_id.identify_unknown_items()
     unknown_questions = unknown_id.generate_contextual_questions(unknown_items)
     
@@ -1967,17 +3674,398 @@ async def summarize_session(request: Dict[str, Any]):
     config = config_manager.get()
     llm_client = get_or_create_llm_client(config)
     
-    # Extract indexes and sourcetypes from discovery results
+    # Extract environment entities from discovery results
     discovered_indexes = set()
     discovered_sourcetypes = set()
+    discovered_hosts = set()
     for result in discovery_results:
         data = result.get('data', {})
+        if isinstance(data, dict):
+            host_value = data.get('host') or data.get('hostname')
+            if isinstance(host_value, str) and host_value.strip():
+                discovered_hosts.add(host_value.strip())
+            if isinstance(data.get('hosts'), list):
+                for host in data.get('hosts', []):
+                    if isinstance(host, str) and host.strip():
+                        discovered_hosts.add(host.strip())
+            index_value = data.get('index')
+            if isinstance(index_value, str) and index_value.strip():
+                discovered_indexes.add(index_value.strip())
         if 'title' in data and 'totalEventCount' in data:
             discovered_indexes.add(data['title'])
         elif 'sourcetype' in data:
             discovered_sourcetypes.add(data['sourcetype'])
+
+    discovered_indexes_list = sorted([idx for idx in discovered_indexes if isinstance(idx, str) and idx.strip()])
+    discovered_sourcetypes_list = sorted([st for st in discovered_sourcetypes if isinstance(st, str) and st.strip()])
+    discovered_hosts_list = sorted([h for h in discovered_hosts if isinstance(h, str) and h.strip()])
+
+    environment_context_block = {
+        "indexes": discovered_indexes_list[:30],
+        "sourcetypes": discovered_sourcetypes_list[:40],
+        "hosts": discovered_hosts_list[:40],
+        "coverage_gaps": [g.get("gap") for g in coverage_gaps[:10] if isinstance(g, dict)],
+        "risk_register": [r.get("risk") for r in risk_register[:10] if isinstance(r, dict)],
+    }
+
+    def _safe_str(value: Any, fallback: str = "") -> str:
+        if value is None:
+            return fallback
+        text = str(value).strip()
+        return text if text else fallback
+
+    def _severity_rank(severity: str) -> int:
+        normalized = _safe_str(severity, "medium").lower()
+        if normalized == "critical":
+            return 4
+        if normalized == "high":
+            return 3
+        if normalized == "medium":
+            return 2
+        return 1
+
+    def _priority_from_severity(severity: str) -> str:
+        rank = _severity_rank(severity)
+        if rank >= 4:
+            return "🔴 HIGH"
+        if rank == 3:
+            return "🔴 HIGH"
+        if rank == 2:
+            return "🟠 MEDIUM"
+        return "🟡 LOW"
+
+    def _preferred_anchor_index() -> str:
+        if discovered_indexes_list:
+            return discovered_indexes_list[0]
+        return "*"
+
+    def _anchor_spl_to_environment(spl_query: str) -> str:
+        query = (spl_query or "").strip()
+        if not query:
+            return query
+        if not discovered_indexes_list:
+            return query
+        query_lower = query.lower()
+        has_index = any(f"index={idx.lower()}" in query_lower for idx in discovered_indexes_list)
+        if has_index:
+            return query
+        anchor_index = discovered_indexes_list[0]
+        if query.startswith("|"):
+            return f"index={anchor_index} {query}"
+        if query_lower.startswith("search "):
+            return f"search index={anchor_index} {query[len('search '):]}"
+        return f"index={anchor_index} | {query}"
+
+    def _strip_code_fence(text: str) -> str:
+        cleaned = _safe_str(text)
+        cleaned = cleaned.replace("```spl", "").replace("```sql", "").replace("```", "").strip()
+        return cleaned
+
+    def _extract_environment_evidence(spl_query: str) -> List[str]:
+        evidence = []
+        q = (spl_query or "").lower()
+        for idx in discovered_indexes_list[:20]:
+            if f"index={idx.lower()}" in q:
+                evidence.append(f"index:{idx}")
+        for st in discovered_sourcetypes_list[:20]:
+            if st.lower() in q:
+                evidence.append(f"sourcetype:{st}")
+        for host in discovered_hosts_list[:20]:
+            if host.lower() in q:
+                evidence.append(f"host:{host}")
+        if not evidence and discovered_indexes_list:
+            evidence.append(f"index:{discovered_indexes_list[0]}")
+        return evidence[:5]
+
+    def _flatten_findings(findings: Dict[str, Any]) -> List[Dict[str, str]]:
+        category_to_domain = {
+            "security_findings": "Security & Compliance",
+            "performance_findings": "Infrastructure & Performance",
+            "data_quality_findings": "Data Quality",
+            "optimization_findings": "Capacity Planning",
+            "compliance_findings": "Security & Compliance",
+            "trend_findings": "Infrastructure & Performance",
+            "risk_hypotheses": "Security & Compliance",
+        }
+        flattened: List[Dict[str, str]] = []
+        for category, domain in category_to_domain.items():
+            entries = findings.get(category, []) if isinstance(findings, dict) else []
+            if not isinstance(entries, list):
+                continue
+            for entry in entries[:10]:
+                if not isinstance(entry, dict):
+                    continue
+                description = _safe_str(entry.get("description"), _safe_str(entry.get("type"), "Discovery finding"))
+                flattened.append({
+                    "domain": domain,
+                    "severity": _safe_str(entry.get("severity"), "medium"),
+                    "reference": description[:220],
+                    "recommendation": _safe_str(entry.get("recommendation"), "Investigate and validate in Splunk.")
+                })
+        return flattened
+
+    def _normalize_query_item(query: Dict[str, Any], idx: int, finding_pool: List[Dict[str, str]]) -> Dict[str, Any]:
+        category = _safe_str(query.get("category"), "Infrastructure & Performance")
+        valid_categories = {
+            "Security & Compliance",
+            "Infrastructure & Performance",
+            "Data Quality",
+            "Capacity Planning",
+            "Data Exploration"
+        }
+        if category not in valid_categories:
+            category = "Infrastructure & Performance"
+
+        default_use_case_by_category = {
+            "Security & Compliance": "Security Investigation",
+            "Infrastructure & Performance": "Performance Monitoring",
+            "Data Quality": "Data Quality",
+            "Capacity Planning": "Capacity Planning",
+            "Data Exploration": "Data Quality"
+        }
+
+        finding_ref = _safe_str(query.get("finding_reference"))
+        matching_finding = None
+        if finding_ref:
+            for f in finding_pool:
+                if finding_ref.lower()[:40] in f.get("reference", "").lower():
+                    matching_finding = f
+                    break
+        if not matching_finding and finding_pool:
+            preferred = [f for f in finding_pool if f.get("domain") == category]
+            matching_finding = preferred[0] if preferred else finding_pool[0]
+
+        raw_spl = _strip_code_fence(_safe_str(query.get("spl")))
+        if not raw_spl:
+            anchor_index = _preferred_anchor_index()
+            raw_spl = f"index={anchor_index} earliest=-24h | stats count by sourcetype host | sort - count"
+        normalized_spl = _anchor_spl_to_environment(raw_spl)
+        if "earliest=" not in normalized_spl.lower():
+            normalized_spl = normalized_spl.replace("|", "earliest=-24h |", 1) if "|" in normalized_spl else f"{normalized_spl} earliest=-24h"
+
+        evidence = query.get("environment_evidence")
+        if not isinstance(evidence, list) or not evidence:
+            evidence = _extract_environment_evidence(normalized_spl)
+
+        severity = matching_finding.get("severity", "medium") if matching_finding else "medium"
+        priority = _safe_str(query.get("priority"), _priority_from_severity(severity))
+        if not any(priority.startswith(prefix) for prefix in ["🔴", "🟠", "🟡"]):
+            priority = _priority_from_severity(severity)
+
+        title = _safe_str(query.get("title"), f"🔍 Contextual Query {idx + 1}")
+        description = _safe_str(query.get("description"), "Investigate this finding with environment-specific telemetry.")
+
+        return {
+            "title": title,
+            "description": description,
+            "use_case": _safe_str(query.get("use_case"), default_use_case_by_category.get(category, "Performance Monitoring")),
+            "category": category,
+            "spl": normalized_spl,
+            "finding_reference": finding_ref or (matching_finding.get("reference") if matching_finding else "Discovery-derived finding"),
+            "execution_time": _safe_str(query.get("execution_time"), "< 30s"),
+            "business_value": _safe_str(query.get("business_value"), "Provides measurable visibility into operational and risk posture."),
+            "priority": priority,
+            "difficulty": _safe_str(query.get("difficulty"), "Intermediate"),
+            "environment_evidence": evidence,
+            "query_source": _safe_str(query.get("query_source"), "ai_finding")
+        }
+
+    def _context_engine_queries(finding_pool: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        anchor_index = _preferred_anchor_index()
+        anchor_sourcetype = discovered_sourcetypes_list[0] if discovered_sourcetypes_list else "*"
+        anchor_host = discovered_hosts_list[0] if discovered_hosts_list else "*"
+
+        candidates = [
+            {
+                "title": "📈 Data Throughput & Coverage Drift",
+                "description": "Track ingestion drift by index and sourcetype to detect sudden blind spots.",
+                "use_case": "Performance Monitoring",
+                "category": "Infrastructure & Performance",
+                "spl": f"index={anchor_index} earliest=-24h | bin _time span=1h | stats count dc(host) as hosts dc(sourcetype) as sourcetypes by _time | eval ingestion_risk=if(count<100,'review','ok')",
+                "finding_reference": (finding_pool[0]["reference"] if finding_pool else "Coverage and ingestion monitoring"),
+                "execution_time": "< 30s",
+                "business_value": "Flags ingestion degradation early before detections lose fidelity.",
+                "priority": "🔴 HIGH",
+                "difficulty": "Intermediate",
+                "query_source": "context_engine"
+            },
+            {
+                "title": "🛡️ Security Signal Health by Sourcetype",
+                "description": "Validate that expected security telemetry is present and consistent.",
+                "use_case": "Security Investigation",
+                "category": "Security & Compliance",
+                "spl": f"index={anchor_index} sourcetype={anchor_sourcetype} earliest=-24h | stats count by sourcetype host | sort - count",
+                "finding_reference": "Risk validation for security monitoring coverage.",
+                "execution_time": "< 30s",
+                "business_value": "Confirms security-useful data remains searchable and complete.",
+                "priority": "🔴 HIGH",
+                "difficulty": "Beginner",
+                "query_source": "context_engine"
+            },
+            {
+                "title": "🧪 Unknown Entity Validation",
+                "description": "Profile volume and spread for unknown entities requiring classification.",
+                "use_case": "Data Quality",
+                "category": "Data Quality",
+                "spl": f"index={anchor_index} host={anchor_host} earliest=-7d | stats count by sourcetype host index | sort - count",
+                "finding_reference": "Unknown entities need context before onboarding decisions.",
+                "execution_time": "< 45s",
+                "business_value": "Turns unknown data into actionable ownership and onboarding tasks.",
+                "priority": "🟠 MEDIUM",
+                "difficulty": "Intermediate",
+                "query_source": "context_engine"
+            },
+            {
+                "title": "📊 Hotspot Trend for High-Risk Sources",
+                "description": "Trend high-volume sources to identify accelerating operational or risk hotspots.",
+                "use_case": "Capacity Planning",
+                "category": "Capacity Planning",
+                "spl": f"index={anchor_index} earliest=-14d | timechart span=1d count by sourcetype limit=10 useother=true",
+                "finding_reference": "Trend and hotspot validation from discovery intelligence.",
+                "execution_time": "< 60s",
+                "business_value": "Supports capacity and risk planning with trend evidence.",
+                "priority": "🟠 MEDIUM",
+                "difficulty": "Intermediate",
+                "query_source": "context_engine"
+            }
+        ]
+        return candidates
+
+    def _normalize_task_item(task: Dict[str, Any], idx: int, finding_pool: List[Dict[str, str]]) -> Dict[str, Any]:
+        if not isinstance(task, dict):
+            task = {}
+
+        priority_raw = _safe_str(task.get("priority"), "MEDIUM").upper()
+        if priority_raw not in {"HIGH", "MEDIUM", "LOW"}:
+            priority_raw = "MEDIUM"
+
+        category_raw = _safe_str(task.get("category"), "Configuration")
+        valid_categories = {"Security", "Performance", "Compliance", "Data Quality", "Configuration"}
+        if category_raw not in valid_categories:
+            category_raw = "Configuration"
+
+        steps_raw = task.get("steps") if isinstance(task.get("steps"), list) else []
+        normalized_steps: List[Dict[str, Any]] = []
+        for step_idx, step in enumerate(steps_raw[:6]):
+            if isinstance(step, str):
+                normalized_steps.append({
+                    "number": step_idx + 1,
+                    "action": _safe_str(step, f"Step {step_idx + 1}"),
+                    "spl": ""
+                })
+                continue
+            if not isinstance(step, dict):
+                continue
+            step_spl = _strip_code_fence(_safe_str(step.get("spl")))
+            if step_spl:
+                step_spl = _anchor_spl_to_environment(step_spl)
+            normalized_steps.append({
+                "number": int(step.get("number", step_idx + 1)) if str(step.get("number", "")).isdigit() else step_idx + 1,
+                "action": _safe_str(step.get("action"), f"Step {step_idx + 1}"),
+                "spl": step_spl
+            })
+
+        if not normalized_steps:
+            anchor_index = _preferred_anchor_index()
+            normalized_steps = [
+                {"number": 1, "action": "Baseline current state and affected entities.", "spl": f"index={anchor_index} earliest=-24h | stats count by sourcetype host | sort - count"},
+                {"number": 2, "action": "Apply the remediation/update described by the task.", "spl": ""},
+                {"number": 3, "action": "Re-run validation and compare to baseline.", "spl": f"index={anchor_index} earliest=-24h | timechart span=1h count"}
+            ]
+
+        verification_spl = _strip_code_fence(_safe_str(task.get("verification_spl")))
+        if verification_spl:
+            verification_spl = _anchor_spl_to_environment(verification_spl)
+        elif normalized_steps and _safe_str(normalized_steps[0].get("spl")):
+            verification_spl = _safe_str(normalized_steps[0].get("spl"))
+        else:
+            verification_spl = f"index={_preferred_anchor_index()} earliest=-24h | stats count as post_change_events"
+
+        evidence_blob = verification_spl + " " + " ".join(_safe_str(step.get("spl")) for step in normalized_steps)
+        evidence = _extract_environment_evidence(evidence_blob)
+
+        matching_finding = finding_pool[idx] if idx < len(finding_pool) else (finding_pool[0] if finding_pool else None)
+
+        return {
+            "title": _safe_str(task.get("title"), f"Contextual remediation task {idx + 1}"),
+            "priority": priority_raw,
+            "category": category_raw,
+            "description": _safe_str(task.get("description"), "Apply this action to reduce risk and improve telemetry quality in your environment."),
+            "prerequisites": task.get("prerequisites") if isinstance(task.get("prerequisites"), list) and task.get("prerequisites") else ["Search access to affected indexes", "Change window approval if production-impacting"],
+            "steps": normalized_steps,
+            "verification_spl": verification_spl,
+            "expected_outcome": _safe_str(task.get("expected_outcome"), "Improved stability, visibility, and measurable reduction in the targeted risk."),
+            "impact": _safe_str(task.get("impact"), "Improves operational confidence and lowers blind-spot risk."),
+            "estimated_time": _safe_str(task.get("estimated_time"), "1-2 hours"),
+            "rollback": _safe_str(task.get("rollback"), "Revert configuration changes and re-run baseline query for validation."),
+            "environment_evidence": evidence,
+            "finding_reference": matching_finding.get("reference") if matching_finding else "Discovery-derived finding"
+        }
+
+    def _context_engine_tasks(finding_pool: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        anchor_index = _preferred_anchor_index()
+        security_ref = next((f for f in finding_pool if f.get("domain") == "Security & Compliance"), None)
+        perf_ref = next((f for f in finding_pool if f.get("domain") == "Infrastructure & Performance"), None)
+        quality_ref = next((f for f in finding_pool if f.get("domain") == "Data Quality"), None)
+
+        return [
+            {
+                "title": "Establish telemetry health baseline and anomaly guardrails",
+                "priority": "HIGH",
+                "category": "Data Quality",
+                "description": "Create a repeatable baseline for ingestion, source diversity, and volatility so regressions can be detected quickly.",
+                "prerequisites": ["Access to search indexes", "Agreement on baseline thresholds"],
+                "steps": [
+                    {"number": 1, "action": "Capture baseline counts by index/sourcetype/host.", "spl": f"index={anchor_index} earliest=-24h | stats count dc(host) as hosts dc(sourcetype) as sourcetypes by index"},
+                    {"number": 2, "action": "Define alert thresholds for low-volume or missing data windows."},
+                    {"number": 3, "action": "Schedule recurring baseline checks and ownership review."}
+                ],
+                "verification_spl": f"index={anchor_index} earliest=-24h | timechart span=1h count by sourcetype limit=10",
+                "expected_outcome": "Daily and hourly telemetry baselines exist with alertable thresholds.",
+                "impact": "Reduces blind spots and shortens mean-time-to-detection for ingestion failures.",
+                "estimated_time": "2 hours",
+                "rollback": "Remove scheduled checks and revert threshold configs.",
+                "finding_reference": (quality_ref or perf_ref or security_ref or {"reference": "Discovery trend validation"}).get("reference")
+            },
+            {
+                "title": "Validate high-risk security signal coverage",
+                "priority": "HIGH",
+                "category": "Security",
+                "description": "Ensure critical security sourcetypes and hosts are consistently represented and searchable.",
+                "prerequisites": ["Security data owner mapping", "Access to relevant security indexes"],
+                "steps": [
+                    {"number": 1, "action": "Measure signal consistency by sourcetype and host.", "spl": f"index={anchor_index} earliest=-7d | stats count by sourcetype host | sort - count"},
+                    {"number": 2, "action": "Identify missing/low-volume sources and assign remediation owners."},
+                    {"number": 3, "action": "Re-run signal consistency query after remediation."}
+                ],
+                "verification_spl": f"index={anchor_index} earliest=-24h | stats dc(host) as active_hosts dc(sourcetype) as active_sourcetypes",
+                "expected_outcome": "Critical security signals are present with stable source coverage.",
+                "impact": "Improves detection reliability and reduces high-severity monitoring gaps.",
+                "estimated_time": "3 hours",
+                "rollback": "Revert onboarding/filter changes and restore previous source routing.",
+                "finding_reference": (security_ref or quality_ref or perf_ref or {"reference": "Security risk validation"}).get("reference")
+            },
+            {
+                "title": "Operationalize recursive risk verification loop",
+                "priority": "MEDIUM",
+                "category": "Configuration",
+                "description": "Convert discovery risks into a repeatable review loop with measurable closure criteria.",
+                "prerequisites": ["Risk owner assignment", "Weekly review cadence"],
+                "steps": [
+                    {"number": 1, "action": "Map each top risk to a validation query and owner.", "spl": f"index={anchor_index} earliest=-14d | timechart span=1d count by sourcetype"},
+                    {"number": 2, "action": "Track unresolved items and escalation age."},
+                    {"number": 3, "action": "Review weekly deltas and close or re-prioritize risks."}
+                ],
+                "verification_spl": f"index={anchor_index} earliest=-7d | stats count by host sourcetype",
+                "expected_outcome": "Each risk has owner, evidence query, and clear closure criteria.",
+                "impact": "Builds predictable risk reduction and continuous improvement.",
+                "estimated_time": "1 day",
+                "rollback": "Disable loop schedule and revert to ad-hoc review model.",
+                "finding_reference": (perf_ref or security_ref or quality_ref or {"reference": "Recursive risk reduction"}).get("reference")
+            }
+        ]
     
-    findings_prompt = f"""Analyze these Splunk discovery reports and extract specific, actionable findings.
+    findings_prompt = f"""Analyze these Splunk V2 discovery artifacts and extract specific, actionable findings.
 
 **Executive Summary:**
 {executive_summary[:3000]}
@@ -1988,8 +4076,9 @@ async def summarize_session(request: Dict[str, Any]):
 **Classification Report:**
 {classification_report[:2000]}
 
-**Discovered Indexes:** {', '.join(list(discovered_indexes)[:20])}
-**Discovered Sourcetypes:** {', '.join(list(discovered_sourcetypes)[:30])}
+**Discovered Indexes:** {', '.join(discovered_indexes_list[:20])}
+**Discovered Sourcetypes:** {', '.join(discovered_sourcetypes_list[:30])}
+**Discovered Hosts:** {', '.join(discovered_hosts_list[:20])}
 
 Extract specific findings in these categories:
 1. **Security Issues** (failed logins, suspicious activity, missing security monitoring)
@@ -1997,6 +4086,8 @@ Extract specific findings in these categories:
 3. **Data Quality Issues** (missing data, parsing errors, empty indexes, data gaps)
 4. **Optimization Opportunities** (retention policies, acceleration, index consolidation)
 5. **Compliance Gaps** (missing audit logs, retention violations, access control issues)
+6. **Trend Signals** (behavior shifts over time windows, emerging hot spots)
+7. **Risk & Vulnerability Hypotheses** (areas needing recursive validation)
 
 For each finding, provide:
 - **Type**: Specific issue type
@@ -2014,7 +4105,9 @@ Return as JSON:
   "performance_findings": [...],
   "data_quality_findings": [...],
   "optimization_findings": [...],
-  "compliance_findings": [...]
+    "compliance_findings": [...],
+    "trend_findings": [...],
+    "risk_hypotheses": [...]
 }}
 
 Focus on ACTUAL findings from the reports with SPECIFIC details. If no findings in a category, return empty array.
@@ -2063,7 +4156,9 @@ Return ONLY the JSON object."""
             "performance_findings": [],
             "data_quality_findings": [],
             "optimization_findings": [],
-            "compliance_findings": []
+            "compliance_findings": [],
+            "trend_findings": [],
+            "risk_hypotheses": []
         }
     except Exception as e:
         print(f"Error extracting findings with AI: {e}")
@@ -2072,7 +4167,9 @@ Return ONLY the JSON object."""
             "performance_findings": [],
             "data_quality_findings": [],
             "optimization_findings": [],
-            "compliance_findings": []
+            "compliance_findings": [],
+            "trend_findings": [],
+            "risk_hypotheses": []
         }
     
     # Update progress - findings extracted
@@ -2084,28 +4181,36 @@ Return ONLY the JSON object."""
     
     # ===== AI-POWERED QUERY GENERATION =====
     # Generate SPL queries based on actual findings
-    query_generation_prompt = f"""Generate 4 SPL queries based on these Splunk findings.
+    query_generation_prompt = f"""Generate 8 SPL queries based on these Splunk findings.
 
 Findings: {json.dumps(ai_findings, indent=2)[:2000]}
 
-Available: {len(discovered_indexes)} indexes, {len(discovered_sourcetypes)} sourcetypes
+Environment Context: {json.dumps(environment_context_block, indent=2)[:2500]}
 
-Return JSON array with exactly 4 queries. Each query must have:
+Return JSON array with exactly 8 queries. Each query must have:
 - title: Clear, actionable title with emoji
 - description: 1 sentence explaining the query
 - use_case: Security Investigation, Performance Monitoring, Data Quality, or Capacity Planning
 - category: Security & Compliance, Infrastructure & Performance, Data Quality, or Capacity Planning
-- spl: Valid SPL query using actual indexes/sourcetypes from findings
+- spl: Valid SPL query using actual indexes/sourcetypes/hosts from this specific environment context
 - finding_reference: Which finding this addresses
 - execution_time: Estimated time
 - business_value: Why this matters
 - priority: 🔴 HIGH, 🟠 MEDIUM, or 🟡 LOW
 - difficulty: Beginner, Intermediate, or Advanced
+- environment_evidence: array of specific discovered entities used (index/sourcetype/host)
+
+NON-NEGOTIABLE RULES:
+1) At least 7/8 queries must reference one or more discovered indexes or sourcetypes from Environment Context.
+2) Do not use placeholders like index=main unless it exists in Environment Context.
+3) Every query must be directly tied to a discovery finding or risk hypothesis.
+4) Include time windows (`earliest=...`) and aggregation logic (`stats`, `timechart`, or `tstats`) for operational usefulness.
+5) Avoid near-duplicate queries; each query should answer a distinct investigative question.
 
 Example:
 [{{"title": "🔍 Investigation Title", "description": "What this does", "use_case": "Security Investigation", "category": "Security & Compliance", "spl": "index=main | stats count", "finding_reference": "Specific finding", "execution_time": "< 30s", "business_value": "Why it matters", "priority": "🔴 HIGH", "difficulty": "Beginner"}}]
 
-Return ONLY the JSON array of 4 queries, nothing else."""
+Return ONLY the JSON array of 8 queries, nothing else."""
 
     finding_based_queries = []
     try:
@@ -2163,6 +4268,8 @@ Return ONLY the JSON array of 4 queries, nothing else."""
         
         # Mark as finding-based
         for q in finding_based_queries:
+            q['spl'] = _anchor_spl_to_environment(q.get('spl', ''))
+            q['environment_evidence'] = q.get('environment_evidence') or _extract_environment_evidence(q.get('spl', ''))
             q['query_source'] = 'ai_finding'
         
     except json.JSONDecodeError as e:
@@ -2177,6 +4284,8 @@ Return ONLY the JSON array of 4 queries, nothing else."""
                 finding_based_queries = json.loads(salvaged_json)
                 print(f"Salvaged {len(finding_based_queries)} queries from truncated response")
                 for q in finding_based_queries:
+                    q['spl'] = _anchor_spl_to_environment(q.get('spl', ''))
+                    q['environment_evidence'] = q.get('environment_evidence') or _extract_environment_evidence(q.get('spl', ''))
                     q['query_source'] = 'ai_finding'
             else:
                 raise
@@ -2187,23 +4296,54 @@ Return ONLY the JSON array of 4 queries, nothing else."""
         print(f"Error generating finding-based queries with AI: {e}")
         finding_based_queries = []
     
-    # Combine AI-generated queries with template queries
-    print(f"📊 Query Status: AI generated {len(finding_based_queries)}, Template generated {len(template_queries)}")
-    
-    if len(finding_based_queries) >= 8:
-        # AI generated enough queries - use them, but keep some templates for variety
-        queries = finding_based_queries + template_queries[:4]
-        print(f"✅ Using {len(finding_based_queries)} AI queries + {len(template_queries[:4])} template queries = {len(queries)} total")
-    else:
-        # AI didn't generate enough - prioritize what we have, supplement with templates
-        queries = finding_based_queries + template_queries
-        print(f"⚠️  Using {len(finding_based_queries)} AI queries + all {len(template_queries)} template queries = {len(queries)} total")
-    
-    # Ensure we have at least some queries
-    if len(queries) == 0:
-        print("❌ WARNING: No queries generated at all! This shouldn't happen.")
-        # This should never happen since template_queries should always have content
-        queries = []
+    # Normalize and enrich query set using finding-aware + context-engine strategies
+    finding_pool = _flatten_findings(ai_findings)
+    context_engine_query_candidates = _context_engine_queries(finding_pool)
+
+    normalized_query_candidates: List[Dict[str, Any]] = []
+    for idx, query_item in enumerate(finding_based_queries):
+        if isinstance(query_item, dict):
+            normalized_query_candidates.append(_normalize_query_item(query_item, idx, finding_pool))
+
+    for idx, query_item in enumerate(context_engine_query_candidates):
+        normalized_query_candidates.append(_normalize_query_item(query_item, len(normalized_query_candidates) + idx, finding_pool))
+
+    for idx, template_query in enumerate(template_queries):
+        if not isinstance(template_query, dict):
+            continue
+        template_copy = dict(template_query)
+        template_copy["query_source"] = "template"
+        normalized_query_candidates.append(_normalize_query_item(template_copy, len(normalized_query_candidates) + idx, finding_pool))
+
+    deduped_queries: List[Dict[str, Any]] = []
+    seen_query_keys = set()
+    for query in normalized_query_candidates:
+        key = re.sub(r"\s+", " ", _safe_str(query.get("spl"), "").lower()).strip()
+        if not key:
+            continue
+        if key in seen_query_keys:
+            continue
+        seen_query_keys.add(key)
+        deduped_queries.append(query)
+
+    def _query_rank(query: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        source_rank = 0 if query.get("query_source") == "ai_finding" else 1 if query.get("query_source") == "context_engine" else 2
+        priority_rank = 0 if str(query.get("priority", "")).startswith("🔴") else 1 if str(query.get("priority", "")).startswith("🟠") else 2
+        evidence_rank = -len(query.get("environment_evidence", []) if isinstance(query.get("environment_evidence", []), list) else [])
+        complexity_rank = -len(_safe_str(query.get("spl"), ""))
+        return (source_rank, priority_rank, evidence_rank, complexity_rank)
+
+    deduped_queries.sort(key=_query_rank)
+    queries = deduped_queries[:10]
+
+    # Ensure minimum query volume and environment anchoring
+    if len(queries) < 8:
+        for candidate in deduped_queries[10:]:
+            queries.append(candidate)
+            if len(queries) >= 8:
+                break
+
+    print(f"📊 Query Status: AI raw={len(finding_based_queries)}, context_engine={len(context_engine_query_candidates)}, template={len(template_queries)}, final={len(queries)}")
     
     # Debug: Show query sources
     ai_query_count = sum(1 for q in queries if q.get('query_source') == 'ai_finding')
@@ -2234,7 +4374,7 @@ Return ONLY the JSON array of 4 queries, nothing else."""
     from datetime import datetime
     current_date = datetime.now().strftime("%B %d, %Y")
     
-    summary_prompt = f"""You are analyzing a Splunk discovery report. Create a concise executive summary.
+    summary_prompt = f"""You are analyzing a Splunk V2 intelligence report. Create a high-value executive summary.
 
 **IMPORTANT CONTEXT:** Today's date is {current_date}. Any timestamps in the reports should be interpreted relative to this date, not as future dates.
 
@@ -2252,8 +4392,10 @@ Please provide:
 2. **Priority Actions** (Top 3 immediate actions the admin should take)
 3. **Quick Wins** (2-3 easy implementations with high impact)
 4. **Risk Areas** (Any security or compliance gaps identified)
+5. **Trend Story** (what appears to be changing, increasing, or degrading)
+6. **Recursive Next Loop** (what should be re-checked in the next discovery cycle)
 
-Keep it concise and actionable. Focus on business value and ROI. Base all statements on actual data from the reports above."""
+Keep it concise and actionable. Focus on business value, risk reduction, and measurable outcomes. Base all statements on actual data from the reports above."""
     
     # Update progress - creating summary
     summarization_progress[timestamp] = {
@@ -2292,6 +4434,9 @@ Keep it concise and actionable. Focus on business value and ROI. Base all statem
 **Key Findings:**
 {detailed_findings[:2000]}
 
+**Environment Context (use this explicitly):**
+{json.dumps(environment_context_block, indent=2)[:2500]}
+
 For each task, provide:
 1. **Title**: Clear, action-oriented task name
 2. **Priority**: HIGH/MEDIUM/LOW based on impact and urgency
@@ -2314,6 +4459,10 @@ Focus on:
 - Data quality enhancements
 - Performance optimizations
 
+HARD REQUIREMENTS:
+- At least 3 tasks must include SPL that references discovered indexes/sourcetypes/hosts from Environment Context.
+- Verification SPL must validate outcomes against environment-specific telemetry.
+
 Return ONLY a valid JSON array of task objects. Each task should follow this structure:
 {{
   "title": "Task name",
@@ -2332,7 +4481,9 @@ Return ONLY a valid JSON array of task objects. Each task should follow this str
   "rollback": "How to undo if needed"
 }}
 
-Generate 3-5 prioritized tasks. Keep each task concise but actionable. Return ONLY the JSON array, no other text."""
+Generate 6-8 prioritized tasks. Keep each task concise but actionable.
+At least 4 tasks must include verification SPL anchored to discovered indexes/sourcetypes/hosts.
+Return ONLY the JSON array, no other text."""
 
     try:
         # Use 50% of configured max_tokens for admin tasks to allow comprehensive responses
@@ -2388,62 +4539,69 @@ Generate 3-5 prioritized tasks. Keep each task concise but actionable. Return ON
         except:
             print("Could not salvage tasks, using default task")
             # Use default task when salvage fails
-            admin_tasks = [
-                {
-                    "title": "Verify Data Ingestion Across Indexes",
-                    "priority": "HIGH",
-                    "category": "Data Quality",
-                    "description": "Ensure data is actively flowing into your Splunk indexes and identify any gaps in data collection that could impact monitoring and analysis.",
-                    "prerequisites": ["Access to search Splunk indexes"],
-                    "steps": [
-                        {"number": 1, "action": "Check recent data ingestion across all indexes", "spl": "| tstats count where index=* earliest=-24h by index | sort -count"},
-                        {"number": 2, "action": "Identify indexes with no recent data", "spl": "| tstats count where index=* earliest=-24h by index | where count=0"},
-                        {"number": 3, "action": "Review sourcetypes for active indexes", "spl": "index=* earliest=-1h | stats count by index, sourcetype | sort -count"}
-                    ],
-                    "verification_spl": "| tstats count where index=* earliest=-1h | stats count as active_indexes",
-                    "expected_outcome": "At least one index showing recent data (count > 0)",
-                    "impact": "Ensures continuous monitoring and detection capabilities are functional",
-                    "estimated_time": "30 minutes",
-                    "rollback": "No changes made - this is a read-only verification task"
-                }
-            ]
+            admin_tasks = []
     except Exception as e:
         print(f"Error generating admin tasks: {e}")
         print(f"Raw response: {tasks_response[:500] if 'tasks_response' in locals() else 'No response'}")
         # Create default tasks based on common findings
-        admin_tasks = [
-            {
-                "title": "Verify Data Ingestion Across Indexes",
-                "priority": "HIGH",
-                "category": "Data Quality",
-                "description": "Ensure data is actively flowing into your Splunk indexes and identify any gaps in data collection that could impact monitoring and analysis.",
-                "prerequisites": ["Access to search Splunk indexes"],
-                "steps": [
-                    {"number": 1, "action": "Check recent data ingestion across all indexes", "spl": "| tstats count where index=* earliest=-24h by index | sort -count"},
-                    {"number": 2, "action": "Identify indexes with no recent data", "spl": "| tstats count where index=* earliest=-24h by index | where count=0"},
-                    {"number": 3, "action": "Review sourcetypes for active indexes", "spl": "index=* earliest=-1h | stats count by index, sourcetype | sort -count"}
-                ],
-                "verification_spl": "| tstats count where index=* earliest=-1h | stats count as active_indexes",
-                "expected_outcome": "At least one index showing recent data (count > 0)",
-                "impact": "Ensures continuous monitoring and detection capabilities are functional",
-                "estimated_time": "30 minutes",
-                "rollback": "No changes made - this is a read-only verification task"
-            }
-        ]
+        admin_tasks = []
+
+    # Normalize + enrich admin tasks with context-engine supplement
+    context_engine_tasks = _context_engine_tasks(finding_pool)
+    normalized_task_candidates: List[Dict[str, Any]] = []
+    for idx, task in enumerate(admin_tasks):
+        normalized_task_candidates.append(_normalize_task_item(task, idx, finding_pool))
+    for idx, task in enumerate(context_engine_tasks):
+        normalized_task_candidates.append(_normalize_task_item(task, len(normalized_task_candidates) + idx, finding_pool))
+
+    deduped_tasks: List[Dict[str, Any]] = []
+    seen_task_titles = set()
+    for task in normalized_task_candidates:
+        title_key = _safe_str(task.get("title"), "").lower()
+        if not title_key or title_key in seen_task_titles:
+            continue
+        seen_task_titles.add(title_key)
+        deduped_tasks.append(task)
+
+    def _task_rank(task: Dict[str, Any]) -> Tuple[int, int]:
+        priority = _safe_str(task.get("priority"), "MEDIUM").upper()
+        priority_rank = 0 if priority == "HIGH" else 1 if priority == "MEDIUM" else 2
+        evidence_rank = -len(task.get("environment_evidence", []) if isinstance(task.get("environment_evidence", []), list) else [])
+        return (priority_rank, evidence_rank)
+
+    deduped_tasks.sort(key=_task_rank)
+    admin_tasks = deduped_tasks[:6]
+    if not admin_tasks:
+        admin_tasks = [_normalize_task_item(task, idx, finding_pool) for idx, task in enumerate(context_engine_tasks[:3])]
+
+    print(f"📋 Task Status: ai_raw={len(normalized_task_candidates) - len(context_engine_tasks)}, context_engine={len(context_engine_tasks)}, final={len(admin_tasks)}")
     
     # Prepare response
     response_data = {
         "success": True,
         "session_id": timestamp,
+        "schema_version": "2.0",
         "ai_summary": ai_summary,
         "spl_queries": queries,
         "admin_tasks": admin_tasks,
         "unknown_data": unknown_questions,
+        "readiness_score": readiness_score,
+        "coverage_gaps": coverage_gaps,
+        "risk_register": risk_register,
+        "trend_signals": trend_signals,
+        "vulnerability_hypotheses": vulnerability_hypotheses,
+        "recursive_investigations": recursive_investigations,
+        "v2_context": {
+            "readiness_score": readiness_score,
+            "coverage_gaps": len(coverage_gaps),
+            "risk_register": len(risk_register),
+            "recursive_investigations": len(recursive_investigations)
+        },
         "stats": {
             "total_queries": len(queries),
             "total_tasks": len(admin_tasks),
             "unknown_items": len(unknown_questions),
-            "categories": list(set(q['category'] for q in queries))
+            "categories": list({q.get('category', 'General') for q in queries if isinstance(q, dict)})
         },
         "from_cache": False
     }
@@ -2542,7 +4700,7 @@ async def verify_task(request: Dict[str, Any]):
         mcp_tool_call = {
             "method": "tools/call",
             "params": {
-                "name": "run_splunk_query",
+                "name": "splunk_run_query",
                 "arguments": {
                     "query": verification_spl,
                     "earliest_time": "-24h",
@@ -2973,34 +5131,30 @@ async def chat_with_splunk_stream(request: dict):
 
 
 def load_latest_discovery_insights():
-    """Load key insights from the latest discovery reports for agent context."""
+    """Load key insights from latest V2 artifacts for agent context."""
     try:
         output_dir = Path("output")
         if not output_dir.exists():
             return None
-        
-        # Find latest executive summary
-        exec_summaries = list(output_dir.glob("executive_summary_*.md"))
-        if not exec_summaries:
+
+        insights_files = sorted(output_dir.glob("v2_insights_brief_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not insights_files:
             return None
-        
-        latest_summary = max(exec_summaries, key=lambda p: p.stat().st_mtime)
-        
-        # Read first 2000 chars of summary for key findings
+
+        latest_summary = insights_files[0]
         summary_text = latest_summary.read_text(encoding='utf-8')[:2000]
-        
-        # Also check for AI summary JSON for structured insights
-        timestamp = latest_summary.stem.split('_')[-1]
-        ai_summary_path = output_dir / f"ai_summary_{timestamp}.json"
-        
+
+        timestamp = latest_summary.stem.replace('v2_insights_brief_', '')
+        blueprint_path = output_dir / f"v2_intelligence_blueprint_{timestamp}.json"
+
         structured_insights = None
-        if ai_summary_path.exists():
+        if blueprint_path.exists():
             try:
-                ai_data = json.loads(ai_summary_path.read_text(encoding='utf-8'))
+                ai_data = json.loads(blueprint_path.read_text(encoding='utf-8'))
                 structured_insights = {
-                    'key_findings': ai_data.get('key_findings', [])[:5],
-                    'recommendations': ai_data.get('recommendations', [])[:5],
-                    'data_patterns': ai_data.get('data_patterns', {})
+                    'key_findings': [f.get('title') for f in (ai_data.get('finding_ledger', []) or []) if isinstance(f, dict) and f.get('title')][:5],
+                    'recommendations': [r.get('title') for r in (ai_data.get('recommendations', []) or []) if isinstance(r, dict) and r.get('title')][:5],
+                    'data_patterns': ai_data.get('trend_signals', {})
                 }
             except:
                 pass
@@ -3052,6 +5206,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         print(f"🔵 [CHAT] Request received: {request.get('message', '')[:50]}")
         user_message = request.get('message', '')
         history = request.get('history', [])
+        chat_session_id = sanitize_chat_session_id(request.get('chat_session_id', 'default'))
         
         if not user_message.strip():
             return {"error": "Message cannot be empty"}
@@ -3070,6 +5225,11 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         
         # Load configuration
         config = config_manager.get()
+
+        # Load and update persistent chat memory for this session
+        update_chat_memory(chat_session_id, user_message)
+        chat_memory = load_chat_memory(chat_session_id)
+        memory_context = build_chat_memory_context(chat_memory)
         
         # Get discovery staleness threshold from session settings (days converted to seconds)
         staleness_threshold = chat_session_settings["discovery_freshness_days"] * 86400
@@ -3079,14 +5239,14 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         discovery_age_warning = None
         output_dir = Path("output")
         
-        # Find most recent discovery export
-        discovery_files = sorted(output_dir.glob("discovery_export_*.json"), reverse=True)
+        # Find most recent V2 blueprint
+        discovery_files = sorted(output_dir.glob("v2_intelligence_blueprint_*.json"), reverse=True)
         if discovery_files:
             try:
                 discovery_file = discovery_files[0]
                 
-                # Parse timestamp from filename: discovery_export_YYYYMMDD_HHMMSS.json
-                timestamp_str = discovery_file.stem.replace('discovery_export_', '')
+                # Parse timestamp from filename: v2_intelligence_blueprint_YYYYMMDD_HHMMSS.json
+                timestamp_str = discovery_file.stem.replace('v2_intelligence_blueprint_', '')
                 discovery_datetime = datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
                 discovery_age_seconds = (datetime.now() - discovery_datetime).total_seconds()
                 
@@ -3095,11 +5255,11 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                     days_old = int(discovery_age_seconds / 86400)
                     discovery_age_warning = f"⚠️ Discovery data is {days_old} days old. Consider running a new discovery for up-to-date information."
                 
-                # Use context manager for smart lazy-loading
-                ctx_mgr = get_context_manager()
-                
-                # Get lightweight metadata (avoids parsing full file for simple queries)
-                metadata = ctx_mgr.get_metadata()
+                with discovery_file.open('r', encoding='utf-8') as fp:
+                    latest_blueprint = json.load(fp)
+                metadata = {
+                    "overview": latest_blueprint.get("overview", {}) if isinstance(latest_blueprint, dict) else {}
+                }
                 
                 # Analyze user query to determine if context is needed
                 query_lower = user_message.lower()
@@ -3153,6 +5313,645 @@ For detailed information, use tool calls to query Splunk directly."""
                 traceback.print_exc()
         else:
             discovery_age_warning = "⚠️ No discovery data found. Run a discovery first to get environment context."
+
+        rag_context = ""
+        if bool(chat_session_settings.get("enable_rag_context", False)):
+            rag_max_chunks = _safe_int(chat_session_settings.get("rag_max_chunks", 3))
+            rag_context = build_lightweight_rag_context(user_message, max_chunks=rag_max_chunks)
+
+        available_mcp_tools = await discover_mcp_tools(config)
+        if not available_mcp_tools:
+            available_mcp_tools = {
+                "splunk_run_query",
+                "splunk_get_info",
+                "splunk_get_indexes",
+                "splunk_get_index_info",
+                "splunk_get_metadata",
+                "splunk_get_user_info",
+                "splunk_get_knowledge_objects"
+            }
+
+        primary_tool_order = [
+            "splunk_run_query",
+            "splunk_get_info",
+            "splunk_get_indexes",
+            "splunk_get_index_info",
+            "splunk_get_metadata",
+            "splunk_get_user_info",
+            "splunk_get_knowledge_objects",
+            "saia_generate_spl",
+            "saia_optimize_spl",
+            "saia_explain_spl",
+            "saia_ask_splunk_question"
+        ]
+        ordered_tools = [name for name in primary_tool_order if name in available_mcp_tools]
+        ordered_tools.extend(sorted([name for name in available_mcp_tools if name not in ordered_tools]))
+
+        available_tools_text = "\n".join(
+            f"- {name}: {MCP_TOOL_DESCRIPTIONS.get(name, 'MCP tool available for Splunk operations.')}"
+            for name in ordered_tools
+        )
+
+        query_tool_name = resolve_tool_name("splunk_run_query", available_mcp_tools)
+        provider_name = str(getattr(config.llm, "provider", "")).strip().lower()
+        is_custom_provider = provider_name in {"custom", "custom endpoint"}
+
+        # Deterministic path for "latest entry in <index>" requests to avoid LLM misclassification
+        latest_index_name = detect_latest_entry_index_request(user_message)
+        if latest_index_name:
+            latest_status_timeline: List[Dict[str, Any]] = []
+            latest_tool_calls: List[Dict[str, Any]] = []
+            normalized_index_name = latest_index_name.strip()
+
+            # Step 1: validate index presence from live tool results
+            indexes_tool_name = resolve_tool_name("splunk_get_indexes", available_mcp_tools)
+            indexes_call = {
+                "method": "tools/call",
+                "params": {
+                    "name": indexes_tool_name,
+                    "arguments": {"row_limit": 1000}
+                }
+            }
+            latest_status_timeline.append({"iteration": 1, "action": "📁 Validating index existence", "time": 0.0})
+            indexes_result = await execute_mcp_tool_call(indexes_call, config)
+            parsed_indexes = extract_results_from_mcp_response(indexes_result)
+            index_rows = parsed_indexes.get("results", []) if isinstance(parsed_indexes, dict) else []
+            index_names = []
+            for row in index_rows:
+                if not isinstance(row, dict):
+                    continue
+                candidate = row.get("title") or row.get("name")
+                if isinstance(candidate, str) and candidate.strip():
+                    index_names.append(candidate.strip())
+
+            index_exists = any(name.lower() == normalized_index_name.lower() for name in index_names)
+            latest_tool_calls.append({
+                "iteration": 1,
+                "tool": indexes_tool_name,
+                "args": {"row_limit": 1000},
+                "spl_query": None,
+                "result": indexes_result,
+                "summary": {
+                    "type": indexes_tool_name,
+                    "row_count": len(index_rows),
+                    "findings": [f"Found {len(index_rows)} indexes"],
+                    "actual_results": index_rows[:5]
+                }
+            })
+
+            if not index_exists:
+                similar = [name for name in index_names if normalized_index_name.lower() in name.lower()][:5]
+                response_text = f"I validated live index metadata and could not find an index named `{normalized_index_name}`."
+                if similar:
+                    response_text += "\n\nClosest matches: " + ", ".join(similar)
+                elif index_names:
+                    response_text += "\n\nIf helpful, I can list all currently available indexes."
+
+                updated_memory = update_chat_memory(chat_session_id, user_message, latest_tool_calls)
+                follow_on_actions = build_follow_on_actions(user_message, updated_memory, latest_tool_calls)
+                return {
+                    "response": response_text,
+                    "initial_response": user_message,
+                    "tool_calls": latest_tool_calls,
+                    "iterations": len(latest_tool_calls),
+                    "execution_time": "0.00s",
+                    "insights": ["Index was validated directly from Splunk index inventory."],
+                    "status_timeline": latest_status_timeline,
+                    "discovery_age_warning": discovery_age_warning,
+                    "chat_session_id": chat_session_id,
+                    "chat_memory": updated_memory,
+                    "has_follow_on": len(follow_on_actions) > 0,
+                    "follow_on_actions": follow_on_actions
+                }
+
+            # Step 2: fetch latest event in that index
+            latest_query = f"search index={normalized_index_name} | sort - _time | head 1"
+            latest_call = {
+                "method": "tools/call",
+                "params": {
+                    "name": query_tool_name,
+                    "arguments": {
+                        "query": latest_query,
+                        "earliest_time": "-30d",
+                        "latest_time": "now",
+                        "row_limit": 1
+                    }
+                }
+            }
+            latest_status_timeline.append({"iteration": 2, "action": "🔍 Retrieving latest event", "time": 0.0})
+            latest_result = await execute_mcp_tool_call(latest_call, config)
+            parsed_latest = extract_results_from_mcp_response(latest_result)
+            latest_rows = parsed_latest.get("results", []) if isinstance(parsed_latest, dict) else []
+            latest_error_code = parsed_latest.get("status_code") if isinstance(parsed_latest, dict) else None
+            latest_error_message = parsed_latest.get("error_message") if isinstance(parsed_latest, dict) else ""
+
+            latest_tool_calls.append({
+                "iteration": 2,
+                "tool": query_tool_name,
+                "args": {
+                    "query": latest_query,
+                    "earliest_time": "-30d",
+                    "latest_time": "now",
+                    "row_limit": 1
+                },
+                "spl_query": latest_query,
+                "result": latest_result,
+                "summary": {
+                    "type": query_tool_name,
+                    "row_count": len(latest_rows),
+                    "findings": [f"{len(latest_rows)} results returned"],
+                    "actual_results": latest_rows[:1]
+                }
+            })
+
+            if isinstance(latest_error_code, int) and latest_error_code >= 400:
+                response_text = (
+                    f"I confirmed index `{normalized_index_name}` exists, but the latest-entry query returned an error "
+                    f"(status_code={latest_error_code}).\n\n"
+                    f"{latest_error_message or 'No additional error details were returned.'}"
+                )
+            elif latest_rows:
+                latest_event = latest_rows[0] if isinstance(latest_rows[0], dict) else {"value": latest_rows[0]}
+                pretty_event = json.dumps(latest_event, indent=2, default=str)
+                response_text = (
+                    f"Latest event in index `{normalized_index_name}`:\n\n"
+                    f"```json\n{pretty_event}\n```"
+                )
+            else:
+                response_text = (
+                    f"Index `{normalized_index_name}` exists, but no events were returned for the last 30 days "
+                    f"with `search index={normalized_index_name} | sort - _time | head 1`."
+                )
+
+            updated_memory = update_chat_memory(chat_session_id, user_message, latest_tool_calls)
+            follow_on_actions = build_follow_on_actions(user_message, updated_memory, latest_tool_calls)
+            return {
+                "response": response_text,
+                "initial_response": user_message,
+                "tool_calls": latest_tool_calls,
+                "iterations": len(latest_tool_calls),
+                "execution_time": "0.00s",
+                "insights": ["Used deterministic latest-event flow for index validation and retrieval."],
+                "status_timeline": latest_status_timeline,
+                "discovery_age_warning": discovery_age_warning,
+                "chat_session_id": chat_session_id,
+                "chat_memory": updated_memory,
+                "has_follow_on": len(follow_on_actions) > 0,
+                "follow_on_actions": follow_on_actions
+            }
+
+        if bool(chat_session_settings.get("enable_splunk_augmentation", True)) and detect_edge_processor_template_request(user_message):
+            skill_status_timeline: List[Dict[str, Any]] = []
+            skill_tool_calls: List[Dict[str, Any]] = []
+
+            knowledge_tool_name = resolve_tool_name("splunk_get_knowledge_objects", available_mcp_tools)
+            skill_status_timeline.append({"iteration": 1, "action": "🧭 Fetching knowledge objects", "time": 0.0})
+
+            attempts = [
+                {"object_type": "saved_searches", "row_limit": 1000},
+                {"object_type": "macros", "row_limit": 1000},
+                {"object_type": "data_models", "row_limit": 500},
+                {"row_limit": 1000}
+            ]
+
+            collected_rows: List[Dict[str, Any]] = []
+            for attempt_idx, args in enumerate(attempts, 1):
+                call_payload = {
+                    "method": "tools/call",
+                    "params": {
+                        "name": knowledge_tool_name,
+                        "arguments": args
+                    }
+                }
+                attempt_result = await execute_mcp_tool_call(call_payload, config)
+                parsed = extract_results_from_mcp_response(attempt_result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                if isinstance(rows, list):
+                    for row in rows:
+                        if isinstance(row, dict):
+                            collected_rows.append(row)
+
+                skill_tool_calls.append({
+                    "iteration": attempt_idx,
+                    "tool": knowledge_tool_name,
+                    "args": args,
+                    "spl_query": None,
+                    "result": attempt_result,
+                    "summary": {
+                        "type": knowledge_tool_name,
+                        "row_count": len(rows) if isinstance(rows, list) else 0,
+                        "findings": [f"Attempt {attempt_idx}: {len(rows) if isinstance(rows, list) else 0} objects returned"],
+                        "actual_results": rows[:8] if isinstance(rows, list) else []
+                    }
+                })
+
+            filtered_templates: List[Dict[str, Any]] = []
+            for row in collected_rows:
+                title = str(row.get("title") or row.get("name") or row.get("id") or "").strip()
+                description = str(row.get("description") or row.get("search") or row.get("qualifiedSearch") or "").strip()
+                searchable = f"{title} {description}".lower()
+                if not searchable:
+                    continue
+                if "edge" in searchable and ("processor" in searchable or "template" in searchable):
+                    filtered_templates.append({
+                        "title": title or "Unnamed object",
+                        "description": description[:240],
+                        "type": row.get("type") or row.get("object_type") or "knowledge_object"
+                    })
+
+            deduped: List[Dict[str, Any]] = []
+            seen_titles = set()
+            for item in filtered_templates:
+                key = str(item.get("title", "")).lower()
+                if key and key not in seen_titles:
+                    seen_titles.add(key)
+                    deduped.append(item)
+
+            if deduped:
+                lines = ["I found these Splunk knowledge objects that match Edge Processor template intent:"]
+                for idx, item in enumerate(deduped[:12], 1):
+                    lines.append(f"{idx}. {item.get('title', 'Template')} ({item.get('type', 'knowledge_object')})")
+                    if item.get("description"):
+                        lines.append(f"   - {item.get('description')}")
+                response_text = "\n".join(lines)
+            else:
+                fallback_query_args = {
+                    "query": "| rest /servicesNS/-/-/saved/searches | search title=\"*edge*\" OR search=\"*edge*\" OR title=\"*template*\" | table title description eai:acl.app",
+                    "earliest_time": "-24h",
+                    "latest_time": "now"
+                }
+                fallback_result = await execute_mcp_tool_call({
+                    "method": "tools/call",
+                    "params": {
+                        "name": query_tool_name,
+                        "arguments": fallback_query_args
+                    }
+                }, config)
+                fallback_parsed = extract_results_from_mcp_response(fallback_result)
+                fallback_rows = fallback_parsed.get("results", []) if isinstance(fallback_parsed, dict) else []
+
+                fallback_matches: List[str] = []
+                for row in fallback_rows if isinstance(fallback_rows, list) else []:
+                    if isinstance(row, dict):
+                        title = str(row.get("title") or "").strip()
+                        if title:
+                            fallback_matches.append(title)
+
+                skill_tool_calls.append({
+                    "iteration": len(skill_tool_calls) + 1,
+                    "tool": query_tool_name,
+                    "args": fallback_query_args,
+                    "spl_query": fallback_query_args.get("query"),
+                    "result": fallback_result,
+                    "summary": {
+                        "type": query_tool_name,
+                        "row_count": len(fallback_rows) if isinstance(fallback_rows, list) else 0,
+                        "findings": [f"Fallback REST lookup returned {len(fallback_matches)} entries"],
+                        "actual_results": fallback_rows[:8] if isinstance(fallback_rows, list) else []
+                    }
+                })
+
+                if fallback_matches:
+                    response_text = "I found these template-like saved searches related to edge processing:\n" + "\n".join([f"- {item}" for item in fallback_matches[:20]])
+                else:
+                    response_text = (
+                        "I queried knowledge objects and a saved-search REST fallback, but found no objects clearly tagged as Edge Processor templates. "
+                        "If you use a naming convention, I can search for that exact prefix next."
+                    )
+
+            updated_memory = update_chat_memory(chat_session_id, user_message, skill_tool_calls)
+            follow_on_actions = build_follow_on_actions(user_message, updated_memory, skill_tool_calls)
+            return {
+                "response": response_text,
+                "initial_response": user_message,
+                "tool_calls": skill_tool_calls,
+                "iterations": len(skill_tool_calls),
+                "execution_time": "0.00s",
+                "insights": ["Used deterministic template lookup for Edge Processor intent."],
+                "status_timeline": skill_status_timeline,
+                "discovery_age_warning": discovery_age_warning,
+                "chat_session_id": chat_session_id,
+                "chat_memory": updated_memory,
+                "has_follow_on": len(follow_on_actions) > 0,
+                "follow_on_actions": follow_on_actions
+            }
+
+        offline_target = detect_last_offline_target(user_message) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+        if offline_target:
+            offline_status_timeline: List[Dict[str, Any]] = []
+            offline_tool_calls: List[Dict[str, Any]] = []
+
+            memory_indexes = (chat_memory.get("entities", {}).get("indexes", []) if isinstance(chat_memory, dict) else [])
+            candidate_indexes = []
+            for name in (memory_indexes[-4:] if isinstance(memory_indexes, list) else []) + ["network_logs", "main"]:
+                if isinstance(name, str) and name and name not in candidate_indexes:
+                    candidate_indexes.append(name)
+
+            offline_terms = '(offline OR down OR unreachable OR disconnected OR "link down" OR status=offline OR status=down)'
+            entity_clause = f'(host="{offline_target}" OR src="{offline_target}" OR dest="{offline_target}" OR ip="{offline_target}" OR "{offline_target}")'
+            noise_exclusion = 'NOT sourcetype=mcp_server NOT source="*mcp_server*" NOT "Executing SPL query:"'
+
+            query_attempts = []
+            for idx_name in candidate_indexes[:5]:
+                query_attempts.append({
+                    "query": f"search index={idx_name} {entity_clause} {offline_terms} {noise_exclusion} | sort - _time | head 1 | table _time host src dest ip status sourcetype source message",
+                    "earliest_time": "-30d",
+                    "latest_time": "now"
+                })
+                query_attempts.append({
+                    "query": f"search index={idx_name} {entity_clause} {offline_terms} {noise_exclusion} | sort - _time | head 1 | table _time host src dest ip status sourcetype source message",
+                    "earliest_time": "-90d",
+                    "latest_time": "now"
+                })
+
+            query_attempts.append({
+                "query": f"search {entity_clause} {offline_terms} {noise_exclusion} | sort - _time | head 1 | table _time host src dest ip status sourcetype source message",
+                "earliest_time": "-90d",
+                "latest_time": "now"
+            })
+
+            found_event: Optional[Dict[str, Any]] = None
+            for attempt_idx, attempt_args in enumerate(query_attempts[:8], 1):
+                offline_status_timeline.append({"iteration": attempt_idx, "action": "🔍 Searching for latest offline signal", "time": 0.0})
+                call_payload = {
+                    "method": "tools/call",
+                    "params": {
+                        "name": query_tool_name,
+                        "arguments": attempt_args
+                    }
+                }
+                attempt_result = await execute_mcp_tool_call(call_payload, config)
+                parsed = extract_results_from_mcp_response(attempt_result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                row_count = len(rows) if isinstance(rows, list) else 0
+
+                offline_tool_calls.append({
+                    "iteration": attempt_idx,
+                    "tool": query_tool_name,
+                    "args": attempt_args,
+                    "spl_query": attempt_args.get("query"),
+                    "result": attempt_result,
+                    "summary": {
+                        "type": query_tool_name,
+                        "row_count": row_count,
+                        "findings": [f"Attempt {attempt_idx}: {row_count} results returned"],
+                        "actual_results": rows[:2] if isinstance(rows, list) else []
+                    }
+                })
+
+                if row_count > 0:
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        row_message = str(row.get("message") or "")
+                        row_source = str(row.get("source") or "")
+                        row_sourcetype = str(row.get("sourcetype") or "")
+                        is_noise = (
+                            "executing spl query:" in row_message.lower()
+                            or "mcp_server" in row_source.lower()
+                            or row_sourcetype.lower() == "mcp_server"
+                        )
+                        if not is_noise:
+                            found_event = row
+                            break
+                    if found_event:
+                        break
+
+            if found_event:
+                raw_time = found_event.get("_time") or found_event.get("time") or found_event.get("timestamp")
+                friendly_time = str(raw_time)
+                if isinstance(raw_time, (int, float)):
+                    try:
+                        friendly_time = datetime.fromtimestamp(float(raw_time)).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        friendly_time = str(raw_time)
+
+                pretty_event = json.dumps(found_event, indent=2, default=str)
+                response_text = (
+                    f"The latest offline event I found for `{offline_target}` was at **{friendly_time}**.\n\n"
+                    f"```json\n{pretty_event}\n```"
+                )
+            else:
+                attempted_patterns = [str(call.get("args", {}).get("query", ""))[:90] for call in offline_tool_calls[:3]]
+                response_text = (
+                    f"I searched multiple indexes and broader time windows but found no offline events for `{offline_target}`. "
+                    f"I tried patterns like: {' | '.join(attempted_patterns)}. "
+                    f"If you want, I can retry with a custom index list or alternate status keywords used in your environment."
+                )
+
+            updated_memory = update_chat_memory(chat_session_id, user_message, offline_tool_calls)
+            follow_on_actions = build_follow_on_actions(user_message, updated_memory, offline_tool_calls)
+            return {
+                "response": response_text,
+                "initial_response": user_message,
+                "tool_calls": offline_tool_calls,
+                "iterations": len(offline_tool_calls),
+                "execution_time": "0.00s",
+                "insights": ["Used deterministic offline-event lookup with index and time-range fallbacks."],
+                "status_timeline": offline_status_timeline,
+                "discovery_age_warning": discovery_age_warning,
+                "chat_session_id": chat_session_id,
+                "chat_memory": updated_memory,
+                "has_follow_on": len(follow_on_actions) > 0,
+                "follow_on_actions": follow_on_actions
+            }
+
+        basic_intent = detect_basic_inventory_intent(user_message) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+        if basic_intent:
+            basic_status_timeline: List[Dict[str, Any]] = []
+            basic_tool_calls: List[Dict[str, Any]] = []
+
+            if basic_intent == "list_indexes":
+                indexes_tool_name = resolve_tool_name("splunk_get_indexes", available_mcp_tools)
+                args = {"row_limit": 200}
+                basic_status_timeline.append({"iteration": 1, "action": "📁 Loading indexes", "time": 0.0})
+                result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": indexes_tool_name, "arguments": args}}, config)
+                parsed = extract_results_from_mcp_response(result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                names = []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        candidate = row.get("title") or row.get("name")
+                        if isinstance(candidate, str) and candidate.strip():
+                            names.append(candidate.strip())
+                names = sorted(list(dict.fromkeys(names)))
+                response_text = "Available indexes:\n" + "\n".join([f"- {name}" for name in names[:80]]) if names else "No indexes were returned by Splunk."
+                basic_tool_calls.append({"iteration": 1, "tool": indexes_tool_name, "args": args, "spl_query": None, "result": result, "summary": {"type": indexes_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(names)} indexes"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
+
+            elif basic_intent == "list_sourcetypes":
+                args = {"query": "| tstats count where index=* by sourcetype | sort - count | head 50", "earliest_time": "-7d", "latest_time": "now"}
+                basic_status_timeline.append({"iteration": 1, "action": "🧾 Loading sourcetypes", "time": 0.0})
+                result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                parsed = extract_results_from_mcp_response(result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                sourcetypes = []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        value = row.get("sourcetype") or row.get("SOURCETYPE")
+                        if isinstance(value, str) and value.strip():
+                            sourcetypes.append(value.strip())
+                sourcetypes = list(dict.fromkeys(sourcetypes))
+                response_text = "Top sourcetypes (last 7d):\n" + "\n".join([f"- {value}" for value in sourcetypes[:50]]) if sourcetypes else "No sourcetypes were returned for the selected time range."
+                basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(sourcetypes)} sourcetypes"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
+
+            elif basic_intent == "top_indexes":
+                args = {"query": "| tstats count where index=* by index | sort - count | head 25", "earliest_time": "-7d", "latest_time": "now"}
+                basic_status_timeline.append({"iteration": 1, "action": "📊 Loading top indexes", "time": 0.0})
+                result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                parsed = extract_results_from_mcp_response(result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                lines: List[str] = []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        idx_name = row.get("index") or row.get("INDEX")
+                        count_value = row.get("count") or row.get("COUNT")
+                        if idx_name is not None:
+                            lines.append(f"- {idx_name}: {count_value if count_value is not None else 'n/a'}")
+                response_text = "Top indexes by event count (last 7d):\n" + "\n".join(lines[:25]) if lines else "No index volume data was returned for the selected time range."
+                basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(lines)} index rows"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
+
+            elif basic_intent == "top_errors":
+                args = {"query": "search index=* (error OR failed OR exception) | stats count by sourcetype | sort - count | head 20", "earliest_time": "-24h", "latest_time": "now"}
+                basic_status_timeline.append({"iteration": 1, "action": "🚨 Loading top error sources", "time": 0.0})
+                result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                parsed = extract_results_from_mcp_response(result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                lines = []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        source_type = row.get("sourcetype") or row.get("SOURCETYPE") or "unknown"
+                        count_value = row.get("count") or row.get("COUNT") or "n/a"
+                        lines.append(f"- {source_type}: {count_value}")
+                response_text = "Top error-producing sourcetypes (last 24h):\n" + "\n".join(lines[:20]) if lines else "No error-focused results were returned for the selected time range."
+                basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(lines)} error rows"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
+
+            elif basic_intent == "latest_auth_failures":
+                args = {"query": "search index=* (\"failed login\" OR \"authentication failed\" OR \"login failed\" OR \"invalid user\" OR action=failure) | sort - _time | head 20 | table _time host user src src_ip action status message sourcetype", "earliest_time": "-7d", "latest_time": "now"}
+                basic_status_timeline.append({"iteration": 1, "action": "🔐 Loading latest authentication failures", "time": 0.0})
+                result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                parsed = extract_results_from_mcp_response(result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                entries = []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        entries.append(f"- {row.get('_time', 'unknown time')} | host={row.get('host', 'n/a')} | user={row.get('user', 'n/a')} | src={row.get('src', row.get('src_ip', 'n/a'))}")
+                response_text = "Latest authentication failure events:\n" + "\n".join(entries[:20]) if entries else "No authentication failure events were returned in the last 7 days."
+                basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(entries)} auth failure events"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
+
+            elif basic_intent == "count_index_events":
+                target_index = extract_index_from_message(user_message)
+                if not target_index:
+                    response_text = "I could not identify the index name. Try a prompt like: 'how many events in index=main'."
+                else:
+                    args_24h = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-24h", "latest_time": "now"}
+                    args_7d = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-7d", "latest_time": "now"}
+                    basic_status_timeline.append({"iteration": 1, "action": f"📏 Counting events for index={target_index}", "time": 0.0})
+                    res_24h = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_24h}}, config)
+                    res_7d = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_7d}}, config)
+                    parsed_24h = extract_results_from_mcp_response(res_24h)
+                    parsed_7d = extract_results_from_mcp_response(res_7d)
+                    rows_24h = parsed_24h.get("results", []) if isinstance(parsed_24h, dict) else []
+                    rows_7d = parsed_7d.get("results", []) if isinstance(parsed_7d, dict) else []
+
+                    def _extract_count(rows: Any) -> int:
+                        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                            row = rows[0]
+                            for key in ["event_count", "count", "COUNT"]:
+                                if key in row:
+                                    return _safe_int(row.get(key))
+                        return 0
+
+                    count_24h = _extract_count(rows_24h)
+                    count_7d = _extract_count(rows_7d)
+                    response_text = f"Event counts for index `{target_index}`:\n- Last 24h: {count_24h}\n- Last 7d: {count_7d}"
+                    basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args_24h, "spl_query": args_24h.get("query"), "result": res_24h, "summary": {"type": query_tool_name, "row_count": len(rows_24h) if isinstance(rows_24h, list) else 0, "findings": [f"24h count={count_24h}"], "actual_results": rows_24h[:5] if isinstance(rows_24h, list) else []}})
+                    basic_tool_calls.append({"iteration": 2, "tool": query_tool_name, "args": args_7d, "spl_query": args_7d.get("query"), "result": res_7d, "summary": {"type": query_tool_name, "row_count": len(rows_7d) if isinstance(rows_7d, list) else 0, "findings": [f"7d count={count_7d}"], "actual_results": rows_7d[:5] if isinstance(rows_7d, list) else []}})
+
+            elif basic_intent == "latest_host_heartbeat":
+                target_host = extract_host_or_ip_from_message(user_message)
+                if not target_host and isinstance(chat_memory, dict):
+                    remembered_hosts = chat_memory.get("entities", {}).get("hosts", [])
+                    if isinstance(remembered_hosts, list) and remembered_hosts:
+                        target_host = remembered_hosts[-1]
+
+                if not target_host:
+                    response_text = "I could not identify the host/IP. Try: 'last seen host=router-01' or include an IP address."
+                else:
+                    attempts = [
+                        {"query": f"search index=* host=\"{target_host}\" (heartbeat OR alive OR uptime OR status=up OR status=online) | sort - _time | head 1 | table _time host sourcetype source message", "earliest_time": "-7d", "latest_time": "now"},
+                        {"query": f"search index=* host=\"{target_host}\" | sort - _time | head 1 | table _time host sourcetype source message", "earliest_time": "-30d", "latest_time": "now"}
+                    ]
+                    found_row = None
+                    for attempt_idx, args in enumerate(attempts, 1):
+                        basic_status_timeline.append({"iteration": attempt_idx, "action": f"📡 Checking last-seen for {target_host}", "time": 0.0})
+                        result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                        parsed = extract_results_from_mcp_response(result)
+                        rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                        basic_tool_calls.append({"iteration": attempt_idx, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Attempt {attempt_idx}: {len(rows) if isinstance(rows, list) else 0} rows"], "actual_results": rows[:5] if isinstance(rows, list) else []}})
+                        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                            found_row = rows[0]
+                            break
+
+                    if found_row:
+                        response_text = (
+                            f"Latest event for `{target_host}`:\n"
+                            f"- Time: {found_row.get('_time', 'unknown')}\n"
+                            f"- Sourcetype: {found_row.get('sourcetype', 'n/a')}\n"
+                            f"- Source: {found_row.get('source', 'n/a')}"
+                        )
+                    else:
+                        response_text = f"No events found for `{target_host}` in the attempted heartbeat/last-seen windows."
+
+            elif basic_intent == "list_hosts":
+                args = {"query": "| tstats count where index=* by host | sort - count | head 50", "earliest_time": "-7d", "latest_time": "now"}
+                basic_status_timeline.append({"iteration": 1, "action": "🖥️ Loading hosts", "time": 0.0})
+                result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                parsed = extract_results_from_mcp_response(result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                hosts = []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        value = row.get("host") or row.get("HOST")
+                        if isinstance(value, str) and value.strip():
+                            hosts.append(value.strip())
+                hosts = list(dict.fromkeys(hosts))
+                response_text = "Top hosts (last 7d):\n" + "\n".join([f"- {value}" for value in hosts[:50]]) if hosts else "No hosts were returned for the selected time range."
+                basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(hosts)} hosts"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
+
+            else:
+                knowledge_tool_name = resolve_tool_name("splunk_get_knowledge_objects", available_mcp_tools)
+                args = {"row_limit": 500}
+                basic_status_timeline.append({"iteration": 1, "action": "📚 Loading knowledge objects", "time": 0.0})
+                result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": knowledge_tool_name, "arguments": args}}, config)
+                parsed = extract_results_from_mcp_response(result)
+                rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                templates = []
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict):
+                        title = str(row.get("title") or row.get("name") or "").strip()
+                        searchable = f"{title} {row.get('description', '')} {row.get('search', '')}".lower()
+                        if title and "template" in searchable:
+                            templates.append(title)
+                templates = list(dict.fromkeys(templates))
+                response_text = "Template-like knowledge objects:\n" + "\n".join([f"- {value}" for value in templates[:60]]) if templates else "No template-like knowledge objects were returned."
+                basic_tool_calls.append({"iteration": 1, "tool": knowledge_tool_name, "args": args, "spl_query": None, "result": result, "summary": {"type": knowledge_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(templates)} template-like objects"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
+
+            updated_memory = update_chat_memory(chat_session_id, user_message, basic_tool_calls)
+            follow_on_actions = build_follow_on_actions(user_message, updated_memory, basic_tool_calls)
+            return {
+                "response": response_text,
+                "initial_response": user_message,
+                "tool_calls": basic_tool_calls,
+                "iterations": len(basic_tool_calls),
+                "execution_time": "0.00s",
+                "insights": [f"Used deterministic basic intent route: {basic_intent}."],
+                "status_timeline": basic_status_timeline,
+                "discovery_age_warning": discovery_age_warning,
+                "chat_session_id": chat_session_id,
+                "chat_memory": updated_memory,
+                "has_follow_on": len(follow_on_actions) > 0,
+                "follow_on_actions": follow_on_actions
+            }
         
         # Initialize LLM client (cached for performance)
         print(f"🔵 [CHAT] Getting LLM client...")
@@ -3160,12 +5959,14 @@ For detailed information, use tool calls to query Splunk directly."""
         print(f"🔵 [CHAT] LLM client initialized, provider: {config.llm.provider}")
         
         # Use simplified prompt for custom endpoints (local LLMs have smaller context windows)
-        if config.llm.provider == "Custom Endpoint":
+        if is_custom_provider:
             system_prompt = f"""You are a Splunk assistant. Answer from this context or use tools when needed.
 
 {discovery_context}
+{rag_context}
+{memory_context}
 
-Tool format: <TOOL_CALL>{{"tool": "run_splunk_query", "args": {{"query": "YOUR_SPL_HERE"}}}}</TOOL_CALL>"""
+    Tool format: <TOOL_CALL>{{"tool": "{query_tool_name}", "args": {{"query": "YOUR_SPL_HERE"}}}}</TOOL_CALL>"""
         else:
             # Full agentic prompt for OpenAI (larger context window, better instruction following)
             system_prompt = f"""You are an ELITE Splunk expert with 20+ years of experience across:
@@ -3179,7 +5980,9 @@ Tool format: <TOOL_CALL>{{"tool": "run_splunk_query", "args": {{"query": "YOUR_S
 
 🌍 ENVIRONMENT CONTEXT:
 {discovery_context}
+{rag_context}
 {discovery_age_warning if 'discovery_age_warning' in locals() else ''}
+{memory_context}
 
 📊 DISCOVERY DATA AVAILABLE:
 Latest discovery reports are available in the output/ folder with comprehensive insights:
@@ -3204,11 +6007,7 @@ You are an AUTONOMOUS AGENT with the ability to:
 5. Provide deep insights, not just raw data
 
 🔧 AVAILABLE TOOLS:
-- run_splunk_query(query, earliest_time, latest_time): Execute any SPL search
-- get_indexes(): List all available indexes
-- get_index_info(index_name): Get details about a specific index
-- get_metadata(type, index): Get hosts, sources, or sourcetypes  
-- get_splunk_info(): Get general Splunk system information
+{available_tools_text}
 
 📚 REQUEST ADDITIONAL CONTEXT (On-Demand):
 If you need detailed information, request it dynamically:
@@ -3247,7 +6046,7 @@ Always use this exact format for tool calls:
 
 <TOOL_CALL>
 {{
-  "tool": "run_splunk_query",
+    "tool": "{query_tool_name}",
   "args": {{
     "query": "index=wineventlog earliest=-24h | stats count by EventCode | sort -count | head 10",
     "earliest_time": "-24h",
@@ -3321,7 +6120,7 @@ User: "What indexes have data between 22:00 and 23:00 last Tuesday?"
 
 You: <TOOL_CALL>
 {{
-  "tool": "run_splunk_query",
+    "tool": "{query_tool_name}",
   "args": {{
     "query": "| tstats count where _time>=relative_time(now(), \"-7d@d+22h\") AND _time<relative_time(now(), \"-7d@d+23h\") by index",
     "earliest_time": "-7d",
@@ -3336,7 +6135,7 @@ I'm querying all indexes for data during the 22:00-23:00 hour last Tuesday using
 
 <TOOL_CALL>
 {{
-  "tool": "run_splunk_query",
+    "tool": "{query_tool_name}",
   "args": {{
     "query": "earliest=-7d latest=now index=wineventlog | where _time>=relative_time(now(), \"-7d@d+22h\") AND _time<relative_time(now(), \"-7d@d+23h\") | stats count",
     "earliest_time": "-7d",
@@ -3351,10 +6150,19 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         
         # Prepare messages
         # For custom LLM with simple greetings, skip system prompt entirely for speed
+        system_prompt = build_compact_chat_prompt(
+            query_tool_name=query_tool_name,
+            discovery_context=discovery_context,
+            rag_context=rag_context,
+            memory_context=memory_context,
+            available_tools_text=available_tools_text,
+            discovery_age_warning=discovery_age_warning
+        )
+
         query_lower = user_message.lower().strip()
         is_greeting = any(phrase in query_lower for phrase in ['hi', 'hello', 'hey', 'how are you', 'thanks', 'thank you', 'bye', 'goodbye'])
         
-        if config.llm.provider == "custom" and is_greeting:
+        if is_custom_provider and is_greeting:
             # Bare minimum for greetings - just the user message
             messages = [{"role": "user", "content": user_message}]
         else:
@@ -3414,7 +6222,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                         formatted_context = ctx_mgr.format_context_for_llm({requested_context_type: specific_context})
                         
                         # Inject context into conversation before next LLM call
-                        conversation_history.append({
+                        messages.append({
                             "role": "system",
                             "content": f"[Context loaded: {requested_context_type}]\n{formatted_context}"
                         })
@@ -3434,9 +6242,11 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 raw_json = response[start:end].strip()
                 
                 print(f"🔍 Raw JSON: {repr(raw_json[:200])}")
-                
+
                 try:
-                    tool_data = json.loads(raw_json)
+                    tool_data = parse_tool_call_payload(raw_json)
+                    if not isinstance(tool_data, dict):
+                        raise ValueError("Invalid tool payload")
                     tool_name = tool_data.get('tool')
                     tool_args = tool_data.get('args', {})
                     
@@ -3453,7 +6263,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                     clean_response = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', response, flags=re.DOTALL).strip()
                     
                     debug_log(f"Extracted tool call - {tool_name} with args: {tool_args}", "query", tool_args)
-                except json.JSONDecodeError as e:
+                except Exception as e:
                     print(f"❌ JSON Parse Error: {e}")
                     print(f"❌ Raw JSON that failed: {raw_json}")
                     debug_log(f"Tool call JSON parse error: {e}", "error")
@@ -3470,6 +6280,21 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                     spl_in_text = match.group(1).strip()
                     debug_log(f"Found SPL in code block", "info")
                     break
+
+            if not tool_call and spl_in_text:
+                tool_call = {
+                    "method": "tools/call",
+                    "params": {
+                        "name": query_tool_name,
+                        "arguments": {
+                            "query": spl_in_text,
+                            "earliest_time": "-24h",
+                            "latest_time": "now"
+                        }
+                    }
+                }
+                clean_response = re.sub(r'```(?:spl|splunk)?\s*\n.*?```', '', response, flags=re.DOTALL | re.IGNORECASE).strip()
+                debug_log("Converted SPL code block into executable tool call", "info")
                     
         except Exception as e:
             debug_log(f"Error parsing response: {e}", "error")
@@ -3500,6 +6325,11 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             def summarize_result(result_data, tool_name):
                 """Extract key insights from results without full JSON dump"""
                 summary = {"type": tool_name, "findings": []}
+                is_query_tool = tool_name in {"run_splunk_query", "splunk_run_query"}
+                is_metadata_tool = tool_name in {
+                    "get_indexes", "splunk_get_indexes",
+                    "get_metadata", "splunk_get_metadata"
+                }
                 
                 if isinstance(result_data, dict):
                     if 'error' in result_data:
@@ -3507,28 +6337,48 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                     
                     result = result_data.get('result', {})
                     
-                    # MCP wraps responses in content array - extract the actual data
                     actual_results = None
-                    if isinstance(result, dict) and 'content' in result:
+                    structured_status_code = None
+                    structured_error_message = ""
+
+                    # GA v1 shape: result.structuredContent.results
+                    if isinstance(result, dict):
+                        structured_content = result.get('structuredContent', {})
+                        if isinstance(structured_content, dict):
+                            structured_status_code = structured_content.get('status_code')
+                            if isinstance(structured_content.get('content'), str):
+                                structured_error_message = structured_content.get('content', '')
+                            if isinstance(structured_content.get('results'), list):
+                                actual_results = structured_content.get('results', [])
+
+                    if isinstance(structured_status_code, int) and structured_status_code >= 400:
+                        return {
+                            "type": "error",
+                            "message": structured_error_message or f"MCP tool execution failed with status_code={structured_status_code}"
+                        }
+
+                    # Legacy/direct shape: result.results
+                    if actual_results is None and isinstance(result, dict) and isinstance(result.get('results'), list):
+                        actual_results = result.get('results', [])
+
+                    # Legacy text-wrapper shape: result.content[0].text JSON
+                    if actual_results is None and isinstance(result, dict) and 'content' in result:
                         content_items = result.get('content', [])
                         if content_items and len(content_items) > 0:
                             first_item = content_items[0]
                             if isinstance(first_item, dict) and 'text' in first_item:
                                 try:
-                                    # Parse the JSON string containing actual results
-                                    actual_results = json.loads(first_item['text'])
-                                    print(f"📦 Extracted {len(actual_results.get('results', []))} results from MCP content wrapper")
+                                    parsed_text = json.loads(first_item['text'])
+                                    if isinstance(parsed_text, dict) and isinstance(parsed_text.get('results'), list):
+                                        actual_results = parsed_text.get('results', [])
+                                    elif isinstance(parsed_text, list):
+                                        actual_results = parsed_text
                                 except json.JSONDecodeError as e:
                                     print(f"⚠️  Failed to parse MCP content text as JSON: {e}")
                     
                     # Summarize based on tool type
-                    if tool_name == 'run_splunk_query':
-                        # Check parsed results first, then fall back to direct structure
-                        results_array = None
-                        if actual_results and 'results' in actual_results:
-                            results_array = actual_results['results']
-                        elif 'results' in result:
-                            results_array = result['results']
+                    if is_query_tool:
+                        results_array = actual_results if isinstance(actual_results, list) else None
                         
                         if results_array is not None:
                             result_count = len(results_array)
@@ -3556,13 +6406,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                             summary['row_count'] = 0  # No results found
                             summary['findings'].append("⚠️ No results field found in response")
                     
-                    elif tool_name in ['get_indexes', 'get_metadata']:
-                        # Check parsed results first, then fall back to direct structure
-                        results_array = None
-                        if actual_results and 'results' in actual_results:
-                            results_array = actual_results['results']
-                        elif 'results' in result:
-                            results_array = result['results']
+                    elif is_metadata_tool:
+                        results_array = actual_results if isinstance(actual_results, list) else None
                         
                         if results_array is not None:
                             result_count = len(results_array)
@@ -3662,13 +6507,6 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 if len(recent_spl_queries) == convergence_threshold and len(set(recent_spl_queries)) == 1:
                     return True  # Exact same query N times in a row
                 
-                # Check if we're stuck getting zero results consistently
-                if len(tool_history) >= convergence_threshold:
-                    last_n_counts = [call.get('summary', {}).get('row_count', 0) for call in tool_history[-convergence_threshold:]]
-                    # If all N returned zero results, we're stuck
-                    if all(count == 0 for count in last_n_counts):
-                        return True  # Stuck finding nothing for N iterations
-                
                 return False
             
             while True:
@@ -3689,7 +6527,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 print(f"   Time elapsed: {elapsed:.1f}s")
                 
                 # Add status update (both to timeline and stream if callback provided)
-                action = "🔍 Querying Splunk" if tool_name == 'run_splunk_query' else f"⚙️ Executing {tool_name}"
+                action = "🔍 Querying Splunk" if tool_name in {'run_splunk_query', 'splunk_run_query'} else f"⚙️ Executing {tool_name}"
                 status_timeline.append({"iteration": iteration, "action": action, "time": elapsed})
                 if status_callback:
                     await status_callback(action, iteration, elapsed)
@@ -3768,7 +6606,7 @@ Discovery has been stopped to avoid repeated failed attempts."""
                 
                 # Track this tool call with summary
                 spl_query = None
-                if tool_name == 'run_splunk_query' and 'query' in tool_args:
+                if tool_name in {'run_splunk_query', 'splunk_run_query'} and 'query' in tool_args:
                     spl_query = tool_args['query']
                 
                 all_tool_calls.append({
@@ -3830,7 +6668,7 @@ If you need to clarify the user's intent, ask a clarifying question WITHOUT tool
                     
                     # For metadata queries (indexes, sourcetypes), send full data
                     # For large query results, send sample only
-                    if tool_name in ['get_indexes', 'get_metadata']:
+                    if tool_name in {'get_indexes', 'splunk_get_indexes', 'get_metadata', 'splunk_get_metadata'}:
                         sample_data = actual_results  # Send all metadata
                         data_label = "Complete Data"
                     else:
@@ -4070,7 +6908,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
 You MUST continue investigating using the exact <TOOL_CALL> format:
 
 <TOOL_CALL>
-{{"tool": "run_splunk_query", "args": {{"query": "your SPL query here"}}}}
+{{"tool": "{query_tool_name}", "args": {{"query": "your SPL query here"}}}}
 </TOOL_CALL>
 
 Based on your previous response, provide your next investigation step NOW using the proper format above.
@@ -4178,7 +7016,7 @@ Do not explain what you will do - DO IT with a tool call."""
 Your quality score is {quality_score}/100 (moderate). To proceed, you MUST use the exact format:
 
 <TOOL_CALL>
-{{"tool": "run_splunk_query", "args": {{"query": "your SPL query here"}}}}
+{{"tool": "{query_tool_name}", "args": {{"query": "your SPL query here"}}}}
 </TOOL_CALL>
 
 Based on your previous response, provide your next query NOW using the proper format above."""
@@ -4326,6 +7164,8 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
             
             # Return comprehensive response with status timeline
             # Include conversation_history so follow-up queries maintain context
+            updated_memory = update_chat_memory(chat_session_id, user_message, all_tool_calls)
+            follow_on_actions = build_follow_on_actions(user_message, updated_memory, all_tool_calls)
             return {
                 "response": final_answer or "Investigation complete. See findings above.",
                 "initial_response": user_message,
@@ -4344,14 +7184,24 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                     for i, tc in enumerate(all_tool_calls, 1)
                 ],
                 "conversation_history": conversation_history,  # FIX: Return full conversation for follow-up context
-                "discovery_age_warning": discovery_age_warning
+                "discovery_age_warning": discovery_age_warning,
+                "chat_session_id": chat_session_id,
+                "chat_memory": updated_memory,
+                "has_follow_on": len(follow_on_actions) > 0,
+                "follow_on_actions": follow_on_actions
             }
         
         # No tool call, return clean response with any SPL found
+        updated_memory = update_chat_memory(chat_session_id, user_message)
+        follow_on_actions = build_follow_on_actions(user_message, updated_memory)
         return {
             "response": clean_response,
             "spl_in_text": spl_in_text,
-            "discovery_age_warning": discovery_age_warning
+            "discovery_age_warning": discovery_age_warning,
+            "chat_session_id": chat_session_id,
+            "chat_memory": updated_memory,
+            "has_follow_on": len(follow_on_actions) > 0,
+            "follow_on_actions": follow_on_actions
         }
         
     except Exception as e:
@@ -4372,7 +7222,6 @@ async def execute_mcp_tool_call(tool_call, config):
     """Execute a tool call against the MCP server."""
     try:
         import httpx
-        import ssl
         
         headers = {
             "Accept": "application/json",
@@ -4405,75 +7254,147 @@ async def execute_mcp_tool_call(tool_call, config):
             ssl_verify = False
             print("INFO: SSL verification disabled for MCP calls (self-signed certificates)")
         
+        requested_tool_name = tool_call.get('params', {}).get('name', 'unknown')
+        requested_args = tool_call.get('params', {}).get('arguments', {})
+        available_tools = await discover_mcp_tools(config)
+        resolved_tool_name = resolve_tool_name(requested_tool_name, available_tools)
+        resolved_args = normalize_tool_arguments(resolved_tool_name, requested_args)
+
+        resolved_tool_call = {
+            "method": "tools/call",
+            "params": {
+                "name": resolved_tool_name,
+                "arguments": resolved_args
+            }
+        }
+
         # Debug: Log the tool call being sent
-        tool_name = tool_call.get('params', {}).get('name', 'unknown')
+        tool_name = resolved_tool_name
         print(f"📤 Sending MCP tool call: {tool_name}")
-        print(f"   Method: {tool_call.get('method')}")
-        print(f"   Params: {tool_call.get('params', {}).keys()}")
-        print(f"   Arguments: {tool_call.get('params', {}).get('arguments', {})}")
+        print(f"   Requested tool: {requested_tool_name}")
+        print(f"   Method: {resolved_tool_call.get('method')}")
+        print(f"   Params: {resolved_tool_call.get('params', {}).keys()}")
+        print(f"   Arguments: {resolved_tool_call.get('params', {}).get('arguments', {})}")
         print(f"   Headers: {list(headers.keys())}")
         print(f"   Has Authorization: {'Authorization' in headers}")
         print(f"   Full URL: {config.mcp.url}")
-        
-        async with httpx.AsyncClient(verify=ssl_verify, timeout=30.0) as client:
-            print(f"📡 Posting to: {config.mcp.url}")
-            response = await client.post(
-                config.mcp.url,
-                json=tool_call,
-                headers=headers
-            )
-            print(f"📨 Response Status: {response.status_code}")
-            print(f"📨 Response Content-Type: {response.headers.get('content-type', 'unknown')}")
-            
-            if response.status_code == 200:
-                mcp_response = response.json()
-                
-                # Debug: Log the MCP response structure
-                tool_name = tool_call.get('params', {}).get('name', 'unknown')
-                debug_log(f"🔍 MCP Response from {tool_name}", "response", {
-                    "tool": tool_name,
-                    "status": response.status_code,
-                    "response_type": str(type(mcp_response)),
-                    "response_keys": list(mcp_response.keys()) if isinstance(mcp_response, dict) else None
-                })
-                
-                # Check for 'result' field
-                if isinstance(mcp_response, dict) and 'result' in mcp_response:
-                    result = mcp_response['result']
-                    
-                    # Check for results array
-                    if isinstance(result, dict) and 'results' in result:
-                        results_count = len(result['results']) if isinstance(result['results'], list) else 0
-                        debug_log(f"📦 MCP returned {results_count} results", "response", {
-                            "count": results_count,
-                            "first_result_sample": result['results'][0] if results_count > 0 else None
-                        })
-                    elif isinstance(result, dict):
-                        debug_log(f"📄 MCP result content (no results array)", "response", {
-                            "content_preview": str(result)[:200]
-                        })
-                    else:
-                        debug_log(f"📄 MCP result value: {result}", "response")
-                else:
-                    debug_log(f"⚠️ MCP response missing 'result' field", "warning", {
-                        "response_preview": str(mcp_response)[:200]
-                    })
-                
-                return mcp_response
-            else:
-                error_detail = response.text[:200] if response.text else "No error details"
-                print(f"❌ MCP ERROR: Status {response.status_code} - {error_detail}")
-                
-                # Mark fatal errors that won't be fixed by retrying
-                fatal_statuses = {401, 403, 404}  # Auth, forbidden, not found
-                is_fatal = response.status_code in fatal_statuses
-                
-                return {
-                    "error": f"MCP call failed: {response.status_code}", 
-                    "detail": error_detail,
-                    "status_code": response.status_code,
-                    "fatal": is_fatal  # Signal that retrying won't help
+
+        async def _post_tool_call(payload):
+            async with httpx.AsyncClient(verify=ssl_verify, timeout=30.0) as client:
+                print(f"📡 Posting to: {config.mcp.url}")
+                return await client.post(
+                    config.mcp.url,
+                    json=payload,
+                    headers=headers
+                )
+
+        unknown_tool_signals = ["tool not found", "unknown tool", "invalid tool", "no such tool", "method not found"]
+        should_retry_with_refresh = False
+        retry_reason = ""
+
+        response = await _post_tool_call(resolved_tool_call)
+        print(f"📨 Response Status: {response.status_code}")
+        print(f"📨 Response Content-Type: {response.headers.get('content-type', 'unknown')}")
+
+        if response.status_code == 200:
+            mcp_response = response.json()
+
+            if isinstance(mcp_response, dict) and mcp_response.get('error'):
+                error_text = str(mcp_response.get('error', '')).lower()
+                if any(signal in error_text for signal in unknown_tool_signals):
+                    should_retry_with_refresh = True
+                    retry_reason = str(mcp_response.get('error'))
+            elif isinstance(mcp_response, dict) and mcp_response.get('result'):
+                result_obj = mcp_response.get('result', {})
+                content = result_obj.get('content', []) if isinstance(result_obj, dict) else []
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and isinstance(item.get('text'), str):
+                            text = item.get('text', '').lower()
+                            if any(signal in text for signal in unknown_tool_signals):
+                                should_retry_with_refresh = True
+                                retry_reason = item.get('text', '')
+                                break
+        else:
+            error_detail = response.text[:500] if response.text else "No error details"
+            error_text = error_detail.lower()
+            if any(signal in error_text for signal in unknown_tool_signals):
+                should_retry_with_refresh = True
+                retry_reason = error_detail
+
+        if should_retry_with_refresh:
+            debug_log(f"Refreshing MCP tools after unknown-tool signal: {retry_reason}", "warning")
+            refreshed_tools = await discover_mcp_tools(config, force_refresh=True)
+            retried_tool_name = resolve_tool_name(requested_tool_name, refreshed_tools)
+            retried_args = normalize_tool_arguments(retried_tool_name, requested_args)
+            retried_payload = {
+                "method": "tools/call",
+                "params": {
+                    "name": retried_tool_name,
+                    "arguments": retried_args
                 }
+            }
+            response = await _post_tool_call(retried_payload)
+            print(f"🔁 Retry response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            mcp_response = response.json()
+
+            # Debug: Log the MCP response structure
+            debug_log(f"🔍 MCP Response from {tool_name}", "response", {
+                "tool": tool_name,
+                "status": response.status_code,
+                "response_type": str(type(mcp_response)),
+                "response_keys": list(mcp_response.keys()) if isinstance(mcp_response, dict) else None
+            })
+
+            # Check for 'result' field
+            if isinstance(mcp_response, dict) and 'result' in mcp_response:
+                result = mcp_response['result']
+
+                structured_content = result.get('structuredContent', {}) if isinstance(result, dict) else {}
+                structured_results = structured_content.get('results', []) if isinstance(structured_content, dict) else []
+                direct_results = result.get('results', []) if isinstance(result, dict) else []
+
+                # Check for results array (GA structuredContent first)
+                if isinstance(structured_results, list):
+                    results_count = len(structured_results)
+                    debug_log(f"📦 MCP returned {results_count} results (structuredContent)", "response", {
+                        "count": results_count,
+                        "first_result_sample": structured_results[0] if results_count > 0 else None
+                    })
+                elif isinstance(direct_results, list):
+                    results_count = len(direct_results)
+                    debug_log(f"📦 MCP returned {results_count} results", "response", {
+                        "count": results_count,
+                        "first_result_sample": direct_results[0] if results_count > 0 else None
+                    })
+                elif isinstance(result, dict):
+                    debug_log(f"📄 MCP result content (no results array)", "response", {
+                        "content_preview": str(result)[:200]
+                    })
+                else:
+                    debug_log(f"📄 MCP result value: {result}", "response")
+            else:
+                debug_log(f"⚠️ MCP response missing 'result' field", "warning", {
+                    "response_preview": str(mcp_response)[:200]
+                })
+
+            return mcp_response
+
+        error_detail = response.text[:200] if response.text else "No error details"
+        print(f"❌ MCP ERROR: Status {response.status_code} - {error_detail}")
+
+        # Mark fatal errors that won't be fixed by retrying
+        fatal_statuses = {401, 403, 404}  # Auth, forbidden, not found
+        is_fatal = response.status_code in fatal_statuses
+
+        return {
+            "error": f"MCP call failed: {response.status_code}",
+            "detail": error_detail,
+            "status_code": response.status_code,
+            "fatal": is_fatal  # Signal that retrying won't help
+        }
                 
     except httpx.HTTPError as e:
         print(f"❌ HTTP ERROR: {type(e).__name__} - {str(e)}")
@@ -4619,6 +7540,118 @@ def get_frontend_html():
         .scroll-container::-webkit-scrollbar-thumb:hover {
             background: #5a67d8;
         }
+
+        [data-theme='dark'] .settings-modal-shell {
+            color: #e5e7eb;
+        }
+
+        [data-theme='dark'] .settings-modal-shell .text-gray-900 { color: #f3f4f6 !important; }
+        [data-theme='dark'] .settings-modal-shell .text-gray-800 { color: #e5e7eb !important; }
+        [data-theme='dark'] .settings-modal-shell .text-gray-700 { color: #d1d5db !important; }
+        [data-theme='dark'] .settings-modal-shell .text-gray-600 { color: #cbd5e1 !important; }
+        [data-theme='dark'] .settings-modal-shell .text-gray-500 { color: #94a3b8 !important; }
+        [data-theme='dark'] .settings-modal-shell .text-gray-400 { color: #94a3b8 !important; }
+
+        [data-theme='dark'] .settings-modal-shell .bg-white { background-color: #1f2937 !important; }
+        [data-theme='dark'] .settings-modal-shell .bg-gray-50 { background-color: #111827 !important; }
+        [data-theme='dark'] .settings-modal-shell .bg-gray-100 { background-color: #1f2937 !important; }
+        [data-theme='dark'] .settings-modal-shell .bg-amber-50 { background-color: #3f2c12 !important; }
+        [data-theme='dark'] .settings-modal-shell .bg-emerald-50 { background-color: #0f3b30 !important; }
+        [data-theme='dark'] .settings-modal-shell .from-green-50,
+        [data-theme='dark'] .settings-modal-shell .to-emerald-50,
+        [data-theme='dark'] .settings-modal-shell .from-purple-50,
+        [data-theme='dark'] .settings-modal-shell .to-indigo-50 { background-image: none !important; background-color: #1f2937 !important; }
+
+        [data-theme='dark'] .settings-modal-shell .border-gray-100,
+        [data-theme='dark'] .settings-modal-shell .border-gray-200,
+        [data-theme='dark'] .settings-modal-shell .border-gray-300 { border-color: #4b5563 !important; }
+
+        [data-theme='dark'] .settings-modal-shell input,
+        [data-theme='dark'] .settings-modal-shell select,
+        [data-theme='dark'] .settings-modal-shell textarea {
+            background-color: #111827 !important;
+            color: #f3f4f6 !important;
+            border-color: #4b5563 !important;
+        }
+
+        [data-theme='dark'] .settings-modal-shell input::placeholder,
+        [data-theme='dark'] .settings-modal-shell textarea::placeholder {
+            color: #94a3b8 !important;
+        }
+
+        [data-theme='dark'] .settings-modal-shell code {
+            background-color: #0f172a !important;
+            color: #e2e8f0 !important;
+        }
+
+        [data-theme='dark'] .connection-popover {
+            border: 1px solid #4b5563;
+        }
+
+        [data-theme='dark'] .connection-popover .text-gray-900 { color: #f3f4f6 !important; }
+        [data-theme='dark'] .connection-popover .text-gray-800 { color: #e5e7eb !important; }
+        [data-theme='dark'] .connection-popover .text-gray-700 { color: #d1d5db !important; }
+        [data-theme='dark'] .connection-popover .text-gray-600 { color: #cbd5e1 !important; }
+        [data-theme='dark'] .connection-popover .text-gray-500 { color: #94a3b8 !important; }
+        [data-theme='dark'] .connection-popover .bg-white { background-color: #1f2937 !important; }
+        [data-theme='dark'] .connection-popover .bg-gray-50 { background-color: #111827 !important; }
+        [data-theme='dark'] .connection-popover .from-purple-50,
+        [data-theme='dark'] .connection-popover .to-indigo-50,
+        [data-theme='dark'] .connection-popover .from-green-50,
+        [data-theme='dark'] .connection-popover .to-emerald-50,
+        [data-theme='dark'] .connection-popover .from-blue-50,
+        [data-theme='dark'] .connection-popover .to-cyan-50 { background-image: none !important; background-color: #111827 !important; }
+        [data-theme='dark'] .connection-popover .border-gray-200,
+        [data-theme='dark'] .connection-popover .border-gray-100,
+        [data-theme='dark'] .connection-popover .border-indigo-100,
+        [data-theme='dark'] .connection-popover .border-green-100,
+        [data-theme='dark'] .connection-popover .border-blue-100 { border-color: #374151 !important; }
+
+        [data-theme='dark'] .chat-settings-modal-shell {
+            color: #e5e7eb;
+        }
+
+        [data-theme='dark'] .chat-settings-modal-shell .text-gray-900 { color: #f3f4f6 !important; }
+        [data-theme='dark'] .chat-settings-modal-shell .text-gray-800 { color: #e5e7eb !important; }
+        [data-theme='dark'] .chat-settings-modal-shell .text-gray-700 { color: #d1d5db !important; }
+        [data-theme='dark'] .chat-settings-modal-shell .text-gray-600 { color: #cbd5e1 !important; }
+        [data-theme='dark'] .chat-settings-modal-shell .text-gray-500 { color: #94a3b8 !important; }
+
+        [data-theme='dark'] .chat-settings-modal-shell .bg-white { background-color: #1f2937 !important; }
+        [data-theme='dark'] .chat-settings-modal-shell .bg-gray-50 { background-color: #111827 !important; }
+
+        [data-theme='dark'] .chat-settings-modal-shell .from-green-50,
+        [data-theme='dark'] .chat-settings-modal-shell .to-emerald-50,
+        [data-theme='dark'] .chat-settings-modal-shell .from-purple-50,
+        [data-theme='dark'] .chat-settings-modal-shell .to-indigo-50,
+        [data-theme='dark'] .chat-settings-modal-shell .from-amber-50,
+        [data-theme='dark'] .chat-settings-modal-shell .to-yellow-50,
+        [data-theme='dark'] .chat-settings-modal-shell .from-blue-50,
+        [data-theme='dark'] .chat-settings-modal-shell .to-cyan-50,
+        [data-theme='dark'] .chat-settings-modal-shell .from-indigo-50,
+        [data-theme='dark'] .chat-settings-modal-shell .to-violet-50 {
+            background-image: none !important;
+            background-color: #111827 !important;
+        }
+
+        [data-theme='dark'] .chat-settings-modal-shell .border-gray-200,
+        [data-theme='dark'] .chat-settings-modal-shell .border-gray-300,
+        [data-theme='dark'] .chat-settings-modal-shell .border-green-200,
+        [data-theme='dark'] .chat-settings-modal-shell .border-purple-200,
+        [data-theme='dark'] .chat-settings-modal-shell .border-amber-200,
+        [data-theme='dark'] .chat-settings-modal-shell .border-blue-200,
+        [data-theme='dark'] .chat-settings-modal-shell .border-indigo-200,
+        [data-theme='dark'] .chat-settings-modal-shell .border-indigo-100 {
+            border-color: #4b5563 !important;
+        }
+
+        [data-theme='dark'] .chat-settings-modal-shell input,
+        [data-theme='dark'] .chat-settings-modal-shell select,
+        [data-theme='dark'] .chat-settings-modal-shell textarea {
+            background-color: #111827 !important;
+            color: #f3f4f6 !important;
+            border-color: #4b5563 !important;
+        }
     </style>
 </head>
 <body class="bg-gray-50">
@@ -4626,6 +7659,22 @@ def get_frontend_html():
     
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
+
+        const generateChatSessionId = () => {
+            const now = new Date();
+            const stamp = now.toISOString().replace(/[-:T\\.Z]/g, '').slice(0, 14);
+            const rand = Math.random().toString(36).slice(2, 8);
+            return `chat_${stamp}_${rand}`;
+        };
+
+        const normalizeProvider = (provider) => {
+            const value = String(provider || 'openai').toLowerCase().trim();
+            if (value === 'custom endpoint') return 'custom';
+            if (value === 'azure openai') return 'azure';
+            if (value === 'claude') return 'anthropic';
+            if (value === 'google' || value === 'google ai') return 'gemini';
+            return value;
+        };
         
         // Error Boundary to catch React rendering errors
         class ErrorBoundary extends React.Component {
@@ -4676,11 +7725,20 @@ def get_frontend_html():
         }
         
         function App() {
+            const THEME_PREFERENCE_KEY = 'dt4sms_theme_preference';
             const [isConnected, setIsConnected] = useState(false);
             const [discoveryStatus, setDiscoveryStatus] = useState('idle');
             const [messages, setMessages] = useState([]);
             const [progress, setProgress] = useState({ percentage: 0, description: '' });
             const [reports, setReports] = useState([]);
+            const [sessionCatalog, setSessionCatalog] = useState([]);
+            const [discoveryDashboard, setDiscoveryDashboard] = useState(null);
+            const [v2Intelligence, setV2Intelligence] = useState(null);
+            const [v2Artifacts, setV2Artifacts] = useState({ has_data: false, artifacts: [], count: 0 });
+            const [workflowTab, setWorkflowTab] = useState('admin');
+            const [compareSelection, setCompareSelection] = useState({ current: 'latest', baseline: 'previous' });
+            const [discoveryCompare, setDiscoveryCompare] = useState(null);
+            const [runbookPayload, setRunbookPayload] = useState(null);
             const [selectedReport, setSelectedReport] = useState(null);
             const [reportContent, setReportContent] = useState(null);
             const [expandedSessions, setExpandedSessions] = useState({});
@@ -4695,6 +7753,8 @@ def get_frontend_html():
             const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
             const [chatSettings, setChatSettings] = useState(null); // Loaded from API
             const [serverConversationHistory, setServerConversationHistory] = useState(null); // Server's full conversation with reasoning
+            const [chatSessionId, setChatSessionId] = useState(generateChatSessionId());
+            const [workspaceTab, setWorkspaceTab] = useState('mission');
 
             const [connectionInfo, setConnectionInfo] = useState(null);
             
@@ -4721,6 +7781,7 @@ def get_frontend_html():
             const [selectedProvider, setSelectedProvider] = useState('openai');
             const [isCredentialModalOpen, setIsCredentialModalOpen] = useState(false);
             const [isConnectionModalOpen, setIsConnectionModalOpen] = useState(false);
+            const [connectionModalPosition, setConnectionModalPosition] = useState({ top: 72, left: 16, pointerLeft: 28 });
             const [credentialName, setCredentialName] = useState('');
             const [savedCredentials, setSavedCredentials] = useState({});
             const [loadedCredentialName, setLoadedCredentialName] = useState(null); // Track which credential is currently loaded
@@ -4740,6 +7801,62 @@ def get_frontend_html():
             const [mcpConfigDescription, setMCPConfigDescription] = useState(''); // MCP config description
             const [showMCPConfigForm, setShowMCPConfigForm] = useState(false); // Show/hide MCP configuration form
             const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState('Enter token'); // Track token placeholder state
+            const [showSuggestedQueries, setShowSuggestedQueries] = useState(false);
+            const [themePreference, setThemePreference] = useState(() => {
+                try {
+                    const savedTheme = localStorage.getItem(THEME_PREFERENCE_KEY);
+                    if (savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'system') {
+                        return savedTheme;
+                    }
+                } catch (error) {
+                    console.error('Failed to read theme preference:', error);
+                }
+                return 'system';
+            });
+            const [resolvedTheme, setResolvedTheme] = useState('light');
+
+            const isMissionTab = workspaceTab === 'mission';
+            const isIntelligenceTab = workspaceTab === 'intelligence';
+            const isArtifactsTab = workspaceTab === 'artifacts';
+            const isDarkTheme = resolvedTheme === 'dark';
+            const panelClass = isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200';
+            const panelMutedClass = isDarkTheme ? 'bg-gray-700 border-gray-600' : 'bg-gray-50 border-gray-200';
+            const headingClass = isDarkTheme ? 'text-gray-100' : 'text-gray-900';
+            const subtextClass = isDarkTheme ? 'text-gray-300' : 'text-gray-600';
+            const mutedTextClass = isDarkTheme ? 'text-gray-400' : 'text-gray-500';
+            const v2Blueprint = v2Intelligence?.blueprint || null;
+            const v2Overview = v2Blueprint?.overview || {};
+            const v2CapabilityGraph = v2Blueprint?.capability_graph || {};
+            const v2CoverageGaps = Array.isArray(v2Blueprint?.coverage_gaps) ? v2Blueprint.coverage_gaps : [];
+            const v2FindingLedger = Array.isArray(v2Blueprint?.finding_ledger) ? v2Blueprint.finding_ledger : [];
+            const v2UseCases = Array.isArray(v2Blueprint?.suggested_use_cases) ? v2Blueprint.suggested_use_cases : [];
+            const summaryStageOrder = {
+                idle: 0,
+                loading: 1,
+                loading_reports: 1,
+                generating_queries: 2,
+                identifying_unknowns: 2,
+                generating_summary: 3,
+                creating_summary: 3,
+                generating_tasks: 4,
+                saving: 5,
+                complete: 6,
+                error: 0
+            };
+            const currentSummaryStep = summaryStageOrder[summaryProgress.stage] || 0;
+            const isSummaryStepDone = (step) => summaryProgress.stage === 'complete' || currentSummaryStep > step;
+            const isSummaryStepActive = (step) => summaryProgress.stage !== 'complete' && currentSummaryStep === step;
+
+            const suggestedChatQueries = [
+                'Give me a narrative overview of what our Splunk environment appears to prioritize operationally.',
+                'What story do the current data sources tell about platform usage, reliability, and potential blind spots?',
+                'If you were onboarding a new security lead, what should they review first and why?',
+                'Describe likely risk trends we should monitor weekly, and how to validate whether they are improving.',
+                'Identify where data quality issues could silently undermine detections or reporting confidence.',
+                'Propose a practical 30-day hardening plan with quick wins, medium-term tasks, and measurable outcomes.',
+                'Suggest a recursive analysis loop we can run each week to catch drift, anomalies, and hidden failure modes.',
+                'Translate the discovery output into executive-ready priorities with business impact and verification steps.'
+            ];
             
             // Function to track when settings have been modified
             const handleSettingsChange = () => {
@@ -4761,7 +7878,16 @@ def get_frontend_html():
                     try {
                         const response = await fetch(`/summarize-progress/${currentSessionId}`);
                         const progress = await response.json();
-                        setSummaryProgress(progress);
+                        setSummaryProgress((prev) => {
+                            if (!progress || typeof progress !== 'object') {
+                                return prev;
+                            }
+                            const monotonicProgress = Math.max(prev?.progress || 0, progress?.progress || 0);
+                            return {
+                                ...progress,
+                                progress: monotonicProgress
+                            };
+                        });
                     } catch (error) {
                         console.error('Progress check failed:', error);
                     }
@@ -4780,6 +7906,48 @@ def get_frontend_html():
             useEffect(() => {
                 localStorage.setItem('splunk_task_progress', JSON.stringify(taskProgress));
             }, [taskProgress]);
+
+            useEffect(() => {
+                try {
+                    localStorage.setItem(THEME_PREFERENCE_KEY, themePreference);
+                } catch (error) {
+                    console.error('Failed to persist theme preference:', error);
+                }
+            }, [themePreference]);
+
+            useEffect(() => {
+                const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+                const updateResolvedTheme = () => {
+                    const nextTheme = themePreference === 'system'
+                        ? (mediaQuery.matches ? 'dark' : 'light')
+                        : themePreference;
+                    setResolvedTheme(nextTheme);
+                };
+
+                updateResolvedTheme();
+
+                if (themePreference === 'system') {
+                    const handleMediaChange = () => updateResolvedTheme();
+                    if (mediaQuery.addEventListener) {
+                        mediaQuery.addEventListener('change', handleMediaChange);
+                    } else {
+                        mediaQuery.addListener(handleMediaChange);
+                    }
+
+                    return () => {
+                        if (mediaQuery.removeEventListener) {
+                            mediaQuery.removeEventListener('change', handleMediaChange);
+                        } else {
+                            mediaQuery.removeListener(handleMediaChange);
+                        }
+                    };
+                }
+            }, [themePreference]);
+
+            useEffect(() => {
+                document.documentElement.setAttribute('data-theme', resolvedTheme);
+            }, [resolvedTheme]);
             
             // Toggle step completion
             const toggleStepCompletion = (sessionId, taskIndex, stepNumber) => {
@@ -4949,6 +8117,11 @@ def get_frontend_html():
             useEffect(() => {
                 connectWebSocket();
                 loadReports();
+                loadDiscoveryDashboard();
+                loadV2Intelligence();
+                loadV2Artifacts();
+                loadDiscoveryCompare('latest', 'previous');
+                loadRunbookPayload('latest', 'admin');
                 loadConfig(); // Load config to get active LLM connection info
                 
                 return () => {
@@ -4957,6 +8130,21 @@ def get_frontend_html():
                     }
                 };
             }, []);
+
+            useEffect(() => {
+                if (discoveryDashboard && discoveryDashboard.has_data) {
+                    loadRunbookPayload(compareSelection.current, workflowTab);
+                }
+            }, [workflowTab]);
+
+            useEffect(() => {
+                if (isIntelligenceTab) {
+                    loadV2Intelligence();
+                }
+                if (isArtifactsTab) {
+                    loadV2Artifacts();
+                }
+            }, [workspaceTab]);
             
             // Timer effect - updates elapsed time every second when discovery is running
             useEffect(() => {
@@ -5025,10 +8213,16 @@ def get_frontend_html():
                         break;
                     case 'completion':
                         addMessage('completion', message.data);
+                        setProgress({ percentage: 100, description: 'Discovery completed. Finalizing UI...' });
                         setDiscoveryStatus('completed');
                         setDiscoveryStartTime(null);
                         setElapsedTime(0);
                         loadReports();
+                        loadDiscoveryDashboard();
+                        loadV2Intelligence();
+                        loadV2Artifacts();
+                        loadDiscoveryCompare('latest', 'previous');
+                        loadRunbookPayload('latest', workflowTab);
                         break;
                     case 'rate_limit':
                         addMessage('rate_limit', message.data);
@@ -5137,11 +8331,107 @@ def get_frontend_html():
                     const result = await response.json();
                     console.log('Loaded reports:', result);
                     setReports(result.reports || []);
+                    setSessionCatalog(result.sessions || []);
                 } catch (error) {
                     console.error('Failed to load reports:', error);
                     // Don't crash the UI - just show empty reports
                     setReports([]);
+                    setSessionCatalog([]);
                 }
+            };
+
+            const loadDiscoveryDashboard = async () => {
+                try {
+                    const response = await fetch('/api/discovery/dashboard');
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    const result = await response.json();
+                    setDiscoveryDashboard(result);
+                } catch (error) {
+                    console.error('Failed to load discovery dashboard:', error);
+                    setDiscoveryDashboard(null);
+                }
+            };
+
+            const loadV2Intelligence = async () => {
+                try {
+                    const response = await fetch('/api/v2/intelligence');
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    const result = await response.json();
+                    setV2Intelligence(result);
+                } catch (error) {
+                    console.error('Failed to load V2 intelligence:', error);
+                    setV2Intelligence({ has_data: false, message: error.message || 'Failed to load V2 intelligence.' });
+                }
+            };
+
+            const loadV2Artifacts = async () => {
+                try {
+                    const response = await fetch('/api/v2/artifacts');
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    const result = await response.json();
+                    setV2Artifacts(result);
+                } catch (error) {
+                    console.error('Failed to load V2 artifacts:', error);
+                    setV2Artifacts({ has_data: false, artifacts: [], count: 0, message: error.message || 'Failed to load V2 artifacts.' });
+                }
+            };
+
+            const refreshIntelligenceWorkspace = () => {
+                loadDiscoveryDashboard();
+                loadV2Intelligence();
+            };
+
+            const refreshArtifactsWorkspace = () => {
+                loadReports();
+                loadV2Artifacts();
+            };
+
+            const loadDiscoveryCompare = async (current = 'latest', baseline = 'previous') => {
+                try {
+                    const params = new URLSearchParams();
+                    if (current) params.set('current', current);
+                    if (baseline) params.set('baseline', baseline);
+                    const response = await fetch(`/api/discovery/compare?${params.toString()}`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    const result = await response.json();
+                    setDiscoveryCompare(result);
+                } catch (error) {
+                    console.error('Failed to load discovery compare:', error);
+                    setDiscoveryCompare({ has_data: false, message: error.message || 'Failed to load compare data.' });
+                }
+            };
+
+            const loadRunbookPayload = async (timestamp = 'latest', persona = workflowTab) => {
+                try {
+                    const params = new URLSearchParams();
+                    if (timestamp) params.set('timestamp', timestamp);
+                    if (persona) params.set('persona', persona);
+                    const response = await fetch(`/api/discovery/runbook?${params.toString()}`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    const result = await response.json();
+                    setRunbookPayload(result);
+                } catch (error) {
+                    console.error('Failed to load runbook payload:', error);
+                    setRunbookPayload({ has_data: false, message: error.message || 'Failed to load runbook.' });
+                }
+            };
+
+            const refreshCompareSelection = () => {
+                loadDiscoveryCompare(compareSelection.current, compareSelection.baseline);
+            };
+
+            const refreshRunbook = () => {
+                loadRunbookPayload(compareSelection.current, workflowTab);
             };
             
             const loadConnectionInfo = async () => {
@@ -5175,7 +8465,7 @@ def get_frontend_html():
                     const data = await response.json();
                     setConfig(data);
                     // Initialize selected provider from config
-                    setSelectedProvider(data.llm.provider || 'openai');
+                    setSelectedProvider(normalizeProvider(data.llm.provider || 'openai'));
                     // Set API key placeholder based on whether key exists
                     setApiKeyPlaceholder(data.llm.api_key === '***' ? '(Already Configured)' : 'Enter API key');
                     // Set MCP token placeholder based on whether token exists
@@ -5225,9 +8515,16 @@ def get_frontend_html():
                     });
                     
                     credList.innerHTML = credArray.map(cred => {
-                        const providerIcon = cred.provider === 'openai' ? 'fa-openai' : 
-                                           cred.provider === 'custom' ? 'fa-server' : 'fa-brain';
-                        const providerColor = cred.provider === 'openai' ? 'text-green-600' : 'text-purple-600';
+                        const provider = normalizeProvider(cred.provider);
+                        const providerIcon = provider === 'openai' ? 'fa-openai' :
+                                           provider === 'azure' ? 'fa-cloud' :
+                                           provider === 'anthropic' ? 'fa-robot' :
+                                           provider === 'gemini' ? 'fa-gem' :
+                                           provider === 'custom' ? 'fa-server' : 'fa-brain';
+                        const providerColor = provider === 'openai' ? 'text-green-600' :
+                                              provider === 'azure' ? 'text-blue-600' :
+                                              provider === 'anthropic' ? 'text-orange-600' :
+                                              provider === 'gemini' ? 'text-indigo-600' : 'text-purple-600';
                         const isActive = cred.name === activeCredName;
                         
                         return `
@@ -5322,7 +8619,7 @@ def get_frontend_html():
                         
                         // Update React state first to trigger re-render
                         setConfig(newConfig);
-                        setSelectedProvider(newConfig.llm.provider);
+                        setSelectedProvider(normalizeProvider(newConfig.llm.provider));
                         setLoadedCredentialName(name); // Track which credential is loaded
                         setApiKeyPlaceholder('(Already Configured)'); // Update placeholder
                         setShowConfigForm(true); // Show the config form when loading a credential
@@ -5331,7 +8628,8 @@ def get_frontend_html():
                         
                         // Then update form fields
                         setTimeout(() => {
-                            document.getElementById('llm-provider').value = newConfig.llm.provider;
+                            const normalizedProvider = normalizeProvider(newConfig.llm.provider);
+                            document.getElementById('llm-provider').value = normalizedProvider;
                             const modelInput = document.getElementById('llm-model');
                             if (modelInput) {
                                 modelInput.value = newConfig.llm.model;
@@ -5723,9 +9021,34 @@ def get_frontend_html():
                 }
             };
             
-            const openConnectionModal = () => {
+            const openConnectionModal = (event) => {
+                const target = event?.currentTarget;
+                const modalWidth = 320;
+                const viewportPadding = 12;
+
+                if (target && typeof target.getBoundingClientRect === 'function') {
+                    const rect = target.getBoundingClientRect();
+                    const preferredLeft = rect.left + (rect.width / 2) - (modalWidth / 2);
+                    const maxLeft = Math.max(viewportPadding, window.innerWidth - modalWidth - viewportPadding);
+                    const clampedLeft = Math.min(Math.max(preferredLeft, viewportPadding), maxLeft);
+                    const anchorCenterX = rect.left + (rect.width / 2);
+                    const pointerOffset = anchorCenterX - clampedLeft - 8;
+                    const pointerLeft = Math.min(Math.max(pointerOffset, 16), modalWidth - 24);
+
+                    setConnectionModalPosition({
+                        top: rect.bottom + 10,
+                        left: clampedLeft,
+                        pointerLeft
+                    });
+                }
+
                 loadConnectionInfo();
                 setIsConnectionModalOpen(true);
+            };
+
+            const isSummaryArtifact = (reportName) => {
+                if (!reportName || typeof reportName !== 'string') return false;
+                return reportName.startsWith('v2_ai_summary_') || reportName.startsWith('ai_summary_');
             };
             
             // Group reports hierarchically by Year > Month > Day > Session
@@ -5748,8 +9071,8 @@ def get_frontend_html():
                         }
                         sessions[timestamp].reports.push(report);
                         
-                        // Check if this is an AI summary file
-                        if (report.name.startsWith('ai_summary_')) {
+                        // Check if this is a summary artifact
+                        if (isSummaryArtifact(report.name)) {
                             sessions[timestamp].hasSummary = true;
                         }
                     }
@@ -5852,8 +9175,8 @@ def get_frontend_html():
                         }
                         sessions[timestamp].reports.push(report);
                         
-                        // Check if this is an AI summary file
-                        if (report.name.startsWith('ai_summary_')) {
+                        // Check if this is a summary artifact
+                        if (isSummaryArtifact(report.name)) {
                             sessions[timestamp].hasSummary = true;
                         }
                     } else {
@@ -6000,10 +9323,12 @@ def get_frontend_html():
                 }
             };
             
-            const sendChatMessage = async () => {
-                if (!chatInput.trim() || isTyping) return;
-                
-                const userMessage = chatInput.trim();
+            const sendChatMessage = async (overrideMessage = null) => {
+                if (isTyping) return;
+
+                const resolvedOverride = typeof overrideMessage === 'string' ? overrideMessage : '';
+                const userMessage = (resolvedOverride || chatInput || '').trim();
+                if (!userMessage) return;
                 setChatInput('');
                 setIsTyping(true);
                 
@@ -6029,7 +9354,8 @@ def get_frontend_html():
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
                             message: userMessage,
-                            history: historyToSend
+                            history: historyToSend,
+                            chat_session_id: chatSessionId
                         })
                     });
                     
@@ -6088,6 +9414,7 @@ def get_frontend_html():
                                             spl_query: result.spl_query,
                                             spl_in_text: result.spl_in_text,
                                             has_follow_on: result.has_follow_on,
+                                            follow_on_actions: result.follow_on_actions,
                                             status_timeline: result.status_timeline,
                                             iterations: result.iterations,
                                             execution_time: result.execution_time
@@ -6096,6 +9423,9 @@ def get_frontend_html():
                                         // Store server's conversation history for follow-up queries
                                         if (result.conversation_history) {
                                             setServerConversationHistory(result.conversation_history);
+                                        }
+                                        if (result.chat_session_id) {
+                                            setChatSessionId(result.chat_session_id);
                                         }
                                         
                                         setChatMessages(prev => [...prev, ...messages]);
@@ -6129,6 +9459,17 @@ def get_frontend_html():
                     // Re-focus input after sending
                     setTimeout(() => chatInputRef.current?.focus(), 100);
                 }
+            };
+
+            const useSuggestedQuery = (query) => {
+                setChatInput(query);
+                if (chatInputRef.current) {
+                    setTimeout(() => chatInputRef.current.focus(), 0);
+                }
+            };
+
+            const sendSuggestedQuery = async (query) => {
+                await sendChatMessage(query);
             };
             
             const loadReport = async (filename) => {
@@ -6196,10 +9537,26 @@ def get_frontend_html():
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ timestamp: sessionId })
                     });
-                    
-                    const result = await response.json();
-                    
-                    if (result.error) {
+
+                    let result = null;
+                    const contentType = response.headers.get('content-type') || '';
+
+                    if (contentType.includes('application/json')) {
+                        result = await response.json();
+                    } else {
+                        const rawText = await response.text();
+                        try {
+                            result = JSON.parse(rawText);
+                        } catch {
+                            throw new Error(`Summarization failed (${response.status}): ${rawText.slice(0, 200) || 'Non-JSON server response'}`);
+                        }
+                    }
+
+                    if (!response.ok) {
+                        throw new Error(result?.error || result?.detail || `Summarization failed (${response.status})`);
+                    }
+
+                    if (result?.error) {
                         addMessage('error', { message: result.error });
                         setIsSummaryModalOpen(false);
                         return;
@@ -6300,14 +9657,14 @@ def get_frontend_html():
                     
                     case 'phase':
                         return (
-                            <div className="bg-indigo-50 border-l-4 border-indigo-500 p-4 slide-in">
-                                <h2 className="text-lg font-semibold text-indigo-900">{data.title}</h2>
+                            <div className={`border-l-4 p-4 slide-in ${isDarkTheme ? 'bg-indigo-950 border-indigo-500' : 'bg-indigo-50 border-indigo-500'}`}>
+                                <h2 className={`text-lg font-semibold ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-900'}`}>{data.title}</h2>
                             </div>
                         );
                     
                     case 'success':
                         return (
-                            <div className="flex items-center text-green-700 fade-in">
+                            <div className={`flex items-center p-2 rounded fade-in ${isDarkTheme ? 'text-emerald-300 bg-emerald-950' : 'text-green-700 bg-green-50'}`}>
                                 <i className="fas fa-check-circle mr-2"></i>
                                 <span>{data.message}</span>
                             </div>
@@ -6315,7 +9672,7 @@ def get_frontend_html():
                     
                     case 'error':
                         return (
-                            <div className="flex items-center text-red-700 bg-red-50 p-3 rounded fade-in">
+                            <div className={`flex items-center p-3 rounded fade-in ${isDarkTheme ? 'text-red-200 bg-red-950' : 'text-red-700 bg-red-50'}`}>
                                 <i className="fas fa-exclamation-circle mr-2"></i>
                                 <span>{data.message}</span>
                             </div>
@@ -6323,7 +9680,7 @@ def get_frontend_html():
                     
                     case 'warning':
                         return (
-                            <div className="flex items-center text-yellow-700 bg-yellow-50 p-3 rounded fade-in">
+                            <div className={`flex items-center p-3 rounded fade-in ${isDarkTheme ? 'text-amber-200 bg-amber-950' : 'text-yellow-700 bg-yellow-50'}`}>
                                 <i className="fas fa-exclamation-triangle mr-2"></i>
                                 <span>{data.message}</span>
                             </div>
@@ -6331,7 +9688,7 @@ def get_frontend_html():
                     
                     case 'info':
                         return (
-                            <div className="flex items-center text-blue-700 fade-in">
+                            <div className={`flex items-center p-2 rounded fade-in ${isDarkTheme ? 'text-blue-300 bg-blue-950' : 'text-blue-700'}`}>
                                 <i className="fas fa-info-circle mr-2"></i>
                                 <span>{data.message}</span>
                             </div>
@@ -6339,13 +9696,13 @@ def get_frontend_html():
                     
                     case 'overview':
                         return (
-                            <div className="bg-blue-50 p-4 rounded-lg fade-in">
-                                <h3 className="font-semibold text-blue-900 mb-2">Environment Overview</h3>
-                                <div className="grid grid-cols-2 gap-2 text-sm">
-                                    <div>Indexes: {data.total_indexes}</div>
-                                    <div>Source Types: {data.total_sourcetypes}</div>
-                                    <div>Data Volume: {data.data_volume_24h}</div>
-                                    <div>Active Sources: {data.active_sources}</div>
+                            <div className={`p-4 rounded-lg fade-in border ${isDarkTheme ? 'bg-slate-800 border-slate-700' : 'bg-blue-50 border-blue-200'}`}>
+                                <h3 className={`font-semibold mb-2 ${isDarkTheme ? 'text-blue-200' : 'text-blue-900'}`}>Environment Overview</h3>
+                                <div className={`grid grid-cols-2 gap-2 text-sm ${isDarkTheme ? 'text-slate-200' : 'text-slate-800'}`}>
+                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Indexes: {data.total_indexes}</div>
+                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Source Types: {data.total_sourcetypes}</div>
+                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Data Volume: {data.data_volume_24h}</div>
+                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Active Sources: {data.active_sources}</div>
                                 </div>
                             </div>
                         );
@@ -6353,8 +9710,8 @@ def get_frontend_html():
                     case 'rate_limit':
                         if (data.event === 'rate_limit_start') {
                             return (
-                                <div className="bg-yellow-50 border border-yellow-200 p-4 rounded-lg fade-in">
-                                    <div className="flex items-center text-yellow-700">
+                                <div className={`border p-4 rounded-lg fade-in ${isDarkTheme ? 'bg-amber-950 border-amber-700' : 'bg-yellow-50 border-yellow-200'}`}>
+                                    <div className={`flex items-center ${isDarkTheme ? 'text-amber-200' : 'text-yellow-700'}`}>
                                         <i className="fas fa-clock mr-2"></i>
                                         <span>Rate limit encountered - waiting {data.details.delay}s (attempt {data.details.retry_count}/{data.details.max_retries})</span>
                                     </div>
@@ -6362,14 +9719,14 @@ def get_frontend_html():
                             );
                         } else if (data.event === 'rate_limit_countdown') {
                             return (
-                                <div className="bg-yellow-50 p-3 rounded">
-                                    <div className="flex items-center justify-between text-sm text-yellow-700">
+                                <div className={`p-3 rounded border ${isDarkTheme ? 'bg-amber-950 border-amber-700' : 'bg-yellow-50 border-yellow-200'}`}>
+                                    <div className={`flex items-center justify-between text-sm ${isDarkTheme ? 'text-amber-200' : 'text-yellow-700'}`}>
                                         <span>Waiting...</span>
                                         <span>{Math.ceil(data.details.remaining_seconds)}s remaining</span>
                                     </div>
-                                    <div className="w-full bg-yellow-200 rounded-full h-2 mt-2">
+                                    <div className={`w-full rounded-full h-2 mt-2 ${isDarkTheme ? 'bg-amber-900' : 'bg-yellow-200'}`}>
                                         <div 
-                                            className="bg-yellow-500 h-2 rounded-full progress-bar"
+                                            className={`h-2 rounded-full progress-bar ${isDarkTheme ? 'bg-amber-400' : 'bg-yellow-500'}`}
                                             style={{ width: `${data.details.percentage}%` }}
                                         ></div>
                                     </div>
@@ -6377,7 +9734,7 @@ def get_frontend_html():
                             );
                         } else if (data.event === 'rate_limit_complete') {
                             return (
-                                <div className="flex items-center text-green-700 fade-in">
+                                <div className={`flex items-center p-2 rounded fade-in ${isDarkTheme ? 'text-emerald-300 bg-emerald-950' : 'text-green-700 bg-green-50'}`}>
                                     <i className="fas fa-check-circle mr-2"></i>
                                     <span>Rate limit wait complete - resuming</span>
                                 </div>
@@ -6387,104 +9744,141 @@ def get_frontend_html():
                     
                     case 'completion':
                         return (
-                            <div className="bg-green-50 border border-green-200 p-4 rounded-lg fade-in">
-                                <div className="flex items-center text-green-700 mb-2">
+                            <div className={`border p-4 rounded-lg fade-in ${isDarkTheme ? 'bg-emerald-950 border-emerald-700' : 'bg-green-50 border-green-200'}`}>
+                                <div className={`flex items-center mb-2 ${isDarkTheme ? 'text-emerald-200' : 'text-green-700'}`}>
                                     <i className="fas fa-trophy mr-2"></i>
                                     <span className="font-semibold">Discovery Complete!</span>
                                 </div>
-                                <p className="text-sm text-green-600">Duration: {data.duration || 'N/A'}</p>
-                                <p className="text-sm text-green-600">Generated {data.report_count || 0} reports</p>
+                                <p className={`text-sm ${isDarkTheme ? 'text-emerald-300' : 'text-green-600'}`}>Duration: {data.duration || 'N/A'}</p>
+                                <p className={`text-sm ${isDarkTheme ? 'text-emerald-300' : 'text-green-600'}`}>Generated {data.report_count || 0} reports</p>
                             </div>
                         );
                     
                     default:
                         return (
-                            <div className="text-gray-600 fade-in">
-                                <pre className="text-xs">{JSON.stringify(data, null, 2)}</pre>
+                            <div className={`fade-in ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
+                                <pre className={`text-xs p-2 rounded ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-gray-50 border border-gray-200'}`}>{JSON.stringify(data, null, 2)}</pre>
                             </div>
                         );
                 }
             };
             
             return (
-                <div className="min-h-screen bg-gray-50">
-                    {/* Header */}
-                    <header className="bg-white shadow-sm border-b">
+                <div className={`min-h-screen ${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900'}`}>
+                    {/* Unified Static Top Bar */}
+                    <header className={`${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} sticky top-0 z-50 shadow-sm border-b`}>
                         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                            <div className="flex justify-between items-center py-4">
+                            <div className="flex flex-wrap lg:flex-nowrap justify-between items-center gap-3 py-2 sm:py-3">
                                 <div className="flex items-center">
-                                    <i className="fas fa-search text-2xl text-indigo-600 mr-3"></i>
-                                    <h1 className="text-xl font-semibold text-gray-900">Splunk MCP Discovery Tool</h1>
+                                    <i className="fas fa-search text-xl sm:text-2xl text-indigo-600 mr-2 sm:mr-3"></i>
+                                    <h1 className={`text-lg sm:text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Splunk MCP Discovery Tool</h1>
                                 </div>
-                                <div className="flex items-center space-x-4">
-                                    <button
-                                        onClick={() => setIsChatOpen(true)}
-                                        className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium flex items-center"
-                                    >
-                                        <i className="fas fa-comments mr-2"></i>
-                                        Chat with Splunk
-                                    </button>
+
+                                <div className="flex-1 min-w-[320px] flex items-center justify-center">
+                                    <div className={`w-full max-w-3xl rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-indigo-950/70 border border-indigo-700' : 'bg-indigo-50 border border-indigo-200'}`}>
+                                        <div className="flex flex-wrap items-center justify-center gap-2">
+                                            <div className="inline-flex rounded-lg border border-indigo-300 overflow-hidden text-[11px] sm:text-xs bg-indigo-900">
+                                                <button
+                                                    onClick={() => setWorkspaceTab('mission')}
+                                                    className={`px-3 sm:px-4 py-1.5 ${isMissionTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
+                                                    title="Mission tab: pipeline execution, progress, and live log"
+                                                >
+                                                    Mission
+                                                </button>
+                                                <button
+                                                    onClick={() => {
+                                                        setWorkspaceTab('intelligence');
+                                                        refreshIntelligenceWorkspace();
+                                                    }}
+                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isIntelligenceTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
+                                                    title="Intelligence tab: KPI trends, compare, and persona workflows"
+                                                >
+                                                    Intelligence
+                                                </button>
+                                                <button
+                                                    onClick={() => {
+                                                        setWorkspaceTab('artifacts');
+                                                        refreshArtifactsWorkspace();
+                                                    }}
+                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isArtifactsTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
+                                                    title="Artifacts tab: reports, exports, and summaries"
+                                                >
+                                                    Artifacts
+                                                </button>
+                                            </div>
+
+                                            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs">
+                                                {isMissionTab && (
+                                                    <button
+                                                        onClick={discoveryStatus === 'running' ? abortDiscovery : startDiscovery}
+                                                        className={`px-2.5 sm:px-3 py-1.5 rounded ${discoveryStatus === 'running' ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
+                                                        title={discoveryStatus === 'running' ? 'Abort active discovery pipeline' : 'Run full V2 discovery pipeline'}
+                                                    >
+                                                        {discoveryStatus === 'running' ? (
+                                                            <><i className="fas fa-stop mr-1"></i>Abort Discovery</>
+                                                        ) : (
+                                                            <><i className="fas fa-rocket mr-1"></i>Run V2 Discovery</>
+                                                        )}
+                                                    </button>
+                                                )}
+                                                {isIntelligenceTab && (
+                                                    <button
+                                                        onClick={refreshIntelligenceWorkspace}
+                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white"
+                                                        title="Refresh intelligence KPIs and trends"
+                                                    >
+                                                        <i className="fas fa-brain mr-1"></i>Refresh Intelligence
+                                                    </button>
+                                                )}
+                                                {isArtifactsTab && (
+                                                    <button
+                                                        onClick={refreshArtifactsWorkspace}
+                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
+                                                        title="Reload exported artifacts and reports"
+                                                    >
+                                                        <i className="fas fa-folder-open mr-1"></i>Reload Artifacts
+                                                    </button>
+                                                )}
+                                                <button
+                                                    onClick={() => setIsChatOpen(true)}
+                                                    className="px-2.5 sm:px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white"
+                                                    title="Open chat workspace with deterministic query support"
+                                                >
+                                                    <i className="fas fa-comments mr-1"></i>Open Chat
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="flex items-center flex-wrap justify-end gap-2 sm:gap-3">
                                     <div 
-                                        className="flex items-center cursor-pointer hover:bg-gray-100 px-3 py-2 rounded-lg transition-colors"
+                                        className={`flex items-center cursor-pointer px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg transition-colors ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
                                         onClick={openConnectionModal}
                                         title="View MCP connection details"
                                     >
                                         <div className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-                                        <span className="text-sm text-gray-600">
+                                        <span className={`text-xs sm:text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                             {isConnected ? 'MCP Connected' : 'MCP Disconnected'}
                                         </span>
                                     </div>
                                     <div 
-                                        className="flex items-center cursor-pointer hover:bg-purple-50 px-3 py-2 rounded-lg transition-colors border border-purple-200"
-                                        onClick={openSettings}
-                                        title="Click to change LLM connection"
+                                        className={`flex items-center px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border ${isDarkTheme ? 'bg-gray-800 border-purple-500' : 'bg-white border-purple-200'}`}
+                                        title="Active LLM connection"
                                     >
                                         <i className="fas fa-brain text-purple-600 mr-2"></i>
                                         <div className="flex flex-col">
-                                            <span className="text-xs text-gray-500 leading-tight">LLM:</span>
-                                            <span className="text-sm font-medium text-gray-900 leading-tight">
+                                            <span className={`text-xs leading-tight ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>LLM:</span>
+                                            <span className={`text-xs sm:text-sm font-medium leading-tight ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
                                                 {config?.active_credential_name || config?.llm?.model || 'Not configured'}
                                             </span>
                                         </div>
                                     </div>
                                     <button
-                                        onClick={startDiscovery}
-                                        disabled={discoveryStatus === 'running'}
-                                        className={`px-4 py-2 rounded-lg font-medium ${
-                                            discoveryStatus === 'running'
-                                                ? 'bg-gray-300 cursor-not-allowed'
-                                                : 'bg-indigo-600 hover:bg-indigo-700 text-white'
-                                        }`}
-                                    >
-                                        {discoveryStatus === 'running' ? (
-                                            <div className="flex flex-col items-center">
-                                                <div className="flex items-center">
-                                                    <i className="fas fa-spinner fa-spin mr-2"></i>
-                                                    <span>Running...</span>
-                                                </div>
-                                                <span className="text-xs mt-0.5">{formatElapsedTime(elapsedTime)}</span>
-                                            </div>
-                                        ) : (
-                                            <>
-                                                <i className="fas fa-play mr-2"></i>
-                                                Start Discovery
-                                            </>
-                                        )}
-                                    </button>
-                                    {discoveryStatus === 'running' && (
-                                        <button
-                                            onClick={abortDiscovery}
-                                            className="ml-3 px-4 py-2 rounded-lg font-medium bg-red-600 hover:bg-red-700 text-white"
-                                            title="Abort Discovery"
-                                        >
-                                            <i className="fas fa-stop mr-2"></i>
-                                            Abort
-                                        </button>
-                                    )}
-                                    <button
                                         onClick={openSettings}
-                                        className="ml-3 px-4 py-2 rounded-lg font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-300"
-                                        title="Settings"
+                                        className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border font-medium ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100 border-gray-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'}`}
+                                        title="Open settings"
+                                        aria-label="Open settings"
                                     >
                                         <i className="fas fa-cog"></i>
                                     </button>
@@ -6493,16 +9887,347 @@ def get_frontend_html():
                         </div>
                     </header>
                     
-                    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+
                         <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
                             {/* Main Content Area */}
                             <div className="lg:col-span-3">
+                                {/* Discovery Intelligence Hub */}
+                                {isMissionTab && (
+                                <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
+                                    <div className="flex items-center justify-between mb-4">
+                                        <div>
+                                            <h2 className={`text-lg font-semibold ${headingClass}`}>Discovery Intelligence Hub</h2>
+                                            <p className={`text-sm ${subtextClass}`}>Actionable view for admins, analysts, and executives</p>
+                                        </div>
+                                        <button
+                                            onClick={loadDiscoveryDashboard}
+                                            className="text-indigo-600 hover:text-indigo-800"
+                                            title="Refresh intelligence view"
+                                        >
+                                            <i className="fas fa-sync"></i>
+                                        </button>
+                                    </div>
+
+                                    {!discoveryDashboard || !discoveryDashboard.has_data ? (
+                                        <div className={`text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}`}>
+                                            No discovery intelligence available yet. Run discovery to generate KPI trends and persona playbooks.
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
+                                                <div className="bg-indigo-50 rounded p-3">
+                                                    <div className="text-xs text-indigo-700">Readiness</div>
+                                                    <div className="text-xl font-bold text-indigo-900">{discoveryDashboard.kpis?.readiness_score || 0}/100</div>
+                                                    <div className="text-xs text-indigo-600">Δ {discoveryDashboard.trends?.readiness_delta ?? 0}</div>
+                                                </div>
+                                                <div className="bg-blue-50 rounded p-3">
+                                                    <div className="text-xs text-blue-700">Indexes</div>
+                                                    <div className="text-xl font-bold text-blue-900">{discoveryDashboard.kpis?.total_indexes || 0}</div>
+                                                    <div className="text-xs text-blue-600">Δ {discoveryDashboard.trends?.indexes_delta ?? 0}</div>
+                                                </div>
+                                                <div className="bg-green-50 rounded p-3">
+                                                    <div className="text-xs text-green-700">Sourcetypes</div>
+                                                    <div className="text-xl font-bold text-green-900">{discoveryDashboard.kpis?.total_sourcetypes || 0}</div>
+                                                    <div className="text-xs text-green-600">Δ {discoveryDashboard.trends?.sourcetypes_delta ?? 0}</div>
+                                                </div>
+                                                <div className="bg-amber-50 rounded p-3">
+                                                    <div className="text-xs text-amber-700">Recommendations</div>
+                                                    <div className="text-xl font-bold text-amber-900">{discoveryDashboard.kpis?.recommendation_count || 0}</div>
+                                                    <div className="text-xs text-amber-600">Δ {discoveryDashboard.trends?.recommendations_delta ?? 0}</div>
+                                                </div>
+                                                <div className="bg-purple-50 rounded p-3">
+                                                    <div className="text-xs text-purple-700">MCP Tools</div>
+                                                    <div className="text-xl font-bold text-purple-900">{discoveryDashboard.kpis?.tool_count || 0}</div>
+                                                    <div className="text-xs text-purple-600">Coverage snapshot</div>
+                                                </div>
+                                            </div>
+
+                                            <div className={`border rounded p-3 mb-4 ${isDarkTheme ? 'border-gray-600' : 'border-gray-200'}`}>
+                                                <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+                                                    <div>
+                                                        <h3 className={`text-sm font-semibold ${headingClass}`}>Session Compare</h3>
+                                                        <p className={`text-xs ${mutedTextClass}`}>Track changes between two discovery runs</p>
+                                                    </div>
+                                                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                        <select
+                                                            value={compareSelection.current}
+                                                            onChange={(e) => setCompareSelection(prev => ({ ...prev, current: e.target.value }))}
+                                                            className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                                        >
+                                                            <option value="latest">Latest Session</option>
+                                                            {sessionCatalog.map((session) => (
+                                                                <option key={`current-${session.timestamp}`} value={session.timestamp}>
+                                                                    {session.timestamp}
+                                                                </option>
+                                                            ))}
+                                                        </select>
+                                                        <span className={mutedTextClass}>vs</span>
+                                                        <select
+                                                            value={compareSelection.baseline}
+                                                            onChange={(e) => setCompareSelection(prev => ({ ...prev, baseline: e.target.value }))}
+                                                            className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                                        >
+                                                            <option value="previous">Previous Session</option>
+                                                            {sessionCatalog.map((session) => (
+                                                                <option key={`baseline-${session.timestamp}`} value={session.timestamp}>
+                                                                    {session.timestamp}
+                                                                </option>
+                                                            ))}
+                                                        </select>
+                                                        <button
+                                                            onClick={refreshCompareSelection}
+                                                            className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded"
+                                                        >
+                                                            Compare
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                {!discoveryCompare || !discoveryCompare.has_data ? (
+                                                    <div className={`text-xs mt-3 ${mutedTextClass}`}>
+                                                        {discoveryCompare?.message || 'Compare data will appear once at least two sessions exist.'}
+                                                    </div>
+                                                ) : (
+                                                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-xs">
+                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                            <div className={mutedTextClass}>Readiness Δ</div>
+                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.readiness?.delta ?? 0}</div>
+                                                        </div>
+                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                            <div className={mutedTextClass}>Indexes Δ</div>
+                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.indexes?.delta ?? 0}</div>
+                                                        </div>
+                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                            <div className={mutedTextClass}>Sourcetypes Δ</div>
+                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.sourcetypes?.delta ?? 0}</div>
+                                                        </div>
+                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                            <div className={mutedTextClass}>Recommendations Δ</div>
+                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.recommendations?.delta ?? 0}</div>
+                                                        </div>
+                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                            <div className={mutedTextClass}>Tools Δ</div>
+                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.tools?.delta ?? 0}</div>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            <div className="border border-gray-200 rounded p-3">
+                                                <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                                                    <div className="inline-flex rounded border border-gray-300 overflow-hidden text-xs">
+                                                        <button
+                                                            onClick={() => setWorkflowTab('admin')}
+                                                            className={`px-3 py-1 ${workflowTab === 'admin' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
+                                                        >
+                                                            Admin
+                                                        </button>
+                                                        <button
+                                                            onClick={() => setWorkflowTab('analyst')}
+                                                            className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'analyst' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
+                                                        >
+                                                            Analyst
+                                                        </button>
+                                                        <button
+                                                            onClick={() => setWorkflowTab('executive')}
+                                                            className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'executive' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
+                                                        >
+                                                            Executive
+                                                        </button>
+                                                    </div>
+
+                                                    <div className="flex items-center gap-2 text-xs">
+                                                        <button
+                                                            onClick={refreshRunbook}
+                                                            className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded"
+                                                        >
+                                                            Generate Runbook
+                                                        </button>
+                                                        <button
+                                                            onClick={() => {
+                                                                if (runbookPayload?.markdown && runbookPayload?.filename) {
+                                                                    exportReport(runbookPayload.filename, runbookPayload.markdown);
+                                                                }
+                                                            }}
+                                                            disabled={!runbookPayload?.markdown}
+                                                            className={`px-3 py-1 rounded ${runbookPayload?.markdown ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
+                                                        >
+                                                            Export Runbook
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                {workflowTab === 'admin' && (
+                                                    <ul className="text-xs text-gray-700 space-y-2">
+                                                        {(discoveryDashboard.latest?.personas?.admin?.actions || []).slice(0, 6).map((action, idx) => (
+                                                            <li key={idx} className="bg-gray-50 rounded px-3 py-2">
+                                                                <div className="font-medium text-gray-900">{action.title}</div>
+                                                                <div className="text-gray-500">Effort: {action.effort || 'unknown'}</div>
+                                                                <div className="text-gray-600 mt-1">{action.next_step}</div>
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                )}
+
+                                                {workflowTab === 'analyst' && (
+                                                    <ul className="text-xs text-gray-700 space-y-2">
+                                                        {(discoveryDashboard.latest?.personas?.analyst?.hypotheses || []).slice(0, 6).map((track, idx) => (
+                                                            <li key={idx} className="bg-gray-50 rounded px-3 py-2">
+                                                                <div className="font-medium text-gray-900">{track.title}</div>
+                                                                <div className="text-gray-600 mt-1">{track.question}</div>
+                                                                <div className="text-gray-500 mt-1">Metric: {track.success_metric || 'N/A'}</div>
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                )}
+
+                                                {workflowTab === 'executive' && (
+                                                    <div className={`text-xs ${subtextClass}`}>
+                                                        <div className={`${isDarkTheme ? 'bg-gray-700 text-gray-100' : 'bg-gray-50 text-gray-700'} rounded px-3 py-2 mb-2`}>
+                                                            {discoveryDashboard.latest?.personas?.executive?.headline || 'No executive brief available.'}
+                                                        </div>
+                                                        <ul className={`list-disc pl-4 space-y-1 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
+                                                            {(discoveryDashboard.latest?.personas?.executive?.next_90_day_focus || []).slice(0, 6).map((item, idx) => (
+                                                                <li key={idx}>{item}</li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                )}
+
+                                                {runbookPayload && runbookPayload.has_data && (
+                                                    <div className={`mt-3 text-xs ${mutedTextClass}`}>
+                                                        Ready: {runbookPayload.title || 'Runbook'} ({runbookPayload.filename || 'runbook.md'})
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                                )}
+
+                                {isIntelligenceTab && (
+                                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
+                                        <div className="flex items-center justify-between mb-4">
+                                            <div>
+                                                <h2 className={`text-lg font-semibold ${headingClass}`}>V2 Intelligence Blueprint</h2>
+                                                <p className={`text-sm ${subtextClass}`}>Coverage gaps, capability map, and evidence ledger from latest V2 run</p>
+                                            </div>
+                                            <button
+                                                onClick={loadV2Intelligence}
+                                                className="text-indigo-600 hover:text-indigo-800"
+                                                title="Refresh V2 intelligence"
+                                            >
+                                                <i className="fas fa-sync"></i>
+                                            </button>
+                                        </div>
+
+                                        {!v2Intelligence || !v2Intelligence.has_data ? (
+                                            <div className={`text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                {v2Intelligence?.message || 'No V2 intelligence blueprint available yet. Run V2 discovery to generate the blueprint.'}
+                                            </div>
+                                        ) : (
+                                            <>
+                                                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                                                    <div className={`${isDarkTheme ? 'bg-indigo-900 border border-indigo-700' : 'bg-indigo-50'} rounded p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'} text-xs`}>Indexes</div>
+                                                        <div className={`${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'} text-xl font-bold`}>{v2Overview.total_indexes || 0}</div>
+                                                    </div>
+                                                    <div className={`${isDarkTheme ? 'bg-blue-900 border border-blue-700' : 'bg-blue-50'} rounded p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-blue-200' : 'text-blue-700'} text-xs`}>Sourcetypes</div>
+                                                        <div className={`${isDarkTheme ? 'text-blue-100' : 'text-blue-900'} text-xl font-bold`}>{v2Overview.total_sourcetypes || 0}</div>
+                                                    </div>
+                                                    <div className={`${isDarkTheme ? 'bg-green-900 border border-green-700' : 'bg-green-50'} rounded p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-green-200' : 'text-green-700'} text-xs`}>Hosts</div>
+                                                        <div className={`${isDarkTheme ? 'text-green-100' : 'text-green-900'} text-xl font-bold`}>{v2Overview.total_hosts || 0}</div>
+                                                    </div>
+                                                    <div className={`${isDarkTheme ? 'bg-purple-900 border border-purple-700' : 'bg-purple-50'} rounded p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-purple-200' : 'text-purple-700'} text-xs`}>Splunk Version</div>
+                                                        <div className={`${isDarkTheme ? 'text-purple-100' : 'text-purple-900'} text-sm font-semibold truncate`}>{v2Overview.splunk_version || 'unknown'}</div>
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Coverage Gaps</h3>
+                                                        {v2CoverageGaps.length === 0 ? (
+                                                            <div className={`text-xs ${mutedTextClass}`}>No high-priority gaps were identified.</div>
+                                                        ) : (
+                                                            <ul className="space-y-2 text-xs">
+                                                                {v2CoverageGaps.slice(0, 6).map((gap, idx) => (
+                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                                        <div className={`font-medium ${headingClass}`}>{gap.gap || 'Coverage gap'}</div>
+                                                                        <div className={`mt-1 ${subtextClass}`}>{gap.why_it_matters || 'No description provided.'}</div>
+                                                                        <div className={`mt-1 uppercase ${mutedTextClass}`}>Priority: {gap.priority || 'medium'}</div>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                    </div>
+
+                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Capability Graph</h3>
+                                                        <div className={`text-xs space-y-2 ${subtextClass}`}>
+                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                                <div className={`font-medium mb-1 ${headingClass}`}>Data Surface</div>
+                                                                <div>Indexes: {v2CapabilityGraph?.data_surface?.indexes || 0}</div>
+                                                                <div>Sourcetypes: {v2CapabilityGraph?.data_surface?.sourcetypes || 0}</div>
+                                                                <div>Sources: {v2CapabilityGraph?.data_surface?.sources || 0}</div>
+                                                            </div>
+                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                                <div className={`font-medium mb-1 ${headingClass}`}>Operations Surface</div>
+                                                                <div>Users: {v2CapabilityGraph?.operations_surface?.users || 0}</div>
+                                                                <div>Knowledge Objects: {v2CapabilityGraph?.operations_surface?.knowledge_objects || 0}</div>
+                                                                <div>KV Collections: {v2CapabilityGraph?.operations_surface?.kv_collections || 0}</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Finding Ledger</h3>
+                                                        {v2FindingLedger.length === 0 ? (
+                                                            <div className={`text-xs ${mutedTextClass}`}>No ledger entries available.</div>
+                                                        ) : (
+                                                            <ul className="space-y-2 text-xs">
+                                                                {v2FindingLedger.slice(0, 6).map((entry, idx) => (
+                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                                        <div className={`font-medium ${headingClass}`}>Step {entry.step || 0}: {entry.title || 'Discovery step'}</div>
+                                                                        <div className={`mt-1 ${subtextClass}`}>{(entry.findings || []).slice(0, 2).join(' | ') || 'No notable findings logged.'}</div>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                    </div>
+
+                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Suggested Use Cases</h3>
+                                                        {v2UseCases.length === 0 ? (
+                                                            <div className={`text-xs ${mutedTextClass}`}>No suggested use cases were generated.</div>
+                                                        ) : (
+                                                            <ul className="space-y-2 text-xs">
+                                                                {v2UseCases.slice(0, 6).map((item, idx) => (
+                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                                        <div className={`font-medium ${headingClass}`}>{item.title || item.name || `Use Case ${idx + 1}`}</div>
+                                                                        <div className={`mt-1 ${subtextClass}`}>{item.description || item.use_case || 'No description available.'}</div>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            </>
+                                        )}
+                                    </div>
+                                )}
+
                                 {/* Progress Bar */}
-                                {discoveryStatus === 'running' && (
-                                    <div className="bg-white rounded-lg shadow-sm p-6 mb-6">
+                                {isMissionTab && discoveryStatus === 'running' && (
+                                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
                                         <div className="flex items-center justify-between mb-2">
-                                            <h2 className="text-lg font-medium text-gray-900">Discovery Progress</h2>
-                                            <span className="text-sm text-gray-500">{Math.round(progress.percentage)}%</span>
+                                            <h2 className={`text-lg font-medium ${headingClass}`}>Discovery Progress</h2>
+                                            <span className={`text-sm ${mutedTextClass}`}>{Math.round(progress.percentage)}%</span>
                                         </div>
                                         <div className="w-full bg-gray-200 rounded-full h-3 mb-2">
                                             <div 
@@ -6510,14 +10235,15 @@ def get_frontend_html():
                                                 style={{ width: `${progress.percentage}%` }}
                                             ></div>
                                         </div>
-                                        <p className="text-sm text-gray-600">{progress.description}</p>
+                                        <p className={`text-sm ${subtextClass}`}>{progress.description}</p>
                                     </div>
                                 )}
                                 
                                 {/* Messages */}
-                                <div className="bg-white rounded-lg shadow-sm mb-6">
-                                    <div className="p-6 border-b border-gray-200">
-                                        <h2 className="text-lg font-medium text-gray-900">Discovery Log</h2>
+                                {isMissionTab && (
+                                <div className={`rounded-lg shadow-sm mb-6 border ${panelClass}`}>
+                                    <div className={`p-6 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
+                                        <h2 className={`text-lg font-medium ${headingClass}`}>Discovery Log</h2>
                                     </div>
                                     <div 
                                         className="p-6 overflow-y-auto scroll-container"
@@ -6534,19 +10260,20 @@ def get_frontend_html():
                                     </div>
                                     {/* Resize handle */}
                                     <div 
-                                        className="h-2 bg-gray-100 border-t border-gray-200 cursor-ns-resize hover:bg-gray-200 flex items-center justify-center group"
+                                        className={`h-2 border-t cursor-ns-resize flex items-center justify-center group ${isDarkTheme ? 'bg-gray-700 border-gray-600 hover:bg-gray-600' : 'bg-gray-100 border-gray-200 hover:bg-gray-200'}`}
                                         onMouseDown={handleLogMouseDown}
                                     >
                                         <div className="w-12 h-1 bg-gray-400 rounded group-hover:bg-gray-500"></div>
                                     </div>
                                 </div>
+                                )}
                                 
                                 {/* Report Viewer */}
-                                {selectedReport && reportContent && (
-                                    <div className="bg-white rounded-lg shadow-sm">
-                                        <div className="p-6 border-b border-gray-200">
+                                {(isMissionTab || isArtifactsTab) && selectedReport && reportContent && (
+                                    <div className={`rounded-lg shadow-sm border ${panelClass}`}>
+                                        <div className={`p-6 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
                                             <div className="flex justify-between items-center">
-                                                <h3 className="text-lg font-medium text-gray-900">{selectedReport}</h3>
+                                                <h3 className={`text-lg font-medium ${headingClass}`}>{selectedReport}</h3>
                                                 <button
                                                     onClick={() => exportReport(selectedReport, 
                                                         reportContent.type === 'json' 
@@ -6565,12 +10292,12 @@ def get_frontend_html():
                                             style={{ height: `${reportViewerHeight}px` }}
                                         >
                                             {reportContent.type === 'json' ? (
-                                                <pre className="text-sm text-gray-800 whitespace-pre-wrap font-mono">
+                                                <pre className={`text-sm whitespace-pre-wrap font-mono ${isDarkTheme ? 'text-gray-100' : 'text-gray-800'}`}>
                                                     {JSON.stringify(reportContent.content, null, 2)}
                                                 </pre>
                                             ) : (
                                                 <div className="prose prose-sm max-w-none">
-                                                    <pre className="text-sm text-gray-800 whitespace-pre-wrap font-sans leading-relaxed break-words">
+                                                    <pre className={`text-sm whitespace-pre-wrap font-sans leading-relaxed break-words ${isDarkTheme ? 'text-gray-100' : 'text-gray-800'}`}>
                                                         {reportContent.content}
                                                     </pre>
                                                 </div>
@@ -6578,7 +10305,7 @@ def get_frontend_html():
                                         </div>
                                         {/* Resize handle */}
                                         <div 
-                                            className="h-2 bg-gray-100 border-t border-gray-200 cursor-ns-resize hover:bg-gray-200 flex items-center justify-center group"
+                                            className={`h-2 border-t cursor-ns-resize flex items-center justify-center group ${isDarkTheme ? 'bg-gray-700 border-gray-600 hover:bg-gray-600' : 'bg-gray-100 border-gray-200 hover:bg-gray-200'}`}
                                             onMouseDown={handleReportMouseDown}
                                         >
                                             <div className="w-12 h-1 bg-gray-400 rounded group-hover:bg-gray-500"></div>
@@ -6588,23 +10315,67 @@ def get_frontend_html():
                             </div>
                             
                             {/* Reports Sidebar */}
-                            <div className="lg:col-span-1">
+                            {(isMissionTab || isArtifactsTab) && (
+                            <div className="lg:col-span-1 min-w-0">
                                 {/* Reports List */}
-                                <div className="bg-white rounded-lg shadow-sm">
-                                    <div className="p-6 border-b border-gray-200">
+                                <div className={`rounded-lg shadow-sm border overflow-hidden min-w-0 ${panelClass}`}>
+                                    <div className={`p-6 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
                                         <div className="flex justify-between items-center">
-                                            <h2 className="text-lg font-medium text-gray-900">Generated Reports</h2>
+                                            <div>
+                                                <h2 className={`text-lg font-medium ${headingClass}`}>{isArtifactsTab ? 'V2 Artifacts' : 'Generated Reports'}</h2>
+                                                <p className={`text-xs mt-1 ${mutedTextClass}`}>
+                                                    {isArtifactsTab ? `${v2Artifacts?.count || 0} artifact(s)` : `${sessionCatalog.length} discovery session(s)`}
+                                                </p>
+                                            </div>
                                             <button
-                                                onClick={loadReports}
+                                                onClick={isArtifactsTab ? refreshArtifactsWorkspace : loadReports}
                                                 className="text-indigo-600 hover:text-indigo-800"
                                             >
                                                 <i className="fas fa-refresh"></i>
                                             </button>
                                         </div>
                                     </div>
-                                    <div className="divide-y divide-gray-200">
-                                        {reports.length === 0 ? (
-                                            <p className="p-6 text-gray-500 text-center">No reports generated yet</p>
+                                    <div className={`divide-y overflow-x-hidden min-w-0 ${isDarkTheme ? 'divide-gray-700' : 'divide-gray-200'}`}>
+                                        {isArtifactsTab ? (
+                                            !v2Artifacts?.has_data || (v2Artifacts?.artifacts || []).length === 0 ? (
+                                                <p className={`p-6 text-center ${mutedTextClass}`}>No V2 artifacts generated yet</p>
+                                            ) : (
+                                                <div>
+                                                    {(v2Artifacts.artifacts || []).map((artifact) => (
+                                                        <div
+                                                            key={artifact.name}
+                                                            className={`p-4 border-b ${isDarkTheme ? 'border-gray-700 hover:bg-gray-700' : 'border-gray-200 hover:bg-gray-50'} ${selectedReport === artifact.name ? (isDarkTheme ? 'bg-indigo-900 border-r-4 border-indigo-400' : 'bg-indigo-50 border-r-4 border-indigo-500') : ''}`}
+                                                        >
+                                                            <div className="flex items-start justify-between gap-2">
+                                                                <button
+                                                                    onClick={() => loadReport(artifact.name)}
+                                                                    className="text-left flex-1"
+                                                                    title={`Open ${artifact.name}`}
+                                                                >
+                                                                    <div className={`text-sm font-medium break-all ${headingClass}`}>{artifact.name}</div>
+                                                                    <div className={`text-xs mt-1 ${mutedTextClass}`}>
+                                                                        {(((artifact.size_bytes ?? artifact.size ?? 0) / 1024).toFixed(1))} KB • {new Date(artifact.modified_at || artifact.modified || Date.now()).toLocaleString()}
+                                                                    </div>
+                                                                </button>
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className={`px-2 py-1 text-xs rounded ${artifact.type === 'json' ? (isDarkTheme ? 'bg-blue-900 text-blue-100' : 'bg-blue-100 text-blue-800') : (isDarkTheme ? 'bg-green-900 text-green-100' : 'bg-green-100 text-green-800')}`}>
+                                                                        {(artifact.type || 'file').toUpperCase()}
+                                                                    </span>
+                                                                    <button
+                                                                        onClick={() => copyToClipboard(artifact.path || artifact.name)}
+                                                                        className={`text-xs px-2 py-1 rounded ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'}`}
+                                                                        title="Copy file path"
+                                                                    >
+                                                                        <i className="fas fa-copy"></i>
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )
+                                        ) : reports.length === 0 ? (
+                                            <p className={`p-6 text-center ${mutedTextClass}`}>No reports generated yet</p>
                                         ) : (
                                             (() => {
                                                 const hierarchy = groupReportsByHierarchy(reports);
@@ -6613,12 +10384,12 @@ def get_frontend_html():
                                                         {/* Year Header - Only show if not current year */}
                                                         {yearData.visible && (
                                                             <div 
-                                                                className="p-3 bg-gradient-to-r from-indigo-100 to-purple-100 border-b cursor-pointer font-semibold"
+                                                                className={`p-3 border-b cursor-pointer font-semibold ${isDarkTheme ? 'bg-indigo-900 border-gray-700 hover:bg-indigo-800' : 'bg-gradient-to-r from-indigo-100 to-purple-100 border-gray-200'}`}
                                                                 onClick={() => toggleYear(yearKey)}
                                                             >
                                                                 <div className="flex items-center">
-                                                                    <i className={`fas ${expandedYears[yearKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-indigo-600 text-xs`}></i>
-                                                                    <span className="text-sm text-indigo-900">{yearData.display}</span>
+                                                                    <i className={`fas ${expandedYears[yearKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-600'}`}></i>
+                                                                    <span className={`text-sm ${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'}`}>{yearData.display}</span>
                                                                 </div>
                                                             </div>
                                                         )}
@@ -6629,13 +10400,13 @@ def get_frontend_html():
                                                                 {/* Month Header - Only show if not current month or if year is visible */}
                                                                 {monthData.visible && (
                                                                     <div 
-                                                                        className="p-3 bg-gradient-to-r from-blue-50 to-indigo-50 border-b cursor-pointer"
+                                                                        className={`p-3 border-b cursor-pointer ${isDarkTheme ? 'bg-blue-900 border-gray-700 hover:bg-blue-800' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-gray-200'}`}
                                                                         onClick={() => toggleMonth(monthKey)}
                                                                         style={{paddingLeft: yearData.visible ? '1.5rem' : '0.75rem'}}
                                                                     >
                                                                         <div className="flex items-center">
-                                                                            <i className={`fas ${expandedMonths[monthKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-blue-600 text-xs`}></i>
-                                                                            <span className="text-sm text-blue-900 font-medium">{monthData.display}</span>
+                                                                            <i className={`fas ${expandedMonths[monthKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${isDarkTheme ? 'text-blue-200' : 'text-blue-600'}`}></i>
+                                                                            <span className={`text-sm font-medium ${isDarkTheme ? 'text-blue-100' : 'text-blue-900'}`}>{monthData.display}</span>
                                                                         </div>
                                                                     </div>
                                                                 )}
@@ -6645,46 +10416,60 @@ def get_frontend_html():
                                                                     <div key={dayKey}>
                                                                         {/* Day Header */}
                                                                         <div 
-                                                                            className={`p-3 ${dayData.isToday ? 'bg-green-50' : 'bg-gray-50'} hover:bg-gray-100 border-b cursor-pointer`}
+                                                                            className={`p-3 border-b cursor-pointer ${dayData.isToday ? (isDarkTheme ? 'bg-green-900' : 'bg-green-50') : (isDarkTheme ? 'bg-gray-800' : 'bg-gray-50')} ${isDarkTheme ? 'hover:bg-gray-700 border-gray-700' : 'hover:bg-gray-100 border-gray-200'}`}
                                                                             onClick={() => toggleDay(dayKey)}
                                                                             style={{paddingLeft: monthData.visible ? (yearData.visible ? '3rem' : '1.5rem') : (yearData.visible ? '1.5rem' : '0.75rem')}}
                                                                         >
                                                                             <div className="flex items-center">
-                                                                                <i className={`fas ${expandedDays[dayKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 ${dayData.isToday ? 'text-green-600' : 'text-gray-500'} text-xs`}></i>
-                                                                                <span className={`text-sm ${dayData.isToday ? 'text-green-900 font-semibold' : 'text-gray-900 font-medium'}`}>{dayData.display}</span>
-                                                                                <span className="ml-2 text-xs text-gray-500">({dayData.sessions.length})</span>
+                                                                                <i className={`fas ${expandedDays[dayKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${dayData.isToday ? (isDarkTheme ? 'text-green-200' : 'text-green-600') : mutedTextClass}`}></i>
+                                                                                <span className={`text-sm ${dayData.isToday ? (isDarkTheme ? 'text-green-100 font-semibold' : 'text-green-900 font-semibold') : (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-900 font-medium')}`}>{dayData.display}</span>
+                                                                                <span className={`ml-2 text-xs ${mutedTextClass}`}>({dayData.sessions.length})</span>
                                                                             </div>
                                                                         </div>
                                                                         
                                                                         {/* Sessions under this day */}
-                                                                        {expandedDays[dayKey] && dayData.sessions.map((session) => (
+                                                                        {expandedDays[dayKey] && dayData.sessions.map((session) => {
+                                                                            const summaryArtifact = (session.reports || []).find((report) => isSummaryArtifact(report.name));
+                                                                            return (
                                                                             <div key={session.timestamp}>
                                                                                 {/* Session Header */}
                                                                                 <div 
-                                                                                    className="p-4 bg-white hover:bg-gray-50 border-b cursor-pointer"
+                                                                                    className={`p-4 border-b cursor-pointer transition-colors overflow-hidden ${isDarkTheme ? 'bg-gray-800 hover:bg-gray-700 border-gray-700' : 'bg-white hover:bg-gray-50 border-gray-200'}`}
                                                                                     onClick={() => toggleSession(session.timestamp)}
-                                                                                    style={{paddingLeft: monthData.visible ? (yearData.visible ? '4.5rem' : '3rem') : (yearData.visible ? '3rem' : '2rem')}}
+                                                                                    style={{paddingLeft: monthData.visible ? (yearData.visible ? '3rem' : '2rem') : (yearData.visible ? '2rem' : '1.25rem')}}
                                                                                 >
-                                                                                    <div className="flex items-start justify-between">
-                                                                                        <div className="flex items-start flex-1">
-                                                                                            <i className={`fas ${expandedSessions[session.timestamp] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-3 text-gray-500 text-xs mt-1`}></i>
-                                                                                            <div className="flex-1">
-                                                                                                <h3 className="text-sm font-semibold text-gray-900 mb-1">{formatSessionTime(session.timestamp)}</h3>
-                                                                                                <div className="flex items-center space-x-3 text-xs text-gray-500">
-                                                                                                    <span className="flex items-center">
+                                                                                    <div className="flex flex-col gap-2">
+                                                                                        <div className="flex items-start flex-1 min-w-0">
+                                                                                            <i className={`fas ${expandedSessions[session.timestamp] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-3 text-xs mt-1 ${mutedTextClass}`}></i>
+                                                                                            <div className="flex-1 min-w-0">
+                                                                                                <h3 className={`text-sm font-semibold mb-1 tracking-wide ${headingClass}`}>{formatSessionTime(session.timestamp)}</h3>
+                                                                                                <div className={`flex items-center gap-2 text-xs flex-wrap ${mutedTextClass}`}>
+                                                                                                    <span className={`flex items-center px-2 py-0.5 rounded ${isDarkTheme ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
                                                                                                         <i className="fas fa-file-alt mr-1"></i>
                                                                                                         {session.reports.length} reports
                                                                                                     </span>
+                                                                                                    {session.hasSummary && (
+                                                                                                        <span className={`flex items-center px-2 py-0.5 rounded-full font-medium ${isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-emerald-100 text-emerald-800 border border-emerald-200'}`}>
+                                                                                                            <i className="fas fa-check-circle mr-1"></i>
+                                                                                                            Summarized
+                                                                                                        </span>
+                                                                                                    )}
+                                                                                                    {summaryArtifact?.modified && (
+                                                                                                        <span className={`hidden xl:flex items-center px-2 py-0.5 rounded ${isDarkTheme ? 'bg-gray-700 text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
+                                                                                                            <i className="fas fa-clock mr-1"></i>
+                                                                                                            {new Date(summaryArtifact.modified).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                                                                        </span>
+                                                                                                    )}
                                                                                                 </div>
                                                                                             </div>
                                                                                         </div>
-                                                                                        <div className="flex items-center space-x-2">
+                                                                                        <div className="flex items-center w-full">
                                                                                             <button
                                                                                                 onClick={(e) => {
                                                                                                     e.stopPropagation();
                                                                                                     openSummaryModal(session.timestamp);
                                                                                                 }}
-                                                                                                className={`text-xs ${session.hasSummary ? 'bg-green-600 hover:bg-green-700' : 'bg-indigo-600 hover:bg-indigo-700'} text-white px-3 py-1 rounded flex items-center space-x-1`}
+                                                                                                className={`w-full text-xs px-3 py-1.5 rounded-md font-medium inline-flex justify-center items-center space-x-1 whitespace-nowrap shadow-sm transition-colors ${session.hasSummary ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
                                                                                                 title={session.hasSummary ? 'View saved summary' : 'Generate summary with LLM'}
                                                                                             >
                                                                                                 <i className={`fas ${session.hasSummary ? 'fa-eye' : 'fa-magic'}`}></i>
@@ -6696,26 +10481,28 @@ def get_frontend_html():
                                                                                 
                                                                                 {/* Session Reports */}
                                                                                 {expandedSessions[session.timestamp] && (
-                                                                                    <div className="divide-y divide-gray-100">
+                                                                                    <div className={`divide-y ${isDarkTheme ? 'divide-gray-700' : 'divide-gray-100'}`}>
                                                                                         {session.reports.map((report) => (
                                                                                             <div
                                                                                                 key={report.name}
-                                                                                                className={`p-4 hover:bg-gray-50 cursor-pointer ${
-                                                                                                    selectedReport === report.name ? 'bg-indigo-50 border-r-4 border-indigo-500' : ''
+                                                                                                className={`p-4 cursor-pointer ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-50'} ${
+                                                                                                    selectedReport === report.name ? (isDarkTheme ? 'bg-indigo-900 border-r-4 border-indigo-400' : 'bg-indigo-50 border-r-4 border-indigo-500') : ''
                                                                                                 }`}
                                                                                                 onClick={() => loadReport(report.name)}
-                                                                                                style={{paddingLeft: monthData.visible ? (yearData.visible ? '6rem' : '4.5rem') : (yearData.visible ? '4.5rem' : '3.5rem')}}
+                                                                                                style={{paddingLeft: monthData.visible ? (yearData.visible ? '4rem' : '3rem') : (yearData.visible ? '3rem' : '2rem')}}
                                                                                             >
-                                                                                                <div className="flex items-center justify-between">
-                                                                                                    <div className="flex-1">
-                                                                                                        <p className="text-sm font-medium text-gray-900">
+                                                                                                <div className="flex items-center justify-between gap-2 min-w-0">
+                                                                                                    <div className="flex-1 min-w-0">
+                                                                                                        <p className={`text-sm font-medium truncate ${headingClass}`} title={report.name}>
                                                                                                             {report.name.replace(/_[0-9]{8}_[0-9]{6}/, '')}
                                                                                                         </p>
-                                                                                                        <p className="text-xs text-gray-500">{(report.size / 1024).toFixed(1)} KB</p>
+                                                                                                        <p className={`text-xs ${mutedTextClass}`}>{(report.size / 1024).toFixed(1)} KB</p>
                                                                                                     </div>
-                                                                                                    <div className="flex items-center space-x-2">
+                                                                                                    <div className="flex items-center space-x-2 shrink-0">
                                                                                                         <span className={`px-2 py-1 text-xs rounded ${
-                                                                                                            report.type === 'json' ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800'
+                                                                                                            report.type === 'json'
+                                                                                                                ? (isDarkTheme ? 'bg-blue-900 text-blue-100' : 'bg-blue-100 text-blue-800')
+                                                                                                                : (isDarkTheme ? 'bg-green-900 text-green-100' : 'bg-green-100 text-green-800')
                                                                                                         }`}>
                                                                                                             {report.type.toUpperCase()}
                                                                                                         </span>
@@ -6726,7 +10513,7 @@ def get_frontend_html():
                                                                                     </div>
                                                                                 )}
                                                                             </div>
-                                                                        ))}
+                                                                        );})}
                                                                     </div>
                                                                 ))}
                                                             </div>
@@ -6738,6 +10525,7 @@ def get_frontend_html():
                                     </div>
                                 </div>
                             </div>
+                            )}
                         </div>
                     </div>
                     
@@ -6749,27 +10537,29 @@ def get_frontend_html():
                         >
                             {/* Position modal directly below the connection indicator in the header */}
                             <div 
-                                className="absolute bg-white rounded-xl shadow-2xl w-80"
+                                className={`connection-popover absolute rounded-xl shadow-2xl w-80 ${isDarkTheme ? 'bg-gray-800 border border-gray-600' : 'bg-white border border-gray-200'}`}
                                 onClick={(e) => e.stopPropagation()}
                                 style={{
-                                    top: '65px',
-                                    left: '50%',
-                                    marginLeft: '60px',
+                                    top: `${connectionModalPosition.top}px`,
+                                    left: `${connectionModalPosition.left}px`,
                                     boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)'
                                 }}
                             >
                                 {/* Speech bubble pointer - pointing to connection indicator above */}
-                                <div className="absolute -top-2 left-8 w-4 h-4 bg-white rotate-45 border-l border-t border-gray-200"></div>
+                                <div
+                                    className={`absolute -top-2 w-4 h-4 rotate-45 border-l border-t ${isDarkTheme ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-200'}`}
+                                    style={{ left: `${connectionModalPosition.pointerLeft}px` }}
+                                ></div>
                                 
                                 {/* Modal Header */}
-                                <div className="p-4 border-b border-gray-200 flex justify-between items-center relative z-10 bg-white rounded-t-xl">
+                                <div className={`p-4 border-b flex justify-between items-center relative z-10 rounded-t-xl ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
                                     <div className="flex items-center">
                                         <i className="fas fa-plug text-lg text-indigo-600 mr-2"></i>
-                                        <h2 className="text-base font-semibold text-gray-900">Connection Details</h2>
+                                        <h2 className={`text-base font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Connection Details</h2>
                                     </div>
                                     <button
                                         onClick={() => setIsConnectionModalOpen(false)}
-                                        className="text-gray-400 hover:text-gray-600 transition-colors"
+                                        className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-200' : 'text-gray-400 hover:text-gray-600'} transition-colors`}
                                     >
                                         <i className="fas fa-times"></i>
                                     </button>
@@ -6840,17 +10630,17 @@ def get_frontend_html():
                     {/* Chat Modal */}
                     {isChatOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl h-5/6 flex flex-col">
+                            <div className={`rounded-xl shadow-2xl w-full max-w-4xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
                                 {/* Chat Header */}
-                                <div className="p-6 border-b border-gray-200 flex justify-between items-center">
+                                <div className={`p-6 border-b flex justify-between items-center ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
                                     <div className="flex items-center">
                                         <i className="fas fa-comments text-2xl text-green-600 mr-3"></i>
-                                        <h2 className="text-xl font-semibold text-gray-900">Chat with Splunk</h2>
+                                        <h2 className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Chat with Splunk</h2>
                                     </div>
                                     <div className="flex items-center space-x-2">
                                         <button
                                             onClick={() => setIsChatSettingsOpen(true)}
-                                            className="px-3 py-1 text-sm text-gray-600 hover:text-gray-800"
+                                            className={`px-3 py-1 text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}
                                             title="Chat settings"
                                         >
                                             <i className="fas fa-cog"></i>
@@ -6859,15 +10649,16 @@ def get_frontend_html():
                                             onClick={() => {
                                                 setChatMessages([]);
                                                 setServerConversationHistory(null);
+                                                setChatSessionId(generateChatSessionId());
                                             }}
-                                            className="px-3 py-1 text-sm text-gray-600 hover:text-gray-800"
+                                            className={`px-3 py-1 text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}
                                             title="Clear chat"
                                         >
                                             <i className="fas fa-trash"></i>
                                         </button>
                                         <button
                                             onClick={() => setIsChatOpen(false)}
-                                            className="text-gray-500 hover:text-gray-700"
+                                            className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-100' : 'text-gray-500 hover:text-gray-700'}`}
                                         >
                                             <i className="fas fa-times text-xl"></i>
                                         </button>
@@ -6875,9 +10666,9 @@ def get_frontend_html():
                                 </div>
                                 
                                 {/* Chat Messages */}
-                                <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                                <div className={`flex-1 overflow-y-auto p-6 space-y-4 ${isDarkTheme ? 'bg-gray-900' : 'bg-white'}`}>
                                     {chatMessages.length === 0 && (
-                                        <div className="text-center text-gray-500 mt-12">
+                                        <div className={`text-center mt-12 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                             <i className="fas fa-robot text-4xl mb-4"></i>
                                             <p className="text-lg">Start a conversation with your Splunk environment</p>
                                             <p className="text-sm mt-2">Ask questions about your data, indexes, searches, or get help with SPL queries</p>
@@ -6890,10 +10681,10 @@ def get_frontend_html():
                                                 msg.type === 'user' 
                                                     ? 'bg-indigo-600 text-white' 
                                                     : msg.type === 'error'
-                                                    ? 'bg-red-50 text-red-800 border border-red-200'
+                                                    ? (isDarkTheme ? 'bg-red-900 text-red-100 border border-red-700' : 'bg-red-50 text-red-800 border border-red-200')
                                                     : msg.type === 'warning'
-                                                    ? 'bg-amber-50 text-amber-900 border border-amber-200'
-                                                    : 'bg-gray-100 text-gray-800'
+                                                    ? (isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-50 text-amber-900 border border-amber-200')
+                                                    : (isDarkTheme ? 'bg-gray-700 text-gray-100 border border-gray-600' : 'bg-gray-100 text-gray-800')
                                             }`}>
                                                 {msg.type === 'user' && (
                                                     <div className="flex items-start">
@@ -6944,7 +10735,7 @@ def get_frontend_html():
                                                             {/* Show SPL mentioned in text (even if not executed) */}
                                                             {!msg.spl_query && msg.spl_in_text && (
                                                                 <details className="mt-3">
-                                                                    <summary className="cursor-pointer text-sm font-medium text-gray-600 hover:text-gray-800 flex items-center">
+                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}>
                                                                         <i className="fas fa-code mr-2"></i>
                                                                         SPL Query (Not Executed)
                                                                     </summary>
@@ -6980,9 +10771,9 @@ def get_frontend_html():
                                                                     </summary>
                                                                     <div className="mt-2 space-y-2">
                                                                         {msg.status_timeline.map((status, idx) => (
-                                                                            <div key={idx} className="flex items-center justify-between px-3 py-2 bg-gradient-to-r from-blue-50 to-purple-50 rounded border-l-4 border-blue-400">
-                                                                                <span className="text-sm text-gray-700">{status.action}</span>
-                                                                                <span className="text-xs text-gray-500">{status.time.toFixed(1)}s</span>
+                                                                            <div key={idx} className={`flex items-center justify-between px-3 py-2 rounded border-l-4 border-blue-400 ${isDarkTheme ? 'bg-gray-800' : 'bg-gradient-to-r from-blue-50 to-purple-50'}`}>
+                                                                                <span className={`text-sm ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{status.action}</span>
+                                                                                <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{status.time.toFixed(1)}s</span>
                                                                             </div>
                                                                         ))}
                                                                     </div>
@@ -6992,11 +10783,11 @@ def get_frontend_html():
                                                             {/* Show raw MCP data if available */}
                                                             {msg.mcp_data && (
                                                                 <details className="mt-3">
-                                                                    <summary className="cursor-pointer text-sm text-gray-600 hover:text-gray-800">
+                                                                    <summary className={`cursor-pointer text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}>
                                                                         <i className="fas fa-database mr-1"></i>
                                                                         View Raw Data
                                                                     </summary>
-                                                                    <pre className="mt-2 p-3 bg-gray-200 rounded text-xs overflow-x-auto">
+                                                                    <pre className={`mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-200 text-gray-800'}`}>
                                                                         {JSON.stringify(msg.mcp_data, null, 2)}
                                                                     </pre>
                                                                 </details>
@@ -7004,9 +10795,20 @@ def get_frontend_html():
                                                             
                                                             {/* Indicate if follow-on is expected */}
                                                             {msg.has_follow_on && (
-                                                                <div className="mt-2 text-xs text-indigo-600 flex items-center">
-                                                                    <i className="fas fa-arrow-right mr-1"></i>
-                                                                    <span>Follow-up action available</span>
+                                                                <div className={`mt-3 p-3 border rounded ${isDarkTheme ? 'bg-indigo-900 border-indigo-700' : 'bg-indigo-50 border-indigo-200'}`}>
+                                                                    <div className={`text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'}`}>
+                                                                        <i className="fas fa-arrow-right mr-1"></i>
+                                                                        <span>Suggested next actions</span>
+                                                                    </div>
+                                                                    {Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? (
+                                                                        <ul className={`text-xs space-y-1 list-disc pl-4 ${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'}`}>
+                                                                            {msg.follow_on_actions.map((action, idx) => (
+                                                                                <li key={idx}>{action}</li>
+                                                                            ))}
+                                                                        </ul>
+                                                                    ) : (
+                                                                        <div className={`text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-800'}`}>Follow-up action available.</div>
+                                                                    )}
                                                                 </div>
                                                             )}
                                                         </div>
@@ -7021,9 +10823,9 @@ def get_frontend_html():
                                                 )}
                                                 
                                                 {msg.type === 'warning' && (
-                                                    <div className="flex items-start bg-amber-50 border-l-4 border-amber-400 p-4 rounded">
+                                                    <div className={`flex items-start border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? 'bg-amber-900' : 'bg-amber-50'}`}>
                                                         <i className="fas fa-exclamation-circle mr-3 mt-1 text-amber-600"></i>
-                                                        <p className="flex-1 text-amber-800">{msg.content}</p>
+                                                        <p className={`flex-1 ${isDarkTheme ? 'text-amber-100' : 'text-amber-800'}`}>{msg.content}</p>
                                                     </div>
                                                 )}
                                                 
@@ -7036,7 +10838,7 @@ def get_frontend_html():
                                     
                                     {isTyping && (
                                         <div className="flex justify-start">
-                                            <div className="bg-gradient-to-r from-blue-50 to-green-50 text-gray-800 p-4 rounded-lg shadow-sm border border-blue-100">
+                                            <div className={`p-4 rounded-lg shadow-sm border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-700' : 'bg-gradient-to-r from-blue-50 to-green-50 text-gray-800 border-blue-100'}`}>
                                                 <div className="flex items-center space-x-3">
                                                     <i className="fas fa-robot text-green-600"></i>
                                                     <div className="flex space-x-1">
@@ -7045,7 +10847,7 @@ def get_frontend_html():
                                                         <div className="w-2 h-2 bg-purple-500 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
                                                     </div>
                                                     {chatStatus && (
-                                                        <span className="text-sm text-gray-600 ml-2 animate-pulse">
+                                                        <span className={`text-sm ml-2 animate-pulse ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                                             {chatStatus}
                                                         </span>
                                                     )}
@@ -7058,7 +10860,46 @@ def get_frontend_html():
                                 </div>
                                 
                                 {/* Chat Input */}
-                                <div className="p-6 border-t border-gray-200">
+                                <div className={`p-6 border-t ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                    <div className="mb-4">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <p className={`text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>Suggested Queries (Demo)</p>
+                                            <div className="flex items-center gap-3">
+                                                <span className={`text-xs ${isDarkTheme ? 'text-gray-500' : 'text-gray-400'}`}>Deterministic-friendly prompts</span>
+                                                <button
+                                                    onClick={() => setShowSuggestedQueries(prev => !prev)}
+                                                    className="text-xs text-indigo-600 hover:text-indigo-800 flex items-center"
+                                                    title={showSuggestedQueries ? 'Collapse suggested queries' : 'Expand suggested queries'}
+                                                >
+                                                    <i className={`fas ${showSuggestedQueries ? 'fa-chevron-up' : 'fa-chevron-down'}`}></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        {showSuggestedQueries && (
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                {suggestedChatQueries.map((query, idx) => (
+                                                    <div key={idx} className={`flex items-center border rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                                                        <button
+                                                            onClick={() => useSuggestedQuery(query)}
+                                                            className={`flex-1 text-left text-xs truncate ${isDarkTheme ? 'text-gray-200 hover:text-indigo-300' : 'text-gray-700 hover:text-indigo-700'}`}
+                                                            title={query}
+                                                        >
+                                                            {query}
+                                                        </button>
+                                                        <button
+                                                            onClick={() => sendSuggestedQuery(query)}
+                                                            disabled={isTyping}
+                                                            className={`ml-2 px-2 py-1 text-xs rounded ${isTyping ? (isDarkTheme ? 'bg-gray-700 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed') : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
+                                                            title="Run this query now"
+                                                        >
+                                                            <i className="fas fa-play"></i>
+                                                        </button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+
                                     <div className="flex space-x-4">
                                         <textarea
                                             ref={chatInputRef}
@@ -7071,7 +10912,7 @@ def get_frontend_html():
                                                 }
                                             }}
                                             placeholder="Ask me about your Splunk environment..."
-                                            className="flex-1 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none"
+                                            className={`flex-1 p-3 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
                                             rows="3"
                                             disabled={isTyping}
                                         />
@@ -7081,13 +10922,13 @@ def get_frontend_html():
                                             className={`px-6 py-3 rounded-lg font-medium ${
                                                 chatInput.trim() && !isTyping
                                                     ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
-                                                    : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                                    : (isDarkTheme ? 'bg-gray-700 text-gray-400 cursor-not-allowed' : 'bg-gray-300 text-gray-500 cursor-not-allowed')
                                             }`}
                                         >
                                             <i className="fas fa-paper-plane"></i>
                                         </button>
                                     </div>
-                                    <p className="text-xs text-gray-500 mt-2">
+                                    <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                         Press Enter to send, Shift+Enter for new line • Ask about indexes, searches, data sources, or get help with SPL queries
                                     </p>
                                 </div>
@@ -7098,7 +10939,7 @@ def get_frontend_html():
                     {/* Chat Settings Modal */}
                     {isChatSettingsOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col">
+                            <div className={`chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
                                 {/* Header */}
                                 <div className="p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-t-xl">
                                     <div className="flex items-center">
@@ -7355,12 +11196,65 @@ def get_frontend_html():
                                                     </div>
                                                 </div>
                                             </div>
+
+                                            <div className="bg-gradient-to-r from-indigo-50 to-violet-50 rounded-lg p-5 border-2 border-indigo-200">
+                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                                                    <i className="fas fa-magic text-indigo-600 mr-2"></i>
+                                                    Splunk IQ (Demo)
+                                                </h3>
+                                                <div className="space-y-4">
+                                                    <label className="flex items-center justify-between bg-white rounded p-3 border border-indigo-100">
+                                                        <div>
+                                                            <div className="text-sm font-medium text-gray-800">Enable Splunk Augmentation</div>
+                                                            <div className="text-xs text-gray-500">Use intent-specific deterministic skills for common Splunk questions</div>
+                                                        </div>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={!!chatSettings.enable_splunk_augmentation}
+                                                            onChange={(e) => updateSetting('enable_splunk_augmentation', e.target.checked)}
+                                                            className="h-4 w-4"
+                                                        />
+                                                    </label>
+
+                                                    <label className="flex items-center justify-between bg-white rounded p-3 border border-indigo-100">
+                                                        <div>
+                                                            <div className="text-sm font-medium text-gray-800">Enable Optional Local RAG</div>
+                                                            <div className="text-xs text-gray-500">Retrieve matching snippets from recent discovery output files</div>
+                                                        </div>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={!!chatSettings.enable_rag_context}
+                                                            onChange={(e) => updateSetting('enable_rag_context', e.target.checked)}
+                                                            className="h-4 w-4"
+                                                        />
+                                                    </label>
+
+                                                    <div>
+                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                            RAG Snippet Chunks: {chatSettings.rag_max_chunks}
+                                                        </label>
+                                                        <input
+                                                            type="range"
+                                                            min="1"
+                                                            max="6"
+                                                            value={chatSettings.rag_max_chunks || 3}
+                                                            onChange={(e) => updateSetting('rag_max_chunks', parseInt(e.target.value))}
+                                                            className="w-full"
+                                                            disabled={!chatSettings.enable_rag_context}
+                                                        />
+                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                            <span>1</span>
+                                                            <span>6</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
                                         </>
                                     )}
                                 </div>
                                 
                                 {/* Footer */}
-                                <div className="p-6 border-t border-gray-200 bg-gray-50 rounded-b-xl">
+                                <div className={`p-6 border-t rounded-b-xl ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
                                     <p className="text-sm text-gray-600 text-center">
                                         <i className="fas fa-info-circle mr-2"></i>
                                         Settings apply immediately and reset to defaults on server restart
@@ -7373,14 +11267,14 @@ def get_frontend_html():
                     {/* Summary Modal */}
                     {isSummaryModalOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-7xl h-5/6 flex flex-col">
+                            <div className={`${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'} rounded-xl shadow-2xl w-full max-w-7xl h-5/6 flex flex-col`}>
                                 {/* Header */}
                                 <div className="p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-t-xl">
                                     <div className="flex items-center">
                                         <i className={`fas ${summaryData?.from_cache ? 'fa-eye' : 'fa-magic'} text-2xl mr-3`}></i>
                                         <div>
                                             <h2 className="text-2xl font-bold">
-                                                AI-Powered Summary
+                                                V2 Intelligence Report
                                                 {summaryData?.from_cache && (
                                                     <span className="ml-3 text-sm font-normal bg-green-500 bg-opacity-30 px-3 py-1 rounded-full">
                                                         <i className="fas fa-check-circle mr-1"></i>
@@ -7401,14 +11295,14 @@ def get_frontend_html():
                                 
                                 {/* Tab Navigation */}
                                 {!isLoadingSummary && summaryData && (
-                                    <div className="border-b border-gray-200 bg-gray-50">
+                                    <div className={`border-b ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
                                         <div className="flex space-x-1 px-6">
                                             <button
                                                 onClick={() => setActiveTab('summary')}
                                                 className={`px-6 py-3 font-medium text-sm transition-all ${
                                                     activeTab === 'summary'
-                                                        ? 'border-b-2 border-indigo-600 text-indigo-600 bg-white'
-                                                        : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                                                        ? (isDarkTheme ? 'border-b-2 border-indigo-400 text-indigo-300 bg-gray-900' : 'border-b-2 border-indigo-600 text-indigo-600 bg-white')
+                                                        : (isDarkTheme ? 'text-gray-300 hover:text-white hover:bg-gray-700' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100')
                                                 }`}
                                             >
                                                 <i className="fas fa-brain mr-2"></i>
@@ -7418,8 +11312,8 @@ def get_frontend_html():
                                                 onClick={() => setActiveTab('queries')}
                                                 className={`px-6 py-3 font-medium text-sm transition-all ${
                                                     activeTab === 'queries'
-                                                        ? 'border-b-2 border-indigo-600 text-indigo-600 bg-white'
-                                                        : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                                                        ? (isDarkTheme ? 'border-b-2 border-indigo-400 text-indigo-300 bg-gray-900' : 'border-b-2 border-indigo-600 text-indigo-600 bg-white')
+                                                        : (isDarkTheme ? 'text-gray-300 hover:text-white hover:bg-gray-700' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100')
                                                 }`}
                                             >
                                                 <i className="fas fa-code mr-2"></i>
@@ -7429,8 +11323,8 @@ def get_frontend_html():
                                                 onClick={() => setActiveTab('tasks')}
                                                 className={`px-6 py-3 font-medium text-sm transition-all ${
                                                     activeTab === 'tasks'
-                                                        ? 'border-b-2 border-indigo-600 text-indigo-600 bg-white'
-                                                        : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                                                        ? (isDarkTheme ? 'border-b-2 border-indigo-400 text-indigo-300 bg-gray-900' : 'border-b-2 border-indigo-600 text-indigo-600 bg-white')
+                                                        : (isDarkTheme ? 'text-gray-300 hover:text-white hover:bg-gray-700' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100')
                                                 }`}
                                             >
                                                 <i className="fas fa-tasks mr-2"></i>
@@ -7450,94 +11344,94 @@ def get_frontend_html():
                                             <div className="text-center max-w-md">
                                                 {/* Animated Icon */}
                                                 <div className="relative mb-8">
-                                                    <div className="inline-block animate-spin rounded-full h-20 w-20 border-4 border-indigo-200 border-t-indigo-600"></div>
-                                                    <i className="fas fa-brain absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-3xl text-indigo-600 animate-pulse"></i>
+                                                    <div className={`inline-block animate-spin rounded-full h-20 w-20 border-4 ${isDarkTheme ? 'border-indigo-900 border-t-indigo-400' : 'border-indigo-200 border-t-indigo-600'}`}></div>
+                                                    <i className={`fas fa-brain absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-3xl animate-pulse ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`}></i>
                                                 </div>
                                                 
                                                 {/* Main Message */}
-                                                <h3 className="text-2xl font-bold text-gray-800 mb-4">
+                                                <h3 className={`text-2xl font-bold mb-4 ${isDarkTheme ? 'text-gray-100' : 'text-gray-800'}`}>
                                                     Analyzing Your Splunk Environment
                                                 </h3>
                                                 
                                                 {/* Progress Steps */}
-                                                <div className="space-y-3 text-left bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-4">
+                                                <div className={`space-y-3 text-left rounded-lg shadow-sm border p-4 mb-4 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
                                                     {/* Stage 1: Loading Reports */}
-                                                    <div className={`flex items-center text-sm ${summaryProgress.stage === 'loading' ? 'animate-pulse' : ''}`}>
+                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(1) ? 'animate-pulse' : ''}`}>
                                                         <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            ['generating_queries', 'identifying_unknowns', 'loading_reports', 'generating_summary', 'generating_tasks', 'saving', 'complete'].includes(summaryProgress.stage)
-                                                                ? 'bg-green-500' 
-                                                                : summaryProgress.stage === 'loading'
+                                                            isSummaryStepDone(1)
+                                                                ? 'bg-green-500'
+                                                                : isSummaryStepActive(1)
                                                                     ? 'bg-indigo-500'
-                                                                    : 'border-2 border-gray-300'
+                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
                                                         }`}>
-                                                            {['generating_queries', 'identifying_unknowns', 'loading_reports', 'generating_summary', 'generating_tasks', 'saving', 'complete'].includes(summaryProgress.stage) ? (
+                                                            {isSummaryStepDone(1) ? (
                                                                 <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : summaryProgress.stage === 'loading' ? (
+                                                            ) : isSummaryStepActive(1) ? (
                                                                 <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
                                                             ) : null}
                                                         </div>
-                                                        <span className={summaryProgress.stage === 'loading' ? 'text-gray-700 font-medium' : 'text-gray-700'}>
+                                                        <span className={isSummaryStepActive(1) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-300' : 'text-gray-700')}>
                                                             Loading discovery reports...
                                                         </span>
                                                     </div>
                                                     
                                                     {/* Stage 2: Generating Queries */}
-                                                    <div className={`flex items-center text-sm ${['generating_queries', 'identifying_unknowns', 'loading_reports'].includes(summaryProgress.stage) ? 'animate-pulse' : ''}`}>
+                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(2) ? 'animate-pulse' : ''}`}>
                                                         <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            ['generating_summary', 'generating_tasks', 'saving', 'complete'].includes(summaryProgress.stage)
-                                                                ? 'bg-green-500' 
-                                                                : ['generating_queries', 'identifying_unknowns', 'loading_reports'].includes(summaryProgress.stage)
+                                                            isSummaryStepDone(2)
+                                                                ? 'bg-green-500'
+                                                                : isSummaryStepActive(2)
                                                                     ? 'bg-indigo-500'
-                                                                    : 'border-2 border-gray-300'
+                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
                                                         }`}>
-                                                            {['generating_summary', 'generating_tasks', 'saving', 'complete'].includes(summaryProgress.stage) ? (
+                                                            {isSummaryStepDone(2) ? (
                                                                 <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : ['generating_queries', 'identifying_unknowns', 'loading_reports'].includes(summaryProgress.stage) ? (
+                                                            ) : isSummaryStepActive(2) ? (
                                                                 <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
                                                             ) : null}
                                                         </div>
-                                                        <span className={['generating_queries', 'identifying_unknowns', 'loading_reports'].includes(summaryProgress.stage) ? 'text-gray-700 font-medium' : 'text-gray-500'}>
+                                                        <span className={isSummaryStepActive(2) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-400' : 'text-gray-500')}>
                                                             Generating SPL queries...
                                                         </span>
                                                     </div>
                                                     
-                                                    {/* Stage 3: Creating Tasks */}
-                                                    <div className={`flex items-center text-sm ${summaryProgress.stage === 'generating_tasks' ? 'animate-pulse' : ''}`}>
+                                                    {/* Stage 3: Building Summary */}
+                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(3) ? 'animate-pulse' : ''}`}>
                                                         <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            ['saving', 'complete'].includes(summaryProgress.stage)
-                                                                ? 'bg-green-500' 
-                                                                : summaryProgress.stage === 'generating_tasks'
+                                                            isSummaryStepDone(3)
+                                                                ? 'bg-green-500'
+                                                                : isSummaryStepActive(3)
                                                                     ? 'bg-indigo-500'
-                                                                    : 'border-2 border-gray-300'
+                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
                                                         }`}>
-                                                            {['saving', 'complete'].includes(summaryProgress.stage) ? (
+                                                            {isSummaryStepDone(3) ? (
                                                                 <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : summaryProgress.stage === 'generating_tasks' ? (
+                                                            ) : isSummaryStepActive(3) ? (
                                                                 <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
                                                             ) : null}
                                                         </div>
-                                                        <span className={summaryProgress.stage === 'generating_tasks' ? 'text-gray-700 font-medium' : 'text-gray-500'}>
-                                                            Creating admin tasks...
+                                                        <span className={isSummaryStepActive(3) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-400' : 'text-gray-500')}>
+                                                            Building executive summary...
                                                         </span>
                                                     </div>
                                                     
-                                                    {/* Stage 4: Building Summary */}
-                                                    <div className={`flex items-center text-sm ${summaryProgress.stage === 'generating_summary' ? 'animate-pulse' : ''}`}>
+                                                    {/* Stage 4: Creating Tasks */}
+                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(4) ? 'animate-pulse' : ''}`}>
                                                         <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            summaryProgress.stage === 'complete'
-                                                                ? 'bg-green-500' 
-                                                                : summaryProgress.stage === 'generating_summary'
+                                                            isSummaryStepDone(4)
+                                                                ? 'bg-green-500'
+                                                                : isSummaryStepActive(4)
                                                                     ? 'bg-indigo-500'
-                                                                    : 'border-2 border-gray-300'
+                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
                                                         }`}>
-                                                            {summaryProgress.stage === 'complete' ? (
+                                                            {isSummaryStepDone(4) ? (
                                                                 <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : summaryProgress.stage === 'generating_summary' ? (
+                                                            ) : isSummaryStepActive(4) ? (
                                                                 <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
                                                             ) : null}
                                                         </div>
-                                                        <span className={summaryProgress.stage === 'generating_summary' ? 'text-gray-700 font-medium' : 'text-gray-500'}>
-                                                            Building executive summary...
+                                                        <span className={isSummaryStepActive(4) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-400' : 'text-gray-500')}>
+                                                            Creating admin tasks...
                                                         </span>
                                                     </div>
                                                 </div>
@@ -7545,10 +11439,10 @@ def get_frontend_html():
                                                 {/* Progress Bar */}
                                                 <div className="mb-4">
                                                     <div className="flex justify-between items-center mb-1">
-                                                        <span className="text-xs font-medium text-gray-700">{summaryProgress.message}</span>
+                                                        <span className={`text-xs font-medium ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{summaryProgress.message}</span>
                                                         <span className="text-xs font-semibold text-indigo-600">{summaryProgress.progress}%</span>
                                                     </div>
-                                                    <div className="w-full bg-gray-200 rounded-full h-2">
+                                                    <div className={`w-full rounded-full h-2 ${isDarkTheme ? 'bg-gray-700' : 'bg-gray-200'}`}>
                                                         <div 
                                                             className="bg-gradient-to-r from-indigo-500 to-purple-600 h-2 rounded-full transition-all duration-500 ease-out"
                                                             style={{width: `${summaryProgress.progress}%`}}
@@ -7557,7 +11451,7 @@ def get_frontend_html():
                                                 </div>
                                                 
                                                 {/* Fun Facts */}
-                                                <div className="text-xs text-gray-500 italic">
+                                                <div className={`text-xs italic ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                                     <i className="fas fa-lightbulb mr-1 text-yellow-500"></i>
                                                     This analysis uses AI to understand your data patterns and recommend optimizations
                                                 </div>
@@ -7569,61 +11463,203 @@ def get_frontend_html():
                                             {activeTab === 'summary' && (
                                                 <div className="space-y-6">
                                                     {/* AI Summary Section */}
-                                                    <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border-l-4 border-indigo-600 p-6 rounded-r-lg">
-                                                        <h3 className="text-xl font-semibold text-gray-900 mb-4 flex items-center">
+                                                    <div className={`border-l-4 p-6 rounded-r-lg ${isDarkTheme ? 'bg-gradient-to-r from-slate-800 to-indigo-950 border-indigo-400' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-indigo-600'}`}>
+                                                        <h3 className={`text-xl font-semibold mb-4 flex items-center ${isDarkTheme ? 'text-indigo-100' : 'text-gray-900'}`}>
                                                             <i className="fas fa-brain text-indigo-600 mr-2"></i>
                                                             Executive Summary
                                                         </h3>
                                                         <div className="prose max-w-none">
-                                                            <pre className="whitespace-pre-wrap font-sans text-gray-700">{summaryData.ai_summary}</pre>
+                                                            <pre className={`whitespace-pre-wrap font-sans ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{summaryData.ai_summary}</pre>
+                                                        </div>
+                                                    </div>
+
+                                                    {/* V2 Intelligence KPIs */}
+                                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-indigo-950 border-indigo-700' : 'bg-indigo-100 border-indigo-300'}`}>
+                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-900'}`}>{summaryData.readiness_score ?? summaryData.v2_context?.readiness_score ?? 'N/A'}</div>
+                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-800'}`}>Readiness Score</div>
+                                                        </div>
+                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-red-950 border-red-700' : 'bg-red-100 border-red-300'}`}>
+                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-red-200' : 'text-red-900'}`}>{summaryData.risk_register?.length ?? summaryData.v2_context?.risk_register ?? 0}</div>
+                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-red-300' : 'text-red-800'}`}>Risk Register Items</div>
+                                                        </div>
+                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-amber-950 border-amber-700' : 'bg-amber-100 border-amber-300'}`}>
+                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-amber-200' : 'text-amber-900'}`}>{summaryData.coverage_gaps?.length ?? summaryData.v2_context?.coverage_gaps ?? 0}</div>
+                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-amber-300' : 'text-amber-800'}`}>Coverage Gaps</div>
+                                                        </div>
+                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-purple-950 border-purple-700' : 'bg-purple-100 border-purple-300'}`}>
+                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-purple-200' : 'text-purple-900'}`}>{summaryData.recursive_investigations?.length ?? summaryData.v2_context?.recursive_investigations ?? 0}</div>
+                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-purple-300' : 'text-purple-800'}`}>Recursive Loops</div>
                                                         </div>
                                                     </div>
                                                     
                                                     {/* Stats Section */}
                                                     {summaryData.stats && (
-                                                        <div className="grid grid-cols-3 gap-4">
-                                                            <div className="bg-green-50 border border-green-200 rounded-lg p-4 text-center">
-                                                                <div className="text-3xl font-bold text-green-600">{summaryData.stats.total_queries}</div>
-                                                                <div className="text-sm text-green-700 mt-1">SPL Queries Generated</div>
+                                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                                            <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-green-950 border-green-700' : 'bg-green-100 border-green-300'}`}>
+                                                                <div className={`text-3xl font-bold ${isDarkTheme ? 'text-green-200' : 'text-green-900'}`}>{summaryData.stats.total_queries}</div>
+                                                                <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-green-300' : 'text-green-800'}`}>SPL Queries Generated</div>
                                                             </div>
-                                                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-center">
-                                                                <div className="text-3xl font-bold text-blue-600">{summaryData.stats.categories?.length || 0}</div>
-                                                                <div className="text-sm text-blue-700 mt-1">Use Case Categories</div>
+                                                            <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-blue-950 border-blue-700' : 'bg-blue-100 border-blue-300'}`}>
+                                                                <div className={`text-3xl font-bold ${isDarkTheme ? 'text-blue-200' : 'text-blue-900'}`}>{summaryData.stats.categories?.length || 0}</div>
+                                                                <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>Use Case Categories</div>
                                                             </div>
-                                                            <div className="bg-orange-50 border border-orange-200 rounded-lg p-4 text-center">
-                                                                <div className="text-3xl font-bold text-orange-600">{summaryData.stats.unknown_items}</div>
-                                                                <div className="text-sm text-orange-700 mt-1">Data Sources Needing Review</div>
+                                                            <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-orange-950 border-orange-700' : 'bg-orange-100 border-orange-300'}`}>
+                                                                <div className={`text-3xl font-bold ${isDarkTheme ? 'text-orange-200' : 'text-orange-900'}`}>{summaryData.stats.unknown_items}</div>
+                                                                <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-orange-300' : 'text-orange-800'}`}>Data Sources Needing Review</div>
+                                                            </div>
+                                                        </div>
+                                                    )}
+
+                                                    {/* Trend Signals Panel */}
+                                                    {summaryData.trend_signals && (
+                                                        <div className={`${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} border rounded-lg p-5`}>
+                                                            <h3 className={`text-lg font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
+                                                                <i className="fas fa-chart-line text-blue-600 mr-2"></i>
+                                                                Trend & Usage Signals
+                                                            </h3>
+                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                                <div className={`${isDarkTheme ? 'bg-blue-950 border-blue-700' : 'bg-blue-100 border-blue-300'} border rounded p-3`}>
+                                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>Evidence Steps</div>
+                                                                    <div className={`text-2xl font-bold ${isDarkTheme ? 'text-blue-100' : 'text-blue-900'}`}>{summaryData.trend_signals.evidence_steps ?? 0}</div>
+                                                                </div>
+                                                                <div className={`${isDarkTheme ? 'bg-green-950 border-green-700' : 'bg-green-100 border-green-300'} border rounded p-3`}>
+                                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-green-300' : 'text-green-800'}`}>High Priority Recommendations</div>
+                                                                    <div className={`text-2xl font-bold ${isDarkTheme ? 'text-green-100' : 'text-green-900'}`}>{summaryData.trend_signals.high_priority_recommendations ?? 0}</div>
+                                                                </div>
+                                                            </div>
+                                                            {summaryData.trend_signals.recommendation_by_domain && (
+                                                                <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+                                                                    {Object.entries(summaryData.trend_signals.recommendation_by_domain).map(([domain, count]) => (
+                                                                        <div key={domain} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded p-2 text-center`}>
+                                                                            <div className={`text-xs uppercase ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{domain.replace('_', ' ')}</div>
+                                                                            <div className={`text-lg font-bold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{count}</div>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
+
+                                                    {/* Risk Register Panel */}
+                                                    {summaryData.risk_register && summaryData.risk_register.length > 0 && (
+                                                        <div className={`${isDarkTheme ? 'bg-red-950 border-red-700' : 'bg-red-50 border-red-200'} border rounded-lg p-5`}>
+                                                            <h3 className={`text-lg font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-red-200' : 'text-red-900'}`}>
+                                                                <i className="fas fa-shield-alt text-red-600 mr-2"></i>
+                                                                Risk Register (Top {Math.min(summaryData.risk_register.length, 6)})
+                                                            </h3>
+                                                            <div className="space-y-3">
+                                                                {summaryData.risk_register.slice(0, 6).map((risk, idx) => (
+                                                                    <div key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-red-700' : 'bg-white border-red-200'} border rounded p-3`}>
+                                                                        <div className="flex items-start justify-between gap-3">
+                                                                            <div className="flex-1">
+                                                                                <div className="flex items-center gap-2 mb-1">
+                                                                                    <span className={`px-2 py-0.5 text-xs font-semibold rounded-full ${
+                                                                                        String(risk.severity || '').toLowerCase() === 'high' ? 'bg-red-600 text-white' :
+                                                                                        String(risk.severity || '').toLowerCase() === 'critical' ? 'bg-red-700 text-white' :
+                                                                                        String(risk.severity || '').toLowerCase() === 'medium' ? 'bg-orange-500 text-white' :
+                                                                                        'bg-gray-500 text-white'
+                                                                                    }`}>
+                                                                                        {(risk.severity || 'medium').toString().toUpperCase()}
+                                                                                    </span>
+                                                                                    <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{risk.domain || 'general'}</span>
+                                                                                </div>
+                                                                                <p className={`font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{risk.risk || 'Operational risk'}</p>
+                                                                                {risk.impact && <p className={`text-sm mt-1 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>{risk.impact}</p>}
+                                                                            </div>
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    setChatInput(`Help me investigate and mitigate this risk in Splunk:\n\n${risk.risk || ''}\nImpact: ${risk.impact || ''}\nMitigation: ${risk.mitigation || ''}`);
+                                                                                    setIsChatOpen(true);
+                                                                                    closeSummaryModal();
+                                                                                }}
+                                                                                className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs rounded"
+                                                                            >
+                                                                                Investigate
+                                                                            </button>
+                                                                        </div>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+
+                                                    {/* Recursive Loop Panel */}
+                                                    {summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && (
+                                                        <div className={`${isDarkTheme ? 'bg-purple-950 border-purple-700' : 'bg-purple-50 border-purple-200'} border rounded-lg p-5`}>
+                                                            <h3 className={`text-lg font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-purple-200' : 'text-purple-900'}`}>
+                                                                <i className="fas fa-sync-alt text-purple-600 mr-2"></i>
+                                                                Recursive Discovery & Analysis Loops
+                                                            </h3>
+                                                            <div className="space-y-3">
+                                                                {summaryData.recursive_investigations.map((loop, idx) => (
+                                                                    <details key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-purple-700' : 'bg-white border-purple-200'} border rounded p-3`} open={idx === 0}>
+                                                                        <summary className={`cursor-pointer font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{loop.loop || `Loop ${idx + 1}`}</summary>
+                                                                        <div className={`mt-2 text-sm space-y-1 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>
+                                                                            <p><strong>Objective:</strong> {loop.objective || 'N/A'}</p>
+                                                                            <p><strong>Trigger:</strong> {loop.next_iteration_trigger || 'N/A'}</p>
+                                                                            <p><strong>Deliverable:</strong> {loop.output || 'N/A'}</p>
+                                                                        </div>
+                                                                    </details>
+                                                                ))}
                                                             </div>
                                                         </div>
                                                     )}
                                                     
                                                     {/* Unknown Data Section */}
                                                     {summaryData.unknown_data && summaryData.unknown_data.length > 0 && (
-                                                        <div>
-                                                            <h3 className="text-xl font-semibold text-gray-900 mb-4 flex items-center">
+                                                        <div className={`${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-orange-50 border-orange-200'} border rounded-lg p-4`}>
+                                                            <h3 className={`text-xl font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-orange-200' : 'text-gray-900'}`}>
                                                                 <i className="fas fa-question-circle text-orange-600 mr-2"></i>
                                                                 Help Us Understand Your Data ({summaryData.unknown_data.length})
                                                             </h3>
-                                                            <p className="text-sm text-gray-600 mb-4">
+                                                            <p className={`text-sm mb-4 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                                                 We found some data sources we're not familiar with. Your answers will help us provide better recommendations.
                                                             </p>
                                                             <div className="space-y-4">
                                                                 {summaryData.unknown_data.slice(0, 3).map((item, idx) => (
-                                                                    <div key={idx} className="border border-orange-200 rounded-lg p-4 bg-orange-50">
+                                                                    <div key={idx} className={`${isDarkTheme ? 'border-orange-700 bg-gray-900' : 'border-orange-200 bg-orange-50'} border rounded-lg p-4`}>
                                                                         <div className="flex items-center justify-between">
-                                                                            <h4 className="text-base font-semibold text-gray-900">
+                                                                            <h4 className={`text-base font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
                                                                                 {item.type === 'index' ? '📦' : '📄'} 
-                                                                                <code className="ml-2 px-2 py-1 bg-white rounded text-sm">{item.name}</code>
+                                                                                <code className={`ml-2 px-2 py-1 rounded text-sm ${isDarkTheme ? 'bg-gray-800 text-orange-200' : 'bg-white text-gray-900'}`}>{item.name}</code>
                                                                             </h4>
-                                                                            <span className="text-xs text-gray-500">{item.type}</span>
+                                                                            <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{item.type}</span>
                                                                         </div>
                                                                         {item.reason && (
-                                                                            <p className="text-sm text-gray-600 mt-2">{item.reason}</p>
+                                                                            <p className={`text-sm mt-2 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>{item.reason}</p>
                                                                         )}
+                                                                        <div className="mt-3 flex flex-wrap gap-2">
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    setChatInput(`Investigate this unknown Splunk ${item.type || 'entity'} and explain what it is, whether it is expected, and how to validate it:\n\nName: ${item.name || 'unknown'}\nReason: ${item.reason || 'not classified in current model'}`);
+                                                                                    setIsChatOpen(true);
+                                                                                    closeSummaryModal();
+                                                                                }}
+                                                                                className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 text-white text-xs rounded"
+                                                                            >
+                                                                                Investigate in Chat
+                                                                            </button>
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    const entityType = (item.type || '').toLowerCase();
+                                                                                    const entityName = item.name || '';
+                                                                                    const suggestedSPL = entityType === 'index'
+                                                                                        ? `index=${entityName} | stats count by sourcetype host | sort - count`
+                                                                                        : `index=* sourcetype=${entityName} | stats count by index host | sort - count`;
+                                                                                    setChatInput(`Create and explain a validation workflow for this unknown entity. Start with this SPL and improve it if needed:\n\n${suggestedSPL}`);
+                                                                                    setIsChatOpen(true);
+                                                                                    closeSummaryModal();
+                                                                                }}
+                                                                                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded"
+                                                                            >
+                                                                                Build Validation Query
+                                                                            </button>
+                                                                        </div>
                                                                     </div>
                                                                 ))}
                                                                 {summaryData.unknown_data.length > 3 && (
-                                                                    <p className="text-sm text-gray-500 text-center">
+                                                                    <p className={`text-sm text-center ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                                                         And {summaryData.unknown_data.length - 3} more...
                                                                     </p>
                                                                 )}
@@ -7635,9 +11671,28 @@ def get_frontend_html():
                                             
                                             {/* SPL Queries Tab */}
                                             {activeTab === 'queries' && (
-                                                <div>
+                                                <div className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
+                                                    {summaryData.risk_register && summaryData.risk_register.length > 0 && (
+                                                        <div className={`mb-4 rounded-lg p-4 border ${isDarkTheme ? 'bg-red-950 border-red-700' : 'bg-red-50 border-red-200'}`}>
+                                                            <h4 className={`text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-red-200' : 'text-red-900'}`}>
+                                                                <i className="fas fa-shield-alt mr-2"></i>
+                                                                Risk-Linked Query Focus
+                                                            </h4>
+                                                            <p className={`text-sm mb-3 ${isDarkTheme ? 'text-red-300' : 'text-red-800'}`}>
+                                                                Prioritize queries that validate or reduce the highest-severity risks discovered in this session.
+                                                            </p>
+                                                            <div className="space-y-1">
+                                                                {summaryData.risk_register.slice(0, 3).map((risk, idx) => (
+                                                                    <div key={idx} className={`text-xs rounded px-3 py-2 border ${isDarkTheme ? 'text-red-200 bg-gray-900 border-red-800' : 'text-red-900 bg-white border-red-200'}`}>
+                                                                        <span className="font-semibold">{(risk.severity || 'medium').toString().toUpperCase()}:</span> {risk.risk || 'Operational risk'}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+
                                                     <div className="flex items-center justify-between mb-4">
-                                                        <h3 className="text-xl font-semibold text-gray-900 flex items-center">
+                                                        <h3 className={`text-xl font-semibold flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
                                                             <i className="fas fa-code text-purple-600 mr-2"></i>
                                                             Ready-to-Use SPL Queries ({summaryData.spl_queries.filter(q => 
                                                                 queryFilter === 'all' || q.query_source === queryFilter
@@ -7651,7 +11706,7 @@ def get_frontend_html():
                                                                 className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors ${
                                                                     queryFilter === 'all' 
                                                                         ? 'bg-indigo-600 text-white' 
-                                                                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                                        : (isDarkTheme ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')
                                                                 }`}
                                                             >
                                                                 All ({summaryData.spl_queries.length})
@@ -7661,7 +11716,7 @@ def get_frontend_html():
                                                                 className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors flex items-center space-x-1 ${
                                                                     queryFilter === 'ai_finding' 
                                                                         ? 'bg-purple-600 text-white' 
-                                                                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                                        : (isDarkTheme ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')
                                                                 }`}
                                                             >
                                                                 <span>⚡</span>
@@ -7672,7 +11727,7 @@ def get_frontend_html():
                                                                 className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors flex items-center space-x-1 ${
                                                                     queryFilter === 'template' 
                                                                         ? 'bg-blue-600 text-white' 
-                                                                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                                                                        : (isDarkTheme ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')
                                                                 }`}
                                                             >
                                                                 <span>📋</span>
@@ -7686,10 +11741,10 @@ def get_frontend_html():
                                                             .filter(query => queryFilter === 'all' || query.query_source === queryFilter)
                                                             .map((query, idx) => (
                                                             <div key={idx} className={`border rounded-lg p-5 hover:shadow-md transition-shadow ${
-                                                                query.priority?.startsWith('🔴') ? 'border-red-300 bg-red-50' :
-                                                                query.priority?.startsWith('🟠') ? 'border-orange-300 bg-orange-50' :
-                                                                query.priority?.startsWith('🟡') ? 'border-yellow-300 bg-yellow-50' :
-                                                                'border-gray-200'
+                                                                query.priority?.startsWith('🔴') ? (isDarkTheme ? 'border-red-700 bg-red-950' : 'border-red-300 bg-red-50') :
+                                                                query.priority?.startsWith('🟠') ? (isDarkTheme ? 'border-orange-700 bg-orange-950' : 'border-orange-300 bg-orange-50') :
+                                                                query.priority?.startsWith('🟡') ? (isDarkTheme ? 'border-yellow-700 bg-yellow-950' : 'border-yellow-300 bg-yellow-50') :
+                                                                (isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white')
                                                             }`}>
                                                                 {/* Priority Badge */}
                                                                 {query.priority && (
@@ -7697,7 +11752,7 @@ def get_frontend_html():
                                                                         <span className={`px-3 py-1 text-xs font-bold rounded-full ${
                                                                             query.priority.startsWith('🔴') ? 'bg-red-600 text-white' :
                                                                             query.priority.startsWith('🟠') ? 'bg-orange-600 text-white' :
-                                                                            query.priority.startsWith('🟡') ? 'bg-yellow-600 text-white' :
+                                                                            query.priority.startsWith('🟡') ? 'bg-yellow-500 text-gray-900' :
                                                                             'bg-gray-600 text-white'
                                                                         }`}>
                                                                             {query.priority}
@@ -7718,29 +11773,38 @@ def get_frontend_html():
                                                                 <div className="flex justify-between items-start mb-3">
                                                                     <div className="flex-1">
                                                                         <div className="flex items-center space-x-2 mb-2">
-                                                                            <h4 className="text-lg font-semibold text-gray-900">{query.title}</h4>
+                                                                            <h4 className={`text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{query.title}</h4>
                                                                             <span className={`px-2 py-1 text-xs rounded-full ${
-                                                                                query.category === 'Security & Compliance' ? 'bg-red-100 text-red-700' :
-                                                                                query.category === 'Infrastructure & Performance' ? 'bg-blue-100 text-blue-700' :
-                                                                                query.category === 'Capacity Planning' ? 'bg-green-100 text-green-700' :
-                                                                                'bg-gray-100 text-gray-700'
+                                                                                query.category === 'Security & Compliance' ? (isDarkTheme ? 'bg-red-900 text-red-200' : 'bg-red-100 text-red-700') :
+                                                                                query.category === 'Infrastructure & Performance' ? (isDarkTheme ? 'bg-blue-900 text-blue-200' : 'bg-blue-100 text-blue-700') :
+                                                                                query.category === 'Capacity Planning' ? (isDarkTheme ? 'bg-green-900 text-green-200' : 'bg-green-100 text-green-700') :
+                                                                                (isDarkTheme ? 'bg-gray-700 text-gray-200' : 'bg-gray-100 text-gray-700')
                                                                             }`}>
                                                                                 {query.category}
                                                                             </span>
-                                                                            <span className="px-2 py-1 text-xs bg-purple-100 text-purple-700 rounded-full">
+                                                                            <span className={`px-2 py-1 text-xs rounded-full ${isDarkTheme ? 'bg-purple-900 text-purple-200' : 'bg-purple-100 text-purple-700'}`}>
                                                                                 {query.difficulty}
                                                                             </span>
                                                                         </div>
-                                                                        <p className="text-sm text-gray-600 mb-2">{query.description}</p>
+                                                                        <p className={`text-sm mb-2 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>{query.description}</p>
                                                                         
                                                                         {/* Finding Reference */}
                                                                         {query.finding_reference && (
-                                                                            <div className="mt-2 p-2 bg-indigo-50 border-l-2 border-indigo-600 rounded-r text-xs text-indigo-900">
+                                                                            <div className={`mt-2 p-2 border-l-2 rounded-r text-xs ${isDarkTheme ? 'bg-indigo-950 border-indigo-500 text-indigo-200' : 'bg-indigo-50 border-indigo-600 text-indigo-900'}`}>
                                                                                 <strong>📋 Discovery Finding:</strong> {query.finding_reference}
                                                                             </div>
                                                                         )}
+                                                                        {query.environment_evidence && query.environment_evidence.length > 0 && (
+                                                                            <div className="mt-2 flex flex-wrap gap-2">
+                                                                                {query.environment_evidence.map((evidence, evidenceIdx) => (
+                                                                                    <span key={evidenceIdx} className={`px-2 py-1 text-xs rounded-full border ${isDarkTheme ? 'bg-emerald-900 text-emerald-200 border-emerald-700' : 'bg-emerald-100 text-emerald-800 border-emerald-300'}`}>
+                                                                                        {evidence}
+                                                                                    </span>
+                                                                                ))}
+                                                                            </div>
+                                                                        )}
                                                                         
-                                                                        <div className="flex items-center space-x-4 text-xs text-gray-500 mt-2">
+                                                                        <div className={`flex items-center space-x-4 text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                                                             <span><i className="fas fa-clock mr-1"></i>{query.execution_time}</span>
                                                                             <span><i className="fas fa-chart-line mr-1"></i>{query.use_case}</span>
                                                                         </div>
@@ -7771,7 +11835,7 @@ def get_frontend_html():
                                                                 </div>
                                                                 
                                                                 <details className="mt-3">
-                                                                    <summary className="cursor-pointer text-sm font-medium text-indigo-600 hover:text-indigo-800">
+                                                                    <summary className={`cursor-pointer text-sm font-medium ${isDarkTheme ? 'text-indigo-300 hover:text-indigo-200' : 'text-indigo-600 hover:text-indigo-800'}`}>
                                                                         <i className="fas fa-code mr-1"></i>
                                                                         View SPL Code
                                                                     </summary>
@@ -7781,8 +11845,8 @@ def get_frontend_html():
                                                                 </details>
                                                                 
                                                                 {query.business_value && (
-                                                                    <div className="mt-3 p-3 bg-yellow-50 border-l-4 border-yellow-400 rounded-r">
-                                                                        <p className="text-sm text-yellow-900">
+                                                                    <div className={`mt-3 p-3 border-l-4 rounded-r ${isDarkTheme ? 'bg-yellow-950 border-yellow-600' : 'bg-yellow-50 border-yellow-400'}`}>
+                                                                        <p className={`text-sm ${isDarkTheme ? 'text-yellow-200' : 'text-yellow-900'}`}>
                                                                             <i className="fas fa-lightbulb mr-1"></i>
                                                                             <strong>Business Value:</strong> {query.business_value}
                                                                         </p>
@@ -7796,15 +11860,32 @@ def get_frontend_html():
                                             
                                             {/* Admin Tasks Tab */}
                                             {activeTab === 'tasks' && (
-                                                <div>
+                                                <div className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
+                                                    {summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && (
+                                                        <div className={`mb-5 rounded-lg p-4 border ${isDarkTheme ? 'bg-purple-950 border-purple-700' : 'bg-purple-50 border-purple-200'}`}>
+                                                            <h4 className={`text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-purple-200' : 'text-purple-900'}`}>
+                                                                <i className="fas fa-sync-alt mr-2"></i>
+                                                                Recursive Execution Guidance
+                                                            </h4>
+                                                            <div className="space-y-2">
+                                                                {summaryData.recursive_investigations.slice(0, 2).map((loop, idx) => (
+                                                                    <div key={idx} className={`rounded p-3 text-xs border ${isDarkTheme ? 'bg-gray-900 border-purple-800 text-purple-200' : 'bg-white border-purple-200 text-purple-900'}`}>
+                                                                        <div className="font-semibold">{loop.loop || `Loop ${idx + 1}`}</div>
+                                                                        <div className="mt-1"><strong>Trigger:</strong> {loop.next_iteration_trigger || 'N/A'}</div>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+
                                                     {summaryData.admin_tasks && summaryData.admin_tasks.length > 0 ? (
                                                         <div>
                                                             <div className="mb-6">
-                                                                <h3 className="text-2xl font-bold text-gray-900 mb-2 flex items-center">
+                                                                <h3 className={`text-2xl font-bold mb-2 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
                                                                     <i className="fas fa-tasks text-indigo-600 mr-3"></i>
                                                                     Recommended Implementation Tasks
                                                                 </h3>
-                                                                <p className="text-gray-600">
+                                                                <p className={isDarkTheme ? 'text-gray-300' : 'text-gray-600'}>
                                                                     Prioritized tasks based on your environment analysis. Each includes step-by-step guidance and verification queries.
                                                                 </p>
                                                             </div>
@@ -7816,14 +11897,14 @@ def get_frontend_html():
                                                                     
                                                                     return (
                                                                     <div key={idx} className={`border-2 rounded-lg overflow-hidden transition-all ${
-                                                                        progress.status === 'completed' ? 'border-green-400 bg-green-50 opacity-90' :
-                                                                        progress.status === 'in-progress' ? 'border-indigo-400 bg-indigo-50' :
-                                                                        task.priority === 'HIGH' ? 'border-red-300 bg-red-50' :
-                                                                        task.priority === 'MEDIUM' ? 'border-orange-300 bg-orange-50' :
-                                                                        'border-yellow-300 bg-yellow-50'
+                                                                        progress.status === 'completed' ? (isDarkTheme ? 'border-green-600 bg-green-950 opacity-95' : 'border-green-400 bg-green-50 opacity-90') :
+                                                                        progress.status === 'in-progress' ? (isDarkTheme ? 'border-indigo-600 bg-indigo-950' : 'border-indigo-400 bg-indigo-50') :
+                                                                        task.priority === 'HIGH' ? (isDarkTheme ? 'border-red-700 bg-red-950' : 'border-red-300 bg-red-50') :
+                                                                        task.priority === 'MEDIUM' ? (isDarkTheme ? 'border-orange-700 bg-orange-950' : 'border-orange-300 bg-orange-50') :
+                                                                        (isDarkTheme ? 'border-yellow-700 bg-yellow-950' : 'border-yellow-300 bg-yellow-50')
                                                                     }`}>
                                                                         {/* Task Header */}
-                                                                        <div className="p-5 bg-white border-b border-gray-200">
+                                                                        <div className={`p-5 border-b ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
                                                                             <div className="flex items-start justify-between mb-3">
                                                                                 <div className="flex-1">
                                                                                     <div className="flex items-center gap-2 mb-2 flex-wrap">
@@ -7843,7 +11924,7 @@ def get_frontend_html():
                                                                                         <span className={`px-3 py-1 text-xs font-bold rounded-full ${
                                                                                             task.priority === 'HIGH' ? 'bg-red-600 text-white' :
                                                                                             task.priority === 'MEDIUM' ? 'bg-orange-600 text-white' :
-                                                                                            'bg-yellow-600 text-white'
+                                                                                            'bg-yellow-500 text-gray-900'
                                                                                         }`}>
                                                                                             {task.priority === 'HIGH' ? '🔴 HIGH' : 
                                                                                              task.priority === 'MEDIUM' ? '🟠 MEDIUM' : '🟡 LOW'} PRIORITY
@@ -7851,34 +11932,34 @@ def get_frontend_html():
                                                                                         
                                                                                         {/* Category Badge */}
                                                                                         <span className={`px-2 py-1 text-xs font-semibold rounded-full ${
-                                                                                            task.category === 'Security' ? 'bg-red-100 text-red-700' :
-                                                                                            task.category === 'Performance' ? 'bg-blue-100 text-blue-700' :
-                                                                                            task.category === 'Compliance' ? 'bg-purple-100 text-purple-700' :
-                                                                                            task.category === 'Data Quality' ? 'bg-green-100 text-green-700' :
-                                                                                            'bg-gray-100 text-gray-700'
+                                                                                            task.category === 'Security' ? (isDarkTheme ? 'bg-red-900 text-red-200' : 'bg-red-100 text-red-700') :
+                                                                                            task.category === 'Performance' ? (isDarkTheme ? 'bg-blue-900 text-blue-200' : 'bg-blue-100 text-blue-700') :
+                                                                                            task.category === 'Compliance' ? (isDarkTheme ? 'bg-purple-900 text-purple-200' : 'bg-purple-100 text-purple-700') :
+                                                                                            task.category === 'Data Quality' ? (isDarkTheme ? 'bg-green-900 text-green-200' : 'bg-green-100 text-green-700') :
+                                                                                            (isDarkTheme ? 'bg-gray-700 text-gray-200' : 'bg-gray-100 text-gray-700')
                                                                                         }`}>
                                                                                             {task.category}
                                                                                         </span>
                                                                                         
                                                                                         {/* Time Estimate */}
                                                                                         {task.estimated_time && (
-                                                                                            <span className="px-2 py-1 text-xs bg-indigo-100 text-indigo-700 rounded-full">
+                                                                                            <span className={`px-2 py-1 text-xs rounded-full ${isDarkTheme ? 'bg-indigo-900 text-indigo-200' : 'bg-indigo-100 text-indigo-700'}`}>
                                                                                                 <i className="fas fa-clock mr-1"></i>
                                                                                                 {task.estimated_time}
                                                                                             </span>
                                                                                         )}
                                                                                     </div>
                                                                                     
-                                                                                    <h4 className="text-xl font-bold text-gray-900 mb-2">{task.title}</h4>
-                                                                                    <p className="text-sm text-gray-700">{task.description}</p>
+                                                                                    <h4 className={`text-xl font-bold mb-2 ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{task.title}</h4>
+                                                                                    <p className={`text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>{task.description}</p>
                                                                                     
                                                                                     {/* Progress Bar */}
                                                                                     <div className="mt-3">
-                                                                                        <div className="flex items-center justify-between text-xs text-gray-600 mb-1">
+                                                                                        <div className={`flex items-center justify-between text-xs mb-1 ${isDarkTheme ? 'text-gray-400' : 'text-gray-600'}`}>
                                                                                             <span className="font-medium">Progress: {completionPct}%</span>
                                                                                             <span>{progress.completedSteps.length} / {task.steps?.length || 0} steps</span>
                                                                                         </div>
-                                                                                        <div className="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                                                                                        <div className={`w-full rounded-full h-2 overflow-hidden ${isDarkTheme ? 'bg-gray-700' : 'bg-gray-200'}`}>
                                                                                             <div 
                                                                                                 className={`h-full rounded-full transition-all duration-500 ${
                                                                                                     completionPct === 100 ? 'bg-green-500' :
@@ -7893,8 +11974,8 @@ def get_frontend_html():
                                                                             
                                                                             {/* Impact */}
                                                                             {task.impact && (
-                                                                                <div className="mt-3 p-3 bg-green-50 border-l-4 border-green-500 rounded-r">
-                                                                                    <p className="text-sm text-green-900">
+                                                                                <div className={`mt-3 p-3 border-l-4 rounded-r ${isDarkTheme ? 'bg-green-950 border-green-600' : 'bg-green-50 border-green-500'}`}>
+                                                                                    <p className={`text-sm ${isDarkTheme ? 'text-green-200' : 'text-green-900'}`}>
                                                                                         <i className="fas fa-chart-line mr-2"></i>
                                                                                         <strong>Impact:</strong> {task.impact}
                                                                                     </p>
@@ -7904,27 +11985,27 @@ def get_frontend_html():
                                                                         
                                                                         {/* Task Details - Expandable */}
                                                                         <details className="group" open={progress.status === 'in-progress'}>
-                                                                            <summary className="cursor-pointer bg-gradient-to-r from-indigo-50 to-purple-50 px-5 py-3 hover:from-indigo-100 hover:to-purple-100 transition-colors list-none flex items-center justify-between">
-                                                                                <span className="font-semibold text-gray-900 flex items-center">
+                                                                            <summary className={`cursor-pointer px-5 py-3 transition-colors list-none flex items-center justify-between ${isDarkTheme ? 'bg-gradient-to-r from-indigo-950 to-purple-950 hover:from-indigo-900 hover:to-purple-900' : 'bg-gradient-to-r from-indigo-50 to-purple-50 hover:from-indigo-100 hover:to-purple-100'}`}>
+                                                                                <span className={`font-semibold flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
                                                                                     <i className="fas fa-chevron-right mr-2 group-open:rotate-90 transition-transform"></i>
                                                                                     Implementation Steps
                                                                                 </span>
-                                                                                <span className="text-sm text-gray-600">
+                                                                                <span className={`text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                                                                     {task.steps?.length || 0} steps
                                                                                 </span>
                                                                             </summary>
                                                                             
-                                                                            <div className="p-5 bg-white space-y-4">
+                                                                            <div className={`p-5 space-y-4 ${isDarkTheme ? 'bg-gray-900' : 'bg-white'}`}>
                                                                                 {/* Prerequisites */}
                                                                                 {task.prerequisites && task.prerequisites.length > 0 && (
                                                                                     <div className="mb-4">
-                                                                                        <h5 className="font-semibold text-gray-900 mb-2 flex items-center">
+                                                                                        <h5 className={`font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
                                                                                             <i className="fas fa-list-check mr-2 text-blue-600"></i>
                                                                                             Prerequisites
                                                                                         </h5>
                                                                                         <ul className="space-y-1">
                                                                                             {task.prerequisites.map((prereq, pIdx) => (
-                                                                                                <li key={pIdx} className="text-sm text-gray-700 flex items-start">
+                                                                                                <li key={pIdx} className={`text-sm flex items-start ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>
                                                                                                     <i className="fas fa-angle-right mr-2 mt-1 text-blue-500"></i>
                                                                                                     <span>{prereq}</span>
                                                                                                 </li>
@@ -7935,7 +12016,7 @@ def get_frontend_html():
                                                                                 
                                                                                 {/* Implementation Steps with Checkboxes */}
                                                                                 <div>
-                                                                                    <h5 className="font-semibold text-gray-900 mb-3 flex items-center">
+                                                                                    <h5 className={`font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
                                                                                         <i className="fas fa-clipboard-list mr-2 text-indigo-600"></i>
                                                                                         Implementation Steps
                                                                                     </h5>
@@ -7945,7 +12026,7 @@ def get_frontend_html():
                                                                                             
                                                                                             return (
                                                                                             <div key={sIdx} className={`border-2 rounded-lg p-4 transition-all ${
-                                                                                                isCompleted ? 'border-green-300 bg-green-50' : 'border-gray-200 bg-gray-50'
+                                                                                                isCompleted ? (isDarkTheme ? 'border-green-700 bg-green-950' : 'border-green-300 bg-green-50') : (isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50')
                                                                                             }`}>
                                                                                                 <div className="flex items-start gap-3">
                                                                                                     {/* Checkbox */}
@@ -7961,7 +12042,7 @@ def get_frontend_html():
                                                                                                     </div>
                                                                                                     <div className="flex-1">
                                                                                                         <p className={`text-sm font-medium ${
-                                                                                                            isCompleted ? 'text-gray-500 line-through' : 'text-gray-900'
+                                                                                                            isCompleted ? (isDarkTheme ? 'text-gray-500 line-through' : 'text-gray-500 line-through') : (isDarkTheme ? 'text-gray-100' : 'text-gray-900')
                                                                                                         }`}>{step.action}</p>
                                                                                                     </div>
                                                                                                 </div>
@@ -7970,7 +12051,7 @@ def get_frontend_html():
                                                                                                 {step.spl && (
                                                                                                     <div className="mt-3 ml-16">
                                                                                                         <div className="flex items-center justify-between mb-1">
-                                                                                                            <span className="text-xs font-semibold text-gray-600">SPL Query:</span>
+                                                                                                            <span className={`text-xs font-semibold ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>SPL Query:</span>
                                                                                                             <button
                                                                                                                 onClick={() => copyToClipboard(step.spl, 'Step SPL')}
                                                                                                                 className="px-2 py-1 bg-gray-700 hover:bg-gray-800 text-white rounded text-xs"
@@ -7992,9 +12073,9 @@ def get_frontend_html():
                                                                                 {/* Verification */}
                                                                                 {task.verification_spl && (
                                                                                     <div className="mt-4">
-                                                                                        <div className="p-4 bg-blue-50 border-l-4 border-blue-500 rounded-r">
+                                                                                        <div className={`p-4 border-l-4 rounded-r ${isDarkTheme ? 'bg-blue-950 border-blue-600' : 'bg-blue-50 border-blue-500'}`}>
                                                                                             <div className="flex items-center justify-between mb-2">
-                                                                                                <h5 className="font-semibold text-blue-900 flex items-center">
+                                                                                                <h5 className={`font-semibold flex items-center ${isDarkTheme ? 'text-blue-200' : 'text-blue-900'}`}>
                                                                                                     <i className="fas fa-check-circle mr-2"></i>
                                                                                                     Verification
                                                                                                 </h5>
@@ -8021,17 +12102,17 @@ def get_frontend_html():
                                                                                                 </button>
                                                                                             </div>
                                                                                             
-                                                                                            <p className="text-sm text-blue-800 mb-2">
+                                                                                            <p className={`text-sm mb-2 ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>
                                                                                                 <strong>Expected Outcome:</strong> {task.expected_outcome}
                                                                                             </p>
                                                                                             
                                                                                             <details className="mt-2">
-                                                                                                <summary className="cursor-pointer text-xs font-semibold text-blue-700 hover:text-blue-900">
+                                                                                                <summary className={`cursor-pointer text-xs font-semibold ${isDarkTheme ? 'text-blue-300 hover:text-blue-200' : 'text-blue-700 hover:text-blue-900'}`}>
                                                                                                     <i className="fas fa-code mr-1"></i>
                                                                                                     View Verification SPL
                                                                                                 </summary>
                                                                                                 <div className="mt-2 flex items-center justify-between mb-1">
-                                                                                                    <span className="text-xs text-blue-700"></span>
+                                                                                                    <span className={`text-xs ${isDarkTheme ? 'text-blue-300' : 'text-blue-700'}`}></span>
                                                                                                     <button
                                                                                                         onClick={() => copyToClipboard(task.verification_spl, 'Verification SPL')}
                                                                                                         className="px-2 py-1 bg-blue-700 hover:bg-blue-800 text-white rounded text-xs"
@@ -8067,7 +12148,7 @@ def get_frontend_html():
                                                                                                                 </span>
                                                                                                             )}
                                                                                                             {verResult.status === 'partial' && (
-                                                                                                                <span className="px-3 py-1 bg-yellow-600 text-white text-xs font-bold rounded-full">
+                                                                                                                <span className="px-3 py-1 bg-yellow-500 text-gray-900 text-xs font-bold rounded-full">
                                                                                                                     ⚠ PARTIAL SUCCESS
                                                                                                                 </span>
                                                                                                             )}
@@ -8089,10 +12170,10 @@ def get_frontend_html():
                                                                                                     
                                                                                                     {/* Message */}
                                                                                                     <p className={`text-sm mb-3 ${
-                                                                                                        verResult.status === 'success' ? 'text-green-900' :
-                                                                                                        verResult.status === 'partial' ? 'text-yellow-900' :
-                                                                                                        verResult.status === 'failed' ? 'text-red-900' :
-                                                                                                        'text-gray-900'
+                                                                                                            verResult.status === 'success' ? (isDarkTheme ? 'text-green-200' : 'text-green-900') :
+                                                                                                            verResult.status === 'partial' ? (isDarkTheme ? 'text-yellow-200' : 'text-yellow-900') :
+                                                                                                            verResult.status === 'failed' ? (isDarkTheme ? 'text-red-200' : 'text-red-900') :
+                                                                                                            (isDarkTheme ? 'text-gray-100' : 'text-gray-900')
                                                                                                     }`}>
                                                                                                         {verResult.message}
                                                                                                     </p>
@@ -8426,23 +12507,58 @@ def get_frontend_html():
                     {/* Settings Modal */}
                     {isSettingsOpen && config && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={closeSettings}>
-                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl h-5/6 flex flex-col" onClick={(e) => e.stopPropagation()}>
+                            <div className={`settings-modal-shell rounded-xl shadow-2xl w-full max-w-2xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800' : 'bg-white'}`} onClick={(e) => e.stopPropagation()}>
                                 {/* Header */}
-                                <div className="p-6 border-b border-gray-200 flex justify-between items-center">
+                                <div className={`p-6 border-b flex justify-between items-center ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
                                     <div className="flex items-center">
                                         <i className="fas fa-cog text-2xl text-indigo-600 mr-3"></i>
-                                        <h2 className="text-xl font-semibold text-gray-900">Settings</h2>
+                                        <h2 className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Settings</h2>
                                     </div>
-                                    <button onClick={closeSettings} className="text-gray-500 hover:text-gray-700">
+                                    <button onClick={closeSettings} className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-200' : 'text-gray-500 hover:text-gray-700'}`}>
                                         <i className="fas fa-times text-xl"></i>
                                     </button>
+                                </div>
+
+                                <div className={`px-6 py-4 border-b ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
+                                    <div className="flex items-center justify-between mb-3">
+                                        <h3 className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
+                                            <i className="fas fa-adjust mr-2 text-indigo-600"></i>
+                                            Appearance Theme
+                                        </h3>
+                                        <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
+                                            Active: {resolvedTheme}
+                                        </span>
+                                    </div>
+                                    <div className={`inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="group" aria-label="Theme preference">
+                                        <button
+                                            onClick={() => setThemePreference('light')}
+                                            className={`px-3 py-2 text-xs font-medium ${themePreference === 'light' ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
+                                        >
+                                            Light
+                                        </button>
+                                        <button
+                                            onClick={() => setThemePreference('dark')}
+                                            className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'dark' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
+                                        >
+                                            Dark
+                                        </button>
+                                        <button
+                                            onClick={() => setThemePreference('system')}
+                                            className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'system' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
+                                        >
+                                            System
+                                        </button>
+                                    </div>
+                                    <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
+                                        System mode follows your OS appearance preference automatically.
+                                    </p>
                                 </div>
                                 
                                 {/* Scrollable Content */}
                                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
                                     {/* MCP Configuration Vault */}
                                     <div>
-                                        <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg p-6 border-2 border-green-200">
+                                        <div className={`rounded-lg p-6 border-2 ${isDarkTheme ? 'bg-gray-800 border-green-700' : 'bg-gradient-to-r from-green-50 to-emerald-50 border-green-200'}`}>
                                             {/* Header */}
                                             <div className="mb-4">
                                                 <h3 className="text-lg font-semibold text-gray-900 mb-2">
@@ -8641,7 +12757,7 @@ def get_frontend_html():
                                     
                                     {/* LLM Credential Vault - Show First */}
                                     <div>
-                                        <div className="bg-gradient-to-r from-purple-50 to-indigo-50 rounded-lg p-6 border-2 border-purple-200">
+                                        <div className={`rounded-lg p-6 border-2 ${isDarkTheme ? 'bg-gray-800 border-purple-700' : 'bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200'}`}>
                                             {/* Header */}
                                             <div className="mb-4">
                                                 <h3 className="text-lg font-semibold text-gray-900 mb-2">
@@ -8721,7 +12837,7 @@ def get_frontend_html():
                                                 <div>
                                                     <label className="block text-sm font-medium text-gray-700 mb-1">Provider</label>
                                                     <select 
-                                                        defaultValue={config.llm.provider}
+                                                        value={selectedProvider}
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="llm-provider"
                                                         onChange={(e) => {
@@ -8730,30 +12846,40 @@ def get_frontend_html():
                                                         }}
                                                     >
                                                         <option value="openai">OpenAI</option>
+                                                        <option value="azure">Azure OpenAI</option>
+                                                        <option value="anthropic">Anthropic (Claude)</option>
+                                                        <option value="gemini">Google Gemini</option>
                                                         <option value="custom">Custom Endpoint</option>
                                                     </select>
                                                 </div>
-                                            {selectedProvider === 'custom' && (
+                                            {selectedProvider !== 'openai' && (
                                                 <div>
                                                     <label className="block text-sm font-medium text-gray-700 mb-1">
                                                         Endpoint URL
                                                         <span className="ml-2 text-xs text-gray-500">
-                                                            (used exactly as configured)
+                                                            ({selectedProvider === 'custom' ? 'used exactly as configured' : 'base URL or full API path'})
                                                         </span>
                                                     </label>
                                                     <input 
                                                         type="text" 
                                                         defaultValue={config.llm.endpoint_url || ''}
-                                                        placeholder="http://localhost:8000/v1/chat/completions"
+                                                        placeholder={
+                                                            selectedProvider === 'azure' ? 'https://YOUR-RESOURCE.openai.azure.com' :
+                                                            selectedProvider === 'anthropic' ? 'https://api.anthropic.com (optional)' :
+                                                            selectedProvider === 'gemini' ? 'https://generativelanguage.googleapis.com (optional)' :
+                                                            'http://localhost:8000/v1/chat/completions'
+                                                        }
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="llm-endpoint-url"
                                                         onChange={handleSettingsChange}
                                                     />
-                                                    <p className="mt-1 text-xs text-gray-500">
-                                                        ✅ <strong>Full API Path (Recommended):</strong> <span className="font-mono">http://localhost:8000/v1/chat/completions</span><br/>
-                                                        ⚠️ <strong>Base URL (Slower):</strong> <span className="font-mono">http://localhost:8000</span> - requires auto-detection<br/>
-                                                        <span className="italic">URL is used exactly as entered. No automatic path manipulation.</span>
-                                                    </p>
+                                                    {selectedProvider === 'custom' && (
+                                                        <p className="mt-1 text-xs text-gray-500">
+                                                            ✅ <strong>Full API Path (Recommended):</strong> <span className="font-mono">http://localhost:8000/v1/chat/completions</span><br/>
+                                                            ⚠️ <strong>Base URL (Slower):</strong> <span className="font-mono">http://localhost:8000</span> - requires auto-detection<br/>
+                                                            <span className="italic">URL is used exactly as entered. No automatic path manipulation.</span>
+                                                        </p>
+                                                    )}
                                                 </div>
                                             )}
                                             <div>
@@ -8833,15 +12959,21 @@ def get_frontend_html():
                                                     <input 
                                                         type="text" 
                                                         defaultValue={config.llm.model}
-                                                        placeholder={selectedProvider === 'openai' ? 'gpt-4o' : 'e.g., llama3.2:3b'}
+                                                        placeholder={
+                                                            selectedProvider === 'openai' ? 'gpt-4o' :
+                                                            selectedProvider === 'azure' ? 'your-azure-deployment-name' :
+                                                            selectedProvider === 'anthropic' ? 'claude-3-5-sonnet-latest' :
+                                                            selectedProvider === 'gemini' ? 'gemini-1.5-pro' :
+                                                            'e.g., llama3.2:3b'
+                                                        }
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="llm-model"
                                                         onChange={handleSettingsChange}
                                                     />
                                                 )}
-                                                {selectedProvider === 'custom' && (
+                                                {selectedProvider !== 'openai' && (
                                                     <p className="mt-1 text-xs text-gray-500 italic">
-                                                        Tip: Click "Fetch Models" to auto-discover available models from your endpoint
+                                                        Tip: Click "Fetch Models" to query provider model/deployment inventory where supported
                                                     </p>
                                                 )}
                                             </div>
@@ -8920,7 +13052,7 @@ def get_frontend_html():
                                                                         provider: provider,
                                                                         api_key: document.getElementById('llm-api-key').value || undefined,
                                                                         model: document.getElementById('llm-model').value,
-                                                                        endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : undefined,
+                                                                        endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
                                                                         max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
                                                                         temperature: parseFloat(document.getElementById('llm-temperature').value)
                                                                     }
@@ -8928,7 +13060,20 @@ def get_frontend_html():
                                                             });
                                                             
                                                             // Then test the connection
-                                                            const response = await fetch('/api/llm/test-connection', { method: 'POST' });
+                                                            const response = await fetch('/api/llm/test-connection', {
+                                                                method: 'POST',
+                                                                headers: { 'Content-Type': 'application/json' },
+                                                                body: JSON.stringify({
+                                                                    llm: {
+                                                                        provider: provider,
+                                                                        api_key: document.getElementById('llm-api-key').value || undefined,
+                                                                        model: document.getElementById('llm-model').value,
+                                                                        endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
+                                                                        max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
+                                                                        temperature: parseFloat(document.getElementById('llm-temperature').value)
+                                                                    }
+                                                                })
+                                                            });
                                                             const result = await response.json();
                                                             
                                                             let html = '<div className="space-y-2">';
@@ -9057,7 +13202,7 @@ def get_frontend_html():
                                 </div>
                                 
                                 {/* Footer */}
-                                <div className="p-6 border-t border-gray-200 bg-gray-50">
+                                <div className={`p-6 border-t ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
                                     <div className="flex justify-between items-center">
                                         <button
                                             onClick={async () => {
@@ -9090,7 +13235,7 @@ def get_frontend_html():
                                                     alert('Failed to load dependencies: ' + err.message);
                                                 }
                                             }}
-                                            className="px-4 py-2 text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg font-medium"
+                                            className={`px-4 py-2 text-sm rounded-lg font-medium ${isDarkTheme ? 'bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'}`}
                                         >
                                             <i className="fas fa-list mr-2"></i>
                                             View Dependencies
@@ -9128,7 +13273,7 @@ def get_frontend_html():
                                                         provider: provider,
                                                         api_key: (apiKeyEl ? apiKeyEl.value : config.llm.api_key) || undefined,
                                                         model: (modelInput ? modelInput.value : selectedModel) || config.llm.model,
-                                                        endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : config.llm.endpoint_url,
+                                                        endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
                                                         max_tokens: maxTokensEl ? parseInt(maxTokensEl.value) : config.llm.max_tokens,
                                                         temperature: tempEl ? parseFloat(tempEl.value) : config.llm.temperature
                                                     },
@@ -9152,7 +13297,7 @@ def get_frontend_html():
                     {/* Credential Save Modal */}
                     {isCredentialModalOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
+                            <div className={`rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
                                 {/* Header */}
                                 <div className={`px-6 py-4 rounded-t-xl ${isUpdateMode ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white'}`}>
                                     <div className="flex items-center justify-between">
@@ -9189,13 +13334,13 @@ def get_frontend_html():
                                             </div>
                                         </div>
                                     ) : (
-                                        <p className="text-sm text-gray-600 mb-4">
+                                        <p className={`text-sm mb-4 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                             Save your current LLM settings as a named credential for quick access later.
                                         </p>
                                     )}
                                     
                                     <div className="mb-6">
-                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <label className={`block text-sm font-medium mb-2 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
                                             Credential Name <span className="text-red-500">*</span>
                                         </label>
                                         <input
@@ -9203,19 +13348,19 @@ def get_frontend_html():
                                             value={credentialName}
                                             onChange={(e) => setCredentialName(e.target.value)}
                                             placeholder="e.g., My OpenAI GPT-4, Local Llama Server"
-                                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                                            className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
                                             disabled={isUpdateMode}
                                             autoFocus={!isUpdateMode}
                                         />
                                         {isUpdateMode && (
-                                            <p className="text-xs text-gray-500 mt-1 italic">Credential name cannot be changed when updating</p>
+                                            <p className={`text-xs mt-1 italic ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>Credential name cannot be changed when updating</p>
                                         )}
                                     </div>
                                     
                                     {/* Preview */}
-                                    <div className="bg-gray-50 rounded-lg p-4 mb-6 border border-gray-200">
-                                        <h4 className="text-xs font-semibold text-gray-700 mb-2 uppercase tracking-wide">Current Settings Preview</h4>
-                                        <div className="space-y-1 text-sm text-gray-600">
+                                    <div className={`rounded-lg p-4 mb-6 border ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                                        <h4 className={`text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>Current Settings Preview</h4>
+                                        <div className={`space-y-1 text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                             <div><span className="font-medium">Provider:</span> {selectedProvider}</div>
                                             <div><span className="font-medium">Model:</span> {document.getElementById('llm-model')?.value || 'N/A'}</div>
                                             <div><span className="font-medium">Max Tokens:</span> {document.getElementById('llm-max-tokens')?.value || 'N/A'}</div>
@@ -9231,7 +13376,7 @@ def get_frontend_html():
                                                 setCredentialName('');
                                                 setIsUpdateMode(false);
                                             }}
-                                            className="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium transition-colors"
+                                            className={`flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}
                                         >
                                             Cancel
                                         </button>
@@ -9318,7 +13463,7 @@ def get_frontend_html():
                     {/* MCP Configuration Save Modal */}
                     {isMCPSaveModalOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
+                            <div className={`rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
                                 {/* Header */}
                                 <div className={`px-6 py-4 rounded-t-xl ${loadedMCPConfigName ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 text-white'}`}>
                                     <div className="flex items-center justify-between">
@@ -9355,13 +13500,13 @@ def get_frontend_html():
                                             </div>
                                         </div>
                                     ) : (
-                                        <p className="text-sm text-gray-600 mb-4">
+                                        <p className={`text-sm mb-4 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                             Save your current MCP server settings as a named configuration for quick access later.
                                         </p>
                                     )}
                                     
                                     <div className="mb-4">
-                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <label className={`block text-sm font-medium mb-2 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
                                             Configuration Name <span className="text-red-500">*</span>
                                         </label>
                                         <input
@@ -9369,17 +13514,17 @@ def get_frontend_html():
                                             value={mcpConfigName}
                                             onChange={(e) => setMCPConfigName(e.target.value)}
                                             placeholder="e.g., Production Splunk, Dev Environment"
-                                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                            className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
                                             disabled={loadedMCPConfigName}
                                             autoFocus={!loadedMCPConfigName}
                                         />
                                         {loadedMCPConfigName && (
-                                            <p className="text-xs text-gray-500 mt-1 italic">Configuration name cannot be changed when updating</p>
+                                            <p className={`text-xs mt-1 italic ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>Configuration name cannot be changed when updating</p>
                                         )}
                                     </div>
                                     
                                     <div className="mb-6">
-                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        <label className={`block text-sm font-medium mb-2 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
                                             Description (Optional)
                                         </label>
                                         <input
@@ -9387,14 +13532,14 @@ def get_frontend_html():
                                             value={mcpConfigDescription}
                                             onChange={(e) => setMCPConfigDescription(e.target.value)}
                                             placeholder="e.g., Main production Splunk server"
-                                            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                            className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
                                         />
                                     </div>
                                     
                                     {/* Preview */}
-                                    <div className="bg-gray-50 rounded-lg p-4 mb-6 border border-gray-200">
-                                        <h4 className="text-xs font-semibold text-gray-700 mb-2 uppercase tracking-wide">Current Settings Preview</h4>
-                                        <div className="space-y-1 text-sm text-gray-600">
+                                    <div className={`rounded-lg p-4 mb-6 border ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                                        <h4 className={`text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>Current Settings Preview</h4>
+                                        <div className={`space-y-1 text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                             <div><span className="font-medium">URL:</span> {config?.mcp?.url || 'N/A'}</div>
                                             <div><span className="font-medium">Token:</span> {config?.mcp?.token ? '***' : 'Not set'}</div>
                                             <div><span className="font-medium">Verify SSL:</span> {config?.mcp?.verify_ssl ? 'Yes' : 'No'}</div>
@@ -9409,7 +13554,7 @@ def get_frontend_html():
                                                 setMCPConfigName('');
                                                 setMCPConfigDescription('');
                                             }}
-                                            className="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium transition-colors"
+                                            className={`flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}
                                         >
                                             Cancel
                                         </button>
@@ -9520,19 +13665,138 @@ def get_frontend_html():
 if __name__ == "__main__":
     import sys
     import io
+
+    def _is_port_available(port: int, host: str = "0.0.0.0") -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _find_listener_pid_windows(port: int) -> Optional[int]:
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode != 0:
+                return None
+
+            for line in result.stdout.splitlines():
+                normalized = " ".join(line.split())
+                if not normalized:
+                    continue
+                if f":{port}" not in normalized:
+                    continue
+                if "LISTENING" not in normalized.upper():
+                    continue
+
+                parts = normalized.split(" ")
+                if len(parts) < 5:
+                    continue
+
+                try:
+                    return int(parts[-1])
+                except ValueError:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def _get_process_commandline_windows(pid: int) -> str:
+        try:
+            ps_command = (
+                f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
+                f"if ($p) {{ $p.CommandLine }}"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode != 0:
+                return ""
+            return (result.stdout or "").strip()
+        except Exception:
+            return ""
+
+    def _is_safe_tool_owned_process(pid: int, workspace_root: str) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            if pid == os.getpid():
+                return False
+        except Exception:
+            pass
+
+        cmdline = _get_process_commandline_windows(pid).lower().replace("\\", "/")
+        if not cmdline:
+            return False
+
+        workspace_norm = workspace_root.lower().replace("\\", "/")
+        return ("web_app.py" in cmdline) and (workspace_norm in cmdline)
+
+    def _try_reclaim_preferred_port_windows(port: int, workspace_root: str) -> bool:
+        listener_pid = _find_listener_pid_windows(port)
+        if listener_pid is None:
+            return False
+
+        if not _is_safe_tool_owned_process(listener_pid, workspace_root):
+            return False
+
+        try:
+            os.kill(listener_pid, 9)
+            time.sleep(0.35)
+            return _is_port_available(port)
+        except Exception:
+            return False
+
+    def _resolve_startup_port(preferred_port: int = 8003, max_scan_ports: int = 20) -> int:
+        workspace_root = str(Path(__file__).resolve().parent.parent)
+
+        if _is_port_available(preferred_port):
+            return preferred_port
+
+        if sys.platform == "win32":
+            reclaimed = _try_reclaim_preferred_port_windows(preferred_port, workspace_root)
+            if reclaimed and _is_port_available(preferred_port):
+                return preferred_port
+
+        for candidate in range(preferred_port + 1, preferred_port + max_scan_ports + 1):
+            if _is_port_available(candidate):
+                return candidate
+
+        raise RuntimeError(
+            f"No open TCP port found in range {preferred_port}-{preferred_port + max_scan_ports}. "
+            f"Please free a port and retry."
+        )
     
     # Fix encoding issues on Windows
     if sys.platform == 'win32':
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+    startup_port = _resolve_startup_port(preferred_port=8003)
+    if startup_port != 8003:
+        print(f"Preferred port 8003 unavailable; using fallback port {startup_port}.")
     
     print("Starting Splunk MCP Discovery Tool Web Interface")
-    print("Access the interface at: http://localhost:8003")
-    print("WebSocket endpoint: ws://localhost:8003/ws")
+    print(f"Access the interface at: http://localhost:{startup_port}")
+    print(f"WebSocket endpoint: ws://localhost:{startup_port}/ws")
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
-        port=8003,
+        port=startup_port,
         log_level="info",
         reload=False  # Set to True for development
     )

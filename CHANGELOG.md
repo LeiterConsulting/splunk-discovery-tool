@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.1.0] - TBD (In Development)
 
+### 🧩 V2 Workspace & Summarization UX Hardening
+
+#### Added
+- **V2 Workspace Surfaces (UI + API integration)**
+  - Unified static top bar with Mission / Intelligence / Artifacts workflow tabs
+  - Intelligence workspace bindings to `/api/discovery/dashboard`, `/api/discovery/compare`, `/api/discovery/runbook`, and `/api/v2/intelligence`
+  - Artifacts workspace bindings to `/api/v2/artifacts` with V2-only artifact handling
+
+- **Summarization Context Enrichment** (`/summarize-session`)
+  - Environment extraction for indexes, sourcetypes, and hosts from V2 finding ledger
+  - Environment-aware SPL query anchoring and evidence tagging
+  - Context-engine fallback generation for both SPL queries and admin tasks
+  - Expanded V2 payload surfaces (`trend_signals`, `risk_register`, `recursive_investigations`, `vulnerability_hypotheses`)
+
+#### Changed
+- **Header Architecture**
+  - Removed legacy “Mission Control” title block
+  - Merged tab controls and action buttons into the top static header layout
+  - Reworked tab actions to trigger real workspace state transitions and refreshes
+
+- **Generated Reports/Artifacts Sidebar Behavior**
+  - Refined session row spacing and indentation
+  - Added clipping + min-width protections to prevent content overflow
+  - Improved action button stacking for constrained widths
+
+- **Summary Modal Progress Semantics**
+  - Normalized stage mapping to include `creating_summary`
+  - Added monotonic progress behavior during polling updates
+
+#### Fixed
+- **Dark Mode Readability**
+  - Corrected compile/progress screen contrast in summary modal
+  - Improved dark styling for SPL query and admin task tabs
+  - Updated discovery log card rendering for phase/success/error/warning/info/rate-limit/completion states
+  - Updated contrast for “Save LLM Credential” and “Save MCP Configuration” modals in dark theme
+
+- **Provider-Agnostic LLM Configuration & Testing**
+  - Normalized provider handling for `openai`, `azure`, `anthropic`, `gemini`, and `custom`
+  - Updated `/api/llm/list-models` and `/api/llm/test-connection` to provider-aware behavior
+  - Added custom endpoint candidate-path fallback for base URLs such as `/v1`
+
+- **Summarization Error Handling**
+  - Added missing `Tuple` typing import causing summarize-time runtime failure
+  - Hardened client-side summary fetch parsing for non-JSON 500 responses
+  - Improved surfaced error messages for failed summary requests
+
 ### 🚀 Phase 1: Resilience & Health Monitoring (CRITICAL)
 
 #### Added
@@ -50,14 +96,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Returns per-endpoint health metrics
 
 #### Testing
-- ✅ **Unit Tests**: 7/7 passing (`tests/test_health_monitor.py`)
+- ✅ **Unit Test Scope**: Core health-monitoring behaviors validated
   - Health status transitions
   - Adaptive timeout calculation
   - Payload size adaptation
   - Hung request detection
   - Consecutive failure handling
   - Retry delay calculation
-- ⚠️ **Integration Tests**: 3/6 passing (`tests/test_integration_health.py`)
+- ⚠️ **Integration Test Scope**: Partial pass with known mock-environment limits
   - HTTP 503 handling ✅
   - Timeout handling ⚠️ (needs mock server fixes)
   - Slow endpoint handling ⚠️ (needs mock server fixes)
