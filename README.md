@@ -1,4 +1,4 @@
-# 🔍 Splunk Discovery Tool (DT4SMS)
+# 🔍 Splunk Discovery Tool
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -89,6 +89,15 @@ src/discovery/v2_pipeline.py   V2 discovery pipeline + artifact packaging
 src/config_manager.py          Encrypted config manager
 output/                        Discovery and summary artifacts
 ```
+
+## 📚 Documentation
+
+Public-facing docs in this repository:
+- `README.md` — install, configure, run
+- `CHANGELOG.md` — release history and notable changes
+- `CONFIGURATION_VARIABLES.md` — configuration reference
+- `docs/DEVELOPER_REFERENCE.md` — developer extension/reference guide
+- `docs/V2_REWRITE_GUIDE.md` — V2 architecture and migration guidance
 
 ## 🛠️ Installer Commands
 

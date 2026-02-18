@@ -65,9 +65,18 @@ test_*.py
 test_*.sh
 
 # Development/Debugging
-DO NOT SENT TO GIT/
+DO NOT SEND TO GIT/
 *.backup*
 *.corrupted*
+
+# Internal documentation (not public-facing)
+AGENT_INTELLIGENCE_ANALYSIS.md
+DEPENDENCY_AUDIT.md
+DESIGN_SYSTEM.md
+PERFORMANCE_OPTIMIZATION.md
+PHASE1_TESTING_REPORT.md
+docs/THEME_SWITCH_PLAN.md
+docs/internal/
 
 # Environment
 .env
