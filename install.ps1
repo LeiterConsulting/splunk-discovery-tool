@@ -12,7 +12,8 @@ param(
     [switch]$Restart,
     [switch]$Status,
     [switch]$Uninstall,
-    [switch]$ForceYes
+    [switch]$ForceYes,
+    [switch]$PublicOnly
 )
 
 # Check PowerShell version (must be compatible with PS 5.1 syntax)
@@ -97,6 +98,18 @@ function Invoke-PipInstallWithFallback {
         [string[]]$InstallArgs
     )
 
+    if ($PublicOnly) {
+        Write-ColorMsg $ColorBlue "Using public PyPI only (-PublicOnly enabled)..."
+        $publicOnlyArgs = @("-m", "pip", "install") + $InstallArgs + @("--disable-pip-version-check", "--retries", "2", "--timeout", "20", "--index-url", $PYPI_INDEX_URL, "--no-cache-dir")
+        & python @publicOnlyArgs
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+
+        Write-ColorMsg $ColorRed "✗ $Description failed while using public PyPI only."
+        exit 1
+    }
+
     $baseArgs = @("-m", "pip", "install") + $InstallArgs + @("--disable-pip-version-check", "--retries", "2", "--timeout", "20")
     & python @baseArgs
     if ($LASTEXITCODE -eq 0) {
@@ -125,6 +138,7 @@ function Show-Help {
     Write-ColorMsg $ColorBlue "OPTIONS:"
     Write-Host "    (no arguments)    Install dependencies and start service"
     Write-Host "    -Help             Show this help message"
+    Write-Host "    -PublicOnly       Use only public PyPI (skip configured private indexes)"
     Write-Host "    -Start            Start the service"
     Write-Host "    -Stop             Stop the service"
     Write-Host "    -Restart          Restart the service"
@@ -134,6 +148,8 @@ function Show-Help {
     Write-Host ""
     Write-ColorMsg $ColorBlue "EXAMPLES:"
     Write-Host "    .\install.ps1                    # Install and start"
+    Write-Host "    .\install.ps1 -PublicOnly        # Install via public PyPI only"
+    Write-Host "    .\install.ps1 -Start -PublicOnly"
     Write-Host "    .\install.ps1 -Stop              # Stop service"
     Write-Host "    .\install.ps1 -Restart           # Restart service"
     Write-Host "    .\install.ps1 -Uninstall         # Uninstall with confirmation"

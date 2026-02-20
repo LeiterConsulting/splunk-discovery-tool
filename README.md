@@ -104,6 +104,7 @@ Public-facing docs in this repository:
 | Command | Description |
 |---------|-------------|
 | `(no arguments)` | Install dependencies and start service |
+| `--public_only` / `-PublicOnly` | Install using public PyPI only (skip private/local indexes) |
 | `--start` / `-Start` | Start service |
 | `--stop` / `-Stop` | Stop service |
 | `--restart` / `-Restart` | Restart service |
@@ -136,6 +137,16 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 - Some systems have a global/private pip index configured; if that index is unavailable, dependency install can time out.
 - The installers now retry automatically against public PyPI (`https://pypi.org/simple`).
+- To bypass private/local indexes immediately, use the installer public-only flag:
+
+```bash
+./install.sh --public_only
+```
+
+```powershell
+.\install.ps1 -PublicOnly
+```
+
 - If needed, force PyPI for the current shell session before reinstall:
 
 ```bash

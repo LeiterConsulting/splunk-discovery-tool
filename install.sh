@@ -21,11 +21,48 @@ MANIFEST_FILE="$INSTALL_DIR/.install_manifest.json"
 PID_FILE="$INSTALL_DIR/.dt4sms.pid"
 VENV_DIR="$INSTALL_DIR/.venv"
 PYPI_INDEX_URL="https://pypi.org/simple"
+PUBLIC_ONLY="no"
+SELECTED_COMMAND=""
+FORCE_YES_FLAG="no"
+
+# Parse CLI arguments (supports global flags like --public_only)
+parse_args() {
+    for arg in "$@"; do
+        case "$arg" in
+            --public_only|--public-only)
+                PUBLIC_ONLY="yes"
+                ;;
+            --force-yes)
+                FORCE_YES_FLAG="yes"
+                ;;
+            --help|-h|--start|--stop|--restart|--status|--uninstall)
+                SELECTED_COMMAND="$arg"
+                ;;
+            "")
+                ;;
+            *)
+                print_msg "$RED" "Unknown option: $arg"
+                echo ""
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+}
 
 # Run pip install command with fallback to public PyPI when custom index is unreachable
 run_pip_with_fallback() {
     local description="$1"
     shift
+
+    if [[ "$PUBLIC_ONLY" == "yes" ]]; then
+        print_msg "$BLUE" "Using public PyPI only (--public_only enabled)..."
+        if python -m pip "$@" --disable-pip-version-check --retries 2 --timeout 20 --index-url "$PYPI_INDEX_URL" --no-cache-dir; then
+            return 0
+        fi
+        print_msg "$RED" "✗ ${description} failed while using public PyPI only."
+        return 1
+    fi
 
     if python -m pip "$@" --disable-pip-version-check --retries 2 --timeout 20; then
         return 0
@@ -70,6 +107,7 @@ ${BLUE}USAGE:${NC}
 ${BLUE}OPTIONS:${NC}
     ${GREEN}(no arguments)${NC}    Install dependencies and start service
     ${GREEN}--help${NC}            Show this help message
+    ${GREEN}--public_only${NC}     Use only public PyPI (skip any configured private indexes)
     ${GREEN}--start${NC}           Start the service
     ${GREEN}--stop${NC}            Stop the service
     ${GREEN}--restart${NC}         Restart the service
@@ -79,6 +117,8 @@ ${BLUE}OPTIONS:${NC}
 
 ${BLUE}EXAMPLES:${NC}
     ./install.sh                    # Install and start
+    ./install.sh --public_only      # Install via public PyPI only
+    ./install.sh --start --public_only
     ./install.sh --stop             # Stop service
     ./install.sh --restart          # Restart service
     ./install.sh --uninstall        # Uninstall with confirmation
@@ -322,7 +362,9 @@ uninstall() {
 
 # Main logic
 main() {
-    case "${1:-}" in
+    parse_args "$@"
+
+    case "${SELECTED_COMMAND:-}" in
         --help|-h)
             show_help
             ;;
@@ -349,7 +391,7 @@ main() {
             check_status
             ;;
         --uninstall)
-            if [[ "${2:-}" == "--force-yes" ]]; then
+            if [[ "$FORCE_YES_FLAG" == "yes" ]]; then
                 uninstall "yes"
             else
                 uninstall "no"
@@ -371,7 +413,7 @@ main() {
             fi
             ;;
         *)
-            print_msg "$RED" "Unknown option: $1"
+            print_msg "$RED" "Unknown option: ${SELECTED_COMMAND}"
             echo ""
             show_help
             exit 1
