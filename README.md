@@ -132,6 +132,22 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 - Verify URL/token in Settings
 - Toggle SSL verification or set CA bundle for private cert chains
 
+### pip install timeout / `repo.splunkdev.net` unreachable
+
+- Some systems have a global/private pip index configured; if that index is unavailable, dependency install can time out.
+- The installers now retry automatically against public PyPI (`https://pypi.org/simple`).
+- If needed, force PyPI for the current shell session before reinstall:
+
+```bash
+export PIP_INDEX_URL=https://pypi.org/simple
+./install.sh
+```
+
+```powershell
+$env:PIP_INDEX_URL = "https://pypi.org/simple"
+.\install.ps1
+```
+
 ## 🤝 Contributing
 
 Contributions are welcome via pull requests.

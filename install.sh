@@ -20,6 +20,26 @@ INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_FILE="$INSTALL_DIR/.install_manifest.json"
 PID_FILE="$INSTALL_DIR/.dt4sms.pid"
 VENV_DIR="$INSTALL_DIR/.venv"
+PYPI_INDEX_URL="https://pypi.org/simple"
+
+# Run pip install command with fallback to public PyPI when custom index is unreachable
+run_pip_with_fallback() {
+    local description="$1"
+    shift
+
+    if python -m pip "$@" --disable-pip-version-check --retries 2 --timeout 20; then
+        return 0
+    fi
+
+    print_msg "$YELLOW" "⚠ ${description} failed with current pip index. Retrying with public PyPI..."
+
+    if python -m pip "$@" --disable-pip-version-check --retries 2 --timeout 20 --index-url "$PYPI_INDEX_URL" --no-cache-dir; then
+        return 0
+    fi
+
+    print_msg "$RED" "✗ ${description} failed. If a private pip index is configured, verify it is reachable or set PIP_INDEX_URL=https://pypi.org/simple and retry."
+    return 1
+}
 
 # Detect OS
 detect_os() {
@@ -159,13 +179,13 @@ install_deps() {
     
     # Upgrade pip
     print_msg "$BLUE" "Upgrading pip..."
-    pip install --upgrade pip -q
+    run_pip_with_fallback "pip upgrade" install --upgrade pip -q
     PIP_VERSION=$(pip --version | awk '{print $2}')
     print_msg "$GREEN" "✓ pip ${PIP_VERSION}"
     
     # Install requirements
     print_msg "$BLUE" "Installing Python packages..."
-    pip install -q -r requirements.txt
+    run_pip_with_fallback "dependency installation" install -q -r requirements.txt
     print_msg "$GREEN" "✓ All dependencies installed"
     
     # Create manifest

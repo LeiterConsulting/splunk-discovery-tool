@@ -76,6 +76,7 @@ $PID_FILE = Join-Path $INSTALL_DIR ".dt4sms.pid"
 $VENV_DIR = Join-Path $INSTALL_DIR ".venv"
 $LOG_FILE = Join-Path $INSTALL_DIR "dt4sms.log"
 $ERR_LOG_FILE = Join-Path $INSTALL_DIR "dt4sms.err.log"
+$PYPI_INDEX_URL = "https://pypi.org/simple"
 
 # Colors
 $ColorGreen = "Green"
@@ -87,6 +88,31 @@ $ColorBlue = "Cyan"
 function Write-ColorMsg {
     param([string]$Color, [string]$Message)
     Write-Host $Message -ForegroundColor $Color
+}
+
+# Run pip install command with fallback to public PyPI when custom index is unreachable
+function Invoke-PipInstallWithFallback {
+    param(
+        [string]$Description,
+        [string[]]$InstallArgs
+    )
+
+    $baseArgs = @("-m", "pip", "install") + $InstallArgs + @("--disable-pip-version-check", "--retries", "2", "--timeout", "20")
+    & python @baseArgs
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    Write-ColorMsg $ColorYellow "⚠ $Description failed with current pip index. Retrying with public PyPI..."
+
+    $fallbackArgs = @("-m", "pip", "install") + $InstallArgs + @("--disable-pip-version-check", "--retries", "2", "--timeout", "20", "--index-url", $PYPI_INDEX_URL, "--no-cache-dir")
+    & python @fallbackArgs
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    Write-ColorMsg $ColorRed "✗ $Description failed. If a private pip index is configured, verify it is reachable or set PIP_INDEX_URL=https://pypi.org/simple and retry."
+    exit 1
 }
 
 # Show help
@@ -197,13 +223,13 @@ function Install-Dependencies {
     
     # Upgrade pip
     Write-ColorMsg $ColorBlue "Upgrading pip..."
-    python -m pip install --upgrade pip -q
+    Invoke-PipInstallWithFallback "pip upgrade" @("--upgrade", "pip", "-q")
     $pipVersion = (pip --version) -replace "pip ", "" -replace " from.*", ""
     Write-ColorMsg $ColorGreen "✓ pip $pipVersion"
     
     # Install requirements
     Write-ColorMsg $ColorBlue "Installing Python packages..."
-    pip install -q -r requirements.txt
+    Invoke-PipInstallWithFallback "dependency installation" @("-q", "-r", "requirements.txt")
     Write-ColorMsg $ColorGreen "✓ All dependencies installed"
     
     # Create manifest
