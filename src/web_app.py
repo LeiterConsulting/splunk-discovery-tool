@@ -715,6 +715,89 @@ def parse_tool_call_payload(raw_json: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def sanitize_llm_response_text(text: str) -> str:
+    """Remove control markup like TOOL_CALL/CONTEXT_REQUEST from user-facing text."""
+    if not isinstance(text, str):
+        return ""
+
+    cleaned = re.sub(r'<CONTEXT_REQUEST>.*?</CONTEXT_REQUEST>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<TOOL_CALL>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace('</TOOL_CALL>', '')
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
+def extract_tool_call_from_text(response_text: str) -> Optional[Dict[str, Any]]:
+    """Extract and normalize tool call payload from tagged response text."""
+    if not isinstance(response_text, str):
+        return None
+    if '<TOOL_CALL>' not in response_text or '</TOOL_CALL>' not in response_text:
+        return None
+
+    start = response_text.find('<TOOL_CALL>') + len('<TOOL_CALL>')
+    end = response_text.find('</TOOL_CALL>', start)
+    if end <= start:
+        return None
+
+    raw_json = response_text[start:end].strip()
+    tool_data = parse_tool_call_payload(raw_json)
+    if not isinstance(tool_data, dict):
+        return None
+
+    tool_name = tool_data.get('tool')
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        return None
+
+    tool_args = tool_data.get('args', {})
+    if not isinstance(tool_args, dict):
+        tool_args = {}
+
+    return {
+        "method": "tools/call",
+        "params": {
+            "name": tool_name.strip(),
+            "arguments": tool_args
+        }
+    }
+
+
+def has_continuation_intent(response_text: str) -> bool:
+    """Detect when the model says it will run another step/query but omitted tool-call markup."""
+    if not isinstance(response_text, str):
+        return False
+
+    lowered = response_text.lower()
+    keyword_hits = [
+        "let me run a query",
+        "let me run",
+        "let me query",
+        "let me calculate",
+        "let me check",
+        "i will run",
+        "i'll run",
+        "i will query",
+        "i'll query",
+        "i will execute",
+        "i'll execute",
+        "i will calculate",
+        "i'll calculate",
+        "i need to calculate",
+        "i will first",
+        "i'll first",
+        "next step"
+    ]
+    if any(token in lowered for token in keyword_hits):
+        return True
+
+    patterns = [
+        r"\blet me\s+(run|execute|query|check|calculate|retrieve|search|analyze)\b",
+        r"\bi\s+(will|need to)\s+(run|execute|query|check|calculate|retrieve|search|analyze)\b",
+        r"\bi(?:'ll)\s+(run|execute|query|check|calculate|retrieve|search|analyze)\b"
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
 def build_compact_chat_prompt(
     query_tool_name: str,
     discovery_context: str,
@@ -6202,7 +6285,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         # Check if response contains tool call or SPL
         tool_call = None
         spl_in_text = None
-        clean_response = response
+        clean_response = sanitize_llm_response_text(response)
         
         try:
             import re
@@ -6237,36 +6320,14 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             # Extract tool call using <TOOL_CALL> tags
             # Extract everything between the tags (handles nested braces correctly)
             if '<TOOL_CALL>' in response and '</TOOL_CALL>' in response:
-                start = response.find('<TOOL_CALL>') + len('<TOOL_CALL>')
-                end = response.find('</TOOL_CALL>')
-                raw_json = response[start:end].strip()
-                
-                print(f"🔍 Raw JSON: {repr(raw_json[:200])}")
-
-                try:
-                    tool_data = parse_tool_call_payload(raw_json)
-                    if not isinstance(tool_data, dict):
-                        raise ValueError("Invalid tool payload")
-                    tool_name = tool_data.get('tool')
-                    tool_args = tool_data.get('args', {})
-                    
-                    # Convert to MCP format
-                    tool_call = {
-                        "method": "tools/call",
-                        "params": {
-                            "name": tool_name,
-                            "arguments": tool_args
-                        }
-                    }
-                    
-                    # Remove tool call from response for cleaner display
-                    clean_response = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', response, flags=re.DOTALL).strip()
-                    
-                    debug_log(f"Extracted tool call - {tool_name} with args: {tool_args}", "query", tool_args)
-                except Exception as e:
-                    print(f"❌ JSON Parse Error: {e}")
-                    print(f"❌ Raw JSON that failed: {raw_json}")
-                    debug_log(f"Tool call JSON parse error: {e}", "error")
+                tool_call = extract_tool_call_from_text(response)
+                if tool_call:
+                    extracted_name = tool_call.get("params", {}).get("name")
+                    extracted_args = tool_call.get("params", {}).get("arguments", {})
+                    clean_response = sanitize_llm_response_text(response)
+                    debug_log(f"Extracted tool call - {extracted_name} with args: {extracted_args}", "query", extracted_args)
+                else:
+                    debug_log("Tool call tag detected but payload could not be parsed", "error")
             
             # Extract SPL queries from code blocks
             spl_patterns = [
@@ -6819,22 +6880,16 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                 next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                 if next_tool_match:
                                     try:
-                                        tool_data = json.loads(next_tool_match.group(1))
-                                        tool_name = tool_data.get('tool')
-                                        tool_args = tool_data.get('args', {})
-                                        tool_call = {
-                                            "method": "tools/call",
-                                            "params": {
-                                                "name": tool_name,
-                                                "arguments": tool_args
-                                            }
-                                        }
+                                        extracted_tool_call = extract_tool_call_from_text(next_response)
+                                        if not extracted_tool_call:
+                                            raise ValueError("Malformed tool call payload")
+                                        tool_call = extracted_tool_call
                                         continue  # Execute this tool call in next iteration
-                                    except json.JSONDecodeError as e:
+                                    except Exception as e:
                                         print(f"❌ Failed to parse tool call JSON (HIGH quality, first check): {e}")
                                         print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
                                         # Strip the malformed tool call and use the text explanation
-                                        final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                        final_answer = sanitize_llm_response_text(next_response)
                                         if not final_answer:
                                             final_answer = "Investigation incomplete due to malformed query format."
                                         break
@@ -6853,28 +6908,22 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                 next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                 if next_tool_match:
                                     try:
-                                        tool_data = json.loads(next_tool_match.group(1))
-                                        tool_name = tool_data.get('tool')
-                                        tool_args = tool_data.get('args', {})
-                                        tool_call = {
-                                            "method": "tools/call",
-                                            "params": {
-                                                "name": tool_name,
-                                                "arguments": tool_args
-                                            }
-                                        }
-                                        continue  # Execute this tool call in next iteration
-                                    except json.JSONDecodeError as e:
+                                        extracted_tool_call = extract_tool_call_from_text(next_response)
+                                        if extracted_tool_call:
+                                            tool_call = extracted_tool_call
+                                            continue  # Execute this tool call in next iteration
+                                        raise ValueError("Malformed tool call payload")
+                                    except Exception as e:
                                         print(f"❌ Failed to parse tool call JSON (HIGH quality, second check): {e}")
                                         print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
                                         # Strip the malformed tool call and use the text explanation
-                                        final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                        final_answer = sanitize_llm_response_text(next_response)
                                         if not final_answer:
                                             final_answer = "Investigation incomplete due to malformed query format."
                                         break
                             else:
                                 print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
-                                final_answer = next_response
+                                final_answer = sanitize_llm_response_text(next_response)
                     
                     if final_answer:
                         break
@@ -6897,9 +6946,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                         print(f"    🔄 Forcing continuation...")
                         
                         # Check for continuation intent in natural language
-                        continuation_intent = any(keyword in next_response.lower() for keyword in 
-                                                 ["i'll proceed", "i will proceed", "let me try", "i'll check", 
-                                                  "i will check", "next step", "let me search", "i'll search"])
+                        continuation_intent = has_continuation_intent(next_response)
                         
                         if continuation_intent or quality_score < (quality_threshold / 3):
                             # Add strict format enforcement message
@@ -6945,29 +6992,22 @@ Do not explain what you will do - DO IT with a tool call."""
                         else:
                             # No clear continuation intent - accept as final
                             print(f"🏁 [Iteration {iteration}] No continuation intent detected despite low quality")
-                            final_answer = next_response
+                            final_answer = sanitize_llm_response_text(next_response)
                             break
                     
                     # Has tool call (either original or from retry) - execute it
                     if next_tool_match:
                         try:
-                            tool_data = json.loads(next_tool_match.group(1))
-                            tool_name = tool_data.get('tool')
-                            tool_args = tool_data.get('args', {})
-                            
-                            tool_call = {
-                                "method": "tools/call",
-                                "params": {
-                                    "name": tool_name,
-                                    "arguments": tool_args
-                                }
-                            }
+                            extracted_tool_call = extract_tool_call_from_text(next_response)
+                            if not extracted_tool_call:
+                                raise ValueError("Malformed tool call payload")
+                            tool_call = extracted_tool_call
                             
                             clean_response = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
                             continue  # Execute this tool call in next iteration
-                        except json.JSONDecodeError as e:
+                        except Exception as e:
                             print(f"❌ Failed to parse tool call: {e}")
-                            final_answer = next_response
+                            final_answer = sanitize_llm_response_text(next_response)
                             break
                 
                 else:
@@ -6977,34 +7017,23 @@ Do not explain what you will do - DO IT with a tool call."""
                         if iteration < 5:
                             print(f"▶️  [Iteration {iteration}] Moderate quality ({quality_score}/100), allowing refinement")
                             try:
-                                tool_data = json.loads(next_tool_match.group(1))
-                                tool_name = tool_data.get('tool')
-                                tool_args = tool_data.get('args', {})
-                                
-                                tool_call = {
-                                    "method": "tools/call",
-                                    "params": {
-                                        "name": tool_name,
-                                        "arguments": tool_args
-                                    }
-                                }
+                                extracted_tool_call = extract_tool_call_from_text(next_response)
+                                if not extracted_tool_call:
+                                    raise ValueError("Malformed tool call payload")
+                                tool_call = extracted_tool_call
                                 continue  # Execute this tool call in next iteration
-                            except json.JSONDecodeError as e:
+                            except Exception as e:
                                 print(f"❌ Failed to parse tool call: {e}")
-                                final_answer = next_response
+                                final_answer = sanitize_llm_response_text(next_response)
                                 break
                         else:
                             # Too many iterations for moderate quality - accept current
                             print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) after {iteration} iterations - accepting")
-                            final_answer = next_response
+                            final_answer = sanitize_llm_response_text(next_response)
                             break
                     else:
                         # Moderate quality, no tool call - check for continuation intent
-                        continuation_intent = any(keyword in next_response.lower() for keyword in 
-                                                 ["i'll proceed", "i will proceed", "let me try", "i'll check", 
-                                                  "i will check", "next step", "let me search", "i'll search",
-                                                  "i'll execute", "i will execute", "i'll query", "i will query",
-                                                  "let me retrieve", "i'll retrieve", "i will retrieve"])
+                        continuation_intent = has_continuation_intent(next_response)
                         
                         if continuation_intent and iteration < 5:
                             # LLM wants to continue but didn't provide tool call - force retry
@@ -7037,25 +7066,18 @@ Based on your previous response, provide your next query NOW using the proper fo
                                 next_tool_match = retry_tool_match
                                 # Fall through to tool execution
                                 try:
-                                    tool_data = json.loads(retry_tool_match.group(1))
-                                    tool_name = tool_data.get('tool')
-                                    tool_args = tool_data.get('args', {})
-                                    
-                                    tool_call = {
-                                        "method": "tools/call",
-                                        "params": {
-                                            "name": tool_name,
-                                            "arguments": tool_args
-                                        }
-                                    }
+                                    extracted_tool_call = extract_tool_call_from_text(retry_response)
+                                    if not extracted_tool_call:
+                                        raise ValueError("Malformed tool call payload")
+                                    tool_call = extracted_tool_call
                                     continue  # Execute this tool call in next iteration
-                                except json.JSONDecodeError as e:
+                                except Exception as e:
                                     print(f"❌ Failed to parse tool call: {e}")
-                                    final_answer = next_response
+                                    final_answer = sanitize_llm_response_text(next_response)
                                     break
                             else:
                                 print(f"⚠️  Retry failed - accepting current answer")
-                                final_answer = next_response
+                                final_answer = sanitize_llm_response_text(next_response)
                                 break
                         else:
                             # Moderate quality, no tool call, no continuation intent
@@ -7099,28 +7121,22 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                         next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                         if next_tool_match:
                                             try:
-                                                tool_data = json.loads(next_tool_match.group(1))
-                                                tool_name = tool_data.get('tool')
-                                                tool_args = tool_data.get('args', {})
-                                                tool_call = {
-                                                    "method": "tools/call",
-                                                    "params": {
-                                                        "name": tool_name,
-                                                        "arguments": tool_args
-                                                    }
-                                                }
+                                                extracted_tool_call = extract_tool_call_from_text(next_response)
+                                                if not extracted_tool_call:
+                                                    raise ValueError("Malformed tool call payload")
+                                                tool_call = extracted_tool_call
                                                 continue  # Execute this tool call in next iteration
-                                            except json.JSONDecodeError as e:
+                                            except Exception as e:
                                                 print(f"❌ Failed to parse tool call JSON: {e}")
                                                 print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
                                                 # Strip the malformed tool call and use the text explanation
-                                                final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                                final_answer = sanitize_llm_response_text(next_response)
                                                 if not final_answer:
                                                     final_answer = "Investigation incomplete due to malformed query format."
                                                 break
                                     else:
                                         print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                                        final_answer = next_response
+                                        final_answer = sanitize_llm_response_text(next_response)
                             else:
                                 # No data - accept response as-is, but check for tool calls
                                 if '<TOOL_CALL>' in next_response:
@@ -7128,28 +7144,22 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                     next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
                                     if next_tool_match:
                                         try:
-                                            tool_data = json.loads(next_tool_match.group(1))
-                                            tool_name = tool_data.get('tool')
-                                            tool_args = tool_data.get('args', {})
-                                            tool_call = {
-                                                "method": "tools/call",
-                                                "params": {
-                                                    "name": tool_name,
-                                                    "arguments": tool_args
-                                                }
-                                            }
+                                            extracted_tool_call = extract_tool_call_from_text(next_response)
+                                            if not extracted_tool_call:
+                                                raise ValueError("Malformed tool call payload")
+                                            tool_call = extracted_tool_call
                                             continue  # Execute this tool call in next iteration
-                                        except json.JSONDecodeError as e:
+                                        except Exception as e:
                                             print(f"❌ Failed to parse tool call JSON: {e}")
                                             print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
                                             # Strip the malformed tool call and use the text explanation
-                                            final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                                            final_answer = sanitize_llm_response_text(next_response)
                                             if not final_answer:
                                                 final_answer = "Investigation incomplete due to malformed query format."
                                             break
                                 else:
                                     print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                                    final_answer = next_response
+                                    final_answer = sanitize_llm_response_text(next_response)
                             break
             
             # CRITICAL SAFETY CHECK: If final_answer contains <TOOL_CALL>, the LLM isn't done
@@ -7158,7 +7168,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                 print(f"⚠️ WARNING: final_answer contains <TOOL_CALL> tags - LLM finished prematurely!")
                 print(f"Response: {final_answer[:200]}...")
                 # Strip tool calls from response and return with warning
-                final_answer = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', final_answer, flags=re.DOTALL).strip()
+                final_answer = sanitize_llm_response_text(final_answer)
                 if not final_answer:
                     final_answer = "Investigation incomplete. The agent attempted to continue but reached response limits."
             
@@ -7167,7 +7177,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
             updated_memory = update_chat_memory(chat_session_id, user_message, all_tool_calls)
             follow_on_actions = build_follow_on_actions(user_message, updated_memory, all_tool_calls)
             return {
-                "response": final_answer or "Investigation complete. See findings above.",
+                "response": sanitize_llm_response_text(final_answer or "Investigation complete. See findings above."),
                 "initial_response": user_message,
                 "tool_calls": all_tool_calls,
                 "iterations": iteration,
@@ -7195,7 +7205,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
         updated_memory = update_chat_memory(chat_session_id, user_message)
         follow_on_actions = build_follow_on_actions(user_message, updated_memory)
         return {
-            "response": clean_response,
+            "response": sanitize_llm_response_text(clean_response),
             "spl_in_text": spl_in_text,
             "discovery_age_warning": discovery_age_warning,
             "chat_session_id": chat_session_id,
