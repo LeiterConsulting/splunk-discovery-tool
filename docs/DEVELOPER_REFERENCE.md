@@ -114,7 +114,22 @@ Every button should communicate purpose:
 - `GET /api/discovery/runbook` → Persona runbook payload
 - `GET /api/v2/intelligence` → Latest blueprint payload
 - `GET /api/v2/artifacts` → V2 artifact catalog
+- `GET /api/capabilities` → Capability registry with persisted state
+- `GET /api/capabilities/health` → Capability health snapshot
+- `POST /api/capabilities/{name}/install` → Install or prepare a capability
+- `POST /api/capabilities/{name}/enable` → Enable an installed capability
+- `POST /api/capabilities/{name}/disable` → Disable a capability
+- `POST /api/capabilities/{name}/test` → Run a capability health check
+- `POST /api/capabilities/{name}/reindex` → Rebuild indexed retrieval content for capabilities that support it
+- `POST /api/capabilities/{name}/config` → Persist capability-specific config
+- `POST /api/capabilities/deeplinks/build` → Build a Splunk Web search deeplink through the optional deeplink capability
 - `GET /reports` → V2 report/session list
+
+### Capability notes
+
+- `rag_chromadb` persists an `index_summary` alongside the local Chroma storage and surfaces that summary through `GET /api/capabilities`
+- Chroma indexing uses a deterministic local hash-based embedding function so optional retrieval works without downloading an external embedding model
+- `splunk_deeplink_tools` derives a Splunk Web base URL from `config.mcp.url` by default, supports a `web_base_url` override in capability config, and currently ships search deeplinks first
 
 ## 9) Build-Your-Own Checklist
 
@@ -123,3 +138,18 @@ Every button should communicate purpose:
 - Create role-specific runbooks from V2 blueprint
 - Add org-specific KPI cards over capability_graph and finding_ledger
 - Keep settings contract stable for operator familiarity
+
+## 10) Optional Capabilities
+
+For the proposed optional RAG and installable enhancement-pack model, see:
+
+- `docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md`
+
+## 11) Execution Control
+
+The optional capabilities initiative is governed by the engineering control process in:
+
+- `docs/EXEC_CTRL.md`
+- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_EXEC_CTRL.md`
+- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_AUDIT_LOG.md`
+- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_DECISION_LOG.md`
