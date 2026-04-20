@@ -63,6 +63,8 @@ htmlcov/
 .tox/
 test_*.py
 test_*.sh
+!tests/test_*.py
+!tests/**/test_*.py
 
 # Development/Debugging
 DO NOT SEND TO GIT/

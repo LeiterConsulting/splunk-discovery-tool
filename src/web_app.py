@@ -28,9 +28,15 @@ from pydantic import BaseModel
 
 # DT4SMS: Use encrypted config manager instead of YAML
 from config_manager import ConfigManager
+from capabilities import CapabilityManager, CapabilityRegistry
 from discovery.engine import DiscoveryEngine
 from discovery.v2_pipeline import DiscoveryV2Pipeline
-from llm.factory import LLMClientFactory, normalize_provider_name
+from llm.factory import (
+    LLMClientFactory,
+    filter_openai_generation_models,
+    get_openai_model_capabilities,
+    normalize_provider_name,
+)
 from discovery.context_manager import get_context_manager
 
 # Ensure console/log prints do not crash on Windows code pages (cp1252, etc.)
@@ -44,6 +50,8 @@ except Exception:
 
 # Initialize encrypted config manager
 config_manager = ConfigManager("config.encrypted")
+capability_registry = CapabilityRegistry()
+capability_manager = CapabilityManager(config_manager, registry=capability_registry)
 
 # Module-level LLM client cache for performance
 _cached_llm_client = None
@@ -205,6 +213,10 @@ def _default_chat_memory(chat_session_id: str) -> Dict[str, Any]:
         "updated_at": now,
         "primary_intent": "",
         "recent_intents": [],
+        "current_focus": "",
+        "last_user_message": "",
+        "last_assistant_response": "",
+        "recent_turns": [],
         "tracked_terms": [],
         "locations": [],
         "entities": {
@@ -214,7 +226,8 @@ def _default_chat_memory(chat_session_id: str) -> Dict[str, Any]:
             "sources": []
         },
         "time_preferences": [],
-        "last_tools_used": []
+        "last_tools_used": [],
+        "last_result": {}
     }
 
 
@@ -291,7 +304,19 @@ def _extract_memory_signals(text: str) -> Dict[str, List[str]]:
     sources = re.findall(r'source=([^\s\|]+)', text, flags=re.IGNORECASE)
 
     time_preferences = []
-    for token in ["-24h", "-7d", "-30d", "today", "yesterday", "last week", "last month", "now"]:
+    for token in [
+        "-24h",
+        "-7d",
+        "-30d",
+        "today",
+        "yesterday",
+        "last week",
+        "last month",
+        "last 24 hours",
+        "last 7 days",
+        "last 30 days",
+        "now",
+    ]:
         if token in lower_text:
             time_preferences.append(token)
 
@@ -319,14 +344,554 @@ def _extract_memory_signals(text: str) -> Dict[str, List[str]]:
     }
 
 
-def update_chat_memory(chat_session_id: str, user_message: str, tool_calls: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """Update chat memory with latest user message and optional tool activity."""
+def _extract_last_result_context(tool_calls: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Capture compact state from the latest tool activity for follow-on routing."""
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return {}
+
+    last_call = next((call for call in reversed(tool_calls) if isinstance(call, dict)), None)
+    if not isinstance(last_call, dict):
+        return {}
+
+    args = last_call.get("args", {}) if isinstance(last_call.get("args", {}), dict) else {}
+    summary = last_call.get("summary", {}) if isinstance(last_call.get("summary", {}), dict) else {}
+    query = args.get("query", "") if isinstance(args.get("query", ""), str) else ""
+    query_signals = _extract_memory_signals(query)
+
+    actual_results = summary.get("actual_results", []) if isinstance(summary.get("actual_results", []), list) else []
+    first_row = actual_results[0] if actual_results and isinstance(actual_results[0], dict) else {}
+
+    def _pick_from_row(keys: List[str]) -> str:
+        for key in keys:
+            value = first_row.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    index_value = query_signals.get("indexes", [])[-1] if query_signals.get("indexes") else _pick_from_row(["index", "INDEX"])
+    host_value = query_signals.get("hosts", [])[-1] if query_signals.get("hosts") else _pick_from_row(["host", "HOST", "src", "src_ip", "dest"])
+    sourcetype_value = query_signals.get("sourcetypes", [])[-1] if query_signals.get("sourcetypes") else _pick_from_row(["sourcetype", "SOURCETYPE"])
+
+    result_fields = summary.get("sample_fields", []) if isinstance(summary.get("sample_fields", []), list) else []
+    top_dimensions = summary.get("top_dimensions", []) if isinstance(summary.get("top_dimensions", []), list) else []
+    next_pivots = summary.get("next_pivots", []) if isinstance(summary.get("next_pivots", []), list) else []
+    findings = summary.get("findings", []) if isinstance(summary.get("findings", []), list) else []
+    time_bounds = summary.get("time_bounds", {}) if isinstance(summary.get("time_bounds", {}), dict) else {}
+
+    context = {
+        "tool": str(last_call.get("tool", "")).strip(),
+        "query": query[:600],
+        "row_count": _safe_int(summary.get("row_count")),
+        "earliest_time": str(args.get("earliest_time", "") or ""),
+        "latest_time": str(args.get("latest_time", "") or ""),
+        "index": index_value,
+        "host": host_value,
+        "sourcetype": sourcetype_value,
+        "result_fields": result_fields[:10],
+        "query_shape": str(summary.get("query_shape", "") or "").strip(),
+        "top_dimensions": [item for item in top_dimensions[:2] if isinstance(item, dict)],
+        "next_pivots": [str(item).strip() for item in next_pivots[:3] if isinstance(item, str) and str(item).strip()],
+        "findings": [str(item).strip() for item in findings[:4] if isinstance(item, str) and str(item).strip()],
+        "time_bounds": time_bounds,
+    }
+
+    if not any([
+        context.get("query"),
+        context.get("index"),
+        context.get("host"),
+        context.get("sourcetype"),
+        context.get("row_count"),
+    ]):
+        return {}
+
+    return context
+
+
+def _remembered_entity(memory: Dict[str, Any], entity_key: str) -> Optional[str]:
+    """Resolve the most recent entity anchor from memory or latest result context."""
+    if not isinstance(memory, dict):
+        return None
+
+    last_result = memory.get("last_result", {}) if isinstance(memory.get("last_result", {}), dict) else {}
+    candidate = last_result.get(entity_key)
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+
+    plural_map = {
+        "index": "indexes",
+        "host": "hosts",
+        "sourcetype": "sourcetypes",
+        "source": "sources",
+    }
+    entity_values = memory.get("entities", {}).get(plural_map.get(entity_key, ""), [])
+    if isinstance(entity_values, list) and entity_values:
+        last_value = entity_values[-1]
+        if isinstance(last_value, str) and last_value.strip():
+            return last_value.strip()
+    return None
+
+
+def _describe_time_window(earliest_time: str, latest_time: str) -> str:
+    earliest = str(earliest_time or "").strip().lower()
+    latest = str(latest_time or "").strip().lower()
+    known_windows = {
+        ("-24h", "now"): "the last 24 hours",
+        ("-7d", "now"): "the last 7 days",
+        ("-30d", "now"): "the last 30 days",
+    }
+    if (earliest, latest) in known_windows:
+        return known_windows[(earliest, latest)]
+    if earliest:
+        return f"the window {earliest} to {latest or 'now'}"
+    return "the recent time window"
+
+
+def _make_follow_on_action(label: str, prompt: str, kind: str) -> Dict[str, str]:
+    return {
+        "label": label,
+        "prompt": prompt,
+        "kind": kind,
+    }
+
+
+def _extract_top_dimension_context(summary: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {}
+
+    top_dimensions = summary.get("top_dimensions", []) if isinstance(summary.get("top_dimensions", []), list) else []
+    for dimension in top_dimensions:
+        if not isinstance(dimension, dict):
+            continue
+        field = str(dimension.get("field", "")).strip()
+        values = [
+            str(value).strip()
+            for value in (dimension.get("values", []) if isinstance(dimension.get("values", []), list) else [])
+            if str(value).strip()
+        ]
+        if not field or not values:
+            continue
+        top_value = values[0].rsplit(" (", 1)[0].strip()
+        return {
+            "field": field,
+            "values": values[:3],
+            "top_value": top_value,
+        }
+    return {}
+
+
+def _build_output_follow_on_actions(
+    summary: Dict[str, Any],
+    remembered_index: Optional[str],
+    remembered_host: Optional[str],
+    time_window_label: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(summary, dict):
+        return []
+
+    actions: List[Dict[str, Any]] = []
+    row_count = _safe_int(summary.get("row_count"))
+    if row_count <= 0:
+        return actions
+
+    query_shape = str(summary.get("query_shape", "") or "").strip().lower()
+    findings_text = " ".join(
+        item.strip().lower()
+        for item in summary.get("findings", [])
+        if isinstance(item, str) and item.strip()
+    )
+    next_pivots = [
+        str(item).strip()
+        for item in summary.get("next_pivots", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    sample_fields = [
+        str(field).strip().lower()
+        for field in summary.get("sample_fields", [])
+        if isinstance(field, str) and str(field).strip()
+    ]
+    top_dimension = _extract_top_dimension_context(summary)
+    dimension_field = str(top_dimension.get("field", "")).strip()
+    top_value = str(top_dimension.get("top_value", "")).strip()
+    top_values = top_dimension.get("values", []) if isinstance(top_dimension.get("values", []), list) else []
+    index_clause = f" in index={remembered_index}" if remembered_index else ""
+
+    if query_shape == "time_series":
+        if remembered_index:
+            actions.append(_make_follow_on_action(
+                f"Explain changes in index={remembered_index}",
+                f"Explain the biggest spikes or drops in index={remembered_index} over {time_window_label} by breaking the trend down by sourcetype and host.",
+                "explain_trend_change",
+            ))
+            actions.append(_make_follow_on_action(
+                "Compare with the previous window",
+                f"Compare event volume for index={remembered_index} in {time_window_label} versus the previous equivalent window and summarize what changed.",
+                "compare_previous_window",
+            ))
+        if remembered_host:
+            actions.append(_make_follow_on_action(
+                f"Inspect host={remembered_host} around the change",
+                f"Show surrounding events for host={remembered_host}{index_clause} over {time_window_label} and highlight what lines up with the biggest spike or drop.",
+                "host_spike_pivot",
+            ))
+    elif query_shape == "aggregation":
+        if dimension_field and top_value:
+            actions.append(_make_follow_on_action(
+                f"Filter on {dimension_field}={top_value}",
+                f"Filter the last query on {dimension_field}={top_value}{index_clause} over {time_window_label} and explain why it stands out.",
+                "filter_dimension_value",
+            ))
+            if remembered_index:
+                actions.append(_make_follow_on_action(
+                    f"Trend {top_value} over time",
+                    f"Show a timechart for {dimension_field}={top_value} in index={remembered_index} over {time_window_label}.",
+                    "trend_dimension_value",
+                ))
+        if dimension_field and len(top_values) > 1:
+            actions.append(_make_follow_on_action(
+                f"Compare the top {dimension_field} values",
+                f"Compare the top {dimension_field} values from the last result ({', '.join(top_values[:3])}){index_clause} and summarize what separates them.",
+                "compare_dimension_values",
+            ))
+    elif query_shape == "event_sample":
+        if remembered_host:
+            actions.append(_make_follow_on_action(
+                f"Show surrounding events for host={remembered_host}",
+                f"Show surrounding events for host={remembered_host}{index_clause} over {time_window_label} and highlight the most relevant patterns.",
+                "surrounding_events_host",
+            ))
+        if "sourcetype" in sample_fields or "host" in sample_fields:
+            actions.append(_make_follow_on_action(
+                "Summarize the event pattern",
+                f"Group the last result by sourcetype and host{index_clause} over {time_window_label} so the main event pattern is easier to interpret.",
+                "summarize_event_pattern",
+            ))
+        if any(field in sample_fields for field in ["user", "src", "src_ip", "dest", "dest_ip", "action", "status", "signature"]):
+            actions.append(_make_follow_on_action(
+                "Pivot on the key entities",
+                f"Pivot on the most important entities from the last result{index_clause} over {time_window_label} and show the strongest outliers.",
+                "pivot_key_entities",
+            ))
+    elif dimension_field and top_value:
+        actions.append(_make_follow_on_action(
+            f"Filter on {dimension_field}={top_value}",
+            f"Filter the last query on {dimension_field}={top_value}{index_clause} over {time_window_label} and explain what changes.",
+            "filter_dimension_value",
+        ))
+
+    for pivot in next_pivots[:2]:
+        lowered_pivot = pivot.lower()
+        if lowered_pivot.startswith("filter on ") and "=" in pivot:
+            filter_target = pivot[len("Filter on "):].strip()
+            actions.append(_make_follow_on_action(
+                f"Filter on {filter_target}",
+                f"Filter the last query on {filter_target}{index_clause} over {time_window_label} and explain what changes.",
+                "filter_dimension_value",
+            ))
+        elif "compare adjacent time buckets" in lowered_pivot and remembered_index:
+            actions.append(_make_follow_on_action(
+                "Compare adjacent time buckets",
+                f"Compare adjacent time buckets for index={remembered_index} over {time_window_label} and explain the biggest changes.",
+                "compare_time_buckets",
+            ))
+        elif "aggregate by one dimension" in lowered_pivot:
+            actions.append(_make_follow_on_action(
+                "Aggregate by one dimension",
+                f"Aggregate the last query{index_clause} by one dimension over {time_window_label} so the result is easier to explain.",
+                "aggregate_one_dimension",
+            ))
+
+    if "large result set" in findings_text or row_count > 100:
+        actions.append(_make_follow_on_action(
+            "Tighten the result set",
+            f"Tighten the last query{index_clause} by one dimension or a narrower time window so the result is easier to explain.",
+            "tighten_result_set",
+        ))
+
+    return _dedupe_follow_on_actions(actions, limit=3)
+
+
+def _compact_memory_text(text: Any, limit: int = 280) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = re.sub(r'\s+', ' ', text).strip()
+    return cleaned[:limit]
+
+
+def _append_recent_turn(memory: Dict[str, Any], role: str, content: str, limit: int = 8) -> None:
+    if not isinstance(memory, dict):
+        return
+
+    cleaned = _compact_memory_text(content, limit=320)
+    if not cleaned:
+        return
+
+    turns = memory.get("recent_turns", []) if isinstance(memory.get("recent_turns", []), list) else []
+    candidate = {
+        "role": str(role or "user").strip().lower(),
+        "content": cleaned,
+    }
+    if turns and isinstance(turns[-1], dict):
+        if turns[-1].get("role") == candidate["role"] and turns[-1].get("content") == candidate["content"]:
+            memory["recent_turns"] = turns[-limit:]
+            return
+
+    turns.append(candidate)
+    memory["recent_turns"] = turns[-limit:]
+
+
+def _build_conversation_focus_text(
+    user_message: str,
+    memory: Dict[str, Any],
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    assistant_response: str = "",
+) -> str:
+    parts = [
+        str(user_message or ""),
+        str(assistant_response or ""),
+        str(memory.get("primary_intent", "") if isinstance(memory, dict) else ""),
+        str(memory.get("current_focus", "") if isinstance(memory, dict) else ""),
+        str(memory.get("last_user_message", "") if isinstance(memory, dict) else ""),
+        str(memory.get("last_assistant_response", "") if isinstance(memory, dict) else ""),
+    ]
+
+    if isinstance(memory, dict):
+        last_result = memory.get("last_result", {}) if isinstance(memory.get("last_result", {}), dict) else {}
+        for key in ["query", "index", "host", "sourcetype"]:
+            value = last_result.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+        for finding in last_result.get("findings", []) if isinstance(last_result.get("findings", []), list) else []:
+            if isinstance(finding, str):
+                parts.append(finding)
+        for pivot in last_result.get("next_pivots", []) if isinstance(last_result.get("next_pivots", []), list) else []:
+            if isinstance(pivot, str):
+                parts.append(pivot)
+
+        for turn in memory.get("recent_turns", [])[-4:] if isinstance(memory.get("recent_turns", []), list) else []:
+            if isinstance(turn, dict) and isinstance(turn.get("content"), str):
+                parts.append(turn.get("content", ""))
+
+    if tool_calls:
+        last_call = next((call for call in reversed(tool_calls) if isinstance(call, dict)), None)
+        if isinstance(last_call, dict):
+            args = last_call.get("args", {}) if isinstance(last_call.get("args", {}), dict) else {}
+            summary = last_call.get("summary", {}) if isinstance(last_call.get("summary", {}), dict) else {}
+            if isinstance(args.get("query"), str):
+                parts.append(args.get("query", ""))
+            for finding in summary.get("findings", [])[:4] if isinstance(summary.get("findings", []), list) else []:
+                if isinstance(finding, str):
+                    parts.append(finding)
+
+    return " ".join(part for part in parts if isinstance(part, str) and part.strip()).lower()
+
+
+def _detect_conversation_focus(
+    user_message: str,
+    memory: Dict[str, Any],
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    assistant_response: str = "",
+    report_intent: Optional[str] = None,
+) -> str:
+    if report_intent:
+        return str(report_intent).strip().lower()
+
+    focus_text = _build_conversation_focus_text(user_message, memory, tool_calls, assistant_response)
+    last_result = memory.get("last_result", {}) if isinstance(memory, dict) and isinstance(memory.get("last_result", {}), dict) else {}
+    query_text = str(last_result.get("query", "") or "").lower()
+
+    if any(token in focus_text for token in ["windows security", "failed logon", "failed login", "authentication", "lockout", "privilege", "wineventlog:security"]):
+        return "security"
+    if any(token in focus_text for token in ["platform health", "_internal", "_audit", "_introspection", "ingestion", "license", "scheduler", "search failure", "splunk health"]):
+        return "platform_health"
+    if any(token in focus_text for token in ["wmata", "api availability", "collector", "latency spike", "feed health"]):
+        return "wmata"
+    if any(token in focus_text for token in ["network", "latency", "packet loss", "connectivity", "ping"]):
+        return "network"
+    if any(token in focus_text for token in ["compliance", "audit", "governance", "admin action", "privileged action"]):
+        return "compliance"
+    if any(token in focus_text for token in ["recommendation", "recommend", "improve", "next step", "priority action"]):
+        return "recommendations"
+    if any(token in focus_text for token in ["risk", "exposure", "blind spot", "weak spot"]):
+        return "top_risks"
+    if any(token in focus_text for token in ["coverage gap", "coverage gaps", "missing coverage", "what is missing"]):
+        return "coverage_gaps"
+    if any(token in focus_text for token in ["use case", "use cases", "what should we build", "monitoring opportunity"]):
+        return "use_cases"
+    if any(token in focus_text for token in ["readiness", "maturity", "posture", "how ready"]):
+        return "readiness"
+    if "timechart" in focus_text or "timechart" in query_text:
+        return "trend_analysis"
+    if any(token in focus_text for token in ["break down", "breakdown", "by sourcetype", "by host"]) or any(token in query_text for token in [" by sourcetype", " by host"]):
+        return "breakdown_analysis"
+    if any(token in focus_text for token in ["last seen", "latest event", "surrounding events", "host investigation", "pivot on host"]) or memory.get("last_result", {}).get("host"):
+        if memory.get("last_result", {}).get("host"):
+            return "host_analysis"
+    if memory.get("last_result", {}).get("index"):
+        return "index_analysis"
+    return str(memory.get("primary_intent", "") or "general").strip().lower() or "general"
+
+
+def _dedupe_follow_on_actions(actions: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        key = (str(action.get("kind", "")).strip().lower(), str(action.get("prompt", "")).strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(action)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _build_focus_follow_on_actions(
+    focus: str,
+    remembered_index: Optional[str],
+    remembered_host: Optional[str],
+    time_window_label: str,
+) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    index_clause = f" in index={remembered_index}" if remembered_index else ""
+
+    if focus == "security":
+        actions.extend([
+            _make_follow_on_action(
+                "Validate failed logons",
+                f"Validate failed logons{index_clause} over {time_window_label} and show the top users, hosts, and source IPs.",
+                "validate_failed_logons",
+            ),
+            _make_follow_on_action(
+                "Check privilege changes",
+                f"Check privilege changes, account lockouts, and group membership changes{index_clause} over {time_window_label}.",
+                "validate_privilege_changes",
+            ),
+        ])
+    elif focus == "platform_health":
+        actions.extend([
+            _make_follow_on_action(
+                "Check Splunk platform health",
+                "Check platform health in _internal, _audit, and _introspection over the last 24 hours and summarize ingestion issues, search failures, and license signals.",
+                "validate_platform_health",
+            ),
+            _make_follow_on_action(
+                "Inspect ingestion failures",
+                "Show ingestion errors, queue pressure, and blocked pipelines from _internal over the last 24 hours.",
+                "inspect_ingestion_failures",
+            ),
+        ])
+    elif focus == "wmata":
+        actions.extend([
+            _make_follow_on_action(
+                "Review WMATA feed health",
+                "Check WMATA API and collector data over the last 24 hours for outages, elevated errors, and latency spikes.",
+                "validate_wmata_health",
+            ),
+            _make_follow_on_action(
+                "Compare WMATA sources",
+                "Compare WMATA sources or collectors by error rate and response time over the last 24 hours.",
+                "compare_wmata_sources",
+            ),
+        ])
+    elif focus == "network":
+        actions.extend([
+            _make_follow_on_action(
+                "Inspect network connectivity",
+                "Show connectivity, latency, and packet-loss trends from ping or network telemetry over the last 24 hours.",
+                "validate_network_health",
+            ),
+            _make_follow_on_action(
+                "Compare noisy hosts",
+                "Compare the noisiest network hosts over the last 24 hours and highlight packet-loss or latency outliers.",
+                "compare_network_hosts",
+            ),
+        ])
+    elif focus == "compliance":
+        actions.extend([
+            _make_follow_on_action(
+                "Review audit activity",
+                "Show privileged actions, configuration changes, and audit failures over the last 7 days.",
+                "review_audit_activity",
+            ),
+            _make_follow_on_action(
+                "Check admin changes",
+                "Summarize admin changes and notable governance events over the last 7 days.",
+                "review_admin_changes",
+            ),
+        ])
+    elif focus == "trend_analysis" and remembered_index:
+        actions.extend([
+            _make_follow_on_action(
+                f"Explain spikes in index={remembered_index}",
+                f"Break down the biggest spikes in index={remembered_index} by sourcetype and host over {time_window_label}.",
+                "explain_trend_spikes",
+            ),
+            _make_follow_on_action(
+                f"Compare trend windows for index={remembered_index}",
+                f"Compare event volume for index={remembered_index} in {time_window_label} versus the previous equivalent window.",
+                "compare_trend_windows",
+            ),
+        ])
+    elif focus == "breakdown_analysis" and remembered_index:
+        actions.extend([
+            _make_follow_on_action(
+                f"Trend the top sourcetype in index={remembered_index}",
+                f"Show a timechart for the top sourcetype in index={remembered_index} over {time_window_label}.",
+                "trend_top_sourcetype",
+            ),
+            _make_follow_on_action(
+                f"Inspect top host in index={remembered_index}",
+                f"Inspect the busiest host in index={remembered_index} and show representative events over {time_window_label}.",
+                "inspect_top_host",
+            ),
+        ])
+    elif focus == "host_analysis" and remembered_host:
+        actions.extend([
+            _make_follow_on_action(
+                f"Show surrounding events for host={remembered_host}",
+                f"Show surrounding events for host={remembered_host}{index_clause} over {time_window_label} with sourcetype breakdown.",
+                "surrounding_events_host",
+            ),
+            _make_follow_on_action(
+                f"Check last seen for host={remembered_host}",
+                f"When was host={remembered_host} last seen in Splunk, and what sourcetypes did it report most recently?",
+                "last_seen_host",
+            ),
+        ])
+    elif focus in {"recommendations", "top_risks", "coverage_gaps", "use_cases", "readiness"}:
+        actions.append(_make_follow_on_action(
+            "Validate the top issue live",
+            "Validate the top recommendation, risk, or coverage gap with a live query and summarize current drift from the report snapshot.",
+            "validate_top_gap",
+        ))
+
+    return actions
+
+
+def update_chat_memory(
+    chat_session_id: str,
+    user_message: str,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    assistant_response: Optional[str] = None,
+    report_intent: Optional[str] = None,
+    record_user_turn: bool = True,
+) -> Dict[str, Any]:
+    """Update chat memory with latest user message, optional tool activity, and optional assistant response."""
     memory = load_chat_memory(chat_session_id)
     signals = _extract_memory_signals(user_message)
+
+    if isinstance(user_message, str) and user_message.strip():
+        memory["last_user_message"] = _compact_memory_text(user_message, limit=320)
+        if record_user_turn:
+            _append_recent_turn(memory, "user", user_message)
 
     if signals.get("intent"):
         memory["primary_intent"] = signals["intent"]
         _append_unique(memory["recent_intents"], [signals["intent"]], limit=8)
+    if report_intent:
+        _append_unique(memory["recent_intents"], [str(report_intent).strip().lower()], limit=8)
 
     _append_unique(memory["tracked_terms"], signals.get("terms", []), limit=30)
     _append_unique(memory["time_preferences"], signals.get("time_preferences", []), limit=10)
@@ -354,6 +919,24 @@ def update_chat_memory(chat_session_id: str, user_message: str, tool_calls: Opti
                 _append_unique(entities.setdefault("hosts", []), query_signals.get("hosts", []), limit=25)
                 _append_unique(entities.setdefault("sources", []), query_signals.get("sources", []), limit=25)
 
+        last_result_context = _extract_last_result_context(tool_calls)
+        if last_result_context:
+            memory["last_result"] = last_result_context
+
+    if isinstance(assistant_response, str) and assistant_response.strip():
+        memory["last_assistant_response"] = _compact_memory_text(assistant_response, limit=400)
+        _append_recent_turn(memory, "assistant", assistant_response)
+
+    focus = _detect_conversation_focus(
+        user_message,
+        memory,
+        tool_calls=tool_calls,
+        assistant_response=assistant_response or "",
+        report_intent=report_intent,
+    )
+    if focus:
+        memory["current_focus"] = focus
+
     memory["entities"] = entities
     save_chat_memory(chat_session_id, memory)
     return memory
@@ -368,6 +951,8 @@ def build_chat_memory_context(memory: Dict[str, Any]) -> str:
     lines = ["🧠 SESSION MEMORY:"]
     if memory.get("primary_intent"):
         lines.append(f"- Primary intent: {memory['primary_intent']}")
+    if memory.get("current_focus"):
+        lines.append(f"- Current focus: {memory['current_focus']}")
     if memory.get("recent_intents"):
         lines.append(f"- Recent intents: {', '.join(memory['recent_intents'][-3:])}")
     if memory.get("tracked_terms"):
@@ -382,39 +967,119 @@ def build_chat_memory_context(memory: Dict[str, Any]) -> str:
         lines.append(f"- Preferred time ranges: {', '.join(memory['time_preferences'][-4:])}")
     if memory.get("last_tools_used"):
         lines.append(f"- Last tools used: {', '.join(memory['last_tools_used'][-5:])}")
+    last_result = memory.get("last_result", {}) if isinstance(memory.get("last_result", {}), dict) else {}
+    if last_result:
+        last_context_parts = []
+        if last_result.get("index"):
+            last_context_parts.append(f"index={last_result['index']}")
+        if last_result.get("host"):
+            last_context_parts.append(f"host={last_result['host']}")
+        if last_result.get("row_count") is not None:
+            last_context_parts.append(f"row_count={last_result.get('row_count', 0)}")
+        if last_result.get("earliest_time"):
+            last_context_parts.append(
+                f"window={last_result.get('earliest_time', '')} to {last_result.get('latest_time', 'now') or 'now'}"
+            )
+        if last_context_parts:
+            lines.append(f"- Last result context: {', '.join(last_context_parts)}")
+    if memory.get("recent_turns"):
+        turn_snapshot = []
+        for turn in memory.get("recent_turns", [])[-3:]:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role", "user")).strip().capitalize()
+            content = _compact_memory_text(turn.get("content", ""), limit=80)
+            if content:
+                turn_snapshot.append(f"{role}: {content}")
+        if turn_snapshot:
+            lines.append(f"- Recent turns: {' | '.join(turn_snapshot)}")
 
     return "\n".join(lines)
 
 
-def build_follow_on_actions(user_message: str, memory: Dict[str, Any], tool_calls: Optional[List[Dict[str, Any]]] = None) -> List[str]:
-    """Generate concise follow-on action suggestions for the next interaction step."""
-    actions: List[str] = []
-    entities = memory.get("entities", {}) if isinstance(memory, dict) else {}
-    remembered_index = (entities.get("indexes") or [None])[-1]
-    remembered_host = (entities.get("hosts") or [None])[-1]
+def build_follow_on_actions(user_message: str, memory: Dict[str, Any], tool_calls: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Generate executable, context-aware follow-on action suggestions."""
+    actions: List[Dict[str, Any]] = []
+    remembered_index = _remembered_entity(memory, "index")
+    remembered_host = _remembered_entity(memory, "host")
+    last_result = memory.get("last_result", {}) if isinstance(memory, dict) and isinstance(memory.get("last_result", {}), dict) else {}
+    earliest_time = str(last_result.get("earliest_time") or "").strip() or "-24h"
+    latest_time = str(last_result.get("latest_time") or "").strip() or "now"
+    time_window_label = _describe_time_window(earliest_time, latest_time)
+    row_count = _safe_int(last_result.get("row_count"))
+    focus = _detect_conversation_focus(user_message, memory, tool_calls=tool_calls)
+    latest_summary = {}
+    if tool_calls:
+        last_call = next((call for call in reversed(tool_calls) if isinstance(call, dict)), {})
+        latest_summary = last_call.get("summary", {}) if isinstance(last_call.get("summary", {}), dict) else {}
+
+    output_actions = _build_output_follow_on_actions(latest_summary, remembered_index, remembered_host, time_window_label)
+    focus_actions = _build_focus_follow_on_actions(focus, remembered_index, remembered_host, time_window_label)
+
+    if output_actions:
+        actions.extend(output_actions)
+        if focus in {"security", "platform_health", "wmata", "network", "compliance", "recommendations", "top_risks", "coverage_gaps", "use_cases", "readiness"}:
+            actions.extend(focus_actions[:1])
+    else:
+        actions.extend(focus_actions)
 
     if tool_calls:
         last_call = tool_calls[-1] if tool_calls else {}
         summary = last_call.get("summary", {}) if isinstance(last_call, dict) else {}
-        row_count = summary.get("row_count", 0)
+        row_count = _safe_int(summary.get("row_count"))
 
         if row_count == 0:
-            actions.append("Retry with a broader time range, such as earliest=-7d latest=now.")
+            broaden_prompt = "Retry the last search over the last 7 days and tell me whether any relevant data exists."
             if remembered_index:
-                actions.append(f"Run a baseline count check on index={remembered_index} to confirm data availability.")
-        elif row_count > 0:
-            actions.append("Add a timechart view to evaluate trend changes over time.")
+                broaden_prompt = f"Retry the last search for index={remembered_index} over the last 7 days and tell me whether any relevant data exists."
+            actions.append(_make_follow_on_action("Broaden the time range", broaden_prompt, "broaden_time"))
             if remembered_index:
-                actions.append(f"Drill into index={remembered_index} with top sourcetype and host breakdown.")
+                actions.append(_make_follow_on_action(
+                    f"Baseline index={remembered_index}",
+                    f"Run a baseline count check for index={remembered_index} and confirm whether data is available over the last 7 days.",
+                    "baseline_index",
+                ))
             if remembered_host:
-                actions.append(f"Pivot on host={remembered_host} to identify related anomalies.")
+                actions.append(_make_follow_on_action(
+                    f"Check last seen for host={remembered_host}",
+                    f"When was host={remembered_host} last seen in Splunk?",
+                    "last_seen_host",
+                ))
+        elif row_count > 0 and not actions:
+            if remembered_index:
+                actions.append(_make_follow_on_action(
+                    f"Trend index={remembered_index}",
+                    f"Show a timechart of event volume for index={remembered_index} over {time_window_label}.",
+                    "timechart_index",
+                ))
+                actions.append(_make_follow_on_action(
+                    f"Break down index={remembered_index}",
+                    f"Break down index={remembered_index} by sourcetype and host for {time_window_label}.",
+                    "breakdown_index",
+                ))
+            if remembered_host:
+                host_scope = f" within index={remembered_index}" if remembered_index else ""
+                actions.append(_make_follow_on_action(
+                    f"Investigate host={remembered_host}",
+                    f"Pivot on host={remembered_host}{host_scope} and identify related anomalies for {time_window_label}.",
+                    "host_pivot",
+                ))
 
     if not actions:
-        actions.append("Ask a focused plain-language question about one index, host, or sourcetype for deeper analysis.")
         if remembered_index:
-            actions.append(f"Try: 'Show me unusual events in index={remembered_index} over the last 24h'.")
+            actions.append(_make_follow_on_action(
+                "Investigate unusual events",
+                f"Show me unusual events in index={remembered_index} over the last 24 hours.",
+                "unusual_events",
+            ))
+        else:
+            actions.append(_make_follow_on_action(
+                "Ask a focused follow-up",
+                "Ask a focused plain-language question about one index, host, or sourcetype for deeper analysis.",
+                "generic_follow_up",
+            ))
 
-    return actions[:3]
+    return _dedupe_follow_on_actions(actions, limit=3)
 
 
 def resolve_tool_name(tool_name: str, available_tools: Optional[set] = None) -> str:
@@ -498,6 +1163,137 @@ def extract_results_from_mcp_response(tool_response: Dict[str, Any]) -> Dict[str
     return normalized
 
 
+def extract_primary_spl_query(tool_calls: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """Return the most relevant executed SPL query from a tool-call history."""
+    if not isinstance(tool_calls, list):
+        return None
+
+    for tool_call in reversed(tool_calls):
+        if not isinstance(tool_call, dict):
+            continue
+
+        spl_query = tool_call.get("spl_query")
+        if isinstance(spl_query, str) and spl_query.strip():
+            return spl_query.strip()
+
+        args = tool_call.get("args", {})
+        if isinstance(args, dict):
+            query = args.get("query")
+            if isinstance(query, str) and query.strip():
+                return query.strip()
+
+    return None
+
+
+def _capability_is_ready(capability_name: str) -> bool:
+    """Return True when an optional capability is installed, enabled, and healthy."""
+    try:
+        capability_state = capability_manager.get_capability_state(capability_name)
+    except Exception:
+        return False
+
+    return (
+        bool(capability_state.get("installed"))
+        and bool(capability_state.get("enabled"))
+        and not bool(capability_state.get("restart_required"))
+        and str(capability_state.get("health_status") or "").lower() == "ready"
+    )
+
+
+def build_visualization_capability_usage(visualization_spec: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Describe visualization-preview contribution in the normalized capability-usage format."""
+    if not isinstance(visualization_spec, dict) or not visualization_spec.get("chart_type"):
+        return []
+
+    definition = capability_registry.get_definition("visualization_tools")
+    point_count = _safe_int(visualization_spec.get("point_count"))
+    chart_type = str(visualization_spec.get("chart_type") or "chart").strip()
+    summary_text = str(visualization_spec.get("summary_text") or "").strip()
+    if not summary_text:
+        summary_text = f"Generated a {chart_type} preview from {point_count or 'several'} plotted values."
+
+    return [
+        {
+            "name": "visualization_tools",
+            "title": definition.title if definition else "Visualization Tools",
+            "category": definition.category if definition else "tool_pack",
+            "used_in": "chat_preview",
+            "contribution": summary_text,
+            "chunks": [
+                {
+                    "source": "Splunk query results",
+                    "score": 100,
+                    "snippet": summary_text,
+                    "source_type": "query_result_preview",
+                }
+            ],
+        }
+    ]
+
+
+def extract_primary_visualization(tool_calls: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    """Build or recover the most relevant visualization preview from recent tool calls."""
+    if not isinstance(tool_calls, list) or not _capability_is_ready("visualization_tools"):
+        return None
+
+    for tool_call in reversed(tool_calls):
+        if not isinstance(tool_call, dict):
+            continue
+
+        summary = tool_call.get("summary", {}) if isinstance(tool_call.get("summary", {}), dict) else {}
+        existing_preview = summary.get("visualization_spec")
+        if isinstance(existing_preview, dict) and existing_preview.get("chart_type"):
+            return existing_preview
+
+        rows = summary.get("actual_results", []) if isinstance(summary.get("actual_results", []), list) else []
+        if not rows:
+            continue
+
+        visualization_result = capability_manager.build_visualization(
+            "visualization_tools",
+            {
+                "rows": rows,
+                "spl_query": tool_call.get("spl_query") or (tool_call.get("args", {}) if isinstance(tool_call.get("args", {}), dict) else {}).get("query"),
+                "query_shape": summary.get("query_shape"),
+                "sample_fields": summary.get("sample_fields"),
+                "time_bounds": summary.get("time_bounds"),
+                "top_dimensions": summary.get("top_dimensions"),
+                "numeric_fields": summary.get("numeric_fields"),
+                "row_count": summary.get("row_count"),
+                "findings": summary.get("findings"),
+            },
+        )
+
+        if visualization_result.ok:
+            visualization_spec = visualization_result.details.get("visualization")
+            if isinstance(visualization_spec, dict) and visualization_spec.get("chart_type"):
+                summary["visualization_spec"] = visualization_spec
+                return visualization_spec
+
+    return None
+
+
+def augment_capability_usage_with_visualization(
+    tool_calls: Optional[List[Dict[str, Any]]],
+    capability_usage: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Attach visualization contribution metadata when the preview capability contributes."""
+    visualization_spec = extract_primary_visualization(tool_calls)
+    enriched_usage = list(capability_usage or [])
+    if not visualization_spec:
+        return None, enriched_usage
+
+    existing_names = {
+        str(item.get("name") or "").strip().lower()
+        for item in enriched_usage
+        if isinstance(item, dict)
+    }
+    if "visualization_tools" not in existing_names:
+        enriched_usage.extend(build_visualization_capability_usage(visualization_spec))
+
+    return visualization_spec, enriched_usage
+
+
 def detect_latest_entry_index_request(user_message: str) -> Optional[str]:
     """Detect user intent asking for latest/newest entry in a specific index."""
     if not isinstance(user_message, str):
@@ -579,55 +1375,82 @@ def _extract_query_terms_for_rag(user_message: str) -> List[str]:
 
 
 def build_lightweight_rag_context(user_message: str, max_chunks: int = 3) -> str:
-    """Return compact local retrieval snippets from recent output reports for demo-mode RAG."""
-    output_dir = Path("output")
-    if not output_dir.exists():
-        return ""
+    """Return optional RAG context through the capability framework."""
+    rag_context, _ = get_optional_rag_context(user_message=user_message, max_chunks=max_chunks)
+    return rag_context
 
-    query_terms = _extract_query_terms_for_rag(user_message)
-    if not query_terms:
-        return ""
 
-    candidate_files = sorted(
-        [p for p in output_dir.glob("*") if p.is_file() and p.suffix.lower() in {".md", ".txt", ".json"}],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
-    )[:8]
+def build_capability_usage_from_rag_result(rag_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Normalize capability contribution details for UI and persistence."""
+    if not isinstance(rag_result, dict):
+        return []
 
-    scored_chunks: List[Dict[str, Any]] = []
-    for file_path in candidate_files:
-        try:
-            text = file_path.read_text(encoding="utf-8", errors="ignore")[:12000]
-        except Exception:
+    capability_name = str(rag_result.get("capability") or rag_result.get("provider") or "").strip()
+    context_text = str(rag_result.get("context_text") or "")
+    if not capability_name or not context_text:
+        return []
+
+    definition = capability_registry.get_definition(capability_name)
+    chunks = rag_result.get("chunks", []) if isinstance(rag_result.get("chunks", []), list) else []
+    normalized_chunks = []
+    for chunk in chunks[:6]:
+        if not isinstance(chunk, dict):
             continue
+        source_name = str(chunk.get("source") or chunk.get("file") or "artifact").strip() or "artifact"
+        snippet = str(chunk.get("snippet") or "").strip()
+        metadata = chunk.get("metadata", {}) if isinstance(chunk.get("metadata", {}), dict) else {}
+        normalized_chunks.append(
+            {
+                "source": source_name,
+                "score": _safe_int(chunk.get("score", 0)),
+                "snippet": snippet,
+                "source_type": str(metadata.get("source_type") or "").strip() or None,
+            }
+        )
 
-        blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
-        for block in blocks:
-            lower_block = block.lower()
-            hits = sum(1 for term in query_terms if term in lower_block)
-            if hits <= 0:
-                continue
-            scored_chunks.append({
-                "file": file_path.name,
-                "score": hits,
-                "snippet": block[:420]
-            })
+    chunk_count = len(normalized_chunks)
+    contribution = (
+        f"Added {chunk_count} matching artifact snippet{'s' if chunk_count != 1 else ''} to the LLM prompt context."
+        if chunk_count > 0
+        else "Added optional capability context to the LLM prompt."
+    )
 
-    if not scored_chunks:
-        return ""
-
-    top_chunks = sorted(scored_chunks, key=lambda item: item["score"], reverse=True)[:max(1, min(max_chunks, 6))]
-    lines = ["📚 OPTIONAL LOCAL RAG CONTEXT:"]
-    for idx, chunk in enumerate(top_chunks, 1):
-        lines.append(f"{idx}. [{chunk['file']}] {chunk['snippet']}")
-    return "\n".join(lines)
+    return [
+        {
+            "name": capability_name,
+            "title": definition.title if definition else capability_name,
+            "category": definition.category if definition else "capability",
+            "used_in": "llm_prompt",
+            "contribution": contribution,
+            "chunks": normalized_chunks,
+        }
+    ]
 
 
-def detect_basic_inventory_intent(user_message: str) -> Optional[str]:
-    """Detect common simple inventory intents that should not rely on LLM tool formatting."""
+def get_optional_rag_context(user_message: str, max_chunks: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return optional RAG context and normalized capability usage details."""
+    rag_result = capability_manager.get_rag_context(user_message=user_message, max_chunks=max_chunks)
+    context_text = str(rag_result.get("context_text") or "") if isinstance(rag_result, dict) else ""
+    capability_usage = build_capability_usage_from_rag_result(rag_result)
+    return context_text, capability_usage
+
+
+def detect_basic_inventory_intent(user_message: str, memory: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Detect common simple or memory-anchored intents that should not rely on LLM tool formatting."""
     if not isinstance(user_message, str):
         return None
     message = user_message.lower()
+    remembered_index = extract_index_from_message(user_message) or _remembered_entity(memory or {}, "index")
+    remembered_host = extract_host_or_ip_from_message(user_message) or _remembered_entity(memory or {}, "host")
+
+    if remembered_index and any(token in message for token in ["timechart", "trend over time", "volume over time", "show trend"]):
+        return "timechart_index_trend"
+    if remembered_index and any(token in message for token in ["break it down", "breakdown", "by sourcetype", "by host"]):
+        return "breakdown_index"
+    if remembered_index and any(token in message for token in ["baseline count", "baseline check", "confirm data availability", "data availability"]):
+        return "baseline_index_check"
+    if remembered_host and any(token in message for token in ["pivot on host", "investigate host", "related anomalies", "host anomalies"]):
+        return "host_pivot"
 
     if any(token in message for token in ["list indexes", "show indexes", "what indexes", "available indexes"]):
         return "list_indexes"
@@ -681,6 +1504,21 @@ def extract_host_or_ip_from_message(user_message: str) -> Optional[str]:
     if host_match:
         return host_match.group(1).strip()
     return None
+
+
+def extract_time_range_from_message(user_message: str) -> Tuple[str, str]:
+    """Extract a simple relative time range from plain language follow-on prompts."""
+    if not isinstance(user_message, str):
+        return "", ""
+
+    message = user_message.lower()
+    if any(token in message for token in ["last 24 hours", "past 24 hours", "-24h"]):
+        return "-24h", "now"
+    if any(token in message for token in ["last 7 days", "past 7 days", "last week", "-7d"]):
+        return "-7d", "now"
+    if any(token in message for token in ["last 30 days", "past 30 days", "last month", "-30d"]):
+        return "-30d", "now"
+    return "", ""
 
 
 def parse_tool_call_payload(raw_json: str) -> Optional[Dict[str, Any]]:
@@ -760,6 +1598,159 @@ def extract_tool_call_from_text(response_text: str) -> Optional[Dict[str, Any]]:
             "arguments": tool_args
         }
     }
+
+
+def _decode_inline_json_string(value: str) -> str:
+    """Best-effort decode for partially escaped JSON fragments."""
+    if not isinstance(value, str):
+        return ""
+    try:
+        return bytes(value, "utf-8").decode("unicode_escape")
+    except Exception:
+        return value
+
+
+def extract_spl_from_response_text(response_text: str) -> Optional[str]:
+    """Recover an SPL query from fenced code or simple inline query text."""
+    if not isinstance(response_text, str) or not response_text.strip():
+        return None
+
+    patterns = [
+        r'```spl\s*\n(.*?)```',
+        r'```splunk\s*\n(.*?)```',
+        r'```(?:\w+)?\s*\n((?:search\s+)?index=.*?)```',
+        r'(?mi)^\s*(\|\s*tstats[^\n`]+)\s*$',
+        r'(?mi)^\s*((?:search\s+)?index=[^\n`]+(?:\|\s*[^\n`]+)*)\s*$',
+        r'(?mi)^\s*(search\s+[^\n`]+(?:\|\s*[^\n`]+)*)\s*$',
+        r'(?is)\b(?:spl|query)\s*:\s*((?:search\s+)?index=.*?)(?:\n|$)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1).strip().strip('"').strip("'")
+        if candidate:
+            return candidate
+
+    return None
+
+
+def _recover_tool_call_from_tagged_payload(
+    response_text: str,
+    query_tool_name: str,
+    default_earliest: str = "-24h",
+    default_latest: str = "now",
+) -> Optional[Dict[str, Any]]:
+    """Recover a tool call when the tagged JSON payload is malformed but structurally recognizable."""
+    if not isinstance(response_text, str) or '<TOOL_CALL>' not in response_text or '</TOOL_CALL>' not in response_text:
+        return None
+
+    start = response_text.find('<TOOL_CALL>') + len('<TOOL_CALL>')
+    end = response_text.find('</TOOL_CALL>', start)
+    if end <= start:
+        return None
+
+    raw_payload = response_text[start:end].strip()
+    if not raw_payload:
+        return None
+
+    tool_match = re.search(r'"tool"\s*:\s*"([^"]+)"', raw_payload)
+    tool_name = tool_match.group(1).strip() if tool_match else query_tool_name
+
+    query = None
+    query_patterns = [
+        r'"query"\s*:\s*"(?P<query>.*?)(?="\s*,\s*"(?:earliest_time|latest_time|row_limit|limit|count)|"\s*\}\s*\}|"\s*\})',
+        r"'query'\s*:\s*'(?P<query>.*?)(?='\s*,\s*'(?:earliest_time|latest_time|row_limit|limit|count)|'\s*\}\s*\}|'\s*\})",
+    ]
+    for pattern in query_patterns:
+        query_match = re.search(pattern, raw_payload, re.DOTALL)
+        if query_match:
+            query = _decode_inline_json_string(query_match.group('query').strip())
+            break
+
+    if not query:
+        query = extract_spl_from_response_text(raw_payload)
+
+    if not query:
+        return None
+
+    earliest_match = re.search(r'"earliest_time"\s*:\s*"([^"]+)"', raw_payload)
+    latest_match = re.search(r'"latest_time"\s*:\s*"([^"]+)"', raw_payload)
+    row_limit_match = re.search(r'"row_limit"\s*:\s*(\d+)', raw_payload)
+
+    arguments: Dict[str, Any] = {
+        "query": query,
+        "earliest_time": earliest_match.group(1).strip() if earliest_match else default_earliest,
+        "latest_time": latest_match.group(1).strip() if latest_match else default_latest,
+    }
+    if row_limit_match:
+        arguments["row_limit"] = int(row_limit_match.group(1))
+
+    return {
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        }
+    }
+
+
+def extract_recoverable_tool_call(
+    response_text: str,
+    query_tool_name: str,
+    default_earliest: str = "-24h",
+    default_latest: str = "now",
+) -> Optional[Dict[str, Any]]:
+    """Recover the next tool call from tagged JSON, malformed tags, bare JSON, or SPL text."""
+    if not isinstance(response_text, str) or not response_text.strip():
+        return None
+
+    extracted = extract_tool_call_from_text(response_text)
+    if extracted:
+        return extracted
+
+    recovered = _recover_tool_call_from_tagged_payload(
+        response_text,
+        query_tool_name,
+        default_earliest=default_earliest,
+        default_latest=default_latest,
+    )
+    if recovered:
+        return recovered
+
+    stripped = response_text.strip()
+    if stripped.startswith("{") and 'tool' in stripped:
+        payload = parse_tool_call_payload(stripped)
+        if isinstance(payload, dict) and isinstance(payload.get('tool'), str):
+            args = payload.get('args', {}) if isinstance(payload.get('args', {}), dict) else {}
+            if 'query' in args and 'earliest_time' not in args:
+                args['earliest_time'] = default_earliest
+            if 'query' in args and 'latest_time' not in args:
+                args['latest_time'] = default_latest
+            return {
+                "method": "tools/call",
+                "params": {
+                    "name": str(payload.get('tool')).strip(),
+                    "arguments": args,
+                }
+            }
+
+    spl_query = extract_spl_from_response_text(response_text)
+    if spl_query:
+        return {
+            "method": "tools/call",
+            "params": {
+                "name": query_tool_name,
+                "arguments": {
+                    "query": spl_query,
+                    "earliest_time": default_earliest,
+                    "latest_time": default_latest,
+                }
+            }
+        }
+
+    return None
 
 
 def has_continuation_intent(response_text: str) -> bool:
@@ -2672,6 +3663,27 @@ class ConfigUpdate(BaseModel):
     llm: Optional[LLMSettings] = None
     server: Optional[ServerSettings] = None
 
+
+class CapabilityConfigUpdate(BaseModel):
+    config: Dict[str, Any]
+
+
+class CapabilityDeeplinkBuildRequest(BaseModel):
+    query: str
+    earliest: Optional[str] = None
+    latest: Optional[str] = None
+    app: Optional[str] = None
+    link_type: str = "search"
+
+
+class CapabilityExportBuildRequest(BaseModel):
+    timestamp: Optional[str] = None
+    persona: str = "admin"
+    artifact_names: List[str] = []
+    title: Optional[str] = None
+    runbook_markdown: Optional[str] = None
+    runbook_filename: Optional[str] = None
+
 @app.get("/api/config")
 async def get_config():
     """Get current configuration (safe export with masked secrets)"""
@@ -2730,6 +3742,7 @@ async def update_config(config_update: ConfigUpdate):
         
         # Reload config
         config_manager._config = config_manager.load()
+        capability_manager.refresh()
         
         return {"status": "success", "message": "Configuration updated successfully"}
         
@@ -2739,6 +3752,143 @@ async def update_config(config_update: ConfigUpdate):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to update configuration: {str(e)}")
+
+
+def _raise_for_capability_result(result: Dict[str, Any]):
+    if result.get("ok"):
+        return
+    detail = result.get("message") or "Capability operation failed"
+    status_code = 404 if "unknown capability" in detail.lower() else 400
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+@app.get("/api/capabilities")
+async def get_capabilities():
+    """Get current capability registry state and persisted config."""
+    return {
+        "status": "success",
+        "summary": capability_manager.get_summary(),
+        "capabilities": capability_manager.list_capabilities(),
+    }
+
+
+@app.get("/api/capabilities/health")
+async def get_capability_health():
+    """Return current capability health snapshots."""
+    capabilities = capability_manager.list_capabilities()
+    return {
+        "status": "success",
+        "capabilities": {
+            name: {
+                "health_status": state.get("health_status"),
+                "health_message": state.get("health_message"),
+                "last_tested_at": state.get("last_tested_at"),
+                "restart_required": state.get("restart_required"),
+            }
+            for name, state in capabilities.items()
+        },
+    }
+
+
+@app.post("/api/capabilities/{name}/install")
+async def install_capability(name: str):
+    """Install or prepare an optional capability."""
+    result = capability_manager.install_capability(name).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/{name}/enable")
+async def enable_capability(name: str):
+    """Enable an installed optional capability."""
+    result = capability_manager.enable_capability(name).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/{name}/disable")
+async def disable_capability(name: str):
+    """Disable an optional capability without uninstalling it."""
+    result = capability_manager.disable_capability(name).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/{name}/test")
+async def test_capability(name: str):
+    """Run a health check for an optional capability."""
+    result = capability_manager.test_capability(name).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/{name}/reindex")
+async def reindex_capability(name: str):
+    """Run an index rebuild for capabilities that manage retrieval content."""
+    result = capability_manager.reindex_capability(name).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/{name}/config")
+async def update_capability_config(name: str, config_update: CapabilityConfigUpdate):
+    """Persist capability-specific configuration updates."""
+    result = capability_manager.update_capability_config(name, config_update.config).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/deeplinks/build")
+async def build_splunk_deeplink(build_request: CapabilityDeeplinkBuildRequest):
+    """Build a Splunk deeplink using the optional deeplink capability pack."""
+    result = capability_manager.build_deeplink(
+        "splunk_deeplink_tools",
+        build_request.link_type,
+        {
+            "query": build_request.query,
+            "earliest": build_request.earliest,
+            "latest": build_request.latest,
+            "app": build_request.app,
+        },
+    ).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/exports/build")
+async def build_capability_export(build_request: CapabilityExportBuildRequest):
+    """Build a deterministic export bundle using the optional export capability pack."""
+    result = capability_manager.build_export(
+        "export_tools",
+        {
+            "timestamp": build_request.timestamp,
+            "persona": build_request.persona,
+            "artifact_names": list(build_request.artifact_names or []),
+            "title": build_request.title,
+            "runbook_markdown": build_request.runbook_markdown,
+            "runbook_filename": build_request.runbook_filename,
+        },
+    ).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.get("/api/capabilities/exports/download/{filename}")
+async def download_capability_export(filename: str):
+    """Download a generated deterministic export bundle from output/exports."""
+    safe_filename = Path(filename).name
+    if not re.match(r"^[a-zA-Z0-9_\-.]+$", safe_filename) or not safe_filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Invalid report package filename")
+
+    export_state = capability_manager.get_capability_state("export_tools")
+    export_dir = Path(str(export_state.get("export_dir") or Path("output") / "exports"))
+    file_path = export_dir / safe_filename
+    if not file_path.resolve().is_relative_to(export_dir.resolve()):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Report package not found")
+
+    return FileResponse(path=file_path, filename=file_path.name, media_type="application/zip")
 
 # ==================== Credential Vault API ====================
 
@@ -2822,6 +3972,7 @@ async def load_credential(name: str):
     if success:
         # Reload config
         config_manager._config = config_manager.load()
+        capability_manager.refresh()
         return {
             "status": "success", 
             "message": f"Credential '{name}' loaded",
@@ -2908,6 +4059,7 @@ async def load_mcp_config(name: str):
     if success:
         # Reload config
         config_manager._config = config_manager.load()
+        capability_manager.refresh()
         return {
             "status": "success", 
             "message": f"MCP configuration '{name}' loaded",
@@ -3075,14 +4227,25 @@ async def list_models(request: Request):
             if provider == 'openai':
                 if not api_key:
                     raise HTTPException(status_code=400, detail="API key required for OpenAI")
+                base = (endpoint_url or 'https://api.openai.com').rstrip('/')
+                if base.endswith('/v1'):
+                    models_url = f'{base}/models'
+                elif base.endswith('/models'):
+                    models_url = base
+                else:
+                    models_url = f'{base}/v1/models'
                 response = await client.get(
-                    'https://api.openai.com/v1/models',
+                    models_url,
                     headers={'Authorization': f'Bearer {api_key}'},
                 )
                 response.raise_for_status()
                 models_data = response.json()
-                models = sorted({m.get('id') for m in models_data.get('data', []) if isinstance(m, dict) and m.get('id')})
-                return {'models': [m for m in models if isinstance(m, str)]}
+                raw_models = sorted({m.get('id') for m in models_data.get('data', []) if isinstance(m, dict) and m.get('id')})
+                filtered_models = filter_openai_generation_models([m for m in raw_models if isinstance(m, str)])
+                return {
+                    'models': filtered_models,
+                    'filtered_out': max(0, len(raw_models) - len(filtered_models)),
+                }
 
             if provider == 'azure':
                 if not endpoint_url:
@@ -3241,7 +4404,7 @@ async def get_dependencies():
         
         # Sort by name
         packages.sort(key=lambda x: x['name'].lower())
-        
+
         return {
             "status": "success",
             "packages": packages,
@@ -3274,10 +4437,11 @@ async def assess_max_tokens():
                 "message": f"Automatic max token probing is optimized for OpenAI. Using provider-safe default for {provider}: {fallback}"
             }
         
-        from openai import OpenAI
-        client = OpenAI(
+        llm_client = LLMClientFactory.create_client(
+            provider=provider,
+            custom_endpoint=config.llm.endpoint_url,
             api_key=config.llm.api_key,
-            base_url=config.llm.endpoint_url if config.llm.endpoint_url else None
+            model=config.llm.model,
         )
         
         # Try progressively larger max_tokens until we hit the limit
@@ -3285,11 +4449,10 @@ async def assess_max_tokens():
         
         for test_max in test_values:
             try:
-                response = client.chat.completions.create(
-                    model=config.llm.model,
-                    messages=[{"role": "user", "content": "Hi"}],
+                await llm_client.generate_response(
+                    messages=[{"role": "user", "content": "Reply with exactly: ok"}],
                     max_tokens=test_max,
-                    temperature=0.7
+                    temperature=0.0,
                 )
                 
                 return {
@@ -3303,6 +4466,8 @@ async def assess_max_tokens():
                 error_str = str(e)
                 import re
                 match = re.search(r'supports at most (\d+)', error_str)
+                if not match:
+                    match = re.search(r'max(?:imum)?[^\d]{0,20}(\d+)', error_str, flags=re.IGNORECASE)
                 if match:
                     actual_limit = int(match.group(1))
                     recommended = int(actual_limit * 0.9)
@@ -3388,12 +4553,22 @@ async def test_llm_connection(request: Request):
             "tests": {}
         }
 
+        if provider == "openai":
+            results["model_capabilities"] = get_openai_model_capabilities(model)
+
         # Test 1: Connectivity probe
         try:
             async with httpx.AsyncClient(timeout=12.0) as client:
                 if provider == "openai":
+                    base = (endpoint_url or "https://api.openai.com").rstrip('/')
+                    if base.endswith('/v1'):
+                        probe_url = f"{base}/models"
+                    elif base.endswith('/models'):
+                        probe_url = base
+                    else:
+                        probe_url = f"{base}/v1/models"
                     probe = await client.get(
-                        "https://api.openai.com/v1/models",
+                        probe_url,
                         headers={"Authorization": f"Bearer {api_key}"}
                     )
                     probe.raise_for_status()
@@ -5215,47 +6390,807 @@ async def chat_with_splunk_stream(request: dict):
 
 def load_latest_discovery_insights():
     """Load key insights from latest V2 artifacts for agent context."""
-    try:
-        output_dir = Path("output")
-        if not output_dir.exists():
-            return None
-
-        insights_files = sorted(output_dir.glob("v2_insights_brief_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not insights_files:
-            return None
-
-        latest_summary = insights_files[0]
-        summary_text = latest_summary.read_text(encoding='utf-8')[:2000]
-
-        timestamp = latest_summary.stem.replace('v2_insights_brief_', '')
-        blueprint_path = output_dir / f"v2_intelligence_blueprint_{timestamp}.json"
-
-        structured_insights = None
-        if blueprint_path.exists():
-            try:
-                ai_data = json.loads(blueprint_path.read_text(encoding='utf-8'))
-                structured_insights = {
-                    'key_findings': [f.get('title') for f in (ai_data.get('finding_ledger', []) or []) if isinstance(f, dict) and f.get('title')][:5],
-                    'recommendations': [r.get('title') for r in (ai_data.get('recommendations', []) or []) if isinstance(r, dict) and r.get('title')][:5],
-                    'data_patterns': ai_data.get('trend_signals', {})
-                }
-            except:
-                pass
-        
-        # Get file age
-        import time as time_module
-        age_seconds = time_module.time() - latest_summary.stat().st_mtime
-        age_days = int(age_seconds / 86400)
-        
-        return {
-            'summary_text': summary_text,
-            'structured': structured_insights,
-            'age_days': age_days,
-            'timestamp': timestamp
-        }
-    except Exception as e:
-        print(f"Error loading discovery insights: {e}")
+    knowledge = load_latest_report_knowledge(chat_session_settings.get("discovery_freshness_days", 7))
+    if not knowledge:
         return None
+
+    return {
+        'summary_text': knowledge.get('executive_summary', ''),
+        'structured': {
+            'key_findings': knowledge.get('headline_findings', []),
+            'recommendations': [
+                rec.get('title') for rec in knowledge.get('recommendations', [])[:5]
+                if isinstance(rec, dict) and rec.get('title')
+            ],
+            'data_patterns': knowledge.get('trend_signals', {}),
+            'coverage_gaps': [
+                gap.get('gap') for gap in knowledge.get('coverage_gaps', [])[:5]
+                if isinstance(gap, dict) and gap.get('gap')
+            ],
+        },
+        'age_days': knowledge.get('age_days', 0),
+        'timestamp': knowledge.get('timestamp', ''),
+    }
+
+
+def _read_text_if_exists(path: Path, limit: Optional[int] = None) -> str:
+    if not isinstance(path, Path) or not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return ""
+    if isinstance(limit, int) and limit > 0:
+        return text[:limit]
+    return text
+
+
+def _read_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
+    text = _read_text_if_exists(path)
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _extract_markdown_section_items(markdown_text: str, heading: str, max_items: int = 4) -> List[str]:
+    if not isinstance(markdown_text, str) or not markdown_text.strip():
+        return []
+
+    pattern = rf'##\s+{re.escape(heading)}\s*\n(.*?)(?:\n##\s+|\Z)'
+    match = re.search(pattern, markdown_text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return []
+
+    items: List[str] = []
+    for line in match.group(1).splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r'^[-*]\s+', '', cleaned)
+        cleaned = re.sub(r'^\d+\.\s+', '', cleaned)
+        cleaned = cleaned.strip()
+        if cleaned:
+            items.append(cleaned)
+    return items[:max(1, max_items)]
+
+
+def _parse_v2_notable_patterns(raw_patterns: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_patterns, list):
+        return []
+
+    for item in raw_patterns:
+        payload = item
+        if isinstance(item, str):
+            try:
+                payload = json.loads(item)
+            except Exception:
+                continue
+        if isinstance(payload, dict) and isinstance(payload.get('patterns'), list):
+            return [pattern for pattern in payload.get('patterns', []) if isinstance(pattern, dict)]
+    return []
+
+
+def _dedupe_ranked_entities(items: List[Dict[str, Any]], limit: int = 6) -> List[Dict[str, Any]]:
+    ranked = sorted(items, key=lambda item: item.get('events', 0), reverse=True)
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in ranked:
+        name = str(item.get('name', '')).strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _rank_v2_entities(finding_ledger: Any, entity_type: str, limit: int = 6) -> List[Dict[str, Any]]:
+    if not isinstance(finding_ledger, list):
+        return []
+
+    ranked: List[Dict[str, Any]] = []
+    for entry in finding_ledger:
+        if not isinstance(entry, dict):
+            continue
+        data = entry.get('data', {}) if isinstance(entry.get('data', {}), dict) else {}
+        if not data:
+            continue
+
+        name = None
+        events = 0
+        size_mb = None
+
+        if entity_type == 'indexes' and 'title' in data and 'totalEventCount' in data:
+            name = data.get('title')
+            events = _safe_int(data.get('totalEventCount'))
+            size_mb = _safe_int(data.get('currentDBSizeMB'))
+        elif entity_type == 'sourcetypes':
+            name = data.get('sourcetype') or (data.get('title') if str(data.get('type', '')).lower() in {'sourcetypes', 'source_types'} else None)
+            events = _safe_int(data.get('totalCount') or data.get('count') or data.get('eventCount'))
+        elif entity_type == 'hosts':
+            name = data.get('host') or data.get('hostname')
+            events = _safe_int(data.get('totalCount') or data.get('count') or data.get('eventCount'))
+        elif entity_type == 'sources':
+            name = data.get('source')
+            events = _safe_int(data.get('totalCount') or data.get('count') or data.get('eventCount'))
+
+        if isinstance(name, str) and name.strip():
+            entity = {
+                'name': name.strip(),
+                'events': events,
+            }
+            if size_mb is not None:
+                entity['size_mb'] = size_mb
+            if isinstance(data.get('recentTimeIso'), str):
+                entity['recent_time'] = data.get('recentTimeIso')
+            ranked.append(entity)
+
+    return _dedupe_ranked_entities(ranked, limit=limit)
+
+
+def _format_ranked_entities(items: List[Dict[str, Any]], include_size: bool = False) -> str:
+    formatted: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get('name', '')).strip()
+        if not label:
+            continue
+        events = _safe_int(item.get('events'))
+        if include_size and item.get('size_mb') is not None:
+            formatted.append(f"{label} ({events:,} events, {item.get('size_mb')}MB)")
+        else:
+            formatted.append(f"{label} ({events:,} events)")
+    return ', '.join(formatted)
+
+
+def _extract_report_priority_actions(ai_summary_payload: Dict[str, Any]) -> List[str]:
+    ai_summary_text = ai_summary_payload.get('ai_summary', '') if isinstance(ai_summary_payload, dict) else ''
+    return _extract_markdown_section_items(ai_summary_text, 'Priority Actions', max_items=4)
+
+
+def _extract_report_quick_wins(ai_summary_payload: Dict[str, Any]) -> List[str]:
+    ai_summary_text = ai_summary_payload.get('ai_summary', '') if isinstance(ai_summary_payload, dict) else ''
+    return _extract_markdown_section_items(ai_summary_text, 'Quick Wins', max_items=4)
+
+
+def _build_report_viability(bundle: Dict[str, Any], staleness_days: int) -> Dict[str, Any]:
+    timestamp = str(bundle.get('timestamp', '')).strip()
+    age_days = 999
+    try:
+        if timestamp:
+            bundle_time = datetime.strptime(timestamp, '%Y%m%d_%H%M%S')
+            age_days = max(0, int((datetime.now() - bundle_time).total_seconds() / 86400))
+    except Exception:
+        age_days = 999
+
+    blueprint = bundle.get('blueprint', {}) if isinstance(bundle.get('blueprint', {}), dict) else {}
+    ai_summary = bundle.get('ai_summary', {}) if isinstance(bundle.get('ai_summary', {}), dict) else {}
+    insights_text = bundle.get('insights_brief_text', '') if isinstance(bundle.get('insights_brief_text', ''), str) else ''
+
+    score = 0
+    reasons: List[str] = []
+
+    if blueprint:
+        score += 40
+    else:
+        reasons.append('Missing V2 intelligence blueprint')
+
+    if insights_text or ai_summary:
+        score += 20
+    else:
+        reasons.append('Missing summarized discovery narrative')
+
+    if isinstance(blueprint.get('overview', {}), dict) and blueprint.get('overview'):
+        score += 10
+    else:
+        reasons.append('Overview section is incomplete')
+
+    if isinstance(blueprint.get('finding_ledger', []), list) and blueprint.get('finding_ledger'):
+        score += 10
+    else:
+        reasons.append('Finding ledger is missing or empty')
+
+    if isinstance(blueprint.get('recommendations', []), list) and blueprint.get('recommendations'):
+        score += 10
+    elif isinstance(ai_summary.get('risk_register', []), list) and ai_summary.get('risk_register'):
+        score += 5
+    else:
+        reasons.append('Recommendations and risk register are thin')
+
+    freshness_window = max(1, int(staleness_days))
+    if age_days <= freshness_window:
+        score += 10
+    elif age_days <= freshness_window * 2:
+        reasons.append(f'Discovery bundle is {age_days} days old')
+    else:
+        reasons.append(f'Discovery bundle is stale at {age_days} days old')
+
+    has_core_artifacts = bool(blueprint) and bool(insights_text or ai_summary)
+    fresh = age_days <= freshness_window
+    usable = bool(blueprint) and score >= 45
+    viable = has_core_artifacts and score >= 60 and fresh
+
+    status = 'viable'
+    if not viable and usable:
+        status = 'stale' if has_core_artifacts else 'partial'
+    elif not usable:
+        status = 'partial'
+
+    warning = None
+    if status == 'stale':
+        warning = f"⚠️ Discovery reports are {age_days} days old. Treat them as baseline context and validate live findings before acting."
+    elif status == 'partial':
+        warning = '⚠️ Discovery reports are incomplete. Strategic guidance is available, but it should be treated as partial context.'
+
+    return {
+        'timestamp': timestamp,
+        'age_days': age_days,
+        'score': score,
+        'status': status,
+        'fresh': fresh,
+        'usable': usable,
+        'viable': viable,
+        'reasons': reasons,
+        'warning': warning,
+    }
+
+
+def _build_report_knowledge(bundle: Dict[str, Any], viability: Dict[str, Any]) -> Dict[str, Any]:
+    blueprint = bundle.get('blueprint', {}) if isinstance(bundle.get('blueprint', {}), dict) else {}
+    ai_summary_payload = bundle.get('ai_summary', {}) if isinstance(bundle.get('ai_summary', {}), dict) else {}
+    overview = blueprint.get('overview', {}) if isinstance(blueprint.get('overview', {}), dict) else {}
+    finding_ledger = blueprint.get('finding_ledger', []) if isinstance(blueprint.get('finding_ledger', []), list) else []
+    coverage_gaps = blueprint.get('coverage_gaps', []) if isinstance(blueprint.get('coverage_gaps', []), list) else ai_summary_payload.get('coverage_gaps', [])
+    risk_register = blueprint.get('risk_register', []) if isinstance(blueprint.get('risk_register', []), list) else ai_summary_payload.get('risk_register', [])
+    recommendations = blueprint.get('recommendations', []) if isinstance(blueprint.get('recommendations', []), list) else []
+    suggested_use_cases = blueprint.get('suggested_use_cases', []) if isinstance(blueprint.get('suggested_use_cases', []), list) else []
+    trend_signals = blueprint.get('trend_signals', {}) if isinstance(blueprint.get('trend_signals', {}), dict) else {}
+    notable_patterns = _parse_v2_notable_patterns(overview.get('notable_patterns', []))
+    top_indexes = _rank_v2_entities(finding_ledger, 'indexes', limit=6)
+    top_sourcetypes = _rank_v2_entities(finding_ledger, 'sourcetypes', limit=6)
+    top_hosts = _rank_v2_entities(finding_ledger, 'hosts', limit=6)
+    top_sources = _rank_v2_entities(finding_ledger, 'sources', limit=6)
+    priority_actions = _extract_report_priority_actions(ai_summary_payload)
+    quick_wins = _extract_report_quick_wins(ai_summary_payload)
+
+    executive_summary = ''
+    if isinstance(ai_summary_payload.get('ai_summary'), str) and ai_summary_payload.get('ai_summary', '').strip():
+        executive_summary = ai_summary_payload.get('ai_summary', '').strip()[:2400]
+    elif isinstance(bundle.get('insights_brief_text', ''), str):
+        executive_summary = bundle.get('insights_brief_text', '').strip()[:2400]
+
+    headline_findings: List[str] = []
+    for entry in finding_ledger:
+        if not isinstance(entry, dict):
+            continue
+        findings = entry.get('findings', []) if isinstance(entry.get('findings', []), list) else []
+        title = str(entry.get('title', '')).strip()
+        if title and findings:
+            headline_findings.append(title)
+        for finding in findings[:2]:
+            if isinstance(finding, str) and finding.strip():
+                headline_findings.append(finding.strip())
+        if len(headline_findings) >= 8:
+            break
+    headline_findings = list(dict.fromkeys(headline_findings))[:6]
+
+    top_gap_titles = [gap.get('gap') for gap in coverage_gaps[:4] if isinstance(gap, dict) and gap.get('gap')]
+    top_recommendation_titles = [rec.get('title') for rec in recommendations[:4] if isinstance(rec, dict) and rec.get('title')]
+    top_risk_titles = [risk.get('risk') for risk in risk_register[:4] if isinstance(risk, dict) and risk.get('risk')]
+
+    prompt_context_compact = "\n".join([
+        '🔍 DISCOVERY KNOWLEDGE SNAPSHOT:',
+        f"- Report viability: {viability.get('status', 'unknown')} (score {viability.get('score', 0)}/100, {viability.get('age_days', 0)} days old)",
+        f"- Readiness score: {_safe_int(blueprint.get('readiness_score') or ai_summary_payload.get('readiness_score'))}/100",
+        f"- Surface area: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes, {overview.get('total_hosts', 0)} hosts, {overview.get('total_sources', 0)} sources, {overview.get('data_volume_24h', 'unknown')} over 24h",
+        f"- Dominant indexes: {_format_ranked_entities(top_indexes[:4], include_size=True) or 'unknown'}",
+        f"- Dominant sourcetypes: {_format_ranked_entities(top_sourcetypes[:4]) or 'unknown'}",
+        f"- Highest-priority gaps: {', '.join(top_gap_titles[:4]) or 'none identified'}",
+        f"- Highest-priority recommendations: {', '.join(top_recommendation_titles[:4]) or 'none identified'}",
+    ]).strip()
+
+    prompt_context_strategic = "\n".join([
+        '📊 STRATEGIC REPORT CONTEXT:',
+        f"- Top risks: {', '.join(top_risk_titles[:4]) or 'none identified'}",
+        f"- Priority actions: {', '.join(priority_actions[:4]) or 'none extracted'}",
+        f"- Quick wins: {', '.join(quick_wins[:3]) or 'none extracted'}",
+        f"- Trend signals: evidence_steps={_safe_int(trend_signals.get('evidence_steps'))}, high_priority_recommendations={_safe_int(trend_signals.get('high_priority_recommendations'))}, coverage_gap_count={_safe_int(trend_signals.get('coverage_gap_count'))}",
+        f"- Suggested live validation areas: {', '.join(top_recommendation_titles[:3] or top_gap_titles[:3]) or 'validate the most active indexes and sources live'}",
+    ]).strip()
+
+    greeting_context = (
+        f"\n🔍 Splunk Environment: {overview.get('total_indexes', 0)} indexes, "
+        f"{overview.get('total_sourcetypes', 0)} sourcetypes, {overview.get('total_hosts', 0)} hosts"
+    )
+
+    return {
+        'timestamp': viability.get('timestamp') or bundle.get('timestamp', ''),
+        'age_days': viability.get('age_days', 0),
+        'viability': viability,
+        'warning': viability.get('warning'),
+        'readiness_score': _safe_int(blueprint.get('readiness_score') or ai_summary_payload.get('readiness_score')),
+        'overview': overview,
+        'finding_ledger': finding_ledger,
+        'coverage_gaps': coverage_gaps if isinstance(coverage_gaps, list) else [],
+        'risk_register': risk_register if isinstance(risk_register, list) else [],
+        'recommendations': recommendations if isinstance(recommendations, list) else [],
+        'suggested_use_cases': suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+        'trend_signals': trend_signals,
+        'notable_patterns': notable_patterns,
+        'top_indexes': top_indexes,
+        'top_sourcetypes': top_sourcetypes,
+        'top_hosts': top_hosts,
+        'top_sources': top_sources,
+        'priority_actions': priority_actions,
+        'quick_wins': quick_wins,
+        'executive_summary': executive_summary,
+        'headline_findings': headline_findings,
+        'prompt_context_compact': prompt_context_compact,
+        'prompt_context_strategic': prompt_context_strategic,
+        'greeting_context': greeting_context,
+        'known_entities': {
+            'indexes': [item.get('name') for item in top_indexes if isinstance(item, dict) and item.get('name')],
+            'sourcetypes': [item.get('name') for item in top_sourcetypes if isinstance(item, dict) and item.get('name')],
+            'hosts': [item.get('name') for item in top_hosts if isinstance(item, dict) and item.get('name')],
+            'sources': [item.get('name') for item in top_sources if isinstance(item, dict) and item.get('name')],
+        },
+    }
+
+
+def load_latest_report_knowledge(staleness_days: int = 7) -> Optional[Dict[str, Any]]:
+    """Load the latest viable V2 report bundle and synthesize a reusable knowledge object."""
+    output_dir = Path('output')
+    if not output_dir.exists():
+        return None
+
+    timestamps = set()
+    prefixes = [
+        'v2_intelligence_blueprint_',
+        'v2_insights_brief_',
+        'v2_ai_summary_',
+        'v2_operator_runbook_',
+        'v2_developer_handoff_',
+    ]
+    for prefix in prefixes:
+        for path in output_dir.glob(f'{prefix}*'):
+            if path.is_file():
+                timestamps.add(path.stem.replace(prefix, '', 1))
+
+    best_usable = None
+    for timestamp in sorted(timestamps, reverse=True):
+        bundle = {
+            'timestamp': timestamp,
+            'blueprint': _read_json_if_exists(output_dir / f'v2_intelligence_blueprint_{timestamp}.json'),
+            'insights_brief_text': _read_text_if_exists(output_dir / f'v2_insights_brief_{timestamp}.md', limit=5000),
+            'ai_summary': _read_json_if_exists(output_dir / f'v2_ai_summary_{timestamp}.json'),
+            'runbook_text': _read_text_if_exists(output_dir / f'v2_operator_runbook_{timestamp}.md', limit=3000),
+            'handoff_text': _read_text_if_exists(output_dir / f'v2_developer_handoff_{timestamp}.md', limit=3000),
+        }
+        viability = _build_report_viability(bundle, staleness_days)
+        knowledge = _build_report_knowledge(bundle, viability)
+        if viability.get('viable'):
+            return knowledge
+        if viability.get('usable') and best_usable is None:
+            best_usable = knowledge
+
+    return best_usable
+
+
+def _known_entity_matches(user_message: str, candidates: List[str], limit: int = 4) -> List[str]:
+    if not isinstance(user_message, str):
+        return []
+    lowered = user_message.lower()
+    matches: List[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = candidate.strip()
+        if cleaned and cleaned.lower() in lowered and cleaned not in matches:
+            matches.append(cleaned)
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def _candidate_indexes_for_domain(domain: str, report_knowledge: Dict[str, Any]) -> List[str]:
+    known_indexes = report_knowledge.get('known_entities', {}).get('indexes', []) if isinstance(report_knowledge, dict) else []
+    domain_defaults = {
+        'security': ['endpoint', 'wineventlog', '_audit', 'security'],
+        'platform operations': ['_internal', '_audit', '_introspection'],
+        'application monitoring': ['wmata', 'main'],
+        'network operations': ['netops', 'ping', 'main'],
+        'iot monitoring': ['homebridge_for_splunk', 'esp32', 'main'],
+        'compliance': ['_audit', 'wineventlog'],
+    }
+    candidates = []
+    for desired in domain_defaults.get(domain, []):
+        for index_name in known_indexes:
+            if index_name.lower() == desired.lower() and index_name not in candidates:
+                candidates.append(index_name)
+    if candidates:
+        return candidates[:4]
+    return [name for name in known_indexes[:4] if isinstance(name, str)]
+
+
+def build_query_plan_brief(user_message: str, report_knowledge: Optional[Dict[str, Any]], memory: Optional[Dict[str, Any]] = None) -> str:
+    """Build a concise deterministic investigation plan from report knowledge and chat memory."""
+    if not isinstance(user_message, str) or not report_knowledge:
+        return ''
+
+    message = user_message.lower()
+    known_entities = report_knowledge.get('known_entities', {}) if isinstance(report_knowledge, dict) else {}
+    domain = 'general'
+    anchor = 'Use the report as baseline context and live queries for recency checks.'
+
+    if any(token in message for token in ['windows', 'security', 'auth', 'login', 'privilege', 'lockout']):
+        domain = 'security'
+        anchor = 'Windows Security Monitoring and Threat Detection is a known high-priority gap with existing telemetry.'
+    elif any(token in message for token in ['platform', 'splunk health', 'ingestion', 'license', 'scheduler', 'search performance', '_internal', '_audit', '_introspection']):
+        domain = 'platform operations'
+        anchor = 'Platform Health and Splunk Operational Monitoring is a top recommendation backed by heavy internal telemetry.'
+    elif any(token in message for token in ['wmata', 'api', 'feed', 'collector']):
+        domain = 'application monitoring'
+        anchor = 'WMATA API monitoring is a top recommendation and a major business/application data surface.'
+    elif any(token in message for token in ['network', 'ping', 'latency', 'packet loss', 'interface', 'connectivity']):
+        domain = 'network operations'
+        anchor = 'Network traffic and connectivity monitoring is a named coverage gap.'
+    elif any(token in message for token in ['compliance', 'audit', 'admin action', 'governance']):
+        domain = 'compliance'
+        anchor = 'Compliance and audit activity monitoring is already identified as a medium-priority risk area.'
+
+    remembered_index = _remembered_entity(memory or {}, 'index')
+    remembered_host = _remembered_entity(memory or {}, 'host')
+    candidate_indexes = _known_entity_matches(user_message, known_entities.get('indexes', []), limit=4) or _candidate_indexes_for_domain(domain, report_knowledge)
+    candidate_sourcetypes = _known_entity_matches(user_message, known_entities.get('sourcetypes', []), limit=4)
+    if not candidate_sourcetypes and domain == 'security':
+        candidate_sourcetypes = [name for name in known_entities.get('sourcetypes', []) if isinstance(name, str) and 'wineventlog' in name.lower()][:3]
+
+    lines = [
+        'INVESTIGATION PLAN HINTS:',
+        f"- Likely domain: {domain}",
+        f"- Report anchor: {anchor}",
+    ]
+
+    if candidate_indexes:
+        lines.append(f"- Candidate indexes: {', '.join(candidate_indexes[:4])}")
+    if candidate_sourcetypes:
+        lines.append(f"- Candidate sourcetypes: {', '.join(candidate_sourcetypes[:4])}")
+    if remembered_index or remembered_host:
+        memory_parts = []
+        if remembered_index:
+            memory_parts.append(f"index={remembered_index}")
+        if remembered_host:
+            memory_parts.append(f"host={remembered_host}")
+        lines.append(f"- Chat memory anchors: {', '.join(memory_parts)}")
+
+    if any(token in message for token in ['summary', 'overview', 'recommend', 'risk', 'gap', 'improve', 'priority']):
+        lines.append('- This is partly answerable from the discovery reports; use live queries only to validate freshness, compare drift, or drill deeper.')
+    else:
+        lines.append('- Start with one focused validation query, then broaden the time range or pivot by sourcetype/host if the first result is thin.')
+
+    return '\n'.join(lines)
+
+
+def detect_report_intent(user_message: str, report_knowledge: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Detect strategic report-backed questions that should be answered directly from discovery knowledge."""
+    if not isinstance(user_message, str) or not report_knowledge:
+        return None
+    viability = report_knowledge.get('viability', {}) if isinstance(report_knowledge, dict) else {}
+    if not viability.get('usable'):
+        return None
+
+    message = user_message.lower()
+    if detect_latest_entry_index_request(user_message) or detect_last_offline_target(user_message) or detect_edge_processor_template_request(user_message):
+        return None
+    if detect_basic_inventory_intent(user_message):
+        return None
+    if re.search(r'\b(index|host|sourcetype|source)\s*[=:]', message):
+        return None
+    if any(token in message for token in ['how many', 'count', 'latest event', 'last seen', 'timechart', 'break down', 'show events', 'run query', 'search for']):
+        return None
+
+    if any(token in message for token in ['what should i improve', 'what should we improve', 'what should i do next', 'next steps', 'priorities', 'recommend', 'recommendation', 'improve the environment']):
+        return 'recommendations'
+    if any(token in message for token in ['biggest risk', 'top risk', 'risks', 'weak spot', 'weak spots', 'exposure', 'blind spot']):
+        return 'top_risks'
+    if any(token in message for token in ['coverage gap', 'coverage gaps', 'gaps', 'missing coverage', 'what is missing']):
+        return 'coverage_gaps'
+    if any(token in message for token in ['use case', 'use cases', 'detections should', 'dashboards should', 'what should we build', 'monitoring opportunity']):
+        return 'use_cases'
+    if any(token in message for token in ['readiness', 'maturity', 'posture', 'how ready are we']):
+        return 'readiness'
+    if any(token in message for token in ['overall environment', 'summarize the environment', 'environment summary', 'what do we know about this environment', 'give me a summary', 'overview of the environment']):
+        return 'environment_summary'
+    return None
+
+
+def build_report_intent_response(intent: str, report_knowledge: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Build a deterministic response from the current report knowledge bundle."""
+    overview = report_knowledge.get('overview', {}) if isinstance(report_knowledge.get('overview', {}), dict) else {}
+    viability = report_knowledge.get('viability', {}) if isinstance(report_knowledge.get('viability', {}), dict) else {}
+    coverage_gaps = report_knowledge.get('coverage_gaps', []) if isinstance(report_knowledge.get('coverage_gaps', []), list) else []
+    risk_register = report_knowledge.get('risk_register', []) if isinstance(report_knowledge.get('risk_register', []), list) else []
+    recommendations = report_knowledge.get('recommendations', []) if isinstance(report_knowledge.get('recommendations', []), list) else []
+    suggested_use_cases = report_knowledge.get('suggested_use_cases', []) if isinstance(report_knowledge.get('suggested_use_cases', []), list) else []
+    top_indexes = report_knowledge.get('top_indexes', []) if isinstance(report_knowledge.get('top_indexes', []), list) else []
+    top_sourcetypes = report_knowledge.get('top_sourcetypes', []) if isinstance(report_knowledge.get('top_sourcetypes', []), list) else []
+
+    opening = (
+        f"Latest discovery bundle status: {viability.get('status', 'unknown')} "
+        f"(score {viability.get('score', 0)}/100, {viability.get('age_days', 0)} days old)."
+    )
+    if viability.get('warning'):
+        opening = f"{opening}\n\n{viability.get('warning')}"
+
+    insights: List[str] = []
+    lines = [opening]
+
+    if intent == 'environment_summary':
+        insights = [item for item in (report_knowledge.get('headline_findings', []) or [])[:5] if isinstance(item, str)]
+        lines.extend([
+            '',
+            f"Environment snapshot: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes, {overview.get('total_hosts', 0)} hosts, {overview.get('total_sources', 0)} sources, and {overview.get('data_volume_24h', 'unknown')} of data over 24 hours.",
+            f"Readiness score: {_safe_int(report_knowledge.get('readiness_score'))} / 100.",
+            f"Dominant indexes: {_format_ranked_entities(top_indexes[:4], include_size=True) or 'unknown' }.",
+            f"Dominant sourcetypes: {_format_ranked_entities(top_sourcetypes[:4]) or 'unknown' }.",
+            f"Highest-value gaps: {', '.join([gap.get('gap') for gap in coverage_gaps[:4] if isinstance(gap, dict) and gap.get('gap')]) or 'none identified' }.",
+            f"Priority actions: {', '.join(report_knowledge.get('priority_actions', [])[:3]) or ', '.join([rec.get('title') for rec in recommendations[:3] if isinstance(rec, dict) and rec.get('title')]) or 'no explicit priority actions extracted' }.",
+        ])
+    elif intent == 'recommendations':
+        for rec in recommendations[:5]:
+            if not isinstance(rec, dict):
+                continue
+            title = rec.get('title')
+            if not title:
+                continue
+            insights.append(str(title))
+            lines.append(f"- {title} [{str(rec.get('priority', 'medium')).upper()}]: {str(rec.get('description', '')).strip()}")
+        if report_knowledge.get('priority_actions'):
+            lines.extend(['', 'Fastest priority actions:'])
+            lines.extend([f"- {item}" for item in report_knowledge.get('priority_actions', [])[:3]])
+    elif intent == 'top_risks':
+        for risk in risk_register[:6]:
+            if not isinstance(risk, dict):
+                continue
+            title = risk.get('risk')
+            if not title:
+                continue
+            insights.append(str(title))
+            severity = str(risk.get('severity', 'medium')).upper()
+            impact = str(risk.get('impact', '')).strip()
+            lines.append(f"- {title} [{severity}]: {impact}")
+    elif intent == 'coverage_gaps':
+        for gap in coverage_gaps[:6]:
+            if not isinstance(gap, dict):
+                continue
+            title = gap.get('gap')
+            if not title:
+                continue
+            insights.append(str(title))
+            priority = str(gap.get('priority', 'medium')).upper()
+            lines.append(f"- {title} [{priority}]: {str(gap.get('why_it_matters', '')).strip()}")
+    elif intent == 'use_cases':
+        for use_case in suggested_use_cases[:5]:
+            if not isinstance(use_case, dict):
+                continue
+            title = use_case.get('title')
+            if not title:
+                continue
+            insights.append(str(title))
+            lines.append(f"- {title}: {str(use_case.get('scenario') or use_case.get('description') or '').strip()} Business value: {str(use_case.get('business_value', '')).strip()}")
+    else:
+        blocker_titles = [gap.get('gap') for gap in coverage_gaps[:3] if isinstance(gap, dict) and gap.get('gap')]
+        readiness_score = _safe_int(report_knowledge.get('overview', {}).get('readiness_score') or report_knowledge.get('readiness_score') or report_knowledge.get('viability', {}).get('score'))
+        insights = blocker_titles
+        lines.extend([
+            '',
+            f"Readiness score: {readiness_score}/100.",
+            f"Top blockers: {', '.join(blocker_titles) or 'no major blockers identified'}.",
+            f"The main drag on readiness is that the environment is data-rich but still missing higher-order detections and operational monitoring in areas like {', '.join(blocker_titles[:3]) or 'security and platform health'}.",
+        ])
+
+    lines.extend([
+        '',
+        'Use MCP queries to validate current conditions, measure drift since the report snapshot, or drill into one risk area live.',
+    ])
+    return '\n'.join([line for line in lines if isinstance(line, str)]).strip(), insights[:8]
+
+
+def build_report_follow_on_actions(intent: str, report_knowledge: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return live validation prompts that naturally follow a strategic report-backed answer."""
+    actions: List[Dict[str, Any]] = []
+    recommendation_titles = [
+        str(rec.get('title')).lower()
+        for rec in report_knowledge.get('recommendations', [])[:6]
+        if isinstance(rec, dict) and rec.get('title')
+    ]
+
+    if any('windows security' in title for title in recommendation_titles):
+        actions.append(_make_follow_on_action(
+            'Validate Windows security live',
+            'Validate Windows security telemetry over the last 24 hours and show failed logons, privilege changes, and account lockouts.',
+            'validate_windows_security',
+        ))
+    if any('platform health' in title for title in recommendation_titles):
+        actions.append(_make_follow_on_action(
+            'Check Splunk platform health',
+            'Check platform health in _internal, _audit, and _introspection over the last 24 hours and summarize ingestion issues, search failures, and license signals.',
+            'validate_platform_health',
+        ))
+    if any('wmata' in title for title in recommendation_titles):
+        actions.append(_make_follow_on_action(
+            'Review WMATA feed health',
+            'Check WMATA API and collector data over the last 24 hours for outages, elevated errors, and latency spikes.',
+            'validate_wmata_health',
+        ))
+    if any('network' in title for title in recommendation_titles):
+        actions.append(_make_follow_on_action(
+            'Inspect network connectivity',
+            'Show connectivity, latency, and packet-loss trends from ping or network telemetry over the last 24 hours.',
+            'validate_network_health',
+        ))
+
+    if intent == 'use_cases':
+        actions.append(_make_follow_on_action(
+            'Show the strongest live use-case candidate',
+            'Show the strongest live candidate for a new detection or dashboard based on the most active data sources in this environment.',
+            'live_use_case_candidate',
+        ))
+
+    if not actions:
+        actions.append(_make_follow_on_action(
+            'Validate the top gap live',
+            'Validate the highest-priority discovery gap with a live query and summarize whether the current data supports immediate implementation.',
+            'validate_top_gap',
+        ))
+
+    return actions[:3]
+
+
+def _is_numeric_like(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        cleaned = value.strip().replace(',', '')
+        if not cleaned:
+            return False
+        try:
+            float(cleaned)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def analyze_result_rows(rows: Any) -> Dict[str, Any]:
+    """Extract compact structural clues from query results for planning and summarization."""
+    if not isinstance(rows, list) or not rows:
+        return {}
+
+    dict_rows = [row for row in rows[:60] if isinstance(row, dict)]
+    if not dict_rows:
+        return {}
+
+    sample_fields = list(dict_rows[0].keys())[:12]
+    time_fields = [
+        field for field in sample_fields
+        if field.lower() in {'_time', 'time', 'firsttimeiso', 'lasttimeiso', 'recenttimeiso'}
+        or field.lower().endswith('time')
+        or field.lower().endswith('timeiso')
+    ]
+
+    numeric_fields: List[str] = []
+    for field in sample_fields:
+        sample_values = [row.get(field) for row in dict_rows[:8] if row.get(field) not in (None, '')]
+        if sample_values and all(_is_numeric_like(value) for value in sample_values):
+            numeric_fields.append(field)
+
+    top_dimensions: List[Dict[str, Any]] = []
+    for field in sample_fields:
+        lowered = field.lower()
+        if field in numeric_fields or lowered in time_fields or lowered.endswith('time') or lowered.endswith('timeiso'):
+            continue
+        counts: Dict[str, int] = {}
+        for row in dict_rows[:50]:
+            value = row.get(field)
+            if value in (None, ''):
+                continue
+            text = str(value).strip()
+            if not text or len(text) > 80:
+                continue
+            counts[text] = counts.get(text, 0) + 1
+        if len(counts) < 2:
+            continue
+        ranked_counts = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        top_dimensions.append({
+            'field': field,
+            'distinct_count': len(counts),
+            'values': [f"{name} ({count})" for name, count in ranked_counts[:3]],
+        })
+
+    top_dimensions = sorted(top_dimensions, key=lambda item: item.get('distinct_count', 0), reverse=True)[:3]
+
+    time_bounds = {}
+    for field in time_fields[:2]:
+        values = [str(row.get(field)).strip() for row in dict_rows if row.get(field) not in (None, '')]
+        if values:
+            time_bounds = {
+                'field': field,
+                'first': values[0],
+                'last': values[-1],
+            }
+            break
+
+    query_shape = 'tabular'
+    numeric_names = {field.lower() for field in numeric_fields}
+    if time_fields and numeric_names.intersection({'count', 'event_count', 'events', 'totalcount'}):
+        query_shape = 'time_series'
+    elif top_dimensions and numeric_fields:
+        query_shape = 'aggregation'
+    elif len(rows) <= 5 and len(sample_fields) >= 4:
+        query_shape = 'event_sample'
+
+    next_pivots: List[str] = []
+    if top_dimensions:
+        first_dimension = top_dimensions[0]
+        top_value = str(first_dimension['values'][0]).rsplit(' (', 1)[0]
+        next_pivots.append(f"Filter on {first_dimension['field']}={top_value}")
+    if query_shape == 'time_series':
+        next_pivots.append('Compare adjacent time buckets for spikes or drops')
+    if len(rows) > 100:
+        next_pivots.append('Tighten the query or aggregate by one dimension')
+
+    return {
+        'query_shape': query_shape,
+        'sample_fields': sample_fields,
+        'time_bounds': time_bounds,
+        'top_dimensions': top_dimensions,
+        'numeric_fields': numeric_fields[:6],
+        'next_pivots': next_pivots[:3],
+    }
+
+
+def format_result_summary_for_llm(summary: Dict[str, Any]) -> str:
+    """Convert structured result metadata into a compact analysis brief for follow-up reasoning."""
+    if not isinstance(summary, dict):
+        return ''
+
+    lines: List[str] = []
+    for finding in summary.get('findings', [])[:5]:
+        if isinstance(finding, str) and finding.strip():
+            lines.append(f"- {finding}")
+
+    query_shape = str(summary.get('query_shape', '')).strip()
+    if query_shape:
+        lines.append(f"- Result shape: {query_shape}")
+
+    time_bounds = summary.get('time_bounds', {}) if isinstance(summary.get('time_bounds', {}), dict) else {}
+    if time_bounds.get('field') and (time_bounds.get('first') or time_bounds.get('last')):
+        lines.append(
+            f"- Time bounds from {time_bounds.get('field')}: {time_bounds.get('first', 'unknown')} -> {time_bounds.get('last', 'unknown')}"
+        )
+
+    for dimension in summary.get('top_dimensions', [])[:2]:
+        if not isinstance(dimension, dict):
+            continue
+        field = str(dimension.get('field', '')).strip()
+        values = dimension.get('values', []) if isinstance(dimension.get('values', []), list) else []
+        if field and values:
+            lines.append(f"- Top {field} values: {', '.join(values[:3])}")
+
+    next_pivots = summary.get('next_pivots', []) if isinstance(summary.get('next_pivots', []), list) else []
+    if next_pivots:
+        lines.append(f"- Suggested pivots: {', '.join(next_pivots[:3])}")
+
+    return '\n'.join(lines)
 
 
 async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue):
@@ -5308,99 +7243,78 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         
         # Load configuration
         config = config_manager.get()
+        request_started_at = time.time()
+
+        async def push_status(timeline: List[Dict[str, Any]], action: str, iteration: int = 0):
+            elapsed = time.time() - request_started_at
+            event = {"iteration": iteration, "action": action, "time": elapsed}
+            timeline.append(event)
+            if status_callback:
+                await status_callback(action, iteration, elapsed)
 
         # Load and update persistent chat memory for this session
         update_chat_memory(chat_session_id, user_message)
         chat_memory = load_chat_memory(chat_session_id)
         memory_context = build_chat_memory_context(chat_memory)
         
-        # Get discovery staleness threshold from session settings (days converted to seconds)
-        staleness_threshold = chat_session_settings["discovery_freshness_days"] * 86400
-        
-        # Load latest discovery context if available
+        query_lower = user_message.lower()
+        simple_greetings = any(word in query_lower for word in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'bye'])
+        needs_insights = any(keyword in query_lower for keyword in [
+            'summary', 'overview', 'recommend', 'best practice', 'optimization',
+            'use case', 'compliance', 'security', 'improve', 'assess', 'risk', 'gap', 'priority'
+        ])
+
+        report_knowledge = load_latest_report_knowledge(chat_session_settings["discovery_freshness_days"])
         discovery_context = ""
         discovery_age_warning = None
-        output_dir = Path("output")
-        
-        # Find most recent V2 blueprint
-        discovery_files = sorted(output_dir.glob("v2_intelligence_blueprint_*.json"), reverse=True)
-        if discovery_files:
-            try:
-                discovery_file = discovery_files[0]
-                
-                # Parse timestamp from filename: v2_intelligence_blueprint_YYYYMMDD_HHMMSS.json
-                timestamp_str = discovery_file.stem.replace('v2_intelligence_blueprint_', '')
-                discovery_datetime = datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
-                discovery_age_seconds = (datetime.now() - discovery_datetime).total_seconds()
-                
-                # Check if discovery is too old
-                if discovery_age_seconds > staleness_threshold:
-                    days_old = int(discovery_age_seconds / 86400)
-                    discovery_age_warning = f"⚠️ Discovery data is {days_old} days old. Consider running a new discovery for up-to-date information."
-                
-                with discovery_file.open('r', encoding='utf-8') as fp:
-                    latest_blueprint = json.load(fp)
-                metadata = {
-                    "overview": latest_blueprint.get("overview", {}) if isinstance(latest_blueprint, dict) else {}
-                }
-                
-                # Analyze user query to determine if context is needed
-                query_lower = user_message.lower()
-                simple_greetings = any(word in query_lower for word in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'bye'])
-                
-                # Check if query needs discovery insights
-                needs_insights = any(keyword in query_lower for keyword in [
-                    'summary', 'overview', 'recommend', 'best practice', 'optimization',
-                    'use case', 'compliance', 'security', 'improve', 'assess'
-                ])
-                
-                # Get overview for all custom LLM requests (lightweight, fast)
-                overview = metadata.get('overview', {})
-                
-                if simple_greetings:
-                    # For greetings, just show counts
-                    discovery_context = f"\n🔍 Splunk Environment: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes"
-                else:
-                    # For real queries on custom LLMs, provide ONLY summary stats (no detailed context)
-                    # Local LLMs struggle with large contexts - let them use tool calls to get details
-                    discovery_context = f"""
-🔍 Splunk Environment Summary:
-- Indexes: {overview.get('total_indexes', 0)}
-- Sourcetypes: {overview.get('total_sourcetypes', 0)}
-- Hosts: {overview.get('total_hosts', 0)}
-- Users: {overview.get('total_users', 0)}
-- Data (24h): {overview.get('data_volume_24h', 'unknown')}
-- Version: {overview.get('splunk_version', 'unknown')}
 
-For detailed information, use tool calls to query Splunk directly."""
-                
-                # Load discovery insights if needed for strategic questions
-                if needs_insights:
-                    insights = load_latest_discovery_insights()
-                    if insights:
-                        discovery_context += f"\n\n📊 DISCOVERY INSIGHTS (from {insights['age_days']} days ago):\n"
-                        if insights.get('structured') and insights['structured'].get('key_findings'):
-                            discovery_context += "\nKey Findings:\n"
-                            for finding in insights['structured']['key_findings'][:3]:
-                                discovery_context += f"- {finding}\n"
-                        if insights.get('structured') and insights['structured'].get('recommendations'):
-                            discovery_context += "\nRecommendations:\n"
-                            for rec in insights['structured']['recommendations'][:3]:
-                                discovery_context += f"- {rec}\n"
-                
-
-                
-            except Exception as e:
-                print(f"Could not load discovery context: {e}")
-                import traceback
-                traceback.print_exc()
+        if report_knowledge:
+            discovery_age_warning = report_knowledge.get('warning')
+            if simple_greetings:
+                discovery_context = report_knowledge.get('greeting_context', '')
+            else:
+                discovery_context = report_knowledge.get('prompt_context_compact', '')
+                if needs_insights and report_knowledge.get('prompt_context_strategic'):
+                    discovery_context = "\n\n".join([
+                        section for section in [
+                            discovery_context,
+                            report_knowledge.get('prompt_context_strategic', ''),
+                        ] if isinstance(section, str) and section.strip()
+                    ])
         else:
             discovery_age_warning = "⚠️ No discovery data found. Run a discovery first to get environment context."
 
-        rag_context = ""
-        if bool(chat_session_settings.get("enable_rag_context", False)):
-            rag_max_chunks = _safe_int(chat_session_settings.get("rag_max_chunks", 3))
-            rag_context = build_lightweight_rag_context(user_message, max_chunks=rag_max_chunks)
+        query_plan_context = build_query_plan_brief(user_message, report_knowledge, chat_memory)
+
+        report_intent = detect_report_intent(user_message, report_knowledge) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+        if report_intent:
+            report_status_timeline: List[Dict[str, Any]] = []
+            await push_status(report_status_timeline, "📚 Synthesizing discovery knowledge", 0)
+            response_text, report_insights = build_report_intent_response(report_intent, report_knowledge)
+            follow_on_actions = build_report_follow_on_actions(report_intent, report_knowledge)
+            updated_memory = update_chat_memory(
+                chat_session_id,
+                user_message,
+                assistant_response=response_text,
+                report_intent=report_intent,
+                record_user_turn=False,
+            )
+            await push_status(report_status_timeline, "✅ Returning report-backed guidance", 0)
+            return {
+                "response": response_text,
+                "initial_response": user_message,
+                "tool_calls": [],
+                "spl_query": None,
+                "iterations": 0,
+                "execution_time": f"{time.time() - request_started_at:.2f}s",
+                "insights": report_insights,
+                "status_timeline": report_status_timeline,
+                "discovery_age_warning": discovery_age_warning,
+                "chat_session_id": chat_session_id,
+                "chat_memory": updated_memory,
+                "has_follow_on": len(follow_on_actions) > 0,
+                "follow_on_actions": follow_on_actions,
+            }
 
         available_mcp_tools = await discover_mcp_tools(config)
         if not available_mcp_tools:
@@ -5455,7 +7369,7 @@ For detailed information, use tool calls to query Splunk directly."""
                     "arguments": {"row_limit": 1000}
                 }
             }
-            latest_status_timeline.append({"iteration": 1, "action": "📁 Validating index existence", "time": 0.0})
+            await push_status(latest_status_timeline, "📁 Validating index existence", 1)
             indexes_result = await execute_mcp_tool_call(indexes_call, config)
             parsed_indexes = extract_results_from_mcp_response(indexes_result)
             index_rows = parsed_indexes.get("results", []) if isinstance(parsed_indexes, dict) else []
@@ -5490,19 +7404,30 @@ For detailed information, use tool calls to query Splunk directly."""
                 elif index_names:
                     response_text += "\n\nIf helpful, I can list all currently available indexes."
 
-                updated_memory = update_chat_memory(chat_session_id, user_message, latest_tool_calls)
+                updated_memory = update_chat_memory(
+                    chat_session_id,
+                    user_message,
+                    latest_tool_calls,
+                    assistant_response=response_text,
+                    record_user_turn=False,
+                )
                 follow_on_actions = build_follow_on_actions(user_message, updated_memory, latest_tool_calls)
+                await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
+                visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
                 return {
                     "response": response_text,
                     "initial_response": user_message,
                     "tool_calls": latest_tool_calls,
+                    "spl_query": extract_primary_spl_query(latest_tool_calls),
+                    "visualization_spec": visualization_spec,
                     "iterations": len(latest_tool_calls),
-                    "execution_time": "0.00s",
+                    "execution_time": f"{time.time() - request_started_at:.2f}s",
                     "insights": ["Index was validated directly from Splunk index inventory."],
                     "status_timeline": latest_status_timeline,
                     "discovery_age_warning": discovery_age_warning,
                     "chat_session_id": chat_session_id,
                     "chat_memory": updated_memory,
+                    "capability_usage": capability_usage,
                     "has_follow_on": len(follow_on_actions) > 0,
                     "follow_on_actions": follow_on_actions
                 }
@@ -5521,7 +7446,7 @@ For detailed information, use tool calls to query Splunk directly."""
                     }
                 }
             }
-            latest_status_timeline.append({"iteration": 2, "action": "🔍 Retrieving latest event", "time": 0.0})
+            await push_status(latest_status_timeline, "🔍 Retrieving latest event", 2)
             latest_result = await execute_mcp_tool_call(latest_call, config)
             parsed_latest = extract_results_from_mcp_response(latest_result)
             latest_rows = parsed_latest.get("results", []) if isinstance(parsed_latest, dict) else []
@@ -5566,19 +7491,30 @@ For detailed information, use tool calls to query Splunk directly."""
                     f"with `search index={normalized_index_name} | sort - _time | head 1`."
                 )
 
-            updated_memory = update_chat_memory(chat_session_id, user_message, latest_tool_calls)
+            updated_memory = update_chat_memory(
+                chat_session_id,
+                user_message,
+                latest_tool_calls,
+                assistant_response=response_text,
+                record_user_turn=False,
+            )
             follow_on_actions = build_follow_on_actions(user_message, updated_memory, latest_tool_calls)
+            await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
                 "tool_calls": latest_tool_calls,
+                "spl_query": extract_primary_spl_query(latest_tool_calls),
+                "visualization_spec": visualization_spec,
                 "iterations": len(latest_tool_calls),
-                "execution_time": "0.00s",
+                "execution_time": f"{time.time() - request_started_at:.2f}s",
                 "insights": ["Used deterministic latest-event flow for index validation and retrieval."],
                 "status_timeline": latest_status_timeline,
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
             }
@@ -5588,7 +7524,7 @@ For detailed information, use tool calls to query Splunk directly."""
             skill_tool_calls: List[Dict[str, Any]] = []
 
             knowledge_tool_name = resolve_tool_name("splunk_get_knowledge_objects", available_mcp_tools)
-            skill_status_timeline.append({"iteration": 1, "action": "🧭 Fetching knowledge objects", "time": 0.0})
+            await push_status(skill_status_timeline, "🧭 Fetching knowledge objects", 1)
 
             attempts = [
                 {"object_type": "saved_searches", "row_limit": 1000},
@@ -5702,19 +7638,30 @@ For detailed information, use tool calls to query Splunk directly."""
                         "If you use a naming convention, I can search for that exact prefix next."
                     )
 
-            updated_memory = update_chat_memory(chat_session_id, user_message, skill_tool_calls)
+            updated_memory = update_chat_memory(
+                chat_session_id,
+                user_message,
+                skill_tool_calls,
+                assistant_response=response_text,
+                record_user_turn=False,
+            )
             follow_on_actions = build_follow_on_actions(user_message, updated_memory, skill_tool_calls)
+            await push_status(skill_status_timeline, "✅ Finalizing response", max(1, len(skill_tool_calls)))
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(skill_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
                 "tool_calls": skill_tool_calls,
+                "spl_query": extract_primary_spl_query(skill_tool_calls),
+                "visualization_spec": visualization_spec,
                 "iterations": len(skill_tool_calls),
-                "execution_time": "0.00s",
+                "execution_time": f"{time.time() - request_started_at:.2f}s",
                 "insights": ["Used deterministic template lookup for Edge Processor intent."],
                 "status_timeline": skill_status_timeline,
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
             }
@@ -5755,7 +7702,7 @@ For detailed information, use tool calls to query Splunk directly."""
 
             found_event: Optional[Dict[str, Any]] = None
             for attempt_idx, attempt_args in enumerate(query_attempts[:8], 1):
-                offline_status_timeline.append({"iteration": attempt_idx, "action": "🔍 Searching for latest offline signal", "time": 0.0})
+                await push_status(offline_status_timeline, "🔍 Searching for latest offline signal", attempt_idx)
                 call_payload = {
                     "method": "tools/call",
                     "params": {
@@ -5822,32 +7769,44 @@ For detailed information, use tool calls to query Splunk directly."""
                     f"If you want, I can retry with a custom index list or alternate status keywords used in your environment."
                 )
 
-            updated_memory = update_chat_memory(chat_session_id, user_message, offline_tool_calls)
+            updated_memory = update_chat_memory(
+                chat_session_id,
+                user_message,
+                offline_tool_calls,
+                assistant_response=response_text,
+                record_user_turn=False,
+            )
             follow_on_actions = build_follow_on_actions(user_message, updated_memory, offline_tool_calls)
+            await push_status(offline_status_timeline, "✅ Finalizing response", max(1, len(offline_tool_calls)))
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(offline_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
                 "tool_calls": offline_tool_calls,
+                "spl_query": extract_primary_spl_query(offline_tool_calls),
+                "visualization_spec": visualization_spec,
                 "iterations": len(offline_tool_calls),
-                "execution_time": "0.00s",
+                "execution_time": f"{time.time() - request_started_at:.2f}s",
                 "insights": ["Used deterministic offline-event lookup with index and time-range fallbacks."],
                 "status_timeline": offline_status_timeline,
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
             }
 
-        basic_intent = detect_basic_inventory_intent(user_message) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+        basic_intent = detect_basic_inventory_intent(user_message, chat_memory) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
         if basic_intent:
             basic_status_timeline: List[Dict[str, Any]] = []
             basic_tool_calls: List[Dict[str, Any]] = []
+            await push_status(basic_status_timeline, "🧭 Interpreting request with deterministic route", 0)
 
             if basic_intent == "list_indexes":
                 indexes_tool_name = resolve_tool_name("splunk_get_indexes", available_mcp_tools)
                 args = {"row_limit": 200}
-                basic_status_timeline.append({"iteration": 1, "action": "📁 Loading indexes", "time": 0.0})
+                await push_status(basic_status_timeline, "📁 Loading indexes", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": indexes_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
                 rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -5863,7 +7822,7 @@ For detailed information, use tool calls to query Splunk directly."""
 
             elif basic_intent == "list_sourcetypes":
                 args = {"query": "| tstats count where index=* by sourcetype | sort - count | head 50", "earliest_time": "-7d", "latest_time": "now"}
-                basic_status_timeline.append({"iteration": 1, "action": "🧾 Loading sourcetypes", "time": 0.0})
+                await push_status(basic_status_timeline, "🧾 Loading sourcetypes", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
                 rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -5879,7 +7838,7 @@ For detailed information, use tool calls to query Splunk directly."""
 
             elif basic_intent == "top_indexes":
                 args = {"query": "| tstats count where index=* by index | sort - count | head 25", "earliest_time": "-7d", "latest_time": "now"}
-                basic_status_timeline.append({"iteration": 1, "action": "📊 Loading top indexes", "time": 0.0})
+                await push_status(basic_status_timeline, "📊 Loading top indexes", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
                 rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -5895,7 +7854,7 @@ For detailed information, use tool calls to query Splunk directly."""
 
             elif basic_intent == "top_errors":
                 args = {"query": "search index=* (error OR failed OR exception) | stats count by sourcetype | sort - count | head 20", "earliest_time": "-24h", "latest_time": "now"}
-                basic_status_timeline.append({"iteration": 1, "action": "🚨 Loading top error sources", "time": 0.0})
+                await push_status(basic_status_timeline, "🚨 Loading top error sources", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
                 rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -5910,7 +7869,7 @@ For detailed information, use tool calls to query Splunk directly."""
 
             elif basic_intent == "latest_auth_failures":
                 args = {"query": "search index=* (\"failed login\" OR \"authentication failed\" OR \"login failed\" OR \"invalid user\" OR action=failure) | sort - _time | head 20 | table _time host user src src_ip action status message sourcetype", "earliest_time": "-7d", "latest_time": "now"}
-                basic_status_timeline.append({"iteration": 1, "action": "🔐 Loading latest authentication failures", "time": 0.0})
+                await push_status(basic_status_timeline, "🔐 Loading latest authentication failures", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
                 rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -5928,7 +7887,7 @@ For detailed information, use tool calls to query Splunk directly."""
                 else:
                     args_24h = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-24h", "latest_time": "now"}
                     args_7d = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-7d", "latest_time": "now"}
-                    basic_status_timeline.append({"iteration": 1, "action": f"📏 Counting events for index={target_index}", "time": 0.0})
+                    await push_status(basic_status_timeline, f"📏 Counting events for index={target_index}", 1)
                     res_24h = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_24h}}, config)
                     res_7d = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_7d}}, config)
                     parsed_24h = extract_results_from_mcp_response(res_24h)
@@ -5950,6 +7909,175 @@ For detailed information, use tool calls to query Splunk directly."""
                     basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args_24h, "spl_query": args_24h.get("query"), "result": res_24h, "summary": {"type": query_tool_name, "row_count": len(rows_24h) if isinstance(rows_24h, list) else 0, "findings": [f"24h count={count_24h}"], "actual_results": rows_24h[:5] if isinstance(rows_24h, list) else []}})
                     basic_tool_calls.append({"iteration": 2, "tool": query_tool_name, "args": args_7d, "spl_query": args_7d.get("query"), "result": res_7d, "summary": {"type": query_tool_name, "row_count": len(rows_7d) if isinstance(rows_7d, list) else 0, "findings": [f"7d count={count_7d}"], "actual_results": rows_7d[:5] if isinstance(rows_7d, list) else []}})
 
+            elif basic_intent == "timechart_index_trend":
+                target_index = extract_index_from_message(user_message) or _remembered_entity(chat_memory, "index")
+                explicit_earliest, explicit_latest = extract_time_range_from_message(user_message)
+                memory_window = chat_memory.get("last_result", {}) if isinstance(chat_memory, dict) and isinstance(chat_memory.get("last_result", {}), dict) else {}
+                earliest_time = explicit_earliest or str(memory_window.get("earliest_time") or "-24h")
+                latest_time = explicit_latest or str(memory_window.get("latest_time") or "now")
+
+                if not target_index:
+                    response_text = "I need an index anchor for the trend view. Try including an index, for example: 'Show a timechart for index=main over the last 24 hours'."
+                else:
+                    span = "1h" if earliest_time in {"-24h", "-7d"} else "1d"
+                    args = {
+                        "query": f"search index={target_index} | timechart span={span} count",
+                        "earliest_time": earliest_time,
+                        "latest_time": latest_time,
+                    }
+                    await push_status(basic_status_timeline, f"📈 Building timechart for index={target_index}", 1)
+                    result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                    parsed = extract_results_from_mcp_response(result)
+                    rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                    lines = []
+                    for row in rows if isinstance(rows, list) else []:
+                        if isinstance(row, dict):
+                            timestamp = row.get("_time") or row.get("time") or row.get("TIME") or "unknown"
+                            count_value = row.get("count") or row.get("COUNT") or row.get("value") or 0
+                            lines.append(f"- {timestamp}: {count_value}")
+                    response_text = (
+                        f"Event volume trend for index `{target_index}` ({_describe_time_window(earliest_time, latest_time)}):\n"
+                        + "\n".join(lines[:24])
+                    ) if lines else f"No trend data was returned for index `{target_index}` in {_describe_time_window(earliest_time, latest_time)}."
+                    basic_tool_calls.append({
+                        "iteration": 1,
+                        "tool": query_tool_name,
+                        "args": args,
+                        "spl_query": args.get("query"),
+                        "result": result,
+                        "summary": {
+                            "type": query_tool_name,
+                            "row_count": len(rows) if isinstance(rows, list) else 0,
+                            "findings": [f"Found {len(lines)} timechart buckets"],
+                            "actual_results": rows[:8] if isinstance(rows, list) else []
+                        }
+                    })
+
+            elif basic_intent == "breakdown_index":
+                target_index = extract_index_from_message(user_message) or _remembered_entity(chat_memory, "index")
+                explicit_earliest, explicit_latest = extract_time_range_from_message(user_message)
+                memory_window = chat_memory.get("last_result", {}) if isinstance(chat_memory, dict) and isinstance(chat_memory.get("last_result", {}), dict) else {}
+                earliest_time = explicit_earliest or str(memory_window.get("earliest_time") or "-24h")
+                latest_time = explicit_latest or str(memory_window.get("latest_time") or "now")
+
+                if not target_index:
+                    response_text = "I need an index anchor for the breakdown. Try including an index, for example: 'Break down index=main by sourcetype and host'."
+                else:
+                    args = {
+                        "query": f"search index={target_index} | stats count by sourcetype host | sort - count | head 20",
+                        "earliest_time": earliest_time,
+                        "latest_time": latest_time,
+                    }
+                    await push_status(basic_status_timeline, f"🧩 Breaking down index={target_index}", 1)
+                    result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                    parsed = extract_results_from_mcp_response(result)
+                    rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                    lines = []
+                    for row in rows if isinstance(rows, list) else []:
+                        if isinstance(row, dict):
+                            sourcetype = row.get("sourcetype") or row.get("SOURCETYPE") or "unknown"
+                            host = row.get("host") or row.get("HOST") or "unknown"
+                            count_value = row.get("count") or row.get("COUNT") or 0
+                            lines.append(f"- sourcetype={sourcetype} | host={host} | count={count_value}")
+                    response_text = (
+                        f"Top sourcetype and host breakdown for index `{target_index}` ({_describe_time_window(earliest_time, latest_time)}):\n"
+                        + "\n".join(lines[:20])
+                    ) if lines else f"No breakdown rows were returned for index `{target_index}` in {_describe_time_window(earliest_time, latest_time)}."
+                    basic_tool_calls.append({
+                        "iteration": 1,
+                        "tool": query_tool_name,
+                        "args": args,
+                        "spl_query": args.get("query"),
+                        "result": result,
+                        "summary": {
+                            "type": query_tool_name,
+                            "row_count": len(rows) if isinstance(rows, list) else 0,
+                            "findings": [f"Found {len(lines)} breakdown rows"],
+                            "actual_results": rows[:8] if isinstance(rows, list) else []
+                        }
+                    })
+
+            elif basic_intent == "baseline_index_check":
+                target_index = extract_index_from_message(user_message) or _remembered_entity(chat_memory, "index")
+                if not target_index:
+                    response_text = "I need an index anchor for the baseline check. Try including an index, for example: 'Run a baseline count check for index=main'."
+                else:
+                    args_24h = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-24h", "latest_time": "now"}
+                    args_7d = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-7d", "latest_time": "now"}
+                    await push_status(basic_status_timeline, f"📏 Running baseline checks for index={target_index}", 1)
+                    res_24h = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_24h}}, config)
+                    res_7d = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_7d}}, config)
+                    parsed_24h = extract_results_from_mcp_response(res_24h)
+                    parsed_7d = extract_results_from_mcp_response(res_7d)
+                    rows_24h = parsed_24h.get("results", []) if isinstance(parsed_24h, dict) else []
+                    rows_7d = parsed_7d.get("results", []) if isinstance(parsed_7d, dict) else []
+
+                    def _extract_count(rows: Any) -> int:
+                        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                            row = rows[0]
+                            for key in ["event_count", "count", "COUNT"]:
+                                if key in row:
+                                    return _safe_int(row.get(key))
+                        return 0
+
+                    count_24h = _extract_count(rows_24h)
+                    count_7d = _extract_count(rows_7d)
+                    availability = "Data is available" if count_7d > 0 else "No data was found"
+                    response_text = (
+                        f"Baseline check for index `{target_index}`:\n"
+                        f"- Last 24h: {count_24h}\n"
+                        f"- Last 7d: {count_7d}\n"
+                        f"- Assessment: {availability}."
+                    )
+                    basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args_24h, "spl_query": args_24h.get("query"), "result": res_24h, "summary": {"type": query_tool_name, "row_count": len(rows_24h) if isinstance(rows_24h, list) else 0, "findings": [f"24h count={count_24h}"], "actual_results": rows_24h[:5] if isinstance(rows_24h, list) else []}})
+                    basic_tool_calls.append({"iteration": 2, "tool": query_tool_name, "args": args_7d, "spl_query": args_7d.get("query"), "result": res_7d, "summary": {"type": query_tool_name, "row_count": len(rows_7d) if isinstance(rows_7d, list) else 0, "findings": [f"7d count={count_7d}"], "actual_results": rows_7d[:5] if isinstance(rows_7d, list) else []}})
+
+            elif basic_intent == "host_pivot":
+                target_host = extract_host_or_ip_from_message(user_message) or _remembered_entity(chat_memory, "host")
+                target_index = extract_index_from_message(user_message) or _remembered_entity(chat_memory, "index")
+                explicit_earliest, explicit_latest = extract_time_range_from_message(user_message)
+                memory_window = chat_memory.get("last_result", {}) if isinstance(chat_memory, dict) and isinstance(chat_memory.get("last_result", {}), dict) else {}
+                earliest_time = explicit_earliest or str(memory_window.get("earliest_time") or "-24h")
+                latest_time = explicit_latest or str(memory_window.get("latest_time") or "now")
+
+                if not target_host:
+                    response_text = "I need a host or IP to pivot on. Try including a host, for example: 'Pivot on host=router-01 and identify related anomalies'."
+                else:
+                    search_scope = f"index={target_index} " if target_index else "index=* "
+                    args = {
+                        "query": f"search {search_scope}host=\"{target_host}\" | stats count by sourcetype source | sort - count | head 20",
+                        "earliest_time": earliest_time,
+                        "latest_time": latest_time,
+                    }
+                    await push_status(basic_status_timeline, f"🖥️ Pivoting on host={target_host}", 1)
+                    result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
+                    parsed = extract_results_from_mcp_response(result)
+                    rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+                    lines = []
+                    for row in rows if isinstance(rows, list) else []:
+                        if isinstance(row, dict):
+                            sourcetype = row.get("sourcetype") or row.get("SOURCETYPE") or "unknown"
+                            source = row.get("source") or row.get("SOURCE") or "unknown"
+                            count_value = row.get("count") or row.get("COUNT") or 0
+                            lines.append(f"- sourcetype={sourcetype} | source={source} | count={count_value}")
+                    response_text = (
+                        f"Host pivot for `{target_host}` ({_describe_time_window(earliest_time, latest_time)}):\n"
+                        + "\n".join(lines[:20])
+                    ) if lines else f"No host pivot rows were returned for `{target_host}` in {_describe_time_window(earliest_time, latest_time)}."
+                    basic_tool_calls.append({
+                        "iteration": 1,
+                        "tool": query_tool_name,
+                        "args": args,
+                        "spl_query": args.get("query"),
+                        "result": result,
+                        "summary": {
+                            "type": query_tool_name,
+                            "row_count": len(rows) if isinstance(rows, list) else 0,
+                            "findings": [f"Found {len(lines)} host pivot rows"],
+                            "actual_results": rows[:8] if isinstance(rows, list) else []
+                        }
+                    })
+
             elif basic_intent == "latest_host_heartbeat":
                 target_host = extract_host_or_ip_from_message(user_message)
                 if not target_host and isinstance(chat_memory, dict):
@@ -5966,7 +8094,7 @@ For detailed information, use tool calls to query Splunk directly."""
                     ]
                     found_row = None
                     for attempt_idx, args in enumerate(attempts, 1):
-                        basic_status_timeline.append({"iteration": attempt_idx, "action": f"📡 Checking last-seen for {target_host}", "time": 0.0})
+                        await push_status(basic_status_timeline, f"📡 Checking last-seen for {target_host}", attempt_idx)
                         result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
                         parsed = extract_results_from_mcp_response(result)
                         rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -5987,7 +8115,7 @@ For detailed information, use tool calls to query Splunk directly."""
 
             elif basic_intent == "list_hosts":
                 args = {"query": "| tstats count where index=* by host | sort - count | head 50", "earliest_time": "-7d", "latest_time": "now"}
-                basic_status_timeline.append({"iteration": 1, "action": "🖥️ Loading hosts", "time": 0.0})
+                await push_status(basic_status_timeline, "🖥️ Loading hosts", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
                 rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -6004,7 +8132,7 @@ For detailed information, use tool calls to query Splunk directly."""
             else:
                 knowledge_tool_name = resolve_tool_name("splunk_get_knowledge_objects", available_mcp_tools)
                 args = {"row_limit": 500}
-                basic_status_timeline.append({"iteration": 1, "action": "📚 Loading knowledge objects", "time": 0.0})
+                await push_status(basic_status_timeline, "📚 Loading knowledge objects", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": knowledge_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
                 rows = parsed.get("results", []) if isinstance(parsed, dict) else []
@@ -6019,23 +8147,40 @@ For detailed information, use tool calls to query Splunk directly."""
                 response_text = "Template-like knowledge objects:\n" + "\n".join([f"- {value}" for value in templates[:60]]) if templates else "No template-like knowledge objects were returned."
                 basic_tool_calls.append({"iteration": 1, "tool": knowledge_tool_name, "args": args, "spl_query": None, "result": result, "summary": {"type": knowledge_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(templates)} template-like objects"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
 
-            updated_memory = update_chat_memory(chat_session_id, user_message, basic_tool_calls)
+            await push_status(basic_status_timeline, "✅ Finalizing response", max(1, len(basic_tool_calls)))
+            updated_memory = update_chat_memory(
+                chat_session_id,
+                user_message,
+                basic_tool_calls,
+                assistant_response=response_text,
+                record_user_turn=False,
+            )
             follow_on_actions = build_follow_on_actions(user_message, updated_memory, basic_tool_calls)
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(basic_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
                 "tool_calls": basic_tool_calls,
+                "spl_query": extract_primary_spl_query(basic_tool_calls),
+                "visualization_spec": visualization_spec,
                 "iterations": len(basic_tool_calls),
-                "execution_time": "0.00s",
+                "execution_time": f"{time.time() - request_started_at:.2f}s",
                 "insights": [f"Used deterministic basic intent route: {basic_intent}."],
                 "status_timeline": basic_status_timeline,
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
             }
         
+        rag_context = ""
+        capability_usage: List[Dict[str, Any]] = []
+        if bool(chat_session_settings.get("enable_rag_context", False)):
+            rag_max_chunks = _safe_int(chat_session_settings.get("rag_max_chunks", 3))
+            rag_context, capability_usage = get_optional_rag_context(user_message, max_chunks=rag_max_chunks)
+
         # Initialize LLM client (cached for performance)
         print(f"🔵 [CHAT] Getting LLM client...")
         llm_client = get_or_create_llm_client(config)
@@ -6232,15 +8377,16 @@ The tstats approach had a WHERE clause issue, so I'm checking the wineventlog in
 Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Investigate thoroughly until you find the answer or exhaust all reasonable options."""
         
         # Prepare messages
-        # For custom LLM with simple greetings, skip system prompt entirely for speed
-        system_prompt = build_compact_chat_prompt(
-            query_tool_name=query_tool_name,
-            discovery_context=discovery_context,
-            rag_context=rag_context,
-            memory_context=memory_context,
-            available_tools_text=available_tools_text,
-            discovery_age_warning=discovery_age_warning
-        )
+        # Use the compact prompt only for custom/local providers; OpenAI-class providers keep the richer agent prompt above.
+        if is_custom_provider:
+            system_prompt = build_compact_chat_prompt(
+                query_tool_name=query_tool_name,
+                discovery_context=discovery_context,
+                rag_context=rag_context,
+                memory_context=memory_context,
+                available_tools_text=available_tools_text,
+                discovery_age_warning=discovery_age_warning
+            )
 
         query_lower = user_message.lower().strip()
         is_greeting = any(phrase in query_lower for phrase in ['hi', 'hello', 'hey', 'how are you', 'thanks', 'thank you', 'bye', 'goodbye'])
@@ -6253,6 +8399,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             if history and len(history) > 0 and 'role' in history[0]:
                 # Server conversation history - use directly (already has system messages and reasoning)
                 messages = history.copy()
+                if query_plan_context:
+                    messages.append({"role": "system", "content": query_plan_context})
                 # Add current user message
                 messages.append({"role": "user", "content": user_message})
             else:
@@ -6266,11 +8414,16 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                         messages.append({"role": "user", "content": msg['content']})
                     elif msg.get('type') == 'assistant':
                         messages.append({"role": "assistant", "content": msg['content']})
+
+                if query_plan_context:
+                    messages.append({"role": "system", "content": query_plan_context})
                 
                 # Add current user message
                 messages.append({"role": "user", "content": user_message})
         
         # Get LLM response - use session max_tokens setting (with 15% limit for initial chat)
+        status_timeline: List[Dict[str, Any]] = []
+        await push_status(status_timeline, "🧠 Building investigation plan", 0)
         chat_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
         print(f"🔵 [CHAT] Calling LLM with {len(messages)} messages, max_tokens={chat_max_tokens}")
         print(f"🔵 [CHAT] Client type: {type(llm_client)}, has generate_response: {hasattr(llm_client, 'generate_response')}")
@@ -6288,8 +8441,6 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         clean_response = sanitize_llm_response_text(response)
         
         try:
-            import re
-            
             # Extract context requests using <CONTEXT_REQUEST> tags
             context_request_match = re.search(r'<CONTEXT_REQUEST>(.*?)</CONTEXT_REQUEST>', response, re.DOTALL)
             if context_request_match:
@@ -6316,46 +8467,23 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                         debug_log(f"Injected {requested_context_type} context into conversation", "info")
                 except Exception as e:
                     debug_log(f"Error loading requested context: {e}", "error")
-            
-            # Extract tool call using <TOOL_CALL> tags
-            # Extract everything between the tags (handles nested braces correctly)
-            if '<TOOL_CALL>' in response and '</TOOL_CALL>' in response:
-                tool_call = extract_tool_call_from_text(response)
-                if tool_call:
-                    extracted_name = tool_call.get("params", {}).get("name")
-                    extracted_args = tool_call.get("params", {}).get("arguments", {})
-                    clean_response = sanitize_llm_response_text(response)
-                    debug_log(f"Extracted tool call - {extracted_name} with args: {extracted_args}", "query", extracted_args)
-                else:
-                    debug_log("Tool call tag detected but payload could not be parsed", "error")
-            
-            # Extract SPL queries from code blocks
-            spl_patterns = [
-                r'```spl\s*\n(.*?)```',
-                r'```splunk\s*\n(.*?)```', 
-                r'```\s*\n((?:search\s+)?index=.*?)```',
-            ]
-            for pattern in spl_patterns:
-                match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
-                if match:
-                    spl_in_text = match.group(1).strip()
-                    debug_log(f"Found SPL in code block", "info")
-                    break
+            default_earliest, default_latest = extract_time_range_from_message(user_message)
+            default_earliest = default_earliest or "-24h"
+            default_latest = default_latest or "now"
 
-            if not tool_call and spl_in_text:
-                tool_call = {
-                    "method": "tools/call",
-                    "params": {
-                        "name": query_tool_name,
-                        "arguments": {
-                            "query": spl_in_text,
-                            "earliest_time": "-24h",
-                            "latest_time": "now"
-                        }
-                    }
-                }
-                clean_response = re.sub(r'```(?:spl|splunk)?\s*\n.*?```', '', response, flags=re.DOTALL | re.IGNORECASE).strip()
-                debug_log("Converted SPL code block into executable tool call", "info")
+            tool_call = extract_recoverable_tool_call(
+                response,
+                query_tool_name,
+                default_earliest=default_earliest,
+                default_latest=default_latest,
+            )
+            if tool_call:
+                extracted_name = tool_call.get("params", {}).get("name")
+                extracted_args = tool_call.get("params", {}).get("arguments", {})
+                clean_response = sanitize_llm_response_text(response)
+                if extracted_name in {query_tool_name, "splunk_run_query", "run_splunk_query"}:
+                    spl_in_text = str(extracted_args.get("query", "")).strip() or None
+                debug_log(f"Recovered tool call - {extracted_name} with args: {extracted_args}", "query", extracted_args)
                     
         except Exception as e:
             debug_log(f"Error parsing response: {e}", "error")
@@ -6366,7 +8494,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             # ===== INTELLIGENT AGENTIC LOOP WITH QUALITY-DRIVEN STOPPING =====
             import time as time_module
             
-            start_time = time_module.time()
+            await push_status(status_timeline, "🛠 Tool plan created", 0)
+            start_time = request_started_at
             # Use session settings (allow runtime tuning without restart)
             max_execution_time = chat_session_settings["max_execution_time"]
             max_iterations = chat_session_settings["max_iterations"]
@@ -6378,7 +8507,6 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             conversation_history = messages.copy()
             all_tool_calls = []
             accumulated_insights = []  # Track key findings across iterations
-            status_timeline = []  # Track all actions for frontend display
             final_answer = None
             user_intent = user_message  # Track refined understanding of user's goal
             
@@ -6458,6 +8586,23 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                                 
                                 # Store actual results for later use
                                 summary['actual_results'] = results_array[:5]  # First 5 for context
+                                row_analysis = analyze_result_rows(results_array)
+                                if row_analysis:
+                                    summary.update(row_analysis)
+                                    if row_analysis.get('query_shape'):
+                                        summary['findings'].append(f"Result shape: {row_analysis['query_shape']}")
+                                    if row_analysis.get('top_dimensions'):
+                                        top_dimension = row_analysis['top_dimensions'][0]
+                                        if isinstance(top_dimension, dict) and top_dimension.get('field') and top_dimension.get('values'):
+                                            summary['findings'].append(
+                                                f"Top {top_dimension['field']}: {', '.join(top_dimension['values'][:3])}"
+                                            )
+                                    if row_analysis.get('time_bounds'):
+                                        bounds = row_analysis['time_bounds']
+                                        if isinstance(bounds, dict) and bounds.get('field'):
+                                            summary['findings'].append(
+                                                f"Time bounds from {bounds.get('field')}: {bounds.get('first', 'unknown')} -> {bounds.get('last', 'unknown')}"
+                                            )
                             else:
                                 summary['findings'].append("❌ No data found")
                         elif 'fields' in result:
@@ -6484,6 +8629,15 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                                 if isinstance(sample, dict):
                                     summary['sample_fields'] = list(sample.keys())
                                     summary['findings'].append(f"Fields: {', '.join(list(sample.keys())[:5])}")
+                                row_analysis = analyze_result_rows(results_array)
+                                if row_analysis:
+                                    summary.update(row_analysis)
+                                    if row_analysis.get('top_dimensions'):
+                                        top_dimension = row_analysis['top_dimensions'][0]
+                                        if isinstance(top_dimension, dict) and top_dimension.get('field') and top_dimension.get('values'):
+                                            summary['findings'].append(
+                                                f"Top {top_dimension['field']}: {', '.join(top_dimension['values'][:3])}"
+                                            )
                             else:
                                 summary['findings'].append("❌ No items found")
                         else:
@@ -6558,7 +8712,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 # Extract just the SPL query strings, normalize whitespace
                 recent_spl_queries = []
                 for call in tool_history[-convergence_threshold:]:
-                    params = call.get('params', {})
+                    params = call.get('args', {}) if isinstance(call.get('args', {}), dict) else call.get('params', {})
                     if 'query' in params:
                         # Normalize: remove whitespace differences, lowercase for comparison
                         query = ' '.join(params['query'].lower().split())
@@ -6573,6 +8727,14 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             while True:
                 iteration += 1
                 elapsed = time_module.time() - start_time
+
+                if iteration > max_iterations:
+                    print(f"🛑 Max iterations reached ({max_iterations})")
+                    final_answer = (
+                        f"I reached the configured limit of {max_iterations} investigation steps.\n\n"
+                        f"Key findings so far:\n" + "\n".join([f"• {insight}" for insight in accumulated_insights[-8:]])
+                    )
+                    break
                 
                 # Safety valve: timeout check
                 if elapsed > max_execution_time:
@@ -6659,6 +8821,7 @@ Discovery has been stopped to avoid repeated failed attempts."""
                 
                 # Summarize result for efficient context
                 result_summary = summarize_result(mcp_result, tool_name)
+                result_analysis_brief = format_result_summary_for_llm(result_summary)
                 action = f"📊 Analyzing {result_summary.get('row_count', 0)} results"
                 elapsed = time_module.time() - start_time
                 status_timeline.append({"iteration": iteration, "action": action, "time": elapsed})
@@ -6698,6 +8861,7 @@ Discovery has been stopped to avoid repeated failed attempts."""
                 
                 # Build intelligent feedback with accumulated context
                 insights_summary = "\n".join([f"  • {ins}" for ins in accumulated_insights[-5:]])  # Last 5 insights
+                analysis_section = f"\nRESULT ANALYSIS:\n{result_analysis_brief}" if result_analysis_brief else ""
                 
                 # Add post-tool context if available
                 context_section = f"\n\nRELEVANT CONTEXT:\n{post_tool_context}" if post_tool_context else ""
@@ -6709,7 +8873,7 @@ Discovery has been stopped to avoid repeated failed attempts."""
 Error: {error_msg}
 
 ACCUMULATED INSIGHTS SO FAR:
-{insights_summary}{context_section}
+{insights_summary}{analysis_section}{context_section}
 
 REFINED USER INTENT: "{user_intent}"
 
@@ -6743,7 +8907,7 @@ If you need to clarify the user's intent, ask a clarifying question WITHOUT tool
                     
                     system_feedback = f"""✅ ITERATION {iteration} RESULT: SUCCESS - DATA FOUND
 
-{result_summary.get('findings', [])}
+{result_analysis_brief or result_summary.get('findings', [])}
 
 ACCUMULATED INSIGHTS:
 {insights_summary}{context_section}
@@ -6771,7 +8935,7 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
 The query executed successfully but returned no results.
 
 ACCUMULATED INSIGHTS:
-{insights_summary}{context_section}
+{insights_summary}{analysis_section}{context_section}
 
 STRATEGIC OPTIONS:
 1. 🔍 Try different index from discovery context
@@ -6802,8 +8966,13 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
                     temperature=config.llm.temperature * 0.9  # Slightly lower temp for more focused decisions
                 )
                 
-                # Parse LLM's response for tool call
-                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
+                next_tool_call = extract_recoverable_tool_call(
+                    next_response,
+                    query_tool_name,
+                    default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                    default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                )
+                next_tool_match = bool(next_tool_call)
                 
                 # Assess answer quality (independent of whether LLM wants to continue)
                 has_actionable_data = result_summary.get('row_count', 0) > 0 and 'No data' not in str(result_summary.get('findings', []))
@@ -6875,24 +9044,26 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                         else:
                             # Response is already user-facing - but double-check for tool calls
                             if '<TOOL_CALL>' in next_response:
-                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - parsing and continuing")
-                                # Extract and execute the tool call
-                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
-                                if next_tool_match:
-                                    try:
-                                        extracted_tool_call = extract_tool_call_from_text(next_response)
-                                        if not extracted_tool_call:
-                                            raise ValueError("Malformed tool call payload")
-                                        tool_call = extracted_tool_call
-                                        continue  # Execute this tool call in next iteration
-                                    except Exception as e:
-                                        print(f"❌ Failed to parse tool call JSON (HIGH quality, first check): {e}")
-                                        print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
-                                        # Strip the malformed tool call and use the text explanation
-                                        final_answer = sanitize_llm_response_text(next_response)
-                                        if not final_answer:
-                                            final_answer = "Investigation incomplete due to malformed query format."
-                                        break
+                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but primary parse missed it - retrying with recovery parser")
+                                try:
+                                    extracted_tool_call = extract_recoverable_tool_call(
+                                        next_response,
+                                        query_tool_name,
+                                        default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                        default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                                    )
+                                    if not extracted_tool_call:
+                                        raise ValueError("Malformed tool call payload")
+                                    tool_call = extracted_tool_call
+                                    clean_response = sanitize_llm_response_text(next_response)
+                                    continue  # Execute this tool call in next iteration
+                                except Exception as e:
+                                    print(f"❌ Failed to recover tool call (HIGH quality, first check): {e}")
+                                    # Strip the malformed tool call and use the text explanation
+                                    final_answer = sanitize_llm_response_text(next_response)
+                                    if not final_answer:
+                                        final_answer = "Investigation incomplete due to malformed query format."
+                                    break
                             else:
                                 print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
                                 final_answer = next_response
@@ -6900,27 +9071,32 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                         # Either no data or LLM wants to continue
                         if next_tool_match:
                             print(f"▶️  [Iteration {iteration}] High quality but continuing investigation")
-                            # Fall through to execute next tool
+                            tool_call = next_tool_call
+                            clean_response = sanitize_llm_response_text(next_response)
+                            continue
                         else:
                             # Double-check for tool calls that regex might have missed
                             if '<TOOL_CALL>' in next_response:
-                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but regex missed it - parsing and continuing")
-                                next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
-                                if next_tool_match:
-                                    try:
-                                        extracted_tool_call = extract_tool_call_from_text(next_response)
-                                        if extracted_tool_call:
-                                            tool_call = extracted_tool_call
-                                            continue  # Execute this tool call in next iteration
-                                        raise ValueError("Malformed tool call payload")
-                                    except Exception as e:
-                                        print(f"❌ Failed to parse tool call JSON (HIGH quality, second check): {e}")
-                                        print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
-                                        # Strip the malformed tool call and use the text explanation
-                                        final_answer = sanitize_llm_response_text(next_response)
-                                        if not final_answer:
-                                            final_answer = "Investigation incomplete due to malformed query format."
-                                        break
+                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but primary parse missed it - retrying with recovery parser")
+                                try:
+                                    extracted_tool_call = extract_recoverable_tool_call(
+                                        next_response,
+                                        query_tool_name,
+                                        default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                        default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                                    )
+                                    if extracted_tool_call:
+                                        tool_call = extracted_tool_call
+                                        clean_response = sanitize_llm_response_text(next_response)
+                                        continue  # Execute this tool call in next iteration
+                                    raise ValueError("Malformed tool call payload")
+                                except Exception as e:
+                                    print(f"❌ Failed to recover tool call (HIGH quality, second check): {e}")
+                                    # Strip the malformed tool call and use the text explanation
+                                    final_answer = sanitize_llm_response_text(next_response)
+                                    if not final_answer:
+                                        final_answer = "Investigation incomplete due to malformed query format."
+                                    break
                             else:
                                 print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
                                 final_answer = sanitize_llm_response_text(next_response)
@@ -6977,12 +9153,17 @@ Do not explain what you will do - DO IT with a tool call."""
                                 temperature=config.llm.temperature * 0.7  # Lower temp for stricter format
                             )
                             
-                            # Check if retry has proper format
-                            retry_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', retry_response, re.DOTALL)
-                            if retry_tool_match:
+                            retry_tool_call = extract_recoverable_tool_call(
+                                retry_response,
+                                query_tool_name,
+                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                            )
+                            if retry_tool_call:
                                 print(f"✅ Retry successful - proper tool call format obtained")
                                 next_response = retry_response
-                                next_tool_match = retry_tool_match
+                                next_tool_call = retry_tool_call
+                                next_tool_match = True
                                 # Fall through to tool execution below
                             else:
                                 print(f"⚠️  Retry failed - LLM still not providing tool call format")
@@ -6998,12 +9179,17 @@ Do not explain what you will do - DO IT with a tool call."""
                     # Has tool call (either original or from retry) - execute it
                     if next_tool_match:
                         try:
-                            extracted_tool_call = extract_tool_call_from_text(next_response)
+                            extracted_tool_call = next_tool_call or extract_recoverable_tool_call(
+                                next_response,
+                                query_tool_name,
+                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                            )
                             if not extracted_tool_call:
                                 raise ValueError("Malformed tool call payload")
                             tool_call = extracted_tool_call
                             
-                            clean_response = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', next_response, flags=re.DOTALL).strip()
+                            clean_response = sanitize_llm_response_text(next_response)
                             continue  # Execute this tool call in next iteration
                         except Exception as e:
                             print(f"❌ Failed to parse tool call: {e}")
@@ -7017,10 +9203,16 @@ Do not explain what you will do - DO IT with a tool call."""
                         if iteration < 5:
                             print(f"▶️  [Iteration {iteration}] Moderate quality ({quality_score}/100), allowing refinement")
                             try:
-                                extracted_tool_call = extract_tool_call_from_text(next_response)
+                                extracted_tool_call = next_tool_call or extract_recoverable_tool_call(
+                                    next_response,
+                                    query_tool_name,
+                                    default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                    default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                                )
                                 if not extracted_tool_call:
                                     raise ValueError("Malformed tool call payload")
                                 tool_call = extracted_tool_call
+                                clean_response = sanitize_llm_response_text(next_response)
                                 continue  # Execute this tool call in next iteration
                             except Exception as e:
                                 print(f"❌ Failed to parse tool call: {e}")
@@ -7059,17 +9251,29 @@ Based on your previous response, provide your next query NOW using the proper fo
                                 temperature=config.llm.temperature * 0.7
                             )
                             
-                            retry_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', retry_response, re.DOTALL)
-                            if retry_tool_match:
+                            retry_tool_call = extract_recoverable_tool_call(
+                                retry_response,
+                                query_tool_name,
+                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                            )
+                            if retry_tool_call:
                                 print(f"✅ Retry successful - proper tool call format obtained")
                                 next_response = retry_response
-                                next_tool_match = retry_tool_match
+                                next_tool_call = retry_tool_call
+                                next_tool_match = True
                                 # Fall through to tool execution
                                 try:
-                                    extracted_tool_call = extract_tool_call_from_text(retry_response)
+                                    extracted_tool_call = next_tool_call or extract_recoverable_tool_call(
+                                        retry_response,
+                                        query_tool_name,
+                                        default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                        default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                                    )
                                     if not extracted_tool_call:
                                         raise ValueError("Malformed tool call payload")
                                     tool_call = extracted_tool_call
+                                    clean_response = sanitize_llm_response_text(retry_response)
                                     continue  # Execute this tool call in next iteration
                                 except Exception as e:
                                     print(f"❌ Failed to parse tool call: {e}")
@@ -7117,46 +9321,52 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                 else:
                                     # Response is already user-facing - but check for tool calls
                                     if '<TOOL_CALL>' in next_response:
-                                        print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - parsing and continuing")
-                                        next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
-                                        if next_tool_match:
-                                            try:
-                                                extracted_tool_call = extract_tool_call_from_text(next_response)
-                                                if not extracted_tool_call:
-                                                    raise ValueError("Malformed tool call payload")
-                                                tool_call = extracted_tool_call
-                                                continue  # Execute this tool call in next iteration
-                                            except Exception as e:
-                                                print(f"❌ Failed to parse tool call JSON: {e}")
-                                                print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
-                                                # Strip the malformed tool call and use the text explanation
-                                                final_answer = sanitize_llm_response_text(next_response)
-                                                if not final_answer:
-                                                    final_answer = "Investigation incomplete due to malformed query format."
-                                                break
+                                        print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - retrying with recovery parser")
+                                        try:
+                                            extracted_tool_call = extract_recoverable_tool_call(
+                                                next_response,
+                                                query_tool_name,
+                                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                                            )
+                                            if not extracted_tool_call:
+                                                raise ValueError("Malformed tool call payload")
+                                            tool_call = extracted_tool_call
+                                            clean_response = sanitize_llm_response_text(next_response)
+                                            continue  # Execute this tool call in next iteration
+                                        except Exception as e:
+                                            print(f"❌ Failed to recover tool call: {e}")
+                                            # Strip the malformed tool call and use the text explanation
+                                            final_answer = sanitize_llm_response_text(next_response)
+                                            if not final_answer:
+                                                final_answer = "Investigation incomplete due to malformed query format."
+                                            break
                                     else:
                                         print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
                                         final_answer = sanitize_llm_response_text(next_response)
                             else:
                                 # No data - accept response as-is, but check for tool calls
                                 if '<TOOL_CALL>' in next_response:
-                                    print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - parsing and continuing")
-                                    next_tool_match = re.search(r'<TOOL_CALL>\s*(\{.*\})\s*</TOOL_CALL>', next_response, re.DOTALL)
-                                    if next_tool_match:
-                                        try:
-                                            extracted_tool_call = extract_tool_call_from_text(next_response)
-                                            if not extracted_tool_call:
-                                                raise ValueError("Malformed tool call payload")
-                                            tool_call = extracted_tool_call
-                                            continue  # Execute this tool call in next iteration
-                                        except Exception as e:
-                                            print(f"❌ Failed to parse tool call JSON: {e}")
-                                            print(f"   Malformed JSON: {next_tool_match.group(1)[:200] if next_tool_match else 'N/A'}")
-                                            # Strip the malformed tool call and use the text explanation
-                                            final_answer = sanitize_llm_response_text(next_response)
-                                            if not final_answer:
-                                                final_answer = "Investigation incomplete due to malformed query format."
-                                            break
+                                    print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - retrying with recovery parser")
+                                    try:
+                                        extracted_tool_call = extract_recoverable_tool_call(
+                                            next_response,
+                                            query_tool_name,
+                                            default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
+                                            default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                                        )
+                                        if not extracted_tool_call:
+                                            raise ValueError("Malformed tool call payload")
+                                        tool_call = extracted_tool_call
+                                        clean_response = sanitize_llm_response_text(next_response)
+                                        continue  # Execute this tool call in next iteration
+                                    except Exception as e:
+                                        print(f"❌ Failed to recover tool call: {e}")
+                                        # Strip the malformed tool call and use the text explanation
+                                        final_answer = sanitize_llm_response_text(next_response)
+                                        if not final_answer:
+                                            final_answer = "Investigation incomplete due to malformed query format."
+                                        break
                                 else:
                                     print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
                                     final_answer = sanitize_llm_response_text(next_response)
@@ -7174,12 +9384,21 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
             
             # Return comprehensive response with status timeline
             # Include conversation_history so follow-up queries maintain context
-            updated_memory = update_chat_memory(chat_session_id, user_message, all_tool_calls)
+            updated_memory = update_chat_memory(
+                chat_session_id,
+                user_message,
+                all_tool_calls,
+                assistant_response=final_answer or "Investigation complete. See findings above.",
+                record_user_turn=False,
+            )
             follow_on_actions = build_follow_on_actions(user_message, updated_memory, all_tool_calls)
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(all_tool_calls, capability_usage)
             return {
                 "response": sanitize_llm_response_text(final_answer or "Investigation complete. See findings above."),
                 "initial_response": user_message,
                 "tool_calls": all_tool_calls,
+                "spl_query": extract_primary_spl_query(all_tool_calls),
+                "visualization_spec": visualization_spec,
                 "iterations": iteration,
                 "execution_time": f"{time_module.time() - start_time:.2f}s",
                 "insights": accumulated_insights,
@@ -7197,19 +9416,30 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
             }
         
         # No tool call, return clean response with any SPL found
-        updated_memory = update_chat_memory(chat_session_id, user_message)
+        await push_status(status_timeline, "✅ Returning direct answer", 0)
+        updated_memory = update_chat_memory(
+            chat_session_id,
+            user_message,
+            assistant_response=clean_response,
+            record_user_turn=False,
+        )
         follow_on_actions = build_follow_on_actions(user_message, updated_memory)
         return {
             "response": sanitize_llm_response_text(clean_response),
             "spl_in_text": spl_in_text,
+            "status_timeline": status_timeline,
+            "iterations": 0,
+            "execution_time": f"{time.time() - request_started_at:.2f}s",
             "discovery_age_warning": discovery_age_warning,
             "chat_session_id": chat_session_id,
             "chat_memory": updated_memory,
+            "capability_usage": capability_usage,
             "has_follow_on": len(follow_on_actions) > 0,
             "follow_on_actions": follow_on_actions
         }
@@ -7551,6 +9781,196 @@ def get_frontend_html():
             background: #5a67d8;
         }
 
+        button:focus-visible,
+        [role='button']:focus-visible,
+        [role='tab']:focus-visible,
+        summary:focus-visible,
+        a:focus-visible,
+        input:focus-visible,
+        textarea:focus-visible,
+        select:focus-visible {
+            outline: 2px solid #4338ca;
+            outline-offset: 2px;
+        }
+
+        /* Compatibility shim for utility tokens not present in the Tailwind 2.2 CDN stylesheet. */
+        .bg-slate-100 { background-color: #f1f5f9 !important; }
+        .bg-slate-700 { background-color: #334155 !important; }
+        .bg-slate-800 { background-color: #1e293b !important; }
+        .text-slate-100 { color: #f1f5f9 !important; }
+        .text-slate-200 { color: #e2e8f0 !important; }
+        .text-slate-800 { color: #1e293b !important; }
+        .border-slate-300 { border-color: #cbd5e1 !important; }
+        .border-slate-600 { border-color: #475569 !important; }
+        .border-slate-700 { border-color: #334155 !important; }
+
+        .bg-sky-100 { background-color: #e0f2fe !important; }
+        .bg-sky-600 { background-color: #0369a1 !important; }
+        .bg-sky-700 { background-color: #075985 !important; }
+        .bg-sky-800 { background-color: #075985 !important; }
+        .bg-sky-900 { background-color: #0c4a6e !important; }
+        .text-sky-100 { color: #e0f2fe !important; }
+        .text-sky-200 { color: #bae6fd !important; }
+        .text-sky-600 { color: #0369a1 !important; }
+        .text-sky-800 { color: #075985 !important; }
+        .border-sky-300 { border-color: #7dd3fc !important; }
+        .border-sky-700 { border-color: #0369a1 !important; }
+
+        .bg-amber-50 { background-color: #fffbeb !important; }
+        .bg-amber-100 { background-color: #fef3c7 !important; }
+        .bg-amber-400 { background-color: #fbbf24 !important; }
+        .bg-amber-500 { background-color: #f59e0b !important; }
+        .bg-amber-600 { background-color: #b45309 !important; }
+        .bg-amber-700 { background-color: #92400e !important; }
+        .bg-amber-900 { background-color: #78350f !important; }
+        .text-amber-100 { color: #fef3c7 !important; }
+        .text-amber-200 { color: #fde68a !important; }
+        .text-amber-300 { color: #fcd34d !important; }
+        .text-amber-600 { color: #b45309 !important; }
+        .text-amber-700 { color: #92400e !important; }
+        .text-amber-800 { color: #78350f !important; }
+        .text-amber-900 { color: #451a03 !important; }
+        .border-amber-200 { border-color: #fde68a !important; }
+        .border-amber-300 { border-color: #fcd34d !important; }
+        .border-amber-400 { border-color: #fbbf24 !important; }
+        .border-amber-500 { border-color: #f59e0b !important; }
+        .border-amber-600 { border-color: #d97706 !important; }
+        .border-amber-700 { border-color: #b45309 !important; }
+
+        .bg-cyan-100 { background-color: #cffafe !important; }
+        .bg-cyan-500 { background-color: #06b6d4 !important; }
+        .bg-cyan-600 { background-color: #0891b2 !important; }
+        .bg-cyan-700 { background-color: #0e7490 !important; }
+        .bg-cyan-800 { background-color: #155e75 !important; }
+        .bg-cyan-900 { background-color: #164e63 !important; }
+        .text-cyan-100 { color: #cffafe !important; }
+        .text-cyan-300 { color: #67e8f9 !important; }
+        .text-cyan-700 { color: #0e7490 !important; }
+        .text-cyan-800 { color: #155e75 !important; }
+        .text-cyan-900 { color: #164e63 !important; }
+        .border-cyan-300 { border-color: #67e8f9 !important; }
+        .border-cyan-700 { border-color: #0e7490 !important; }
+
+        .bg-emerald-50 { background-color: #ecfdf5 !important; }
+        .bg-emerald-100 { background-color: #d1fae5 !important; }
+        .bg-emerald-600 { background-color: #047857 !important; }
+        .bg-emerald-700 { background-color: #065f46 !important; }
+        .bg-emerald-900 { background-color: #064e3b !important; }
+        .text-emerald-100 { color: #d1fae5 !important; }
+        .text-emerald-200 { color: #a7f3d0 !important; }
+        .text-emerald-300 { color: #6ee7b7 !important; }
+        .text-emerald-600 { color: #059669 !important; }
+        .text-emerald-700 { color: #047857 !important; }
+        .text-emerald-800 { color: #065f46 !important; }
+        .text-emerald-900 { color: #064e3b !important; }
+        .border-emerald-200 { border-color: #a7f3d0 !important; }
+        .border-emerald-300 { border-color: #6ee7b7 !important; }
+        .border-emerald-500 { border-color: #10b981 !important; }
+        .border-emerald-700 { border-color: #047857 !important; }
+        .border-emerald-800 { border-color: #065f46 !important; }
+
+        .bg-rose-600 { background-color: #e11d48 !important; }
+        .bg-rose-700 { background-color: #be123c !important; }
+
+        .bg-violet-600 { background-color: #7c3aed !important; }
+        .bg-violet-700 { background-color: #6d28d9 !important; }
+
+        .bg-fuchsia-100 { background-color: #fae8ff !important; }
+        .bg-fuchsia-900 { background-color: #701a75 !important; }
+        .text-fuchsia-100 { color: #fae8ff !important; }
+        .text-fuchsia-900 { color: #701a75 !important; }
+        .border-fuchsia-300 { border-color: #f0abfc !important; }
+        .border-fuchsia-700 { border-color: #a21caf !important; }
+
+        .bg-gray-950 { background-color: #030712 !important; }
+        .bg-indigo-950 { background-color: #1e1b4b !important; }
+        .bg-indigo-950\/70 { background-color: rgba(30, 27, 75, 0.7) !important; }
+        .bg-emerald-950 { background-color: #022c22 !important; }
+        .bg-red-950 { background-color: #450a0a !important; }
+        .bg-amber-950 { background-color: #451a03 !important; }
+        .bg-blue-950 { background-color: #172554 !important; }
+        .bg-purple-950 { background-color: #3b0764 !important; }
+        .bg-green-950 { background-color: #052e16 !important; }
+        .bg-orange-950 { background-color: #431407 !important; }
+        .bg-yellow-950 { background-color: #422006 !important; }
+
+        .from-slate-800 {
+            --tw-gradient-from: #1e293b !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(30, 41, 59, 0)) !important;
+        }
+
+        .from-amber-50 {
+            --tw-gradient-from: #fffbeb !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(255, 251, 235, 0)) !important;
+        }
+
+        .from-amber-400 {
+            --tw-gradient-from: #fbbf24 !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(251, 191, 36, 0)) !important;
+        }
+
+        .from-amber-500 {
+            --tw-gradient-from: #f59e0b !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(245, 158, 11, 0)) !important;
+        }
+
+        .to-emerald-50 { --tw-gradient-to: #ecfdf5 !important; }
+        .bg-green-500 { background-color: #15803d !important; }
+        .bg-green-600 { background-color: #15803d !important; }
+        .bg-green-700 { background-color: #166534 !important; }
+
+        .from-green-600 {
+            --tw-gradient-from: #15803d !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(21, 128, 61, 0)) !important;
+        }
+
+        .to-emerald-600 { --tw-gradient-to: #047857 !important; }
+        .to-emerald-700 { --tw-gradient-to: #065f46 !important; }
+
+        .from-indigo-950 {
+            --tw-gradient-from: #1e1b4b !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(30, 27, 75, 0)) !important;
+        }
+
+        .to-indigo-950 { --tw-gradient-to: #1e1b4b !important; }
+        .to-purple-950 { --tw-gradient-to: #3b0764 !important; }
+        .to-violet-50 { --tw-gradient-to: #f5f3ff !important; }
+
+        .hover\:bg-sky-700:hover { background-color: #0369a1 !important; }
+        .hover\:bg-sky-800:hover { background-color: #075985 !important; }
+        .hover\:bg-amber-700:hover { background-color: #92400e !important; }
+        .hover\:bg-cyan-800:hover { background-color: #155e75 !important; }
+        .hover\:bg-emerald-700:hover { background-color: #065f46 !important; }
+        .hover\:bg-green-700:hover { background-color: #166534 !important; }
+        .hover\:bg-rose-700:hover { background-color: #be123c !important; }
+        .hover\:bg-violet-700:hover { background-color: #6d28d9 !important; }
+        .hover\:from-amber-600:hover {
+            --tw-gradient-from: #d97706 !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(217, 119, 6, 0)) !important;
+        }
+        .hover\:from-green-700:hover {
+            --tw-gradient-from: #166534 !important;
+            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(22, 101, 52, 0)) !important;
+        }
+        .hover\:to-emerald-700:hover { --tw-gradient-to: #065f46 !important; }
+        .hover\:text-sky-800:hover { color: #075985 !important; }
+        .hover\:text-amber-800:hover { color: #78350f !important; }
+        .hover\:text-cyan-100:hover { color: #cffafe !important; }
+        .hover\:text-cyan-900:hover { color: #164e63 !important; }
+        .hover\:text-emerald-800:hover { color: #065f46 !important; }
+        .hover\:text-emerald-900:hover { color: #064e3b !important; }
+
+        .bg-gray-200.text-gray-500,
+        .bg-gray-200.text-gray-600 { color: #4b5563 !important; }
+
+        .bg-gray-300.text-gray-500 { color: #374151 !important; }
+
+        .bg-gray-700.text-gray-500,
+        .bg-gray-700.text-gray-400,
+        .bg-gray-800.text-gray-500 {
+            color: #d1d5db !important;
+        }
+
         [data-theme='dark'] .settings-modal-shell {
             color: #e5e7eb;
         }
@@ -7677,6 +10097,109 @@ def get_frontend_html():
             return `chat_${stamp}_${rand}`;
         };
 
+        const CHAT_STATE_STORAGE_KEY = 'dt4sms_chat_state_v1';
+
+        const compactPersistedChatMessages = (items) => {
+            if (!Array.isArray(items)) return [];
+            return items.slice(-24).map((msg, idx) => ({
+                id: msg?.id || `persisted_${idx}_${Date.now()}`,
+                type: msg?.type || 'assistant',
+                content: typeof msg?.content === 'string' ? msg.content : '',
+                timestamp: msg?.timestamp || new Date().toISOString(),
+                spl_query: typeof msg?.spl_query === 'string' ? msg.spl_query : undefined,
+                spl_in_text: typeof msg?.spl_in_text === 'string' ? msg.spl_in_text : undefined,
+                visualization_spec: msg?.visualization_spec && typeof msg.visualization_spec === 'object'
+                    ? {
+                        chart_type: typeof msg.visualization_spec?.chart_type === 'string' ? msg.visualization_spec.chart_type : undefined,
+                        title: typeof msg.visualization_spec?.title === 'string' ? msg.visualization_spec.title : undefined,
+                        summary_text: typeof msg.visualization_spec?.summary_text === 'string' ? msg.visualization_spec.summary_text : undefined,
+                        x_field: typeof msg.visualization_spec?.x_field === 'string' ? msg.visualization_spec.x_field : undefined,
+                        y_field: typeof msg.visualization_spec?.y_field === 'string' ? msg.visualization_spec.y_field : undefined,
+                        point_count: typeof msg.visualization_spec?.point_count === 'number' ? msg.visualization_spec.point_count : undefined,
+                        points: Array.isArray(msg.visualization_spec?.points)
+                            ? msg.visualization_spec.points.slice(0, 8).map((point) => ({
+                                label: typeof point?.label === 'string' ? point.label : '',
+                                full_label: typeof point?.full_label === 'string' ? point.full_label : undefined,
+                                value: Number.isFinite(Number(point?.value)) ? Number(point.value) : undefined,
+                            })).filter((point) => Number.isFinite(point.value))
+                            : [],
+                    }
+                    : undefined,
+                capability_usage: Array.isArray(msg?.capability_usage)
+                    ? msg.capability_usage.slice(0, 2).map((usage, usageIdx) => ({
+                        name: typeof usage?.name === 'string' ? usage.name : `capability_${usageIdx}`,
+                        title: typeof usage?.title === 'string' ? usage.title : (typeof usage?.name === 'string' ? usage.name : 'Capability'),
+                        category: typeof usage?.category === 'string' ? usage.category : undefined,
+                        used_in: typeof usage?.used_in === 'string' ? usage.used_in : undefined,
+                        contribution: typeof usage?.contribution === 'string' ? usage.contribution : '',
+                        chunks: Array.isArray(usage?.chunks)
+                            ? usage.chunks.slice(0, 3).map((chunk, chunkIdx) => ({
+                                source: typeof chunk?.source === 'string' ? chunk.source : `artifact_${chunkIdx + 1}`,
+                                score: typeof chunk?.score === 'number' ? chunk.score : undefined,
+                                snippet: typeof chunk?.snippet === 'string' ? chunk.snippet : '',
+                                source_type: typeof chunk?.source_type === 'string' ? chunk.source_type : undefined,
+                            })).filter((chunk) => chunk.snippet)
+                            : [],
+                    }))
+                    : [],
+                has_follow_on: !!msg?.has_follow_on,
+                follow_on_actions: Array.isArray(msg?.follow_on_actions) ? msg.follow_on_actions.slice(0, 3) : [],
+                status_timeline: Array.isArray(msg?.status_timeline) ? msg.status_timeline.slice(-8) : [],
+                iterations: typeof msg?.iterations === 'number' ? msg.iterations : 0,
+                execution_time: typeof msg?.execution_time === 'string' ? msg.execution_time : undefined,
+            }));
+        };
+
+        const compactPersistedConversationHistory = (history) => {
+            if (!Array.isArray(history)) return null;
+            return history.slice(-16)
+                .filter(entry => entry && typeof entry === 'object')
+                .map(entry => ({
+                    role: typeof entry.role === 'string' ? entry.role : 'user',
+                    content: typeof entry.content === 'string' ? entry.content : '',
+                }))
+                .filter(entry => entry.content);
+        };
+
+        const loadPersistedChatState = () => {
+            try {
+                if (typeof window === 'undefined' || !window.localStorage) {
+                    return {};
+                }
+                const raw = window.localStorage.getItem(CHAT_STATE_STORAGE_KEY);
+                if (!raw) {
+                    return {};
+                }
+                const parsed = JSON.parse(raw);
+                return parsed && typeof parsed === 'object' ? parsed : {};
+            } catch (error) {
+                console.warn('Failed to load persisted chat state', error);
+                return {};
+            }
+        };
+
+        const savePersistedChatState = (state) => {
+            try {
+                if (typeof window === 'undefined' || !window.localStorage) {
+                    return;
+                }
+                window.localStorage.setItem(CHAT_STATE_STORAGE_KEY, JSON.stringify(state));
+            } catch (error) {
+                console.warn('Failed to save persisted chat state', error);
+            }
+        };
+
+        const clearPersistedChatState = () => {
+            try {
+                if (typeof window === 'undefined' || !window.localStorage) {
+                    return;
+                }
+                window.localStorage.removeItem(CHAT_STATE_STORAGE_KEY);
+            } catch (error) {
+                console.warn('Failed to clear persisted chat state', error);
+            }
+        };
+
         const normalizeProvider = (provider) => {
             const value = String(provider || 'openai').toLowerCase().trim();
             if (value === 'custom endpoint') return 'custom';
@@ -7736,6 +10259,7 @@ def get_frontend_html():
         
         function App() {
             const THEME_PREFERENCE_KEY = 'dt4sms_theme_preference';
+            const initialChatState = useRef(loadPersistedChatState()).current || {};
             const [isConnected, setIsConnected] = useState(false);
             const [discoveryStatus, setDiscoveryStatus] = useState('idle');
             const [messages, setMessages] = useState([]);
@@ -7756,14 +10280,17 @@ def get_frontend_html():
             const [expandedMonths, setExpandedMonths] = useState({});
             const [expandedDays, setExpandedDays] = useState({});
             const [isChatOpen, setIsChatOpen] = useState(false);
-            const [chatMessages, setChatMessages] = useState([]);
+            const [chatMessages, setChatMessages] = useState(() => Array.isArray(initialChatState.chatMessages) ? initialChatState.chatMessages : []);
             const [chatInput, setChatInput] = useState('');
             const [isTyping, setIsTyping] = useState(false);
             const [chatStatus, setChatStatus] = useState(''); // Real-time status during investigation
             const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
             const [chatSettings, setChatSettings] = useState(null); // Loaded from API
-            const [serverConversationHistory, setServerConversationHistory] = useState(null); // Server's full conversation with reasoning
-            const [chatSessionId, setChatSessionId] = useState(generateChatSessionId());
+            const [serverConversationHistory, setServerConversationHistory] = useState(() => Array.isArray(initialChatState.serverConversationHistory) ? initialChatState.serverConversationHistory : null); // Server's full conversation with reasoning
+            const [chatSessionId, setChatSessionId] = useState(() => {
+                const persistedId = typeof initialChatState.chatSessionId === 'string' ? initialChatState.chatSessionId.trim() : '';
+                return persistedId || generateChatSessionId();
+            });
             const [workspaceTab, setWorkspaceTab] = useState('mission');
 
             const [connectionInfo, setConnectionInfo] = useState(null);
@@ -7802,6 +10329,29 @@ def get_frontend_html():
             const [availableModels, setAvailableModels] = useState([]); // Available models from API
             const [isLoadingModels, setIsLoadingModels] = useState(false); // Loading state for model fetch
             const [selectedModel, setSelectedModel] = useState(''); // Currently selected model
+            const [capabilitiesData, setCapabilitiesData] = useState({
+                status: 'idle',
+                summary: { total: 0, installed: 0, enabled: 0, ready: 0, restart_required: 0 },
+                capabilities: {},
+                error: ''
+            });
+            const [capabilityDrafts, setCapabilityDrafts] = useState({});
+            const [capabilityActionState, setCapabilityActionState] = useState({});
+            const [capabilityNotice, setCapabilityNotice] = useState(null);
+            const [deeplinkDrafts, setDeeplinkDrafts] = useState({
+                splunk_deeplink_tools: {
+                    query: 'search index=_internal | head 20',
+                    earliest: '-24h',
+                    latest: 'now',
+                    app: 'search',
+                }
+            });
+            const [deeplinkBuildResults, setDeeplinkBuildResults] = useState({});
+            const [exportBuildState, setExportBuildState] = useState({
+                status: 'idle',
+                bundle: null,
+                error: ''
+            });
             
             // MCP Configuration Vault State
             const [savedMCPConfigs, setSavedMCPConfigs] = useState({});
@@ -7828,12 +10378,24 @@ def get_frontend_html():
             const isMissionTab = workspaceTab === 'mission';
             const isIntelligenceTab = workspaceTab === 'intelligence';
             const isArtifactsTab = workspaceTab === 'artifacts';
+            const isCapabilitiesTab = workspaceTab === 'capabilities';
             const isDarkTheme = resolvedTheme === 'dark';
             const panelClass = isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200';
             const panelMutedClass = isDarkTheme ? 'bg-gray-700 border-gray-600' : 'bg-gray-50 border-gray-200';
             const headingClass = isDarkTheme ? 'text-gray-100' : 'text-gray-900';
             const subtextClass = isDarkTheme ? 'text-gray-300' : 'text-gray-600';
-            const mutedTextClass = isDarkTheme ? 'text-gray-400' : 'text-gray-500';
+            const mutedTextClass = isDarkTheme ? 'text-gray-300' : 'text-gray-600';
+            const capabilityList = Object.values(capabilitiesData?.capabilities || {});
+            const deeplinkCapability = capabilitiesData?.capabilities?.splunk_deeplink_tools || null;
+            const exportCapability = capabilitiesData?.capabilities?.export_tools || null;
+            const canUseSplunkDeeplinks = !!deeplinkCapability?.installed
+                && !!deeplinkCapability?.enabled
+                && !deeplinkCapability?.restart_required
+                && String(deeplinkCapability?.health_status || '').toLowerCase() === 'ready';
+            const canUseExportTools = !!exportCapability?.installed
+                && !!exportCapability?.enabled
+                && !exportCapability?.restart_required
+                && String(exportCapability?.health_status || '').toLowerCase() === 'ready';
             const v2Blueprint = v2Intelligence?.blueprint || null;
             const v2Overview = v2Blueprint?.overview || {};
             const v2CapabilityGraph = v2Blueprint?.capability_graph || {};
@@ -7878,6 +10440,20 @@ def get_frontend_html():
             const handleApiKeyChange = () => {
                 setApiKeyPlaceholder('Enter API key');
                 handleSettingsChange();
+            };
+
+            const handleKeyActivate = (event, callback) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    callback();
+                }
+            };
+
+            const handleDialogKeyDown = (event, onClose) => {
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    onClose();
+                }
             };
             
             // Poll for summarization progress
@@ -8119,10 +10695,21 @@ def get_frontend_html():
             
             // Auto-focus chat input when chat opens
             useEffect(() => {
-                if (isChatOpen && chatInputRef.current) {
-                    setTimeout(() => chatInputRef.current.focus(), 100);
+                if (isChatOpen) {
+                    setTimeout(() => {
+                        chatEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+                        chatInputRef.current?.focus();
+                    }, 100);
                 }
             }, [isChatOpen]);
+
+            useEffect(() => {
+                savePersistedChatState({
+                    chatSessionId,
+                    chatMessages: compactPersistedChatMessages(chatMessages),
+                    serverConversationHistory: compactPersistedConversationHistory(serverConversationHistory),
+                });
+            }, [chatSessionId, chatMessages, serverConversationHistory]);
             
             useEffect(() => {
                 connectWebSocket();
@@ -8130,9 +10717,11 @@ def get_frontend_html():
                 loadDiscoveryDashboard();
                 loadV2Intelligence();
                 loadV2Artifacts();
+                loadCapabilities();
                 loadDiscoveryCompare('latest', 'previous');
                 loadRunbookPayload('latest', 'admin');
                 loadConfig(); // Load config to get active LLM connection info
+                loadCapabilities();
                 
                 return () => {
                     if (wsRef.current) {
@@ -8153,6 +10742,9 @@ def get_frontend_html():
                 }
                 if (isArtifactsTab) {
                     loadV2Artifacts();
+                }
+                if (isCapabilitiesTab) {
+                    loadCapabilities();
                 }
             }, [workspaceTab]);
             
@@ -8400,6 +10992,541 @@ def get_frontend_html():
             const refreshArtifactsWorkspace = () => {
                 loadReports();
                 loadV2Artifacts();
+                loadCapabilities();
+            };
+
+            const loadCapabilities = async () => {
+                try {
+                    const response = await fetch('/api/capabilities');
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
+                    }
+
+                    setCapabilitiesData({
+                        status: 'success',
+                        summary: result.summary || { total: 0, installed: 0, enabled: 0, ready: 0, restart_required: 0 },
+                        capabilities: result.capabilities || {},
+                        error: ''
+                    });
+
+                    const nextDrafts = {};
+                    Object.entries(result.capabilities || {}).forEach(([name, capability]) => {
+                        nextDrafts[name] = JSON.stringify(capability?.config || {}, null, 2);
+                    });
+                    setCapabilityDrafts(nextDrafts);
+
+                    const deeplinkConfig = result?.capabilities?.splunk_deeplink_tools?.config || {};
+                    setDeeplinkDrafts(prev => ({
+                        ...prev,
+                        splunk_deeplink_tools: {
+                            query: prev?.splunk_deeplink_tools?.query || 'search index=_internal | head 20',
+                            earliest: prev?.splunk_deeplink_tools?.earliest || deeplinkConfig.default_earliest || '-24h',
+                            latest: prev?.splunk_deeplink_tools?.latest || deeplinkConfig.default_latest || 'now',
+                            app: prev?.splunk_deeplink_tools?.app || deeplinkConfig.default_app || 'search',
+                        }
+                    }));
+                } catch (error) {
+                    console.error('Failed to load capabilities:', error);
+                    setCapabilitiesData(prev => ({
+                        ...prev,
+                        status: 'error',
+                        error: error.message || 'Failed to load capabilities.'
+                    }));
+                }
+            };
+
+            const refreshCapabilitiesWorkspace = () => {
+                loadCapabilities();
+            };
+
+            const getCapabilityStatusClasses = (status) => {
+                switch (String(status || '').toLowerCase()) {
+                    case 'ready':
+                        return isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-emerald-100 text-emerald-800 border border-emerald-300';
+                    case 'degraded':
+                        return isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-100 text-amber-900 border border-amber-300';
+                    case 'restart-required':
+                        return isDarkTheme ? 'bg-orange-900 text-orange-100 border border-orange-700' : 'bg-orange-100 text-orange-900 border border-orange-300';
+                    case 'disabled':
+                        return isDarkTheme ? 'bg-slate-800 text-slate-100 border border-slate-600' : 'bg-slate-100 text-slate-800 border border-slate-300';
+                    case 'not_installed':
+                        return isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-800 border border-gray-300';
+                    case 'unavailable':
+                        return isDarkTheme ? 'bg-fuchsia-900 text-fuchsia-100 border border-fuchsia-700' : 'bg-fuchsia-100 text-fuchsia-900 border border-fuchsia-300';
+                    default:
+                        return isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-800 border border-gray-300';
+                }
+            };
+
+            const formatTokenLabel = (value) => {
+                const cleaned = String(value || '').trim();
+                if (!cleaned) {
+                    return '';
+                }
+
+                return cleaned
+                    .split(/[_-]+/)
+                    .filter(Boolean)
+                    .map((part) => {
+                        const normalized = part.toLowerCase();
+                        if (normalized === 'rag') return 'RAG';
+                        if (normalized === 'llm') return 'LLM';
+                        if (normalized === 'mcp') return 'MCP';
+                        return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+                    })
+                    .join(' ');
+            };
+
+            const formatCapabilityStatusLabel = (status) => {
+                switch (String(status || '').toLowerCase()) {
+                    case 'degraded':
+                        return 'Needs attention';
+                    case 'not_installed':
+                        return 'Not installed';
+                    case 'restart-required':
+                        return 'Restart required';
+                    case 'unavailable':
+                        return 'Planned';
+                    default:
+                        return formatTokenLabel(status) || 'Unknown';
+                }
+            };
+
+            const formatCapabilityCategoryLabel = (category) => {
+                switch (String(category || '').toLowerCase()) {
+                    case 'rag':
+                        return 'Retrieval';
+                    case 'tool_pack':
+                        return 'Operator Toolset';
+                    case 'capability':
+                        return 'Capability';
+                    default:
+                        return formatTokenLabel(category) || 'Capability';
+                }
+            };
+
+            const formatCapabilityInstallMethodLabel = (method) => {
+                switch (String(method || '').toLowerCase()) {
+                    case 'internal':
+                        return 'Built In';
+                    case 'pip':
+                        return 'Optional Download';
+                    default:
+                        return formatTokenLabel(method) || 'Unknown';
+                }
+            };
+
+            const formatCapabilityMaturityLabel = (maturity) => {
+                switch (String(maturity || '').toLowerCase()) {
+                    case 'foundation':
+                        return 'Core';
+                    case 'phase4':
+                        return 'Expanded';
+                    case 'phase5':
+                        return 'Advanced';
+                    default:
+                        return formatTokenLabel(maturity) || 'Experimental';
+                }
+            };
+
+            const formatCapabilityUsageContextLabel = (usedIn) => {
+                switch (String(usedIn || '').toLowerCase()) {
+                    case 'chat_preview':
+                        return 'Chat Response';
+                    case 'llm_prompt':
+                        return 'Prompt Context';
+                    default:
+                        return formatTokenLabel(usedIn) || 'Capability Use';
+                }
+            };
+
+            const formatCapabilitySourceTypeLabel = (sourceType) => {
+                switch (String(sourceType || '').toLowerCase()) {
+                    case 'query_result_preview':
+                        return 'Query Result Preview';
+                    case 'discovery_artifact':
+                        return 'Discovery Artifact';
+                    case 'generated_summary':
+                        return 'Generated Summary';
+                    case 'runbook':
+                        return 'Runbook';
+                    case 'handoff':
+                        return 'Developer Handoff';
+                    case 'uploaded_document':
+                        return 'Reference Document';
+                    case 'chat_memory_derived':
+                        return 'Conversation Memory';
+                    case 'tool_result_snapshot':
+                        return 'Tool Result Snapshot';
+                    default:
+                        return formatTokenLabel(sourceType) || 'Artifact';
+                }
+            };
+
+            const formatExportOutputLabel = (output) => {
+                switch (String(output || '').toLowerCase()) {
+                    case 'bundle_zip':
+                        return 'ZIP Package';
+                    case 'manifest_json':
+                        return 'Manifest';
+                    case 'summary_markdown':
+                        return 'Summary Note';
+                    default:
+                        return formatTokenLabel(output) || 'Export Output';
+                }
+            };
+
+            const formatPackageFileLabel = (filename) => {
+                const raw = String(filename || '').trim();
+                if (!raw) {
+                    return 'Unavailable';
+                }
+
+                const basename = raw.replace(/\.zip$/i, '');
+                const match = basename.match(/^dt4sms_(?:export|report_package)_(\d{8})_(\d{6})_([a-z]+)(?:_(.+))?$/i);
+                if (!match) {
+                    return formatTokenLabel(basename.replace(/bundle/gi, 'package')) || raw;
+                }
+
+                const [, datePart, timePart, persona, titlePart] = match;
+                const formattedTimestamp = `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)} ${timePart.slice(0, 2)}:${timePart.slice(2, 4)}:${timePart.slice(4, 6)}`;
+                const labelParts = ['Report Package', formattedTimestamp, formatTokenLabel(persona) || 'Persona'];
+                const normalizedTitle = String(titlePart || '').replace(/bundle/gi, 'package');
+                if (normalizedTitle) {
+                    labelParts.push(formatTokenLabel(normalizedTitle));
+                }
+                return labelParts.join(' - ');
+            };
+
+            const updateCapabilityDraft = (name, value) => {
+                setCapabilityDrafts(prev => ({
+                    ...prev,
+                    [name]: value
+                }));
+            };
+
+            const updateDeeplinkDraft = (name, field, value) => {
+                setDeeplinkDrafts(prev => ({
+                    ...prev,
+                    [name]: {
+                        ...(prev[name] || {}),
+                        [field]: value,
+                    }
+                }));
+            };
+
+            const runCapabilityAction = async (name, action, payload = null) => {
+                setCapabilityActionState(prev => ({
+                    ...prev,
+                    [name]: action
+                }));
+
+                try {
+                    const response = await fetch(`/api/capabilities/${name}/${action}`, {
+                        method: 'POST',
+                        headers: payload ? { 'Content-Type': 'application/json' } : undefined,
+                        body: payload ? JSON.stringify(payload) : undefined,
+                    });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || `${action} failed`);
+                    }
+
+                    setCapabilityNotice({
+                        type: 'success',
+                        message: result?.message || `${name} ${action} completed successfully.`
+                    });
+                    await loadCapabilities();
+                } catch (error) {
+                    console.error(`Capability action failed (${name}/${action}):`, error);
+                    setCapabilityNotice({
+                        type: 'error',
+                        message: `${name}: ${error.message || `${action} failed`}`
+                    });
+                } finally {
+                    setCapabilityActionState(prev => {
+                        const next = { ...prev };
+                        delete next[name];
+                        return next;
+                    });
+                    setTimeout(() => setCapabilityNotice(null), 3500);
+                }
+            };
+
+            const buildCapabilityDeeplink = async (payload, options = {}) => {
+                const capabilityName = options.name || 'splunk_deeplink_tools';
+                const openedWindow = options.openAfterBuild ? window.open('', '_blank') : null;
+                if (openedWindow) {
+                    try {
+                        openedWindow.opener = null;
+                    } catch (error) {
+                        console.warn('Unable to detach deeplink popup opener:', error);
+                    }
+                }
+                setCapabilityActionState(prev => ({
+                    ...prev,
+                    [capabilityName]: 'build'
+                }));
+
+                try {
+                    const response = await fetch('/api/capabilities/deeplinks/build', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload || {}),
+                    });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || 'Failed to build deeplink.');
+                    }
+
+                    const deeplink = result?.details?.deeplink || null;
+                    if (options.storeResult !== false && deeplink) {
+                        setDeeplinkBuildResults(prev => ({
+                            ...prev,
+                            [capabilityName]: deeplink,
+                        }));
+                    }
+                    if (options.openAfterBuild && deeplink?.url) {
+                        if (openedWindow && !openedWindow.closed) {
+                            openedWindow.location.href = deeplink.url;
+                        } else {
+                            window.open(deeplink.url, '_blank', 'noopener,noreferrer');
+                        }
+                    }
+                    if (!options.suppressNotice) {
+                        setCapabilityNotice({
+                            type: 'success',
+                            message: result?.message || 'Splunk deeplink generated.'
+                        });
+                        setTimeout(() => setCapabilityNotice(null), 3500);
+                    }
+                    return deeplink;
+                } catch (error) {
+                    if (openedWindow && !openedWindow.closed) {
+                        openedWindow.close();
+                    }
+                    console.error('Failed to build deeplink:', error);
+                    setCapabilityNotice({
+                        type: 'error',
+                        message: error.message || 'Failed to build deeplink.'
+                    });
+                    setTimeout(() => setCapabilityNotice(null), 3500);
+                    return null;
+                } finally {
+                    setCapabilityActionState(prev => {
+                        const next = { ...prev };
+                        delete next[capabilityName];
+                        return next;
+                    });
+                }
+            };
+
+            const openSplunkSearchFromChat = async (splQuery) => {
+                if (!splQuery || !canUseSplunkDeeplinks) {
+                    return;
+                }
+
+                const capabilityConfig = deeplinkCapability?.config || {};
+                await buildCapabilityDeeplink(
+                    {
+                        query: splQuery,
+                        earliest: capabilityConfig.default_earliest || '-24h',
+                        latest: capabilityConfig.default_latest || 'now',
+                        app: capabilityConfig.default_app || 'search',
+                    },
+                    {
+                        name: 'splunk_deeplink_tools',
+                        openAfterBuild: true,
+                        suppressNotice: true,
+                        storeResult: false,
+                    }
+                );
+            };
+
+            const extractAssistantSplQuery = (result) => {
+                if (typeof result?.spl_query === 'string' && result.spl_query.trim()) {
+                    return result.spl_query.trim();
+                }
+
+                const toolCalls = Array.isArray(result?.tool_calls) ? result.tool_calls : [];
+                for (let index = toolCalls.length - 1; index >= 0; index -= 1) {
+                    const toolCall = toolCalls[index];
+                    if (typeof toolCall?.spl_query === 'string' && toolCall.spl_query.trim()) {
+                        return toolCall.spl_query.trim();
+                    }
+                    if (typeof toolCall?.args?.query === 'string' && toolCall.args.query.trim()) {
+                        return toolCall.args.query.trim();
+                    }
+                }
+
+                return undefined;
+            };
+
+            const formatVisualizationNumber = (value) => {
+                const numericValue = Number(value);
+                if (!Number.isFinite(numericValue)) {
+                    return String(value ?? '');
+                }
+                if (Math.abs(numericValue) >= 1000) {
+                    return numericValue.toLocaleString();
+                }
+                if (Math.abs(numericValue) >= 10 || Number.isInteger(numericValue)) {
+                    return numericValue.toFixed(0);
+                }
+                return numericValue.toFixed(2).replace(/\\.00$/, '');
+            };
+
+            const renderVisualizationPreview = (spec) => {
+                const rawPoints = Array.isArray(spec?.points) ? spec.points : [];
+                const points = rawPoints
+                    .map((point) => {
+                        const numericValue = Number(point?.value);
+                        if (!Number.isFinite(numericValue)) {
+                            return null;
+                        }
+                        return {
+                            label: typeof point?.label === 'string' ? point.label : '',
+                            fullLabel: typeof point?.full_label === 'string'
+                                ? point.full_label
+                                : (typeof point?.label === 'string' ? point.label : ''),
+                            value: numericValue,
+                        };
+                    })
+                    .filter(Boolean);
+
+                if (points.length === 0) {
+                    return null;
+                }
+
+                const maxValue = Math.max(...points.map((point) => point.value), 1);
+                const width = 480;
+                const height = 180;
+                const padding = 18;
+                const innerWidth = width - (padding * 2);
+                const innerHeight = height - (padding * 2);
+
+                if (String(spec?.chart_type || '').toLowerCase() === 'line') {
+                    const polylinePoints = points.map((point, index) => {
+                        const x = points.length === 1
+                            ? padding + (innerWidth / 2)
+                            : padding + ((innerWidth * index) / (points.length - 1));
+                        const y = padding + innerHeight - ((point.value / maxValue) * innerHeight);
+                        return `${x},${y}`;
+                    }).join(' ');
+
+                    return (
+                        <div className={`mt-2 rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
+                            <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
+                                <div>
+                                    <div className={`text-sm font-semibold ${headingClass}`}>{spec?.title || 'Trend Preview'}</div>
+                                    <div className={`text-xs ${subtextClass}`}>{spec?.summary_text || 'Generated from chartable query results.'}</div>
+                                </div>
+                                <div className="flex flex-wrap gap-2 text-[11px]">
+                                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-sky-900 text-sky-100 border-sky-700' : 'bg-sky-100 text-sky-800 border-sky-300'}`}>
+                                        line
+                                    </span>
+                                    {spec?.y_field && (
+                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-gray-50 text-gray-700 border-gray-300'}`}>
+                                            {spec.y_field}
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                            <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-40 overflow-visible">
+                                {[0.25, 0.5, 0.75].map((ratio) => {
+                                    const y = padding + (innerHeight * ratio);
+                                    return (
+                                        <line
+                                            key={ratio}
+                                            x1={padding}
+                                            y1={y}
+                                            x2={width - padding}
+                                            y2={y}
+                                            stroke={isDarkTheme ? '#374151' : '#e5e7eb'}
+                                            strokeDasharray="4 4"
+                                            strokeWidth="1"
+                                        />
+                                    );
+                                })}
+                                <polyline
+                                    fill="none"
+                                    stroke={isDarkTheme ? '#38bdf8' : '#0284c7'}
+                                    strokeWidth="3"
+                                    strokeLinejoin="round"
+                                    strokeLinecap="round"
+                                    points={polylinePoints}
+                                />
+                                {points.map((point, index) => {
+                                    const x = points.length === 1
+                                        ? padding + (innerWidth / 2)
+                                        : padding + ((innerWidth * index) / (points.length - 1));
+                                    const y = padding + innerHeight - ((point.value / maxValue) * innerHeight);
+                                    return (
+                                        <g key={`${point.fullLabel || point.label}-${index}`}>
+                                            <circle cx={x} cy={y} r="4" fill={isDarkTheme ? '#0f172a' : '#ffffff'} stroke={isDarkTheme ? '#38bdf8' : '#0284c7'} strokeWidth="2" />
+                                            <title>{`${point.fullLabel || point.label}: ${formatVisualizationNumber(point.value)}`}</title>
+                                        </g>
+                                    );
+                                })}
+                            </svg>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
+                                {points.slice(0, 8).map((point, index) => (
+                                    <div key={`${point.fullLabel || point.label}-${index}`} className={`rounded border px-2 py-1 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-gray-50 border-gray-200'}`} title={point.fullLabel || point.label}>
+                                        <div className={`text-[10px] uppercase tracking-wide ${mutedTextClass}`}>{point.label}</div>
+                                        <div className={`text-xs font-semibold ${headingClass}`}>{formatVisualizationNumber(point.value)}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    );
+                }
+
+                return (
+                    <div className={`mt-2 rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
+                        <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
+                            <div>
+                                <div className={`text-sm font-semibold ${headingClass}`}>{spec?.title || 'Breakdown Preview'}</div>
+                                <div className={`text-xs ${subtextClass}`}>{spec?.summary_text || 'Generated from chartable query results.'}</div>
+                            </div>
+                            <div className="flex flex-wrap gap-2 text-[11px]">
+                                <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-cyan-900 text-cyan-100 border-cyan-700' : 'bg-cyan-100 text-cyan-800 border-cyan-300'}`}>
+                                    bar
+                                </span>
+                                {spec?.y_field && (
+                                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-gray-50 text-gray-700 border-gray-300'}`}>
+                                        {spec.y_field}
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+                        <div className="flex items-end gap-2 h-40">
+                            {points.map((point, index) => {
+                                const heightPercent = Math.max(14, Math.round((point.value / maxValue) * 100));
+                                return (
+                                    <div key={`${point.fullLabel || point.label}-${index}`} className="flex-1 min-w-0 flex flex-col items-center justify-end" title={`${point.fullLabel || point.label}: ${formatVisualizationNumber(point.value)}`}>
+                                        <div className={`text-[10px] mb-1 ${mutedTextClass}`}>{formatVisualizationNumber(point.value)}</div>
+                                        <div className={`w-full rounded-t ${isDarkTheme ? 'bg-cyan-500' : 'bg-cyan-600'}`} style={{ height: `${heightPercent}%` }}></div>
+                                        <div className={`mt-2 text-[10px] leading-tight text-center ${subtextClass}`}>{point.label}</div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                );
+            };
+
+            const saveCapabilityConfig = async (name) => {
+                try {
+                    const parsed = JSON.parse(capabilityDrafts[name] || '{}');
+                    await runCapabilityAction(name, 'config', { config: parsed });
+                } catch (error) {
+                    setCapabilityNotice({
+                        type: 'error',
+                        message: `${name}: capability config must be valid JSON before saving.`
+                    });
+                    setTimeout(() => setCapabilityNotice(null), 3500);
+                }
             };
 
             const loadDiscoveryCompare = async (current = 'latest', baseline = 'previous') => {
@@ -8442,6 +11569,60 @@ def get_frontend_html():
 
             const refreshRunbook = () => {
                 loadRunbookPayload(compareSelection.current, workflowTab);
+            };
+
+            const downloadCapabilityExport = (filename) => {
+                if (!filename) {
+                    return;
+                }
+
+                const link = document.createElement('a');
+                link.href = `/api/capabilities/exports/download/${encodeURIComponent(filename)}`;
+                link.target = '_blank';
+                link.rel = 'noreferrer';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const buildCapabilityExport = async (payload = {}, options = {}) => {
+                setExportBuildState({ status: 'loading', bundle: null, error: '' });
+
+                try {
+                    const response = await fetch('/api/capabilities/exports/build', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
+                    }
+
+                    const exportBundle = result?.details?.export || null;
+                    if (!exportBundle) {
+                        throw new Error('Report package details were not returned by the server.');
+                    }
+
+                    setExportBuildState({ status: 'success', bundle: exportBundle, error: '' });
+                    loadReports();
+                    loadV2Artifacts();
+                    loadCapabilities();
+
+                    if (options.downloadAfterBuild && exportBundle?.download_name) {
+                        downloadCapabilityExport(exportBundle.download_name);
+                    }
+
+                    return exportBundle;
+                } catch (error) {
+                    console.error('Failed to build report package:', error);
+                    setExportBuildState({
+                        status: 'error',
+                        bundle: null,
+                        error: error?.message || 'Failed to build report package.'
+                    });
+                    return null;
+                }
             };
             
             const loadConnectionInfo = async () => {
@@ -8639,13 +11820,22 @@ def get_frontend_html():
                         // Then update form fields
                         setTimeout(() => {
                             const normalizedProvider = normalizeProvider(newConfig.llm.provider);
-                            document.getElementById('llm-provider').value = normalizedProvider;
+                            const providerInput = document.getElementById('llm-provider');
+                            if (providerInput) {
+                                providerInput.value = normalizedProvider;
+                            }
                             const modelInput = document.getElementById('llm-model');
                             if (modelInput) {
                                 modelInput.value = newConfig.llm.model;
                             }
-                            document.getElementById('llm-max-tokens').value = newConfig.llm.max_tokens;
-                            document.getElementById('llm-temperature').value = newConfig.llm.temperature;
+                            const maxTokensInput = document.getElementById('llm-max-tokens');
+                            if (maxTokensInput) {
+                                maxTokensInput.value = newConfig.llm.max_tokens;
+                            }
+                            const temperatureInput = document.getElementById('llm-temperature');
+                            if (temperatureInput) {
+                                temperatureInput.value = newConfig.llm.temperature;
+                            }
                             
                             // Update API Key field - force placeholder update
                             const apiKeyInput = document.getElementById('llm-api-key');
@@ -9283,10 +12473,10 @@ def get_frontend_html():
             
             // Auto-scroll chat messages to bottom
             useEffect(() => {
-                if (chatMessages.length > 0) {
-                    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+                if (isChatOpen && chatMessages.length > 0) {
+                    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
                 }
-            }, [chatMessages]);
+            }, [chatMessages, isChatOpen]);
             
             // Load chat settings when settings modal opens
             useEffect(() => {
@@ -9421,8 +12611,10 @@ def get_frontend_html():
                                             timestamp: new Date().toISOString(),
                                             mcp_data: result.mcp_data,
                                             tool_used: result.tool_used,
-                                            spl_query: result.spl_query,
+                                            spl_query: extractAssistantSplQuery(result),
+                                            visualization_spec: result.visualization_spec,
                                             spl_in_text: result.spl_in_text,
+                                            capability_usage: Array.isArray(result.capability_usage) ? result.capability_usage : [],
                                             has_follow_on: result.has_follow_on,
                                             follow_on_actions: result.follow_on_actions,
                                             status_timeline: result.status_timeline,
@@ -9787,8 +12979,13 @@ def get_frontend_html():
                                 <div className="flex-1 min-w-[320px] flex items-center justify-center">
                                     <div className={`w-full max-w-3xl rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-indigo-950/70 border border-indigo-700' : 'bg-indigo-50 border border-indigo-200'}`}>
                                         <div className="flex flex-wrap items-center justify-center gap-2">
-                                            <div className="inline-flex rounded-lg border border-indigo-300 overflow-hidden text-[11px] sm:text-xs bg-indigo-900">
+                                            <div className="inline-flex rounded-lg border border-indigo-300 overflow-hidden text-[11px] sm:text-xs bg-indigo-900" role="tablist" aria-label="Workspace views">
                                                 <button
+                                                    type="button"
+                                                    id="workspace-tab-mission"
+                                                    role="tab"
+                                                    aria-selected={isMissionTab}
+                                                    tabIndex={isMissionTab ? 0 : -1}
                                                     onClick={() => setWorkspaceTab('mission')}
                                                     className={`px-3 sm:px-4 py-1.5 ${isMissionTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
                                                     title="Mission tab: pipeline execution, progress, and live log"
@@ -9796,6 +12993,11 @@ def get_frontend_html():
                                                     Mission
                                                 </button>
                                                 <button
+                                                    type="button"
+                                                    id="workspace-tab-intelligence"
+                                                    role="tab"
+                                                    aria-selected={isIntelligenceTab}
+                                                    tabIndex={isIntelligenceTab ? 0 : -1}
                                                     onClick={() => {
                                                         setWorkspaceTab('intelligence');
                                                         refreshIntelligenceWorkspace();
@@ -9806,6 +13008,11 @@ def get_frontend_html():
                                                     Intelligence
                                                 </button>
                                                 <button
+                                                    type="button"
+                                                    id="workspace-tab-artifacts"
+                                                    role="tab"
+                                                    aria-selected={isArtifactsTab}
+                                                    tabIndex={isArtifactsTab ? 0 : -1}
                                                     onClick={() => {
                                                         setWorkspaceTab('artifacts');
                                                         refreshArtifactsWorkspace();
@@ -9814,6 +13021,21 @@ def get_frontend_html():
                                                     title="Artifacts tab: reports, exports, and summaries"
                                                 >
                                                     Artifacts
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    id="workspace-tab-capabilities"
+                                                    role="tab"
+                                                    aria-selected={isCapabilitiesTab}
+                                                    tabIndex={isCapabilitiesTab ? 0 : -1}
+                                                    onClick={() => {
+                                                        setWorkspaceTab('capabilities');
+                                                        refreshCapabilitiesWorkspace();
+                                                    }}
+                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
+                                                    title="Capabilities tab: optional capability packs, health, and control surface"
+                                                >
+                                                    Capabilities
                                                 </button>
                                             </div>
 
@@ -9849,6 +13071,15 @@ def get_frontend_html():
                                                         <i className="fas fa-folder-open mr-1"></i>Reload Artifacts
                                                     </button>
                                                 )}
+                                                {isCapabilitiesTab && (
+                                                    <button
+                                                        onClick={refreshCapabilitiesWorkspace}
+                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-violet-600 hover:bg-violet-700 text-white"
+                                                        title="Refresh optional capability inventory and health"
+                                                    >
+                                                        <i className="fas fa-puzzle-piece mr-1"></i>Refresh Capabilities
+                                                    </button>
+                                                )}
                                                 <button
                                                     onClick={() => setIsChatOpen(true)}
                                                     className="px-2.5 sm:px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white"
@@ -9862,16 +13093,21 @@ def get_frontend_html():
                                 </div>
 
                                 <div className="flex items-center flex-wrap justify-end gap-2 sm:gap-3">
-                                    <div 
+                                    <button
+                                        type="button"
                                         className={`flex items-center cursor-pointer px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg transition-colors ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
                                         onClick={openConnectionModal}
                                         title="View MCP connection details"
+                                        aria-label={isConnected ? 'View MCP connection details. MCP connected.' : 'View MCP connection details. MCP disconnected.'}
+                                        aria-haspopup="dialog"
+                                        aria-expanded={isConnectionModalOpen}
+                                        aria-controls="connection-details-popover"
                                     >
-                                        <div className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                                        <span aria-hidden="true" className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></span>
                                         <span className={`text-xs sm:text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
                                             {isConnected ? 'MCP Connected' : 'MCP Disconnected'}
                                         </span>
-                                    </div>
+                                    </button>
                                     <div 
                                         className={`flex items-center px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border ${isDarkTheme ? 'bg-gray-800 border-purple-500' : 'bg-white border-purple-200'}`}
                                         title="Active LLM connection"
@@ -9911,9 +13147,11 @@ def get_frontend_html():
                                             <p className={`text-sm ${subtextClass}`}>Actionable view for admins, analysts, and executives</p>
                                         </div>
                                         <button
+                                            type="button"
                                             onClick={loadDiscoveryDashboard}
                                             className="text-indigo-600 hover:text-indigo-800"
                                             title="Refresh intelligence view"
+                                            aria-label="Refresh discovery intelligence view"
                                         >
                                             <i className="fas fa-sync"></i>
                                         </button>
@@ -9926,30 +13164,30 @@ def get_frontend_html():
                                     ) : (
                                         <>
                                             <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
-                                                <div className="bg-indigo-50 rounded p-3">
-                                                    <div className="text-xs text-indigo-700">Readiness</div>
-                                                    <div className="text-xl font-bold text-indigo-900">{discoveryDashboard.kpis?.readiness_score || 0}/100</div>
-                                                    <div className="text-xs text-indigo-600">Δ {discoveryDashboard.trends?.readiness_delta ?? 0}</div>
+                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-indigo-900 border border-indigo-700' : 'bg-indigo-50'}`}>
+                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-800'}`}>Readiness</div>
+                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-indigo-50' : 'text-indigo-900'}`}>{discoveryDashboard.kpis?.readiness_score || 0}/100</div>
+                                                    <div className={`text-xs ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-800'}`}>Δ {discoveryDashboard.trends?.readiness_delta ?? 0}</div>
                                                 </div>
-                                                <div className="bg-blue-50 rounded p-3">
-                                                    <div className="text-xs text-blue-700">Indexes</div>
-                                                    <div className="text-xl font-bold text-blue-900">{discoveryDashboard.kpis?.total_indexes || 0}</div>
-                                                    <div className="text-xs text-blue-600">Δ {discoveryDashboard.trends?.indexes_delta ?? 0}</div>
+                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-blue-900 border border-blue-700' : 'bg-blue-50'}`}>
+                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-blue-200' : 'text-blue-800'}`}>Indexes</div>
+                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-blue-50' : 'text-blue-900'}`}>{discoveryDashboard.kpis?.total_indexes || 0}</div>
+                                                    <div className={`text-xs ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>Δ {discoveryDashboard.trends?.indexes_delta ?? 0}</div>
                                                 </div>
-                                                <div className="bg-green-50 rounded p-3">
-                                                    <div className="text-xs text-green-700">Sourcetypes</div>
-                                                    <div className="text-xl font-bold text-green-900">{discoveryDashboard.kpis?.total_sourcetypes || 0}</div>
-                                                    <div className="text-xs text-green-600">Δ {discoveryDashboard.trends?.sourcetypes_delta ?? 0}</div>
+                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-green-900 border border-green-700' : 'bg-green-50'}`}>
+                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-green-200' : 'text-green-800'}`}>Sourcetypes</div>
+                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-green-50' : 'text-green-900'}`}>{discoveryDashboard.kpis?.total_sourcetypes || 0}</div>
+                                                    <div className={`text-xs ${isDarkTheme ? 'text-green-300' : 'text-green-800'}`}>Δ {discoveryDashboard.trends?.sourcetypes_delta ?? 0}</div>
                                                 </div>
-                                                <div className="bg-amber-50 rounded p-3">
-                                                    <div className="text-xs text-amber-700">Recommendations</div>
-                                                    <div className="text-xl font-bold text-amber-900">{discoveryDashboard.kpis?.recommendation_count || 0}</div>
-                                                    <div className="text-xs text-amber-600">Δ {discoveryDashboard.trends?.recommendations_delta ?? 0}</div>
+                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-amber-900 border border-amber-700' : 'bg-amber-50'}`}>
+                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-amber-200' : 'text-amber-900'}`}>Recommendations</div>
+                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-amber-50' : 'text-amber-900'}`}>{discoveryDashboard.kpis?.recommendation_count || 0}</div>
+                                                    <div className={`text-xs ${isDarkTheme ? 'text-amber-300' : 'text-amber-900'}`}>Δ {discoveryDashboard.trends?.recommendations_delta ?? 0}</div>
                                                 </div>
-                                                <div className="bg-purple-50 rounded p-3">
-                                                    <div className="text-xs text-purple-700">MCP Tools</div>
-                                                    <div className="text-xl font-bold text-purple-900">{discoveryDashboard.kpis?.tool_count || 0}</div>
-                                                    <div className="text-xs text-purple-600">Coverage snapshot</div>
+                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-purple-900 border border-purple-700' : 'bg-purple-50'}`}>
+                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-purple-200' : 'text-purple-800'}`}>Available Tools</div>
+                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-purple-50' : 'text-purple-900'}`}>{discoveryDashboard.kpis?.tool_count || 0}</div>
+                                                    <div className={`text-xs ${isDarkTheme ? 'text-purple-300' : 'text-purple-800'}`}>Available now</div>
                                                 </div>
                                             </div>
 
@@ -10017,7 +13255,7 @@ def get_frontend_html():
                                                             <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.recommendations?.delta ?? 0}</div>
                                                         </div>
                                                         <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                            <div className={mutedTextClass}>Tools Δ</div>
+                                                            <div className={mutedTextClass}>Tool Count Δ</div>
                                                             <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.tools?.delta ?? 0}</div>
                                                         </div>
                                                     </div>
@@ -10026,20 +13264,38 @@ def get_frontend_html():
 
                                             <div className="border border-gray-200 rounded p-3">
                                                 <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-                                                    <div className="inline-flex rounded border border-gray-300 overflow-hidden text-xs">
+                                                    <div className="inline-flex rounded border border-gray-300 overflow-hidden text-xs" role="tablist" aria-label="Runbook personas">
                                                         <button
+                                                            type="button"
+                                                            id="workflow-tab-admin"
+                                                            role="tab"
+                                                            aria-selected={workflowTab === 'admin'}
+                                                            aria-controls="workflow-panel-admin"
+                                                            tabIndex={workflowTab === 'admin' ? 0 : -1}
                                                             onClick={() => setWorkflowTab('admin')}
                                                             className={`px-3 py-1 ${workflowTab === 'admin' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
                                                         >
                                                             Admin
                                                         </button>
                                                         <button
+                                                            type="button"
+                                                            id="workflow-tab-analyst"
+                                                            role="tab"
+                                                            aria-selected={workflowTab === 'analyst'}
+                                                            aria-controls="workflow-panel-analyst"
+                                                            tabIndex={workflowTab === 'analyst' ? 0 : -1}
                                                             onClick={() => setWorkflowTab('analyst')}
                                                             className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'analyst' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
                                                         >
                                                             Analyst
                                                         </button>
                                                         <button
+                                                            type="button"
+                                                            id="workflow-tab-executive"
+                                                            role="tab"
+                                                            aria-selected={workflowTab === 'executive'}
+                                                            aria-controls="workflow-panel-executive"
+                                                            tabIndex={workflowTab === 'executive' ? 0 : -1}
                                                             onClick={() => setWorkflowTab('executive')}
                                                             className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'executive' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
                                                         >
@@ -10050,7 +13306,7 @@ def get_frontend_html():
                                                     <div className="flex items-center gap-2 text-xs">
                                                         <button
                                                             onClick={refreshRunbook}
-                                                            className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded"
+                                                            className="px-3 py-1 bg-green-700 hover:bg-green-800 text-white rounded"
                                                         >
                                                             Generate Runbook
                                                         </button>
@@ -10065,11 +13321,58 @@ def get_frontend_html():
                                                         >
                                                             Export Runbook
                                                         </button>
+                                                        <button
+                                                            onClick={() => buildCapabilityExport({
+                                                                timestamp: compareSelection.current || 'latest',
+                                                                persona: workflowTab,
+                                                                title: `${workflowTab} discovery package`,
+                                                                runbook_markdown: runbookPayload?.markdown || undefined,
+                                                                runbook_filename: runbookPayload?.filename || undefined,
+                                                            })}
+                                                            disabled={!canUseExportTools || exportBuildState.status === 'loading'}
+                                                            className={`px-3 py-1 rounded ${canUseExportTools && exportBuildState.status !== 'loading' ? 'bg-cyan-700 hover:bg-cyan-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
+                                                        >
+                                                            {exportBuildState.status === 'loading' ? 'Building Package...' : 'Build Report Package'}
+                                                        </button>
+                                                        <button
+                                                            onClick={() => downloadCapabilityExport(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name)}
+                                                            disabled={!(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name)}
+                                                            className={`px-3 py-1 rounded ${(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name) ? 'bg-slate-700 hover:bg-slate-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
+                                                        >
+                                                            Download Package
+                                                        </button>
                                                     </div>
                                                 </div>
 
+                                                {exportBuildState.status === 'error' && (
+                                                    <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'border-red-800 bg-red-950 text-red-200' : 'border-red-200 bg-red-50 text-red-700'}`}>
+                                                        {exportBuildState.error}
+                                                    </div>
+                                                )}
+
+                                                {(exportBuildState.bundle || exportCapability?.latest_bundle) && (
+                                                    <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${subtextClass}`}>
+                                                        <div className="font-medium mb-1">Report Package</div>
+                                                        <div>
+                                                            Package: {formatPackageFileLabel(exportBuildState.bundle?.bundle_name || exportCapability?.latest_bundle?.name)}
+                                                        </div>
+                                                        {exportBuildState.bundle?.session_timestamp && (
+                                                            <div>Session: {exportBuildState.bundle.session_timestamp}</div>
+                                                        )}
+                                                        {exportBuildState.bundle?.artifact_count != null && (
+                                                            <div>Included artifacts: {exportBuildState.bundle.artifact_count}</div>
+                                                        )}
+                                                        {(exportBuildState.bundle?.bundle_size_bytes || exportCapability?.latest_bundle?.size_bytes) && (
+                                                            <div>Package size: {Number(exportBuildState.bundle?.bundle_size_bytes || exportCapability?.latest_bundle?.size_bytes).toLocaleString()} bytes</div>
+                                                        )}
+                                                        <div className={`mt-2 ${mutedTextClass}`}>
+                                                            Creates a downloadable zip package with the selected discovery session artifacts and the active persona runbook.
+                                                        </div>
+                                                    </div>
+                                                )}
+
                                                 {workflowTab === 'admin' && (
-                                                    <ul className="text-xs text-gray-700 space-y-2">
+                                                    <ul id="workflow-panel-admin" role="tabpanel" aria-labelledby="workflow-tab-admin" className="text-xs text-gray-700 space-y-2">
                                                         {(discoveryDashboard.latest?.personas?.admin?.actions || []).slice(0, 6).map((action, idx) => (
                                                             <li key={idx} className="bg-gray-50 rounded px-3 py-2">
                                                                 <div className="font-medium text-gray-900">{action.title}</div>
@@ -10081,7 +13384,7 @@ def get_frontend_html():
                                                 )}
 
                                                 {workflowTab === 'analyst' && (
-                                                    <ul className="text-xs text-gray-700 space-y-2">
+                                                    <ul id="workflow-panel-analyst" role="tabpanel" aria-labelledby="workflow-tab-analyst" className="text-xs text-gray-700 space-y-2">
                                                         {(discoveryDashboard.latest?.personas?.analyst?.hypotheses || []).slice(0, 6).map((track, idx) => (
                                                             <li key={idx} className="bg-gray-50 rounded px-3 py-2">
                                                                 <div className="font-medium text-gray-900">{track.title}</div>
@@ -10093,7 +13396,7 @@ def get_frontend_html():
                                                 )}
 
                                                 {workflowTab === 'executive' && (
-                                                    <div className={`text-xs ${subtextClass}`}>
+                                                    <div id="workflow-panel-executive" role="tabpanel" aria-labelledby="workflow-tab-executive" className={`text-xs ${subtextClass}`}>
                                                         <div className={`${isDarkTheme ? 'bg-gray-700 text-gray-100' : 'bg-gray-50 text-gray-700'} rounded px-3 py-2 mb-2`}>
                                                             {discoveryDashboard.latest?.personas?.executive?.headline || 'No executive brief available.'}
                                                         </div>
@@ -10124,9 +13427,11 @@ def get_frontend_html():
                                                 <p className={`text-sm ${subtextClass}`}>Coverage gaps, capability map, and evidence ledger from latest V2 run</p>
                                             </div>
                                             <button
+                                                type="button"
                                                 onClick={loadV2Intelligence}
                                                 className="text-indigo-600 hover:text-indigo-800"
                                                 title="Refresh V2 intelligence"
+                                                aria-label="Refresh V2 intelligence"
                                             >
                                                 <i className="fas fa-sync"></i>
                                             </button>
@@ -10226,6 +13531,390 @@ def get_frontend_html():
                                                             </ul>
                                                         )}
                                                     </div>
+                                                </div>
+                                            </>
+                                        )}
+                                    </div>
+                                )}
+
+                                {isCapabilitiesTab && (
+                                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
+                                        <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-4">
+                                            <div>
+                                                <h2 className={`text-lg font-semibold ${headingClass}`}>Capability Management</h2>
+                                                <p className={`text-sm ${subtextClass}`}>Install, enable, test, inspect, and tune optional capabilities without leaving the app.</p>
+                                            </div>
+                                            <div className={`text-xs rounded-lg px-3 py-2 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                Capability state is persisted in the encrypted application configuration.
+                                            </div>
+                                        </div>
+
+                                        {capabilityNotice && (
+                                            <div className={`mb-4 rounded-lg border px-3 py-2 text-sm ${capabilityNotice.type === 'error'
+                                                ? (isDarkTheme ? 'bg-red-950 border-red-800 text-red-100' : 'bg-red-50 border-red-200 text-red-800')
+                                                : (isDarkTheme ? 'bg-emerald-950 border-emerald-800 text-emerald-100' : 'bg-emerald-50 border-emerald-200 text-emerald-800')}`}>
+                                                {capabilityNotice.message}
+                                            </div>
+                                        )}
+
+                                        {capabilitiesData.status === 'error' ? (
+                                            <div className={`text-sm rounded p-4 border ${isDarkTheme ? 'bg-red-950 border-red-800 text-red-100' : 'bg-red-50 border-red-200 text-red-800'}`}>
+                                                {capabilitiesData.error || 'Failed to load capabilities.'}
+                                            </div>
+                                        ) : (
+                                            <>
+                                                <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
+                                                    <div className={`${isDarkTheme ? 'bg-indigo-900 border border-indigo-700' : 'bg-indigo-50'} rounded-lg p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'} text-xs uppercase tracking-wide`}>Registered</div>
+                                                        <div className={`${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.total || 0}</div>
+                                                    </div>
+                                                    <div className={`${isDarkTheme ? 'bg-blue-900 border border-blue-700' : 'bg-blue-50'} rounded-lg p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-blue-200' : 'text-blue-700'} text-xs uppercase tracking-wide`}>Installed</div>
+                                                        <div className={`${isDarkTheme ? 'text-blue-100' : 'text-blue-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.installed || 0}</div>
+                                                    </div>
+                                                    <div className={`${isDarkTheme ? 'bg-emerald-900 border border-emerald-700' : 'bg-emerald-50'} rounded-lg p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-emerald-200' : 'text-emerald-700'} text-xs uppercase tracking-wide`}>Enabled</div>
+                                                        <div className={`${isDarkTheme ? 'text-emerald-100' : 'text-emerald-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.enabled || 0}</div>
+                                                    </div>
+                                                    <div className={`${isDarkTheme ? 'bg-amber-900 border border-amber-700' : 'bg-amber-50'} rounded-lg p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-amber-200' : 'text-amber-700'} text-xs uppercase tracking-wide`}>Ready</div>
+                                                        <div className={`${isDarkTheme ? 'text-amber-100' : 'text-amber-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.ready || 0}</div>
+                                                    </div>
+                                                    <div className={`${isDarkTheme ? 'bg-purple-900 border border-purple-700' : 'bg-purple-50'} rounded-lg p-3`}>
+                                                        <div className={`${isDarkTheme ? 'text-purple-200' : 'text-purple-700'} text-xs uppercase tracking-wide`}>Restart Required</div>
+                                                        <div className={`${isDarkTheme ? 'text-purple-100' : 'text-purple-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.restart_required || 0}</div>
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                                                    {capabilityList.map((capability) => {
+                                                        const actionInProgress = capabilityActionState[capability.name];
+                                                        const isBusy = !!actionInProgress;
+                                                        const statusLabel = capability.health_status || 'unknown';
+                                                        const canInstall = !!capability.runtime_available && !capability.installed;
+                                                        const canEnable = !!capability.installed && !capability.enabled && !capability.restart_required;
+                                                        const canDisable = !!capability.installed && !!capability.enabled;
+                                                        const canTest = !!capability.installed;
+                                                        const canReindex = capability.name === 'rag_chromadb' && !!capability.installed && !capability.restart_required;
+                                                        const canBuildDeeplink = capability.name === 'splunk_deeplink_tools'
+                                                            && !!capability.installed
+                                                            && !!capability.enabled
+                                                            && !capability.restart_required
+                                                            && String(statusLabel).toLowerCase() === 'ready';
+                                                        const indexSummary = capability?.index_summary && typeof capability.index_summary === 'object' ? capability.index_summary : null;
+                                                        const indexSourceTypes = indexSummary?.source_type_counts && typeof indexSummary.source_type_counts === 'object'
+                                                            ? Object.entries(indexSummary.source_type_counts)
+                                                            : [];
+                                                        const deeplinkDraft = deeplinkDrafts[capability.name] || {};
+                                                        const deeplinkBuildResult = deeplinkBuildResults[capability.name] || null;
+
+                                                        return (
+                                                            <div key={capability.name} className={`rounded-lg border p-4 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                                                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-3">
+                                                                    <div>
+                                                                        <div className="flex flex-wrap items-center gap-2 mb-1">
+                                                                            <h3 className={`text-base font-semibold ${headingClass}`}>{capability.title || capability.name}</h3>
+                                                                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${getCapabilityStatusClasses(statusLabel)}`}>
+                                                                                {formatCapabilityStatusLabel(statusLabel)}
+                                                                            </span>
+                                                                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-700 border border-gray-300'}`}>
+                                                                                {formatCapabilityCategoryLabel(capability.category || 'capability')}
+                                                                            </span>
+                                                                        </div>
+                                                                        <p className={`text-sm ${subtextClass}`}>{capability.description || 'Optional capability package.'}</p>
+                                                                    </div>
+                                                                    <div className={`text-xs rounded-lg px-2.5 py-1.5 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                                        {capability.runtime_available ? 'Available now' : 'Planned add-on'}
+                                                                    </div>
+                                                                </div>
+
+                                                                <div className="grid grid-cols-2 gap-2 text-xs mb-3">
+                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
+                                                                        <div className={mutedTextClass}>Setup</div>
+                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{formatCapabilityInstallMethodLabel(capability.install_method || 'unknown')}</div>
+                                                                    </div>
+                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
+                                                                        <div className={mutedTextClass}>Capability stage</div>
+                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{formatCapabilityMaturityLabel(capability.maturity || 'experimental')}</div>
+                                                                    </div>
+                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
+                                                                        <div className={mutedTextClass}>Installed</div>
+                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{capability.installed ? 'Yes' : 'No'}</div>
+                                                                    </div>
+                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
+                                                                        <div className={mutedTextClass}>Enabled</div>
+                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{capability.enabled ? 'Yes' : 'No'}</div>
+                                                                    </div>
+                                                                </div>
+
+                                                                <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
+                                                                    <div className="font-medium mb-1">Health</div>
+                                                                    <div>{capability.health_message || 'Capability has not been tested yet.'}</div>
+                                                                    {capability.last_tested_at && (
+                                                                        <div className={`mt-1 ${mutedTextClass}`}>Last checked: {new Date(capability.last_tested_at).toLocaleString()}</div>
+                                                                    )}
+                                                                    {capability.version && (
+                                                                        <div className={`mt-1 ${mutedTextClass}`}>Version: {capability.version}</div>
+                                                                    )}
+                                                                </div>
+
+                                                                {Array.isArray(capability.dependency_packages) && capability.dependency_packages.length > 0 && (
+                                                                    <div className="mb-3">
+                                                                        <div className={`text-xs font-medium mb-1 ${headingClass}`}>Dependencies</div>
+                                                                        <div className="flex flex-wrap gap-2 text-[11px]">
+                                                                            {capability.dependency_packages.map((pkg) => (
+                                                                                <span key={pkg} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-gray-50 text-gray-700 border-gray-300'}`}>
+                                                                                    {pkg}
+                                                                                </span>
+                                                                            ))}
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+
+                                                                {capability.name === 'rag_chromadb' && (
+                                                                    <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
+                                                                        <div className="font-medium mb-1">Index Status</div>
+                                                                        <div>Documents indexed: {indexSummary?.document_count || 0}</div>
+                                                                        <div>Source files indexed: {indexSummary?.source_file_count || 0}</div>
+                                                                        {indexSummary?.last_indexed_at && (
+                                                                            <div className={`mt-1 ${mutedTextClass}`}>Last indexed: {new Date(indexSummary.last_indexed_at).toLocaleString()}</div>
+                                                                        )}
+                                                                        {indexSourceTypes.length > 0 && (
+                                                                            <div className="flex flex-wrap gap-2 mt-2">
+                                                                                {indexSourceTypes.map(([sourceType, count]) => (
+                                                                                    <span key={sourceType} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-white text-gray-700 border-gray-300'}`}>
+                                                                                        {formatCapabilitySourceTypeLabel(sourceType)}: {count}
+                                                                                    </span>
+                                                                                ))}
+                                                                            </div>
+                                                                        )}
+                                                                        {Array.isArray(indexSummary?.sample_sources) && indexSummary.sample_sources.length > 0 && (
+                                                                            <div className={`mt-2 ${mutedTextClass}`}>
+                                                                                Sample sources: {indexSummary.sample_sources.join(', ')}
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                )}
+
+                                                                {capability.name === 'visualization_tools' && (
+                                                                    <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
+                                                                        <div className="font-medium mb-1">Visualization Status</div>
+                                                                        <div>Preview enabled: {capability.preview_enabled ? 'Yes' : 'No'}</div>
+                                                                        <div>Chart types: {Array.isArray(capability.supported_chart_types) && capability.supported_chart_types.length > 0 ? capability.supported_chart_types.join(', ') : 'line, bar'}</div>
+                                                                        <div>Supported shapes: {Array.isArray(capability.supported_query_shapes) && capability.supported_query_shapes.length > 0 ? capability.supported_query_shapes.join(', ') : 'time_series, aggregation'}</div>
+                                                                        <div>Max preview points: {capability.max_preview_points || capability?.config?.max_preview_points || 8}</div>
+                                                                        <div className={`mt-2 ${mutedTextClass}`}>
+                                                                            Installed and enabled previews appear directly in assistant replies for chartable query results.
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+
+                                                                {capability.name === 'export_tools' && (
+                                                                    <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
+                                                                        <div className="font-medium mb-1">Package Status</div>
+                                                                        <div>Source dir: {capability.output_dir || capability?.config?.source_dir || 'output'}</div>
+                                                                        <div>Export dir: {capability.export_dir || capability?.config?.export_dir || 'output/exports'}</div>
+                                                                        <div>Available sessions: {capability.available_session_count || 0}</div>
+                                                                        <div>Package count: {capability.bundle_count || 0}</div>
+                                                                        <div>Package contents: {Array.isArray(capability.supported_outputs) && capability.supported_outputs.length > 0 ? capability.supported_outputs.map((output) => formatExportOutputLabel(output)).join(', ') : 'ZIP Package, Manifest, Summary Note'}</div>
+                                                                        <div>Max files per package: {capability.max_bundle_files || capability?.config?.max_bundle_files || 12}</div>
+                                                                        {capability.latest_bundle?.name && (
+                                                                            <div className="mt-2 break-all">
+                                                                                Latest package:{' '}
+                                                                                <button
+                                                                                    type="button"
+                                                                                    onClick={() => downloadCapabilityExport(capability.latest_bundle.name)}
+                                                                                    className="text-sky-600 hover:text-sky-800 underline"
+                                                                                >
+                                                                                    {formatPackageFileLabel(capability.latest_bundle.name)}
+                                                                                </button>
+                                                                            </div>
+                                                                        )}
+                                                                        <div className={`mt-2 ${mutedTextClass}`}>
+                                                                            Build Report Package from the runbook workspace to package the active persona runbook with the selected discovery session artifacts.
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+
+                                                                {capability.name === 'splunk_deeplink_tools' && (
+                                                                    <>
+                                                                        <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
+                                                                            <div className="font-medium mb-1">Deeplink Status</div>
+                                                                            <div>Resolved web URL: {capability.resolved_web_base_url || 'Unavailable'}</div>
+                                                                            <div>Source: {capability.base_url_source || 'unresolved'}</div>
+                                                                            <div>Default app: {capability.default_app || capability?.config?.default_app || 'search'}</div>
+                                                                            {capability.sample_search_url && (
+                                                                                <div className="mt-2 break-all">
+                                                                                    <a
+                                                                                        href={capability.sample_search_url}
+                                                                                        target="_blank"
+                                                                                        rel="noreferrer"
+                                                                                        className="text-sky-600 hover:text-sky-800 underline"
+                                                                                    >
+                                                                                        Open sample search
+                                                                                    </a>
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+
+                                                                        <div className={`rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>
+                                                                            <div className={`text-sm font-medium mb-2 ${headingClass}`}>Build Search Deeplink</div>
+                                                                            <textarea
+                                                                                value={deeplinkDraft.query || ''}
+                                                                                onChange={(event) => updateDeeplinkDraft(capability.name, 'query', event.target.value)}
+                                                                                rows={3}
+                                                                                placeholder="search index=_internal | head 20"
+                                                                                className={`w-full rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                                                            />
+                                                                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
+                                                                                <input
+                                                                                    value={deeplinkDraft.earliest || ''}
+                                                                                    onChange={(event) => updateDeeplinkDraft(capability.name, 'earliest', event.target.value)}
+                                                                                    placeholder="-24h"
+                                                                                    className={`rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                                                                />
+                                                                                <input
+                                                                                    value={deeplinkDraft.latest || ''}
+                                                                                    onChange={(event) => updateDeeplinkDraft(capability.name, 'latest', event.target.value)}
+                                                                                    placeholder="now"
+                                                                                    className={`rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                                                                />
+                                                                                <input
+                                                                                    value={deeplinkDraft.app || ''}
+                                                                                    onChange={(event) => updateDeeplinkDraft(capability.name, 'app', event.target.value)}
+                                                                                    placeholder="search"
+                                                                                    className={`rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                                                                />
+                                                                            </div>
+                                                                            {deeplinkBuildResult?.url && (
+                                                                                <div className={`mt-2 text-xs break-all ${subtextClass}`}>
+                                                                                    Latest build:{' '}
+                                                                                    <a
+                                                                                        href={deeplinkBuildResult.url}
+                                                                                        target="_blank"
+                                                                                        rel="noreferrer"
+                                                                                        className="text-sky-600 hover:text-sky-800 underline"
+                                                                                    >
+                                                                                        {deeplinkBuildResult.url}
+                                                                                    </a>
+                                                                                </div>
+                                                                            )}
+                                                                            <div className="flex flex-wrap gap-2 mt-3">
+                                                                                <button
+                                                                                    onClick={() => buildCapabilityDeeplink({
+                                                                                        query: deeplinkDraft.query || '',
+                                                                                        earliest: deeplinkDraft.earliest || undefined,
+                                                                                        latest: deeplinkDraft.latest || undefined,
+                                                                                        app: deeplinkDraft.app || undefined,
+                                                                                    }, { name: capability.name })}
+                                                                                    disabled={!canBuildDeeplink || isBusy}
+                                                                                    className={`px-3 py-1.5 rounded text-sm font-medium ${canBuildDeeplink && !isBusy ? 'bg-sky-600 hover:bg-sky-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                                >
+                                                                                    {actionInProgress === 'build' ? 'Building...' : 'Build Link'}
+                                                                                </button>
+                                                                                <button
+                                                                                    onClick={() => buildCapabilityDeeplink({
+                                                                                        query: deeplinkDraft.query || '',
+                                                                                        earliest: deeplinkDraft.earliest || undefined,
+                                                                                        latest: deeplinkDraft.latest || undefined,
+                                                                                        app: deeplinkDraft.app || undefined,
+                                                                                    }, { name: capability.name, openAfterBuild: true, suppressNotice: true })}
+                                                                                    disabled={!canBuildDeeplink || isBusy}
+                                                                                    className={`px-3 py-1.5 rounded text-sm font-medium ${canBuildDeeplink && !isBusy ? 'bg-cyan-700 hover:bg-cyan-800 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                                >
+                                                                                    Open Link
+                                                                                </button>
+                                                                            </div>
+                                                                        </div>
+                                                                    </>
+                                                                )}
+
+                                                                <details className={`mb-3 rounded-lg border ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>
+                                                                    <summary className={`cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}`}>Inspect Configuration</summary>
+                                                                    <div className="px-3 pb-3">
+                                                                        <textarea
+                                                                            value={capabilityDrafts[capability.name] || '{}'}
+                                                                            onChange={(event) => updateCapabilityDraft(capability.name, event.target.value)}
+                                                                            rows={8}
+                                                                            className={`w-full rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                                                        />
+                                                                        {capability.name === 'rag_local' && (
+                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                                To use local artifact search in chat, install and enable this capability here, then turn on Optional Local Search in Chat Settings.
+                                                                            </div>
+                                                                        )}
+                                                                        {capability.name === 'rag_chromadb' && (
+                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                                Install the capability, restart the app if prompted, then enable and reindex it before using it in chat.
+                                                                            </div>
+                                                                        )}
+                                                                        {capability.name === 'splunk_deeplink_tools' && (
+                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                                Set web_base_url to override automatic derivation from the MCP URL. Once installed and enabled, assistant SPL cards expose an Open in Splunk action.
+                                                                            </div>
+                                                                        )}
+                                                                        {capability.name === 'visualization_tools' && (
+                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                                Keep preview_enabled on to let the assistant render inline chart previews for time-series and aggregation-style query results.
+                                                                            </div>
+                                                                        )}
+                                                                        {capability.name === 'export_tools' && (
+                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                                Set source_dir and export_dir only if discovery output lives outside the default output folder. Once installed and enabled, Build Report Package creates a downloadable zip with a manifest, summary note, selected artifacts, and the current persona runbook.
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                </details>
+
+                                                                <div className="flex flex-wrap gap-2">
+                                                                    <button
+                                                                        onClick={() => runCapabilityAction(capability.name, 'install')}
+                                                                        disabled={!canInstall || isBusy}
+                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canInstall && !isBusy ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                    >
+                                                                        {actionInProgress === 'install' ? 'Installing...' : (capability.installed ? 'Installed' : (capability.runtime_available ? 'Install' : 'Planned'))}
+                                                                    </button>
+                                                                    <button
+                                                                        onClick={() => runCapabilityAction(capability.name, 'enable')}
+                                                                        disabled={!canEnable || isBusy}
+                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canEnable && !isBusy ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                    >
+                                                                        {actionInProgress === 'enable' ? 'Enabling...' : 'Enable'}
+                                                                    </button>
+                                                                    <button
+                                                                        onClick={() => runCapabilityAction(capability.name, 'disable')}
+                                                                        disabled={!canDisable || isBusy}
+                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canDisable && !isBusy ? 'bg-rose-600 hover:bg-rose-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                    >
+                                                                        {actionInProgress === 'disable' ? 'Disabling...' : 'Disable'}
+                                                                    </button>
+                                                                    <button
+                                                                        onClick={() => runCapabilityAction(capability.name, 'test')}
+                                                                        disabled={!canTest || isBusy}
+                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canTest && !isBusy ? 'bg-amber-600 hover:bg-amber-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                    >
+                                                                        {actionInProgress === 'test' ? 'Testing...' : 'Test'}
+                                                                    </button>
+                                                                    {capability.name === 'rag_chromadb' && (
+                                                                        <button
+                                                                            onClick={() => runCapabilityAction(capability.name, 'reindex')}
+                                                                            disabled={!canReindex || isBusy}
+                                                                            className={`px-3 py-1.5 rounded text-sm font-medium ${canReindex && !isBusy ? 'bg-violet-600 hover:bg-violet-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                        >
+                                                                            {actionInProgress === 'reindex' ? 'Reindexing...' : 'Reindex'}
+                                                                        </button>
+                                                                    )}
+                                                                    <button
+                                                                        onClick={() => saveCapabilityConfig(capability.name)}
+                                                                        disabled={isBusy}
+                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${!isBusy ? 'bg-slate-700 hover:bg-slate-800 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                    >
+                                                                        {actionInProgress === 'config' ? 'Saving...' : 'Save Config'}
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })}
                                                 </div>
                                             </>
                                         )}
@@ -10338,8 +14027,10 @@ def get_frontend_html():
                                                 </p>
                                             </div>
                                             <button
+                                                type="button"
                                                 onClick={isArtifactsTab ? refreshArtifactsWorkspace : loadReports}
                                                 className="text-indigo-600 hover:text-indigo-800"
+                                                aria-label={isArtifactsTab ? 'Refresh V2 artifacts' : 'Refresh generated reports'}
                                             >
                                                 <i className="fas fa-refresh"></i>
                                             </button>
@@ -10372,9 +14063,11 @@ def get_frontend_html():
                                                                         {(artifact.type || 'file').toUpperCase()}
                                                                     </span>
                                                                     <button
+                                                                        type="button"
                                                                         onClick={() => copyToClipboard(artifact.path || artifact.name)}
                                                                         className={`text-xs px-2 py-1 rounded ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'}`}
                                                                         title="Copy file path"
+                                                                        aria-label={`Copy file path for ${artifact.name}`}
                                                                     >
                                                                         <i className="fas fa-copy"></i>
                                                                     </button>
@@ -10393,15 +14086,17 @@ def get_frontend_html():
                                                     <div key={yearKey}>
                                                         {/* Year Header - Only show if not current year */}
                                                         {yearData.visible && (
-                                                            <div 
-                                                                className={`p-3 border-b cursor-pointer font-semibold ${isDarkTheme ? 'bg-indigo-900 border-gray-700 hover:bg-indigo-800' : 'bg-gradient-to-r from-indigo-100 to-purple-100 border-gray-200'}`}
+                                                            <button
+                                                                type="button"
+                                                                className={`w-full p-3 border-b text-left font-semibold ${isDarkTheme ? 'bg-indigo-900 border-gray-700 hover:bg-indigo-800' : 'bg-gradient-to-r from-indigo-100 to-purple-100 border-gray-200'}`}
                                                                 onClick={() => toggleYear(yearKey)}
+                                                                aria-expanded={!!expandedYears[yearKey]}
                                                             >
                                                                 <div className="flex items-center">
                                                                     <i className={`fas ${expandedYears[yearKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-600'}`}></i>
                                                                     <span className={`text-sm ${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'}`}>{yearData.display}</span>
                                                                 </div>
-                                                            </div>
+                                                            </button>
                                                         )}
                                                         
                                                         {/* Month Level */}
@@ -10409,33 +14104,37 @@ def get_frontend_html():
                                                             <div key={monthKey}>
                                                                 {/* Month Header - Only show if not current month or if year is visible */}
                                                                 {monthData.visible && (
-                                                                    <div 
-                                                                        className={`p-3 border-b cursor-pointer ${isDarkTheme ? 'bg-blue-900 border-gray-700 hover:bg-blue-800' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-gray-200'}`}
+                                                                    <button
+                                                                        type="button"
+                                                                        className={`w-full p-3 border-b text-left ${isDarkTheme ? 'bg-blue-900 border-gray-700 hover:bg-blue-800' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-gray-200'}`}
                                                                         onClick={() => toggleMonth(monthKey)}
                                                                         style={{paddingLeft: yearData.visible ? '1.5rem' : '0.75rem'}}
+                                                                        aria-expanded={!!expandedMonths[monthKey]}
                                                                     >
                                                                         <div className="flex items-center">
                                                                             <i className={`fas ${expandedMonths[monthKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${isDarkTheme ? 'text-blue-200' : 'text-blue-600'}`}></i>
                                                                             <span className={`text-sm font-medium ${isDarkTheme ? 'text-blue-100' : 'text-blue-900'}`}>{monthData.display}</span>
                                                                         </div>
-                                                                    </div>
+                                                                    </button>
                                                                 )}
                                                                 
                                                                 {/* Day Level */}
                                                                 {(!monthData.visible || expandedMonths[monthKey]) && Object.entries(monthData.days).sort((a, b) => b[1].day - a[1].day).map(([dayKey, dayData]) => (
                                                                     <div key={dayKey}>
                                                                         {/* Day Header */}
-                                                                        <div 
-                                                                            className={`p-3 border-b cursor-pointer ${dayData.isToday ? (isDarkTheme ? 'bg-green-900' : 'bg-green-50') : (isDarkTheme ? 'bg-gray-800' : 'bg-gray-50')} ${isDarkTheme ? 'hover:bg-gray-700 border-gray-700' : 'hover:bg-gray-100 border-gray-200'}`}
+                                                                        <button
+                                                                            type="button"
+                                                                            className={`w-full p-3 border-b text-left ${dayData.isToday ? (isDarkTheme ? 'bg-green-900' : 'bg-green-50') : (isDarkTheme ? 'bg-gray-800' : 'bg-gray-50')} ${isDarkTheme ? 'hover:bg-gray-700 border-gray-700' : 'hover:bg-gray-100 border-gray-200'}`}
                                                                             onClick={() => toggleDay(dayKey)}
                                                                             style={{paddingLeft: monthData.visible ? (yearData.visible ? '3rem' : '1.5rem') : (yearData.visible ? '1.5rem' : '0.75rem')}}
+                                                                            aria-expanded={!!expandedDays[dayKey]}
                                                                         >
                                                                             <div className="flex items-center">
                                                                                 <i className={`fas ${expandedDays[dayKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${dayData.isToday ? (isDarkTheme ? 'text-green-200' : 'text-green-600') : mutedTextClass}`}></i>
                                                                                 <span className={`text-sm ${dayData.isToday ? (isDarkTheme ? 'text-green-100 font-semibold' : 'text-green-900 font-semibold') : (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-900 font-medium')}`}>{dayData.display}</span>
                                                                                 <span className={`ml-2 text-xs ${mutedTextClass}`}>({dayData.sessions.length})</span>
                                                                             </div>
-                                                                        </div>
+                                                                        </button>
                                                                         
                                                                         {/* Sessions under this day */}
                                                                         {expandedDays[dayKey] && dayData.sessions.map((session) => {
@@ -10446,7 +14145,11 @@ def get_frontend_html():
                                                                                 <div 
                                                                                     className={`p-4 border-b cursor-pointer transition-colors overflow-hidden ${isDarkTheme ? 'bg-gray-800 hover:bg-gray-700 border-gray-700' : 'bg-white hover:bg-gray-50 border-gray-200'}`}
                                                                                     onClick={() => toggleSession(session.timestamp)}
+                                                                                    onKeyDown={(event) => handleKeyActivate(event, () => toggleSession(session.timestamp))}
                                                                                     style={{paddingLeft: monthData.visible ? (yearData.visible ? '3rem' : '2rem') : (yearData.visible ? '2rem' : '1.25rem')}}
+                                                                                    role="button"
+                                                                                    tabIndex={0}
+                                                                                    aria-expanded={!!expandedSessions[session.timestamp]}
                                                                                 >
                                                                                     <div className="flex flex-col gap-2">
                                                                                         <div className="flex items-start flex-1 min-w-0">
@@ -10499,7 +14202,10 @@ def get_frontend_html():
                                                                                                     selectedReport === report.name ? (isDarkTheme ? 'bg-indigo-900 border-r-4 border-indigo-400' : 'bg-indigo-50 border-r-4 border-indigo-500') : ''
                                                                                                 }`}
                                                                                                 onClick={() => loadReport(report.name)}
+                                                                                                onKeyDown={(event) => handleKeyActivate(event, () => loadReport(report.name))}
                                                                                                 style={{paddingLeft: monthData.visible ? (yearData.visible ? '4rem' : '3rem') : (yearData.visible ? '3rem' : '2rem')}}
+                                                                                                role="button"
+                                                                                                tabIndex={0}
                                                                                             >
                                                                                                 <div className="flex items-center justify-between gap-2 min-w-0">
                                                                                                     <div className="flex-1 min-w-0">
@@ -10547,8 +14253,14 @@ def get_frontend_html():
                         >
                             {/* Position modal directly below the connection indicator in the header */}
                             <div 
+                                id="connection-details-popover"
+                                role="dialog"
+                                aria-modal="false"
+                                aria-labelledby="connection-details-title"
                                 className={`connection-popover absolute rounded-xl shadow-2xl w-80 ${isDarkTheme ? 'bg-gray-800 border border-gray-600' : 'bg-white border border-gray-200'}`}
                                 onClick={(e) => e.stopPropagation()}
+                                onKeyDown={(event) => handleDialogKeyDown(event, () => setIsConnectionModalOpen(false))}
+                                tabIndex={-1}
                                 style={{
                                     top: `${connectionModalPosition.top}px`,
                                     left: `${connectionModalPosition.left}px`,
@@ -10565,11 +14277,13 @@ def get_frontend_html():
                                 <div className={`p-4 border-b flex justify-between items-center relative z-10 rounded-t-xl ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
                                     <div className="flex items-center">
                                         <i className="fas fa-plug text-lg text-indigo-600 mr-2"></i>
-                                        <h2 className={`text-base font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Connection Details</h2>
+                                        <h2 id="connection-details-title" className={`text-base font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Connection Details</h2>
                                     </div>
                                     <button
+                                        type="button"
                                         onClick={() => setIsConnectionModalOpen(false)}
                                         className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-200' : 'text-gray-400 hover:text-gray-600'} transition-colors`}
+                                        aria-label="Close connection details"
                                     >
                                         <i className="fas fa-times"></i>
                                     </button>
@@ -10640,35 +14354,44 @@ def get_frontend_html():
                     {/* Chat Modal */}
                     {isChatOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                            <div className={`rounded-xl shadow-2xl w-full max-w-4xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
+                            <div className={`rounded-xl shadow-2xl w-full max-w-4xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`} role="dialog" aria-modal="true" aria-labelledby="chat-modal-title" onKeyDown={(event) => handleDialogKeyDown(event, () => setIsChatOpen(false))}>
                                 {/* Chat Header */}
                                 <div className={`p-6 border-b flex justify-between items-center ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
                                     <div className="flex items-center">
                                         <i className="fas fa-comments text-2xl text-green-600 mr-3"></i>
-                                        <h2 className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Chat with Splunk</h2>
+                                        <h2 id="chat-modal-title" className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Chat with Splunk</h2>
                                     </div>
                                     <div className="flex items-center space-x-2">
                                         <button
+                                            type="button"
                                             onClick={() => setIsChatSettingsOpen(true)}
                                             className={`px-3 py-1 text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}
                                             title="Chat settings"
+                                            aria-label="Open chat settings"
                                         >
                                             <i className="fas fa-cog"></i>
                                         </button>
                                         <button
+                                            type="button"
                                             onClick={() => {
+                                                clearPersistedChatState();
                                                 setChatMessages([]);
+                                                setChatInput('');
+                                                setChatStatus('');
                                                 setServerConversationHistory(null);
                                                 setChatSessionId(generateChatSessionId());
                                             }}
                                             className={`px-3 py-1 text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}
                                             title="Clear chat"
+                                            aria-label="Clear chat history"
                                         >
                                             <i className="fas fa-trash"></i>
                                         </button>
                                         <button
+                                            type="button"
                                             onClick={() => setIsChatOpen(false)}
                                             className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-100' : 'text-gray-500 hover:text-gray-700'}`}
+                                            aria-label="Close chat"
                                         >
                                             <i className="fas fa-times text-xl"></i>
                                         </button>
@@ -10721,21 +14444,35 @@ def get_frontend_html():
                                                                     <div className="mt-2 p-4 bg-gray-900 text-green-300 rounded-lg font-mono text-sm">
                                                                         <div className="flex justify-between items-start mb-2">
                                                                             <span className="text-xs text-gray-300 uppercase tracking-wide">Splunk Query</span>
-                                                                            <button 
-                                                                                onClick={() => {
-                                                                                    navigator.clipboard.writeText(msg.spl_query);
-                                                                                    // Show feedback
-                                                                                    const btn = event.currentTarget;
-                                                                                    const originalHTML = btn.innerHTML;
-                                                                                    btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-                                                                                    setTimeout(() => btn.innerHTML = originalHTML, 2000);
-                                                                                }}
-                                                                                className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
-                                                                                title="Copy to clipboard"
-                                                                            >
-                                                                                <i className="fas fa-copy mr-1"></i>
-                                                                                Copy
-                                                                            </button>
+                                                                            <div className="flex items-center gap-2">
+                                                                                {canUseSplunkDeeplinks && (
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => openSplunkSearchFromChat(msg.spl_query)}
+                                                                                        className="px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors"
+                                                                                        title="Open this search in Splunk Web"
+                                                                                    >
+                                                                                        <i className="fas fa-external-link-alt mr-1"></i>
+                                                                                        Open in Splunk
+                                                                                    </button>
+                                                                                )}
+                                                                                <button 
+                                                                                    type="button"
+                                                                                    onClick={(event) => {
+                                                                                        navigator.clipboard.writeText(msg.spl_query);
+                                                                                        const btn = event.currentTarget;
+                                                                                        const originalHTML = btn.innerHTML;
+                                                                                        btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
+                                                                                        setTimeout(() => btn.innerHTML = originalHTML, 2000);
+                                                                                    }}
+                                                                                    className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+                                                                                    title="Copy to clipboard"
+                                                                                    aria-label="Copy executed SPL query to clipboard"
+                                                                                >
+                                                                                    <i className="fas fa-copy mr-1"></i>
+                                                                                    Copy
+                                                                                </button>
+                                                                            </div>
                                                                         </div>
                                                                         <pre className="whitespace-pre-wrap break-all">{msg.spl_query}</pre>
                                                                     </div>
@@ -10752,22 +14489,100 @@ def get_frontend_html():
                                                                     <div className="mt-2 p-4 bg-gray-900 text-amber-300 rounded-lg font-mono text-sm">
                                                                         <div className="flex justify-between items-start mb-2">
                                                                             <span className="text-xs text-gray-300 uppercase tracking-wide">Suggested Query</span>
-                                                                            <button 
-                                                                                onClick={() => {
-                                                                                    navigator.clipboard.writeText(msg.spl_in_text);
-                                                                                    const btn = event.currentTarget;
-                                                                                    const originalHTML = btn.innerHTML;
-                                                                                    btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-                                                                                    setTimeout(() => btn.innerHTML = originalHTML, 2000);
-                                                                                }}
-                                                                                className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
-                                                                                title="Copy to clipboard"
-                                                                            >
-                                                                                <i className="fas fa-copy mr-1"></i>
-                                                                                Copy
-                                                                            </button>
+                                                                            <div className="flex items-center gap-2">
+                                                                                {canUseSplunkDeeplinks && (
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => openSplunkSearchFromChat(msg.spl_in_text)}
+                                                                                        className="px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors"
+                                                                                        title="Open this search in Splunk Web"
+                                                                                    >
+                                                                                        <i className="fas fa-external-link-alt mr-1"></i>
+                                                                                        Open in Splunk
+                                                                                    </button>
+                                                                                )}
+                                                                                <button 
+                                                                                    type="button"
+                                                                                    onClick={(event) => {
+                                                                                        navigator.clipboard.writeText(msg.spl_in_text);
+                                                                                        const btn = event.currentTarget;
+                                                                                        const originalHTML = btn.innerHTML;
+                                                                                        btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
+                                                                                        setTimeout(() => btn.innerHTML = originalHTML, 2000);
+                                                                                    }}
+                                                                                    className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+                                                                                    title="Copy to clipboard"
+                                                                                    aria-label="Copy suggested SPL query to clipboard"
+                                                                                >
+                                                                                    <i className="fas fa-copy mr-1"></i>
+                                                                                    Copy
+                                                                                </button>
+                                                                            </div>
                                                                         </div>
                                                                         <pre className="whitespace-pre-wrap break-all">{msg.spl_in_text}</pre>
+                                                                    </div>
+                                                                </details>
+                                                            )}
+
+                                                            {msg.visualization_spec && (
+                                                                <details className="mt-3" open>
+                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-cyan-300 hover:text-cyan-100' : 'text-cyan-700 hover:text-cyan-900'}`}>
+                                                                        <i className="fas fa-chart-line mr-2"></i>
+                                                                        Visualization Preview
+                                                                    </summary>
+                                                                    {renderVisualizationPreview(msg.visualization_spec)}
+                                                                </details>
+                                                            )}
+
+                                                            {Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && (
+                                                                <details className="mt-3">
+                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-emerald-300 hover:text-emerald-100' : 'text-emerald-700 hover:text-emerald-900'}`}>
+                                                                        <i className="fas fa-puzzle-piece mr-2"></i>
+                                                                        Capability Evidence ({msg.capability_usage.length})
+                                                                    </summary>
+                                                                    <div className="mt-2 space-y-3">
+                                                                        {msg.capability_usage.map((usage, usageIdx) => (
+                                                                            <div key={usageIdx} className={`rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-emerald-50 border-emerald-200'}`}>
+                                                                                <div className="flex flex-wrap items-center gap-2 mb-2">
+                                                                                    <span className={`text-sm font-semibold ${headingClass}`}>{usage.title || usage.name || 'Capability'}</span>
+                                                                                    {usage.category && (
+                                                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-gray-900 text-gray-200 border border-gray-600' : 'bg-white text-gray-700 border border-gray-300'}`}>
+                                                                                            {formatCapabilityCategoryLabel(usage.category)}
+                                                                                        </span>
+                                                                                    )}
+                                                                                    {usage.used_in && (
+                                                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-emerald-100 text-emerald-800 border border-emerald-300'}`}>
+                                                                                            {formatCapabilityUsageContextLabel(usage.used_in)}
+                                                                                        </span>
+                                                                                    )}
+                                                                                </div>
+                                                                                {usage.contribution && (
+                                                                                    <div className={`text-sm mb-2 ${subtextClass}`}>{usage.contribution}</div>
+                                                                                )}
+                                                                                {Array.isArray(usage.chunks) && usage.chunks.length > 0 && (
+                                                                                    <div className="space-y-2">
+                                                                                        {usage.chunks.map((chunk, chunkIdx) => (
+                                                                                            <div key={chunkIdx} className={`rounded border p-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-emerald-200'}`}>
+                                                                                                <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+                                                                                                    <div className="flex flex-wrap items-center gap-2">
+                                                                                                        <span className={`text-xs font-medium ${headingClass}`}>{chunk.source || `artifact_${chunkIdx + 1}`}</span>
+                                                                                                        {chunk.source_type && (
+                                                                                                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-emerald-100 text-emerald-800 border border-emerald-300'}`}>
+                                                                                                                {formatCapabilitySourceTypeLabel(chunk.source_type)}
+                                                                                                            </span>
+                                                                                                        )}
+                                                                                                    </div>
+                                                                                                    {typeof chunk.score === 'number' && (
+                                                                                                        <span className={`text-[11px] ${mutedTextClass}`}>score {chunk.score}</span>
+                                                                                                    )}
+                                                                                                </div>
+                                                                                                <div className={`text-xs whitespace-pre-wrap ${subtextClass}`}>{chunk.snippet}</div>
+                                                                                            </div>
+                                                                                        ))}
+                                                                                    </div>
+                                                                                )}
+                                                                            </div>
+                                                                        ))}
                                                                     </div>
                                                                 </details>
                                                             )}
@@ -10811,11 +14626,32 @@ def get_frontend_html():
                                                                         <span>Suggested next actions</span>
                                                                     </div>
                                                                     {Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? (
-                                                                        <ul className={`text-xs space-y-1 list-disc pl-4 ${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'}`}>
-                                                                            {msg.follow_on_actions.map((action, idx) => (
-                                                                                <li key={idx}>{action}</li>
-                                                                            ))}
-                                                                        </ul>
+                                                                        <div className="space-y-2">
+                                                                            {msg.follow_on_actions.map((action, idx) => {
+                                                                                const actionLabel = typeof action === 'string'
+                                                                                    ? action
+                                                                                    : (action.label || action.prompt || 'Follow-up action');
+                                                                                const actionPrompt = typeof action === 'string'
+                                                                                    ? action
+                                                                                    : (action.prompt || action.label || '');
+
+                                                                                return (
+                                                                                    <button
+                                                                                        key={idx}
+                                                                                        onClick={() => actionPrompt && sendSuggestedQuery(actionPrompt)}
+                                                                                        className={`w-full text-left rounded border px-3 py-2 transition-colors ${isDarkTheme ? 'bg-indigo-950 border-indigo-700 hover:bg-indigo-800 text-indigo-100' : 'bg-white border-indigo-200 hover:bg-indigo-100 text-indigo-900'}`}
+                                                                                        title="Run this follow-up in chat"
+                                                                                    >
+                                                                                        <div className="text-xs font-semibold">{actionLabel}</div>
+                                                                                        {typeof action !== 'string' && action.prompt && action.prompt !== actionLabel && (
+                                                                                            <div className={`text-[11px] mt-1 ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'}`}>
+                                                                                                {action.prompt}
+                                                                                            </div>
+                                                                                        )}
+                                                                                    </button>
+                                                                                );
+                                                                            })}
+                                                                        </div>
                                                                     ) : (
                                                                         <div className={`text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-800'}`}>Follow-up action available.</div>
                                                                     )}
@@ -10877,19 +14713,24 @@ def get_frontend_html():
                                             <div className="flex items-center gap-3">
                                                 <span className={`text-xs ${isDarkTheme ? 'text-gray-500' : 'text-gray-400'}`}>Deterministic-friendly prompts</span>
                                                 <button
+                                                    type="button"
                                                     onClick={() => setShowSuggestedQueries(prev => !prev)}
                                                     className="text-xs text-indigo-600 hover:text-indigo-800 flex items-center"
                                                     title={showSuggestedQueries ? 'Collapse suggested queries' : 'Expand suggested queries'}
+                                                    aria-label={showSuggestedQueries ? 'Collapse suggested queries' : 'Expand suggested queries'}
+                                                    aria-expanded={showSuggestedQueries}
+                                                    aria-controls="suggested-queries-panel"
                                                 >
                                                     <i className={`fas ${showSuggestedQueries ? 'fa-chevron-up' : 'fa-chevron-down'}`}></i>
                                                 </button>
                                             </div>
                                         </div>
                                         {showSuggestedQueries && (
-                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                            <div id="suggested-queries-panel" className="grid grid-cols-1 md:grid-cols-2 gap-2">
                                                 {suggestedChatQueries.map((query, idx) => (
                                                     <div key={idx} className={`flex items-center border rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
                                                         <button
+                                                            type="button"
                                                             onClick={() => useSuggestedQuery(query)}
                                                             className={`flex-1 text-left text-xs truncate ${isDarkTheme ? 'text-gray-200 hover:text-indigo-300' : 'text-gray-700 hover:text-indigo-700'}`}
                                                             title={query}
@@ -10897,6 +14738,7 @@ def get_frontend_html():
                                                             {query}
                                                         </button>
                                                         <button
+                                                            type="button"
                                                             onClick={() => sendSuggestedQuery(query)}
                                                             disabled={isTyping}
                                                             className={`ml-2 px-2 py-1 text-xs rounded ${isTyping ? (isDarkTheme ? 'bg-gray-700 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed') : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
@@ -10922,13 +14764,17 @@ def get_frontend_html():
                                                 }
                                             }}
                                             placeholder="Ask me about your Splunk environment..."
+                                            aria-label="Chat message input"
                                             className={`flex-1 p-3 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
                                             rows="3"
                                             disabled={isTyping}
                                         />
                                         <button
+                                            type="button"
                                             onClick={sendChatMessage}
                                             disabled={!chatInput.trim() || isTyping}
+                                            aria-label={isTyping ? 'Sending chat message' : 'Send chat message'}
+                                            title={isTyping ? 'Sending chat message' : 'Send chat message'}
                                             className={`px-6 py-3 rounded-lg font-medium ${
                                                 chatInput.trim() && !isTyping
                                                     ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
@@ -10940,6 +14786,7 @@ def get_frontend_html():
                                     </div>
                                     <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                         Press Enter to send, Shift+Enter for new line • Ask about indexes, searches, data sources, or get help with SPL queries
+                                        <span className="block mt-1">Conversation context is retained across reloads until you clear chat.</span>
                                     </p>
                                 </div>
                             </div>
@@ -10949,15 +14796,16 @@ def get_frontend_html():
                     {/* Chat Settings Modal */}
                     {isChatSettingsOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                            <div className={`chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
+                            <div className={`chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`} role="dialog" aria-modal="true" aria-labelledby="chat-settings-title" onKeyDown={(event) => handleDialogKeyDown(event, () => setIsChatSettingsOpen(false))}>
                                 {/* Header */}
                                 <div className="p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-t-xl">
                                     <div className="flex items-center">
                                         <i className="fas fa-cog text-2xl mr-3"></i>
-                                        <h2 className="text-2xl font-bold">Chat Settings</h2>
+                                        <h2 id="chat-settings-title" className="text-2xl font-bold">Chat Settings</h2>
                                     </div>
                                     <div className="flex items-center space-x-3">
                                         <button
+                                            type="button"
                                             onClick={resetChatSettings}
                                             className="px-4 py-2 bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg text-sm font-medium transition-all"
                                             title="Reset to defaults"
@@ -10966,8 +14814,10 @@ def get_frontend_html():
                                             Reset
                                         </button>
                                         <button
+                                            type="button"
                                             onClick={() => setIsChatSettingsOpen(false)}
                                             className="text-white hover:text-gray-200"
+                                            aria-label="Close chat settings"
                                         >
                                             <i className="fas fa-times text-2xl"></i>
                                         </button>
@@ -11228,8 +15078,8 @@ def get_frontend_html():
 
                                                     <label className="flex items-center justify-between bg-white rounded p-3 border border-indigo-100">
                                                         <div>
-                                                            <div className="text-sm font-medium text-gray-800">Enable Optional Local RAG</div>
-                                                            <div className="text-xs text-gray-500">Retrieve matching snippets from recent discovery output files</div>
+                                                            <div className="text-sm font-medium text-gray-800">Use Installed Optional RAG Capability</div>
+                                                            <div className="text-xs text-gray-500">Use the enabled optional RAG provider to retrieve matching snippets from indexed or recent discovery artifacts</div>
                                                         </div>
                                                         <input
                                                             type="checkbox"
@@ -11256,6 +15106,9 @@ def get_frontend_html():
                                                             <span>1</span>
                                                             <span>6</span>
                                                         </div>
+                                                        <div className="text-xs text-gray-500 mt-2">
+                                                            Install, enable, and test the capability from the Capabilities workspace before turning this on.
+                                                        </div>
                                                     </div>
                                                 </div>
                                             </div>
@@ -11277,16 +15130,16 @@ def get_frontend_html():
                     {/* Summary Modal */}
                     {isSummaryModalOpen && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                            <div className={`${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'} rounded-xl shadow-2xl w-full max-w-7xl h-5/6 flex flex-col`}>
+                            <div className={`${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'} rounded-xl shadow-2xl w-full max-w-7xl h-5/6 flex flex-col`} role="dialog" aria-modal="true" aria-labelledby="summary-modal-title" onKeyDown={(event) => handleDialogKeyDown(event, closeSummaryModal)}>
                                 {/* Header */}
                                 <div className="p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-t-xl">
                                     <div className="flex items-center">
                                         <i className={`fas ${summaryData?.from_cache ? 'fa-eye' : 'fa-magic'} text-2xl mr-3`}></i>
                                         <div>
-                                            <h2 className="text-2xl font-bold">
+                                            <h2 id="summary-modal-title" className="text-2xl font-bold">
                                                 V2 Intelligence Report
                                                 {summaryData?.from_cache && (
-                                                    <span className="ml-3 text-sm font-normal bg-green-500 bg-opacity-30 px-3 py-1 rounded-full">
+                                                    <span className="ml-3 text-sm font-normal bg-green-700 border border-green-300 px-3 py-1 rounded-full text-white">
                                                         <i className="fas fa-check-circle mr-1"></i>
                                                         Cached
                                                     </span>
@@ -11296,8 +15149,10 @@ def get_frontend_html():
                                         </div>
                                     </div>
                                     <button
+                                        type="button"
                                         onClick={closeSummaryModal}
                                         className="text-white hover:text-gray-200"
+                                        aria-label="Close V2 intelligence report"
                                     >
                                         <i className="fas fa-times text-2xl"></i>
                                     </button>
@@ -11306,8 +15161,14 @@ def get_frontend_html():
                                 {/* Tab Navigation */}
                                 {!isLoadingSummary && summaryData && (
                                     <div className={`border-b ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
-                                        <div className="flex space-x-1 px-6">
+                                        <div className="flex space-x-1 px-6" role="tablist" aria-label="Summary views">
                                             <button
+                                                type="button"
+                                                id="summary-tab-summary"
+                                                role="tab"
+                                                aria-selected={activeTab === 'summary'}
+                                                aria-controls="summary-tabpanel-summary"
+                                                tabIndex={activeTab === 'summary' ? 0 : -1}
                                                 onClick={() => setActiveTab('summary')}
                                                 className={`px-6 py-3 font-medium text-sm transition-all ${
                                                     activeTab === 'summary'
@@ -11319,6 +15180,12 @@ def get_frontend_html():
                                                 Executive Summary
                                             </button>
                                             <button
+                                                type="button"
+                                                id="summary-tab-queries"
+                                                role="tab"
+                                                aria-selected={activeTab === 'queries'}
+                                                aria-controls="summary-tabpanel-queries"
+                                                tabIndex={activeTab === 'queries' ? 0 : -1}
                                                 onClick={() => setActiveTab('queries')}
                                                 className={`px-6 py-3 font-medium text-sm transition-all ${
                                                     activeTab === 'queries'
@@ -11330,6 +15197,12 @@ def get_frontend_html():
                                                 SPL Queries ({summaryData.spl_queries?.length || 0})
                                             </button>
                                             <button
+                                                type="button"
+                                                id="summary-tab-tasks"
+                                                role="tab"
+                                                aria-selected={activeTab === 'tasks'}
+                                                aria-controls="summary-tabpanel-tasks"
+                                                tabIndex={activeTab === 'tasks' ? 0 : -1}
                                                 onClick={() => setActiveTab('tasks')}
                                                 className={`px-6 py-3 font-medium text-sm transition-all ${
                                                     activeTab === 'tasks'
@@ -11471,7 +15344,7 @@ def get_frontend_html():
                                         <div>
                                             {/* Executive Summary Tab */}
                                             {activeTab === 'summary' && (
-                                                <div className="space-y-6">
+                                                <div id="summary-tabpanel-summary" role="tabpanel" aria-labelledby="summary-tab-summary" className="space-y-6">
                                                     {/* AI Summary Section */}
                                                     <div className={`border-l-4 p-6 rounded-r-lg ${isDarkTheme ? 'bg-gradient-to-r from-slate-800 to-indigo-950 border-indigo-400' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-indigo-600'}`}>
                                                         <h3 className={`text-xl font-semibold mb-4 flex items-center ${isDarkTheme ? 'text-indigo-100' : 'text-gray-900'}`}>
@@ -11681,7 +15554,7 @@ def get_frontend_html():
                                             
                                             {/* SPL Queries Tab */}
                                             {activeTab === 'queries' && (
-                                                <div className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
+                                                <div id="summary-tabpanel-queries" role="tabpanel" aria-labelledby="summary-tab-queries" className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
                                                     {summaryData.risk_register && summaryData.risk_register.length > 0 && (
                                                         <div className={`mb-4 rounded-lg p-4 border ${isDarkTheme ? 'bg-red-950 border-red-700' : 'bg-red-50 border-red-200'}`}>
                                                             <h4 className={`text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-red-200' : 'text-red-900'}`}>
@@ -11870,7 +15743,7 @@ def get_frontend_html():
                                             
                                             {/* Admin Tasks Tab */}
                                             {activeTab === 'tasks' && (
-                                                <div className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
+                                                <div id="summary-tabpanel-tasks" role="tabpanel" aria-labelledby="summary-tab-tasks" className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
                                                     {summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && (
                                                         <div className={`mb-5 rounded-lg p-4 border ${isDarkTheme ? 'bg-purple-950 border-purple-700' : 'bg-purple-50 border-purple-200'}`}>
                                                             <h4 className={`text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-purple-200' : 'text-purple-900'}`}>
@@ -12517,14 +16390,14 @@ def get_frontend_html():
                     {/* Settings Modal */}
                     {isSettingsOpen && config && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={closeSettings}>
-                            <div className={`settings-modal-shell rounded-xl shadow-2xl w-full max-w-2xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800' : 'bg-white'}`} onClick={(e) => e.stopPropagation()}>
+                            <div className={`settings-modal-shell rounded-xl shadow-2xl w-full max-w-2xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800' : 'bg-white'}`} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" onKeyDown={(event) => handleDialogKeyDown(event, closeSettings)}>
                                 {/* Header */}
                                 <div className={`p-6 border-b flex justify-between items-center ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
                                     <div className="flex items-center">
                                         <i className="fas fa-cog text-2xl text-indigo-600 mr-3"></i>
-                                        <h2 className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Settings</h2>
+                                        <h2 id="settings-modal-title" className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Settings</h2>
                                     </div>
-                                    <button onClick={closeSettings} className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-200' : 'text-gray-500 hover:text-gray-700'}`}>
+                                    <button type="button" onClick={closeSettings} className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-200' : 'text-gray-500 hover:text-gray-700'}`} aria-label="Close settings">
                                         <i className="fas fa-times text-xl"></i>
                                     </button>
                                 </div>
@@ -12541,20 +16414,26 @@ def get_frontend_html():
                                     </div>
                                     <div className={`inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="group" aria-label="Theme preference">
                                         <button
+                                            type="button"
                                             onClick={() => setThemePreference('light')}
                                             className={`px-3 py-2 text-xs font-medium ${themePreference === 'light' ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
+                                            aria-pressed={themePreference === 'light'}
                                         >
                                             Light
                                         </button>
                                         <button
+                                            type="button"
                                             onClick={() => setThemePreference('dark')}
                                             className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'dark' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
+                                            aria-pressed={themePreference === 'dark'}
                                         >
                                             Dark
                                         </button>
                                         <button
+                                            type="button"
                                             onClick={() => setThemePreference('system')}
                                             className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'system' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
+                                            aria-pressed={themePreference === 'system'}
                                         >
                                             System
                                         </button>
@@ -12594,7 +16473,7 @@ def get_frontend_html():
                                                                 setLoadedMCPConfigName(null);
                                                                 setShowMCPConfigForm(false);
                                                             }}
-                                                            className="text-emerald-600 hover:text-emerald-800 text-sm font-medium"
+                                                            className="text-emerald-700 hover:text-emerald-900 text-sm font-medium"
                                                             title="Clear and close editor"
                                                         >
                                                             <i className="fas fa-times-circle mr-1"></i>Close
@@ -12678,7 +16557,8 @@ def get_frontend_html():
                                                 {/* Test & Save Buttons */}
                                                 <div className="pt-3 border-t border-gray-200 space-y-2">
                                                     <button
-                                                        onClick={async () => {
+                                                        type="button"
+                                                        onClick={async (event) => {
                                                             const urlEl = document.getElementById('mcp-url');
                                                             const tokenEl = document.getElementById('mcp-token');
                                                             const verifySslEl = document.getElementById('mcp-verify-ssl');
@@ -12692,7 +16572,7 @@ def get_frontend_html():
                                                                 return;
                                                             }
                                                             
-                                                            const button = event.target.closest('button');
+                                                            const button = event.currentTarget;
                                                             const originalHTML = button.innerHTML;
                                                             button.disabled = true;
                                                             button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Testing...';

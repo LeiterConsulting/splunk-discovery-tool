@@ -8,7 +8,9 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 from cryptography.fernet import Fernet
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+
+from capabilities.models import CapabilityConfig
 
 @dataclass
 class MCPConfig:
@@ -72,6 +74,7 @@ class AppConfig:
     server: ServerConfig
     saved_credentials: Dict[str, LLMCredential] = None  # name -> credential mapping
     saved_mcp_configs: Dict[str, MCPCredential] = None  # name -> MCP config mapping
+    capabilities: Dict[str, CapabilityConfig] = field(default_factory=dict)
     active_credential_name: Optional[str] = None  # Currently active credential
     active_mcp_config_name: Optional[str] = None  # Currently active MCP config
     version: str = "1.0.0"
@@ -81,6 +84,8 @@ class AppConfig:
             self.saved_credentials = {}
         if self.saved_mcp_configs is None:
             self.saved_mcp_configs = {}
+        if self.capabilities is None:
+            self.capabilities = {}
 
 class ConfigManager:
     """Manages encrypted configuration storage"""
@@ -163,6 +168,12 @@ class ConfigManager:
                 name: MCPCredential(**mcp_data)
                 for name, mcp_data in saved_mcp_dict.items()
             }
+
+            saved_capabilities_dict = config_dict.get('capabilities', {})
+            capabilities = {
+                name: CapabilityConfig(**capability_data)
+                for name, capability_data in saved_capabilities_dict.items()
+            }
             
             return AppConfig(
                 mcp=mcp,
@@ -170,6 +181,7 @@ class ConfigManager:
                 server=server,
                 saved_credentials=saved_credentials,
                 saved_mcp_configs=saved_mcp_configs,
+                capabilities=capabilities,
                 active_credential_name=config_dict.get('active_credential_name'),
                 active_mcp_config_name=config_dict.get('active_mcp_config_name'),
                 version=config_dict.get('version', '1.0.0')
@@ -191,6 +203,11 @@ class ConfigManager:
                 name: asdict(mcp_config)
                 for name, mcp_config in config.saved_mcp_configs.items()
             }
+
+            saved_capabilities_dict = {
+                name: asdict(capability)
+                for name, capability in config.capabilities.items()
+            }
             
             config_dict = {
                 'mcp': asdict(config.mcp),
@@ -198,6 +215,7 @@ class ConfigManager:
                 'server': asdict(config.server),
                 'saved_credentials': saved_creds_dict,
                 'saved_mcp_configs': saved_mcp_dict,
+                'capabilities': saved_capabilities_dict,
                 'active_credential_name': config.active_credential_name,
                 'active_mcp_config_name': config.active_mcp_config_name,
                 'version': config.version
@@ -246,6 +264,35 @@ class ConfigManager:
         for key, value in kwargs.items():
             if hasattr(self._config.server, key):
                 setattr(self._config.server, key, value)
+        return self.save(self._config)
+
+    def get_capability(self, name: str) -> Optional[CapabilityConfig]:
+        """Get a saved capability state by name."""
+        return self._config.capabilities.get(name)
+
+    def list_capabilities(self) -> Dict[str, CapabilityConfig]:
+        """List saved capability state."""
+        return self._config.capabilities.copy()
+
+    def save_capability(self, capability: CapabilityConfig) -> bool:
+        """Save one capability state entry."""
+        self._config.capabilities[capability.name] = capability
+        return self.save(self._config)
+
+    def update_capability(self, name: str, **kwargs) -> bool:
+        """Update a capability state record."""
+        capability = self.get_capability(name)
+        if capability is None:
+            return False
+
+        for key, value in kwargs.items():
+            if key == 'config' and isinstance(value, dict):
+                merged = dict(capability.config)
+                merged.update(value)
+                capability.config = merged
+                continue
+            if hasattr(capability, key):
+                setattr(capability, key, value)
         return self.save(self._config)
     
     # Credential Vault Management
@@ -325,6 +372,11 @@ class ConfigManager:
                 'ca_bundle_path': mcp_config.ca_bundle_path,
                 'description': mcp_config.description
             }
+
+        safe_capabilities = {
+            name: asdict(capability)
+            for name, capability in config.capabilities.items()
+        }
         
         return {
             'mcp': {
@@ -343,6 +395,7 @@ class ConfigManager:
             },
             'saved_credentials': safe_creds,
             'saved_mcp_configs': safe_mcp_configs,
+            'capabilities': safe_capabilities,
             'active_credential_name': config.active_credential_name,
             'active_mcp_config_name': config.active_mcp_config_name,
             'server': {

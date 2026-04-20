@@ -21,6 +21,50 @@ from urllib.parse import quote
 logger = logging.getLogger(__name__)
 
 
+OPENAI_GENERATION_PREFIXES = (
+    "gpt-",
+    "chatgpt-",
+    "o1",
+    "o3",
+    "o4",
+    "codex-",
+)
+
+OPENAI_NON_GENERATION_TOKENS = (
+    "embedding",
+    "whisper",
+    "tts",
+    "audio",
+    "speech",
+    "transcribe",
+    "transcription",
+    "moderation",
+    "dall-e",
+    "image",
+    "realtime",
+    "search-preview",
+    "computer-use-preview",
+)
+
+OPENAI_RESPONSES_MODEL_PREFIXES = (
+    "o1",
+    "o3",
+    "o4",
+    "gpt-5",
+)
+
+OPENAI_CHAT_COMPLETION_NEW_TOKEN_HINTS = (
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-4-turbo",
+    "chatgpt-4o",
+    "o1",
+    "o3",
+    "o4",
+    "gpt-5",
+)
+
+
 def normalize_provider_name(provider: Optional[str]) -> str:
     """Normalize provider labels from UI/config into stable internal identifiers."""
     value = (provider or "openai").strip().lower().replace("_", " ")
@@ -59,6 +103,120 @@ def messages_to_plain_text(messages: list) -> str:
         else:
             lines.append(f"User: {content}")
     return "\n\n".join(lines)
+
+
+def _normalize_openai_model_name(model: Optional[str]) -> str:
+    return (model or "").strip().lower()
+
+
+def is_openai_generation_model(model_id: str) -> bool:
+    """Return True when a model ID is a likely text-generation/chat model."""
+    model_lower = _normalize_openai_model_name(model_id)
+    if not model_lower:
+        return False
+
+    if model_lower.startswith("ft:"):
+        model_lower = model_lower[3:]
+
+    if any(token in model_lower for token in OPENAI_NON_GENERATION_TOKENS):
+        return False
+
+    return model_lower.startswith(OPENAI_GENERATION_PREFIXES)
+
+
+def filter_openai_generation_models(model_ids: list[str]) -> list[str]:
+    """Filter /v1/models output down to likely chat-capable generation models."""
+    filtered = []
+    seen = set()
+    for model_id in sorted(model_ids or []):
+        if not isinstance(model_id, str):
+            continue
+        cleaned = model_id.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        if is_openai_generation_model(cleaned):
+            filtered.append(cleaned)
+    return filtered
+
+
+def get_openai_model_capabilities(model: str) -> Dict[str, Any]:
+    """Infer compatibility hints for OpenAI model families used by the app."""
+    model_lower = _normalize_openai_model_name(model)
+    prefers_responses_api = model_lower.startswith(OPENAI_RESPONSES_MODEL_PREFIXES)
+    supports_temperature = not model_lower.startswith(("o1", "o3", "o4"))
+
+    chat_token_keys = ["max_tokens"]
+    if any(hint in model_lower for hint in OPENAI_CHAT_COMPLETION_NEW_TOKEN_HINTS):
+        chat_token_keys = ["max_completion_tokens", "max_tokens"]
+
+    return {
+        "model": model,
+        "supports_generation": is_openai_generation_model(model),
+        "prefers_responses_api": prefers_responses_api,
+        "supports_temperature": supports_temperature,
+        "chat_token_keys": chat_token_keys,
+        "supports_chat_completions": not prefers_responses_api or model_lower.startswith(("gpt-4", "gpt-3.5", "chatgpt-4o")),
+    }
+
+
+def extract_text_from_openai_response(response_data: Dict[str, Any]) -> str:
+    """Extract assistant text from either chat-completions or responses payloads."""
+    if not isinstance(response_data, dict):
+        return ""
+
+    output_text = response_data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    choices = response_data.get("choices", [])
+    if isinstance(choices, list) and choices:
+        first_choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(message.get("refusal"), str) and message.get("refusal", "").strip():
+                return message.get("refusal", "").strip()
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    text_value = item.get("text") or item.get("content") or item.get("value")
+                    if isinstance(text_value, str) and text_value.strip():
+                        parts.append(text_value.strip())
+                if parts:
+                    return "\n".join(parts).strip()
+
+    output_items = response_data.get("output", [])
+    if isinstance(output_items, list):
+        parts = []
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in {"output_text", "text"}:
+                text_value = item.get("text") or item.get("content") or item.get("value")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+                continue
+            if item.get("type") == "message":
+                for content_item in item.get("content", []) if isinstance(item.get("content", []), list) else []:
+                    if not isinstance(content_item, dict):
+                        continue
+                    text_value = (
+                        content_item.get("text")
+                        or content_item.get("content")
+                        or content_item.get("value")
+                        or content_item.get("refusal")
+                    )
+                    if isinstance(text_value, str) and text_value.strip():
+                        parts.append(text_value.strip())
+        if parts:
+            return "\n".join(parts).strip()
+
+    return ""
 
 
 class RateLimitManager:
@@ -260,13 +418,165 @@ class LLMClient(Protocol):
 class OpenAIClient:
     """OpenAI API client implementation with intelligent rate limiting."""
     
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4", rate_limit_display_callback=None):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4",
+                 endpoint_url: Optional[str] = None, rate_limit_display_callback=None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OpenAI API key required")
         self.model = model
-        self.base_url = "https://api.openai.com/v1"
+        normalized_base_url = (endpoint_url or "https://api.openai.com/v1").rstrip("/")
+        for suffix in ["/chat/completions", "/responses"]:
+            if normalized_base_url.endswith(suffix):
+                normalized_base_url = normalized_base_url[:-len(suffix)]
+        self.base_url = normalized_base_url
         self.rate_limit_manager = RateLimitManager(rate_limit_display_callback)
+        self.model_capabilities = get_openai_model_capabilities(model)
+
+    def _normalize_messages(self, messages: list) -> list:
+        normalized = []
+        for message in messages or []:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "user")).strip().lower()
+            if role not in {"system", "user", "assistant"}:
+                role = "user"
+
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content_parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        text_value = item.get("text") or item.get("content") or item.get("value")
+                        if isinstance(text_value, str) and text_value.strip():
+                            content_parts.append(text_value.strip())
+                    elif isinstance(item, str) and item.strip():
+                        content_parts.append(item.strip())
+                content = "\n".join(content_parts)
+
+            content = str(content).strip()
+            if not content:
+                continue
+            normalized.append({"role": role, "content": content})
+
+        if not normalized:
+            normalized = [{"role": "user", "content": "Hello"}]
+        return normalized
+
+    def _build_chat_payload(self, messages: list, max_tokens: int, temperature: float,
+                            token_key: str, include_temperature: bool) -> Dict[str, Any]:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            token_key: max_tokens,
+        }
+        if include_temperature:
+            payload["temperature"] = temperature
+        return payload
+
+    def _build_responses_payload(self, messages: list, max_tokens: int,
+                                 temperature: float, include_temperature: bool) -> Dict[str, Any]:
+        instructions = []
+        dialogue_lines = []
+        for message in messages:
+            role = str(message.get("role", "user")).strip().lower()
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system":
+                instructions.append(content)
+            elif role == "assistant":
+                dialogue_lines.append(f"Assistant: {content}")
+            else:
+                dialogue_lines.append(f"User: {content}")
+
+        if not dialogue_lines:
+            dialogue_lines = ["User: Hello"]
+
+        payload = {
+            "model": self.model,
+            "input": "\n\n".join(dialogue_lines),
+            "max_output_tokens": max_tokens,
+        }
+        if instructions:
+            payload["instructions"] = "\n\n".join(instructions)
+        if include_temperature:
+            payload["temperature"] = temperature
+        return payload
+
+    def _build_openai_request_strategies(self, messages: list, max_tokens: int,
+                                         temperature: float) -> list[Dict[str, Any]]:
+        strategies = []
+        seen = set()
+
+        def add_strategy(mode: str, token_key: str, include_temperature: bool):
+            signature = (mode, token_key, include_temperature)
+            if signature in seen:
+                return
+            seen.add(signature)
+
+            if mode == "responses":
+                payload = self._build_responses_payload(messages, max_tokens, temperature, include_temperature)
+                endpoint = f"{self.base_url}/responses"
+            else:
+                payload = self._build_chat_payload(messages, max_tokens, temperature, token_key, include_temperature)
+                endpoint = f"{self.base_url}/chat/completions"
+
+            strategies.append({
+                "mode": mode,
+                "token_key": token_key,
+                "include_temperature": include_temperature,
+                "endpoint": endpoint,
+                "payload": payload,
+            })
+
+        chat_token_keys = self.model_capabilities.get("chat_token_keys", ["max_tokens"])
+        supports_temperature = bool(self.model_capabilities.get("supports_temperature", True))
+
+        if self.model_capabilities.get("prefers_responses_api"):
+            if supports_temperature:
+                add_strategy("responses", "max_output_tokens", True)
+            add_strategy("responses", "max_output_tokens", False)
+
+            for token_key in chat_token_keys:
+                if supports_temperature:
+                    add_strategy("chat", token_key, True)
+                add_strategy("chat", token_key, False)
+        else:
+            for token_key in chat_token_keys:
+                if supports_temperature:
+                    add_strategy("chat", token_key, True)
+                add_strategy("chat", token_key, False)
+
+            if supports_temperature:
+                add_strategy("responses", "max_output_tokens", True)
+            add_strategy("responses", "max_output_tokens", False)
+
+        return strategies
+
+    def _should_try_next_strategy(self, status_code: int, error_text: str) -> bool:
+        if status_code == 404:
+            return True
+        if status_code not in {400, 422}:
+            return False
+
+        lowered = (error_text or "").lower()
+        compatibility_hints = [
+            "unsupported parameter",
+            "unknown parameter",
+            "does not support",
+            "not supported",
+            "use the responses api",
+            "responses api",
+            "chat.completions",
+            "temperature",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "instructions",
+            "input",
+            "messages",
+        ]
+        return any(hint in lowered for hint in compatibility_hints)
             
     async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """Generate response using OpenAI API with intelligent rate limiting.
@@ -282,6 +592,8 @@ class OpenAIClient:
             messages = [{"role": "user", "content": prompt}]
         elif messages is None and prompt is None:
             raise ValueError("Either 'prompt' or 'messages' must be provided")
+
+        messages = self._normalize_messages(messages)
         
         attempt = 0
         
@@ -300,101 +612,92 @@ class OpenAIClient:
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
                 }
-                
-                # Determine which parameter to use based on model
-                # Newer models (gpt-4o, gpt-4-turbo, etc.) use max_completion_tokens
-                # Older models use max_tokens
-                model_lower = self.model.lower()
-                uses_new_param = any(x in model_lower for x in ['gpt-4o', 'gpt-4-turbo', 'o1-', 'o1', 'chatgpt-4o', 'gpt4o'])
-                
-                payload = {
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature
-                }
-                
-                # Add the appropriate token limit parameter
-                if uses_new_param:
-                    payload["max_completion_tokens"] = adjusted_max_tokens
-                else:
-                    payload["max_tokens"] = adjusted_max_tokens
-                
+
+                request_strategies = self._build_openai_request_strategies(messages, adjusted_max_tokens, temperature)
+                rate_limited = False
+                last_error = None
+
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=30)  # Faster timeout for quicker failures
-                    ) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            self.rate_limit_manager.reset_retry_count()
-                            return result["choices"][0]["message"]["content"]
-                        elif response.status == 429:  # Rate limit error
+                    for strategy in request_strategies:
+                        async with session.post(
+                            strategy["endpoint"],
+                            headers=headers,
+                            json=strategy["payload"],
+                            timeout=aiohttp.ClientTimeout(total=60)
+                        ) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                response_text = extract_text_from_openai_response(result)
+                                if response_text:
+                                    self.rate_limit_manager.reset_retry_count()
+                                    return response_text
+                                raise Exception(f"OpenAI API returned an empty response payload for model {self.model}")
+
                             error_text = await response.text()
-                            rate_limit_info = self.rate_limit_manager.parse_rate_limit_error(error_text)
-                            
-                            if not self.rate_limit_manager.should_retry(attempt):
-                                raise Exception(f"Max retries exceeded. Last error: {error_text}")
-                            
-                            delay = self.rate_limit_manager.calculate_optimal_delay(rate_limit_info)
-                            await self.rate_limit_manager.wait_for_rate_limit(
-                                delay, 
-                                f"OpenAI rate limit (attempt {attempt + 1}/{self.rate_limit_manager.max_retries})"
-                            )
-                            
-                            attempt += 1
-                            continue
-                        elif response.status == 400:  # Bad request - might be context length or parameter issue
-                            error_text = await response.text()
-                            
-                            # Check for unsupported parameter error (max_tokens vs max_completion_tokens)
-                            if "unsupported parameter" in error_text.lower() and "'max_tokens'" in error_text.lower():
-                                # Wrong parameter used - retry with alternate parameter
-                                uses_new_param = not uses_new_param  # Flip the parameter choice
-                                
-                                # Rebuild payload with alternate parameter
-                                payload = {
-                                    "model": self.model,
-                                    "messages": messages,
-                                    "temperature": temperature
-                                }
-                                if uses_new_param:
-                                    payload["max_completion_tokens"] = adjusted_max_tokens
-                                else:
-                                    payload["max_tokens"] = adjusted_max_tokens
-                                
-                                # Retry immediately without incrementing attempt
-                                continue
-                            
-                            elif "context length" in error_text.lower() or "maximum context" in error_text.lower():
-                                # Context length exceeded
+
+                            if response.status == 429:
+                                rate_limit_info = self.rate_limit_manager.parse_rate_limit_error(error_text)
+
+                                if not self.rate_limit_manager.should_retry(attempt):
+                                    raise Exception(f"Max retries exceeded. Last error: {error_text}")
+
+                                delay = self.rate_limit_manager.calculate_optimal_delay(rate_limit_info)
+                                await self.rate_limit_manager.wait_for_rate_limit(
+                                    delay,
+                                    f"OpenAI rate limit (attempt {attempt + 1}/{self.rate_limit_manager.max_retries})"
+                                )
+                                attempt += 1
+                                rate_limited = True
+                                break
+
+                            if response.status in {400, 422} and (
+                                "context length" in error_text.lower()
+                                or "maximum context" in error_text.lower()
+                                or "too many tokens" in error_text.lower()
+                            ):
                                 truncation_info = self.rate_limit_manager.handle_context_length_error(error_text)
-                                
+
                                 if not self.rate_limit_manager.should_retry(attempt):
                                     raise Exception(f"Max retries exceeded. Context length error: {error_text}")
-                                
-                                # Truncate messages and retry
+
                                 messages = self._truncate_messages(messages, truncation_info)
-                                adjusted_max_tokens = truncation_info.get('safe_max_tokens', 500)
-                                
+
                                 if self.rate_limit_manager.display_callback:
                                     await self.rate_limit_manager.display_callback(
-                                        'context_truncation', 
+                                        'context_truncation',
                                         {
                                             'original_tokens': truncation_info.get('requested_tokens', 'unknown'),
                                             'max_tokens': truncation_info.get('max_context_tokens', 'unknown'),
                                             'attempt': attempt + 1
                                         }
                                     )
-                                
+
                                 attempt += 1
-                                continue
-                            else:
+                                rate_limited = True
+                                break
+
+                            if response.status in {401, 403}:
                                 raise Exception(f"OpenAI API error {response.status}: {error_text}")
-                        else:
-                            error_text = await response.text()
-                            raise Exception(f"OpenAI API error {response.status}: {error_text}")
+
+                            last_error = (
+                                f"OpenAI {strategy['mode']} request failed for model {self.model} "
+                                f"(status {response.status}, token_key={strategy['token_key']}, "
+                                f"temperature={'on' if strategy['include_temperature'] else 'off'}): {error_text}"
+                            )
+
+                            if self._should_try_next_strategy(response.status, error_text):
+                                logger.info("Retrying OpenAI request with alternate strategy after compatibility error: %s", last_error)
+                                continue
+
+                            raise Exception(last_error)
+
+                if rate_limited:
+                    continue
+
+                if last_error:
+                    raise Exception(last_error)
+
+                raise Exception(f"OpenAI request failed without a usable strategy for model {self.model}")
                             
             except aiohttp.ClientError as e:
                 if attempt >= self.rate_limit_manager.max_retries - 1:
@@ -1303,7 +1606,12 @@ class LLMClientFactory:
         normalized_provider = normalize_provider_name(provider)
 
         if normalized_provider == "openai":
-            return OpenAIClient(api_key=api_key, model=model, rate_limit_display_callback=rate_limit_display_callback)
+            return OpenAIClient(
+                api_key=api_key,
+                model=model,
+                endpoint_url=custom_endpoint,
+                rate_limit_display_callback=rate_limit_display_callback,
+            )
 
         if normalized_provider == "custom":
             if not custom_endpoint:
