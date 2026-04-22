@@ -6,7 +6,6 @@ actionable SPL queries that directly address discovered issues.
 """
 
 from typing import Dict, List, Any
-from datetime import datetime
 
 
 class FindingsQueryMapper:

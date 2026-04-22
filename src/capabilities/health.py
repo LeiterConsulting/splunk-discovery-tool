@@ -1,7 +1,6 @@
 """Capability health probes and status normalization."""
 
 import importlib.util
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple

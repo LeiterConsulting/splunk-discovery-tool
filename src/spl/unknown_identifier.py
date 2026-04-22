@@ -3,7 +3,6 @@ Unknown Data Identifier - Detects ambiguous data sources and generates contextua
 """
 
 from typing import Dict, List, Any
-from collections import defaultdict
 
 
 class UnknownDataIdentifier:

@@ -232,6 +232,19 @@ install_deps() {
     create_manifest "$PYTHON_VERSION" "$PIP_VERSION"
 }
 
+check_frontend_bundle_sync() {
+    local sync_check_script="$INSTALL_DIR/tools/check_frontend_sync.py"
+    if [[ ! -f "$sync_check_script" ]]; then
+        return 0
+    fi
+
+    if ! python "$sync_check_script" --quiet; then
+        print_msg "$YELLOW" "⚠ Frontend static assets are out of sync with src/web_app.py."
+        print_msg "$YELLOW" "  The app can still start, but the shipped static frontend may be stale."
+        print_msg "$BLUE" "  Run: npm run build:frontend"
+    fi
+}
+
 # Start service
 start_service() {
     # Check if already running
@@ -251,6 +264,8 @@ start_service() {
     else
         source "$VENV_DIR/bin/activate"
     fi
+
+    check_frontend_bundle_sync
     
     # Start in background
     nohup python "$INSTALL_DIR/src/main.py" > "$INSTALL_DIR/dt4sms.log" 2>&1 &

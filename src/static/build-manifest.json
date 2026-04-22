@@ -1,0 +1,29 @@
+{
+  "built_at_utc": "2026-04-22T20:24:53.352Z",
+  "source": {
+    "legacy_html_sha256": "fd5513c167e0c784c676f9e99e4a86e1d7d632a7b81b6259025d8542d0a9f993",
+    "app_source_sha256": "ea27c34efa3303be480ffd43795287e62a3ccc3dca5978df2cadf2c79b6ccdfa"
+  },
+  "artifacts": {
+    "index_html_sha256": "bb60f59a9b397d7a76ece31ad33281b40da5a5df909dcf58125a27875e3f1bbf",
+    "app_js_sha256": "853f7d6bae5a32d58c1b1860f6503e253de7f7ae7278438e1b940a85e90a9f53"
+  },
+  "runtime": {
+    "script_refs": [
+      "/static/vendor/react/react.production.min.js",
+      "/static/vendor/react/react-dom.production.min.js",
+      "/static/app.js"
+    ],
+    "style_refs": [
+      "/static/vendor/tailwind/tailwind.min.css",
+      "/static/vendor/fontawesome/css/all.min.css"
+    ]
+  },
+  "toolchain": {
+    "react": "18.2.0",
+    "react_dom": "18.2.0",
+    "tailwindcss": "2.2.19",
+    "fontawesome": "6.0.0",
+    "esbuild": "0.25.4"
+  }
+}

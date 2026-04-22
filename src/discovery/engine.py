@@ -5,7 +5,6 @@ This module provides the main DiscoveryEngine class that coordinates
 the entire discovery process through MCP integration.
 """
 
-import asyncio
 import json
 import aiohttp
 from typing import Dict, Any, List, AsyncGenerator, Optional
@@ -13,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import time
 
-from llm.factory import LLMClientFactory
 from discovery.local_analyzer import LocalDataAnalyzer
 
 

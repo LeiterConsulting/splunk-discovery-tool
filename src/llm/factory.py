@@ -8,14 +8,12 @@ import os
 import json
 import asyncio
 import aiohttp
-import requests  # For custom endpoints (better Windows/vLLM compatibility)
 import time
 import re
 import random
 import logging
 from typing import Optional, Protocol, Dict, Any, Callable
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
@@ -44,6 +42,11 @@ OPENAI_NON_GENERATION_TOKENS = (
     "realtime",
     "search-preview",
     "computer-use-preview",
+)
+
+OPENAI_IMAGE_GENERATION_PREFIXES = (
+    "gpt-image-",
+    "dall-e-",
 )
 
 OPENAI_RESPONSES_MODEL_PREFIXES = (
@@ -124,6 +127,18 @@ def is_openai_generation_model(model_id: str) -> bool:
     return model_lower.startswith(OPENAI_GENERATION_PREFIXES)
 
 
+def is_openai_image_generation_model(model_id: str) -> bool:
+    """Return True when a model ID targets OpenAI image generation."""
+    model_lower = _normalize_openai_model_name(model_id)
+    if not model_lower:
+        return False
+
+    if model_lower.startswith("ft:"):
+        model_lower = model_lower[3:]
+
+    return model_lower.startswith(OPENAI_IMAGE_GENERATION_PREFIXES)
+
+
 def filter_openai_generation_models(model_ids: list[str]) -> list[str]:
     """Filter /v1/models output down to likely chat-capable generation models."""
     filtered = []
@@ -153,6 +168,7 @@ def get_openai_model_capabilities(model: str) -> Dict[str, Any]:
     return {
         "model": model,
         "supports_generation": is_openai_generation_model(model),
+        "supports_image_generation": is_openai_image_generation_model(model),
         "prefers_responses_api": prefers_responses_api,
         "supports_temperature": supports_temperature,
         "chat_token_keys": chat_token_keys,
@@ -994,7 +1010,6 @@ class CustomLLMClient:
         """SYNCHRONOUS response generation with health monitoring (v1.1.0)."""
         import requests
         import time
-        import json
         
         start_time = time.time()
         request_id = f"req_{int(start_time * 1000)}"

@@ -25,6 +25,8 @@ class DeterministicExportProvider:
     """Build deterministic session export bundles without third-party exporters."""
 
     SESSION_PATTERN = re.compile(r"_(\d{8}_\d{6})(?:\.|$)")
+    SUMMARY_INFOGRAPHIC_PATTERN = re.compile(r"^summary_infographic_(\d{8}_\d{6})(?:_\d{8}_\d{6})?\.[A-Za-z0-9]+$")
+    SUMMARY_INFOGRAPHIC_DIRNAME = "summary_infographics"
 
     def __init__(self, config: CapabilityConfig, definition: CapabilityDefinition):
         self.config = config
@@ -153,9 +155,9 @@ class DeterministicExportProvider:
 
         artifact_names = request.get("artifact_names") if isinstance(request.get("artifact_names"), list) else []
         for artifact_name in artifact_names:
-            match = self.SESSION_PATTERN.search(str(artifact_name))
-            if match:
-                return match.group(1)
+            timestamp = self._extract_session_timestamp(str(artifact_name))
+            if timestamp:
+                return timestamp
 
         if sessions:
             return str(sessions[0].get("timestamp") or "").strip() or None
@@ -194,7 +196,7 @@ class DeterministicExportProvider:
 
         artifacts: List[Dict[str, Any]] = []
         for name in unique_names[: self.max_bundle_files()]:
-            path = output_dir / name
+            path = self._resolve_artifact_path(output_dir, name)
             if not path.exists() or not path.is_file():
                 continue
             artifacts.append(
@@ -208,24 +210,106 @@ class DeterministicExportProvider:
             )
         return artifacts
 
+    def _resolve_artifact_path(self, output_dir: Path, name: str) -> Path:
+        candidates = [
+            output_dir / name,
+            output_dir / self.SUMMARY_INFOGRAPHIC_DIRNAME / name,
+        ]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return output_dir / name
+
+    def _session_has_meaningful_discovery_data(self, session: Dict[str, Any]) -> bool:
+        overview = session.get("overview", {}) if isinstance(session, dict) else {}
+        if isinstance(overview, dict) and any(value not in (None, "", [], {}, 0) for value in overview.values()):
+            return True
+
+        personas = session.get("personas", {}) if isinstance(session, dict) else {}
+        if isinstance(personas, dict) and any(personas.values()):
+            return True
+
+        mcp_capabilities = session.get("mcp_capabilities", {}) if isinstance(session, dict) else {}
+        if isinstance(mcp_capabilities, dict) and any(mcp_capabilities.values()):
+            return True
+
+        readiness_score = session.get("readiness_score") if isinstance(session, dict) else None
+        if readiness_score not in (None, "", 0):
+            return True
+
+        stats = session.get("stats", {}) if isinstance(session, dict) else {}
+        if isinstance(stats, dict):
+            for value in stats.values():
+                try:
+                    if int(value) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+
+        return False
+
+    def _normalize_sessions(self, sessions: List[Dict[str, Any]], output_dir: Path) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+
+            timestamp = str(session.get("timestamp") or "").strip()
+            if not timestamp:
+                continue
+
+            raw_report_paths = session.get("report_paths", [])
+            report_paths = raw_report_paths if isinstance(raw_report_paths, list) else []
+            clean_report_paths: List[str] = []
+
+            for report_name in report_paths:
+                safe_report_name = Path(str(report_name or "")).name
+                if not safe_report_name:
+                    continue
+                if self._extract_session_timestamp(safe_report_name) != timestamp:
+                    continue
+                artifact_path = self._resolve_artifact_path(output_dir, safe_report_name)
+                if not artifact_path.exists() or not artifact_path.is_file():
+                    continue
+                if safe_report_name not in clean_report_paths:
+                    clean_report_paths.append(safe_report_name)
+
+            normalized_session = dict(session)
+            normalized_session["report_paths"] = clean_report_paths
+
+            if not clean_report_paths and not self._session_has_meaningful_discovery_data(normalized_session):
+                continue
+
+            normalized.append(normalized_session)
+
+        return sorted(normalized, key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+
     def _load_sessions(self, output_dir: Path) -> List[Dict[str, Any]]:
         manifest_path = output_dir / "discovery_sessions.json"
         if manifest_path.exists():
             try:
                 payload = json.loads(manifest_path.read_text(encoding="utf-8"))
                 if isinstance(payload, list):
-                    return sorted(payload, key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+                    normalized = self._normalize_sessions(payload, output_dir)
+                    if normalized != payload:
+                        manifest_path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
+                    return normalized
             except Exception:
                 pass
 
         sessions: Dict[str, Dict[str, Any]] = {}
-        for path in sorted(output_dir.glob("v2_*")):
+        infographic_dir = output_dir / self.SUMMARY_INFOGRAPHIC_DIRNAME
+        artifact_paths = [
+            *sorted(output_dir.glob("v2_*")),
+            *(sorted(infographic_dir.glob("summary_infographic_*")) if infographic_dir.exists() else []),
+        ]
+        for path in artifact_paths:
             if not path.is_file():
                 continue
-            match = self.SESSION_PATTERN.search(path.name)
-            if not match:
+            timestamp = self._extract_session_timestamp(path.name)
+            if not timestamp:
                 continue
-            timestamp = match.group(1)
             entry = sessions.setdefault(
                 timestamp,
                 {
@@ -238,6 +322,19 @@ class DeterministicExportProvider:
             entry["report_paths"].append(path.name)
 
         return sorted(sessions.values(), key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+
+    def _extract_session_timestamp(self, artifact_name: str) -> Optional[str]:
+        infographic_match = self.SUMMARY_INFOGRAPHIC_PATTERN.match(str(artifact_name or ""))
+        if infographic_match:
+            return infographic_match.group(1)
+
+        if str(artifact_name or "").startswith("summary_infographic_"):
+            return None
+
+        generic_matches = re.findall(r"(\d{8}_\d{6})", str(artifact_name or ""))
+        if generic_matches:
+            return generic_matches[0]
+        return None
 
     def _build_manifest(
         self,

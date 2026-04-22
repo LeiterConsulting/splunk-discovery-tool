@@ -6,7 +6,7 @@ import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
 from importlib import metadata
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from capabilities.health import CapabilityHealthService
 from capabilities.models import CapabilityActionResult, CapabilityConfig, CapabilityDefinition
@@ -18,6 +18,16 @@ from capabilities.tools import DeterministicExportProvider, SplunkDeepLinkProvid
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
 
 
 class CapabilityManager:
@@ -255,6 +265,337 @@ class CapabilityManager:
             },
         )
 
+    def list_rag_assets(self, name: str = "rag_chromadb") -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "list-assets", "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        provider = self._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "list_managed_assets"):
+            return self._result(definition.name, "list-assets", False, "Capability does not expose managed knowledge assets.")
+
+        try:
+            asset_summary = provider.list_managed_assets()
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="list-assets",
+                message="Failed to load managed knowledge assets.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action="list-assets",
+            message="Managed knowledge assets loaded.",
+            state=self.get_capability_state(definition.name),
+            details=asset_summary,
+        )
+
+    def get_rag_asset_detail(self, name: str, asset_id: str) -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "get-asset-detail", "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        provider = self._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "get_managed_asset_detail"):
+            return self._result(definition.name, "get-asset-detail", False, "Capability does not expose managed knowledge asset detail.")
+
+        try:
+            detail = provider.get_managed_asset_detail(asset_id)
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="get-asset-detail",
+                message="Failed to load managed knowledge asset detail.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        if detail is None:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="get-asset-detail",
+                message="Knowledge asset was not found.",
+                state=self.get_capability_state(definition.name),
+                details={},
+            )
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action="get-asset-detail",
+            message="Managed knowledge asset detail loaded.",
+            state=self.get_capability_state(definition.name),
+            details=detail,
+        )
+
+    def import_rag_text_asset(self, name: str, payload: Dict[str, Any]) -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "import-asset", "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        provider = self._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "import_text_asset"):
+            return self._result(definition.name, "import-asset", False, "Capability does not support managed knowledge asset import.")
+
+        auto_reindex = self._should_auto_reindex_rag_assets(definition, config)
+        try:
+            details = provider.import_text_asset(
+                title=payload.get("title") or "",
+                asset_type=payload.get("asset_type") or "reference_document",
+                content=payload.get("content") or "",
+                source_label=payload.get("source_label") or "",
+                description=payload.get("description") or "",
+                tags=payload.get("tags") or [],
+                auto_reindex=auto_reindex,
+            )
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="import-asset",
+                message="Knowledge asset import failed.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        if auto_reindex and config.installed:
+            self._sync_health_state(definition, config)
+
+        message = "Knowledge asset imported."
+        if details.get("auto_reindexed"):
+            message = "Knowledge asset imported and indexed."
+        elif not config.enabled:
+            message = "Knowledge asset imported. Enable indexed retrieval to use it in context previews and chat."
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action="import-asset",
+            message=message,
+            state=self.get_capability_state(definition.name),
+            details=details,
+        )
+
+    def import_rag_file_asset(
+        self,
+        name: str,
+        filename: str,
+        content_bytes: bytes,
+        payload: Dict[str, Any],
+    ) -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "import-asset", "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        provider = self._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "import_file_asset"):
+            return self._result(definition.name, "import-asset", False, "Capability does not support managed knowledge asset import.")
+
+        auto_reindex = self._should_auto_reindex_rag_assets(definition, config)
+        try:
+            details = provider.import_file_asset(
+                filename=filename,
+                content_bytes=content_bytes,
+                title=payload.get("title") or None,
+                asset_type=payload.get("asset_type") or "reference_document",
+                source_label=payload.get("source_label") or "",
+                description=payload.get("description") or "",
+                tags=payload.get("tags") or [],
+                auto_reindex=auto_reindex,
+            )
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="import-asset",
+                message="Knowledge asset import failed.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        if auto_reindex and config.installed:
+            self._sync_health_state(definition, config)
+
+        message = "Knowledge asset uploaded."
+        if details.get("auto_reindexed"):
+            message = "Knowledge asset uploaded and indexed."
+        elif not config.enabled:
+            message = "Knowledge asset uploaded. Enable indexed retrieval to use it in context previews and chat."
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action="import-asset",
+            message=message,
+            state=self.get_capability_state(definition.name),
+            details=details,
+        )
+
+    def delete_rag_asset(self, name: str, asset_id: str) -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "delete-asset", "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        provider = self._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "delete_managed_asset"):
+            return self._result(definition.name, "delete-asset", False, "Capability does not expose managed knowledge assets.")
+
+        auto_reindex = self._should_auto_reindex_rag_assets(definition, config)
+        try:
+            details = provider.delete_managed_asset(asset_id=asset_id, auto_reindex=auto_reindex)
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="delete-asset",
+                message="Knowledge asset deletion failed.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        if not details.get("deleted"):
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="delete-asset",
+                message="Knowledge asset was not found.",
+                state=self.get_capability_state(definition.name),
+                details=details,
+            )
+
+        if auto_reindex and config.installed:
+            self._sync_health_state(definition, config)
+
+        message = "Knowledge asset deleted."
+        if details.get("auto_reindexed"):
+            message = "Knowledge asset deleted and index refreshed."
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action="delete-asset",
+            message=message,
+            state=self.get_capability_state(definition.name),
+            details=details,
+        )
+
+    def check_in_rag_asset(self, name: str, asset_id: str) -> CapabilityActionResult:
+        return self._set_rag_asset_library_status(name, asset_id, "checked_in")
+
+    def check_out_rag_asset(self, name: str, asset_id: str) -> CapabilityActionResult:
+        return self._set_rag_asset_library_status(name, asset_id, "checked_out")
+
+    def _set_rag_asset_library_status(
+        self,
+        name: str,
+        asset_id: str,
+        library_status: str,
+    ) -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            action = "check-in-asset" if library_status == "checked_in" else "check-out-asset"
+            return CapabilityActionResult(False, name, action, "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        provider = self._get_rag_provider(definition, config)
+        provider_method_name = "check_in_managed_asset" if library_status == "checked_in" else "check_out_managed_asset"
+        action = "check-in-asset" if library_status == "checked_in" else "check-out-asset"
+        if provider is None or not hasattr(provider, provider_method_name):
+            return self._result(definition.name, action, False, "Capability does not expose managed knowledge asset library controls.")
+
+        auto_reindex = self._should_auto_reindex_rag_assets(definition, config)
+        try:
+            details = getattr(provider, provider_method_name)(asset_id=asset_id, auto_reindex=auto_reindex)
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action=action,
+                message="Knowledge asset library action failed.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        if not details.get("found"):
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action=action,
+                message="Knowledge asset was not found.",
+                state=self.get_capability_state(definition.name),
+                details=details,
+            )
+
+        if auto_reindex and config.installed and details.get("changed"):
+            self._sync_health_state(definition, config)
+
+        state_label = "checked in" if library_status == "checked_in" else "checked out"
+        if not details.get("changed"):
+            message = f"Knowledge asset already {state_label}."
+        elif details.get("auto_reindexed"):
+            message = f"Knowledge asset {state_label} and index refreshed."
+        else:
+            message = f"Knowledge asset {state_label}."
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action=action,
+            message=message,
+            state=self.get_capability_state(definition.name),
+            details=details,
+        )
+
+    def build_rag_context_preview(self, name: str, query: str, max_chunks: int = 4) -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "build-context", "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        if not config.installed:
+            return self._result(definition.name, "build-context", False, "Install the capability before building RAG context previews.")
+        if config.restart_required:
+            return self._result(definition.name, "build-context", False, "Restart the application before using this capability.")
+        if not config.enabled:
+            return self._result(definition.name, "build-context", False, "Enable the capability before building RAG context previews.")
+
+        provider = self._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "build_context_preview"):
+            return self._result(definition.name, "build-context", False, "Capability does not expose context preview generation.")
+
+        try:
+            details = provider.build_context_preview(query=query, max_chunks=max_chunks)
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="build-context",
+                message="RAG context preview generation failed.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action="build-context",
+            message=details.get("message") or "RAG context preview generated.",
+            state=self.get_capability_state(definition.name),
+            details=details,
+        )
+
     def build_deeplink(self, name: str, link_type: str, payload: Dict[str, Any]) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
@@ -464,7 +805,15 @@ class CapabilityManager:
     def _extra_capability_state(self, definition: CapabilityDefinition, config: CapabilityConfig) -> Dict[str, Any]:
         if definition.name == "rag_chromadb":
             provider = ChromaRAGProvider(config=config, definition=definition)
-            return {"index_summary": provider.get_index_summary()}
+            asset_summary = provider.get_knowledge_asset_summary()
+            return {
+                "index_summary": provider.get_index_summary(),
+                "knowledge_asset_summary": {
+                    key: value
+                    for key, value in asset_summary.items()
+                    if key != "assets"
+                },
+            }
         if definition.name == "splunk_deeplink_tools":
             provider = self._get_deeplink_provider(definition, config)
             return provider.get_runtime_summary() if provider is not None else {}
@@ -533,6 +882,34 @@ class CapabilityManager:
 
     def _normalize_capability_config(self, definition: CapabilityDefinition, config: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(config or {})
+        if definition.name == "rag_chromadb":
+            configured_extensions = normalized.get("allowed_extensions")
+            if isinstance(configured_extensions, list):
+                filtered_extensions = []
+                for item in configured_extensions:
+                    cleaned = str(item or "").strip().lower()
+                    if cleaned and not cleaned.startswith("."):
+                        cleaned = f".{cleaned}"
+                    if cleaned and cleaned not in filtered_extensions:
+                        filtered_extensions.append(cleaned)
+            else:
+                filtered_extensions = []
+            normalized["allowed_extensions"] = filtered_extensions or list(definition.default_config.get("allowed_extensions", []))
+
+            normalized["asset_dir"] = str(normalized.get("asset_dir") or "").strip()
+            normalized["auto_reindex_on_asset_change"] = _coerce_bool(
+                normalized.get("auto_reindex_on_asset_change"),
+                bool(definition.default_config.get("auto_reindex_on_asset_change", True)),
+            )
+
+            for key in ("max_files", "max_scan_chars", "max_document_chars", "max_documents", "max_sections_per_file", "context_preview_limit"):
+                value = normalized.get(key)
+                try:
+                    parsed = int(value)
+                    normalized[key] = parsed if parsed > 0 else int(definition.default_config.get(key, 1))
+                except (TypeError, ValueError):
+                    normalized[key] = int(definition.default_config.get(key, 1))
+
         if definition.name == "export_tools":
             supported_outputs = {"bundle_zip", "manifest_json", "summary_markdown"}
             configured_formats = normalized.get("formats")
@@ -542,6 +919,13 @@ class CapabilityManager:
                 filtered_formats = []
             normalized["formats"] = filtered_formats or list(definition.default_config.get("formats", []))
         return normalized
+
+    def _should_auto_reindex_rag_assets(self, definition: CapabilityDefinition, config: CapabilityConfig) -> bool:
+        auto_reindex = _coerce_bool(
+            config.config.get("auto_reindex_on_asset_change"),
+            bool(definition.default_config.get("auto_reindex_on_asset_change", True)),
+        )
+        return bool(auto_reindex and config.installed and config.enabled and not config.restart_required and definition.runtime_available)
 
     def _dependencies_available(self, definition: CapabilityDefinition) -> bool:
         if not definition.module_probes:

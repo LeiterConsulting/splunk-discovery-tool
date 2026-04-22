@@ -1,4 +1,5 @@
 import importlib.util
+from io import BytesIO
 import json
 import os
 import sys
@@ -21,6 +22,50 @@ from capabilities.rag.indexer import ArtifactSourceIndexer
 from capabilities.registry import CapabilityRegistry
 from capabilities.tools import DeterministicExportProvider, SplunkDeepLinkProvider, VisualizationPreviewProvider
 from config_manager import ConfigManager
+
+
+def build_simple_pdf_bytes(text: str) -> bytes:
+    safe_text = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    objects = []
+    objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    objects.append(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n")
+    stream = f"BT\n/F1 12 Tf\n72 720 Td\n({safe_text}) Tj\nET\n".encode("latin-1")
+    objects.append(b"4 0 obj\n<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"endstream\nendobj\n")
+    objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii"))
+    return bytes(pdf)
+
+
+def build_simple_docx_bytes(title: str, paragraphs: list[str], table_rows: list[list[str]] | None = None) -> bytes:
+    from docx import Document
+
+    buffer = BytesIO()
+    document = Document()
+    if title:
+        document.add_heading(title, level=1)
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
+    if table_rows:
+        column_count = max(len(row) for row in table_rows if row)
+        if column_count > 0:
+            table = document.add_table(rows=0, cols=column_count)
+            for row_values in table_rows:
+                row_cells = table.add_row().cells
+                for index in range(column_count):
+                    row_cells[index].text = row_values[index] if index < len(row_values) else ""
+    document.save(buffer)
+    return buffer.getvalue()
 
 
 class CapabilityFrameworkTests(unittest.TestCase):
@@ -242,6 +287,439 @@ class CapabilityFrameworkTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
 
+    def test_rag_chromadb_managed_asset_import_and_listing_flow(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                import_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Indexer cluster dependencies",
+                        "asset_type": "connected_system_context",
+                        "source_label": "Production Splunk Platform",
+                        "description": "Connectivity and service dependencies for the production indexer tier.",
+                        "tags": ["splunk", "network", "dependencies"],
+                        "content": "Indexers receive data from heavy forwarders, rely on shared storage, and forward alerts to external paging systems.",
+                    },
+                )
+
+                self.assertTrue(import_result.ok)
+                self.assertEqual(import_result.details["asset"]["asset_type"], "connected_system_context")
+                self.assertFalse(import_result.details["auto_reindexed"])
+                self.assertGreaterEqual(len(import_result.details["asset"]["focus_terms"]), 1)
+                self.assertGreaterEqual(len(import_result.details["asset"]["key_points"]), 1)
+                self.assertGreaterEqual(len(import_result.details["asset"]["usage_guidance"]), 1)
+
+                list_result = manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(list_result.ok)
+                self.assertEqual(list_result.details["asset_count"], 1)
+                self.assertEqual(list_result.details["assets"][0]["title"], "Indexer cluster dependencies")
+                self.assertGreaterEqual(len(list_result.details["assets"][0]["focus_terms"]), 1)
+
+                capability_state = manager.get_capability_state("rag_chromadb")
+                self.assertEqual(capability_state["knowledge_asset_summary"]["asset_count"], 1)
+
+                reloaded_manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                reloaded_assets = reloaded_manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(reloaded_assets.ok)
+                self.assertEqual(reloaded_assets.details["asset_count"], 1)
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_managed_asset_library_check_out_and_check_in_flow(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                import_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "SOAR integration routing notes",
+                        "asset_type": "integration_context",
+                        "source_label": "SOAR platform",
+                        "description": "Routing dependencies for the SOAR handoff path.",
+                        "tags": ["soar", "routing", "handoff"],
+                        "content": "SOAR alert escalation depends on the webhook relay, the shared certificate rotation path, and the on-call routing roster.",
+                    },
+                )
+
+                self.assertTrue(import_result.ok)
+                asset_id = import_result.details["asset"]["asset_id"]
+                self.assertEqual(import_result.details["asset"]["library_status"], "checked_in")
+                self.assertTrue(import_result.details["asset"].get("last_checked_in_at"))
+                self.assertFalse(import_result.details["asset"].get("checked_out_at"))
+
+                list_result = manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(list_result.ok)
+                self.assertEqual(list_result.details["asset_count"], 1)
+                self.assertEqual(list_result.details["checked_in_asset_count"], 1)
+                self.assertEqual(list_result.details["checked_out_asset_count"], 0)
+                self.assertEqual(list_result.details["library_status_counts"]["checked_in"], 1)
+
+                definition = manager.registry.get_definition("rag_chromadb")
+                config = manager.config_manager.get_capability("rag_chromadb")
+                indexer = ArtifactSourceIndexer(config=config, definition=definition)
+                checked_in_documents = [
+                    document for document in indexer.collect_documents() if document.source_type == "knowledge_asset"
+                ]
+                self.assertGreaterEqual(len(checked_in_documents), 1)
+                self.assertTrue(all(document.metadata.get("asset_library_status") == "checked_in" for document in checked_in_documents))
+
+                check_out_result = manager.check_out_rag_asset("rag_chromadb", asset_id)
+                self.assertTrue(check_out_result.ok)
+                self.assertTrue(check_out_result.details["changed"])
+                self.assertEqual(check_out_result.details["asset"]["library_status"], "checked_out")
+                self.assertTrue(check_out_result.details["asset"].get("checked_out_at"))
+                self.assertEqual(check_out_result.details["asset_summary"]["checked_in_asset_count"], 0)
+                self.assertEqual(check_out_result.details["asset_summary"]["checked_out_asset_count"], 1)
+
+                checked_out_documents = [
+                    document for document in ArtifactSourceIndexer(config=config, definition=definition).collect_documents()
+                    if document.source_type == "knowledge_asset"
+                ]
+                self.assertEqual(len(checked_out_documents), 0)
+
+                check_in_result = manager.check_in_rag_asset("rag_chromadb", asset_id)
+                self.assertTrue(check_in_result.ok)
+                self.assertTrue(check_in_result.details["changed"])
+                self.assertEqual(check_in_result.details["asset"]["library_status"], "checked_in")
+                self.assertTrue(check_in_result.details["asset"].get("last_checked_in_at"))
+                self.assertEqual(check_in_result.details["asset_summary"]["checked_in_asset_count"], 1)
+                self.assertEqual(check_in_result.details["asset_summary"]["checked_out_asset_count"], 0)
+
+                checked_back_in_documents = [
+                    document for document in ArtifactSourceIndexer(config=config, definition=definition).collect_documents()
+                    if document.source_type == "knowledge_asset"
+                ]
+                self.assertGreaterEqual(len(checked_back_in_documents), 1)
+                self.assertTrue(all(document.metadata.get("asset_library_status") == "checked_in" for document in checked_back_in_documents))
+
+                capability_state = manager.get_capability_state("rag_chromadb")
+                self.assertEqual(capability_state["knowledge_asset_summary"]["checked_in_asset_count"], 1)
+                self.assertEqual(capability_state["knowledge_asset_summary"]["checked_out_asset_count"], 0)
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_asset_detail_exposes_stored_sections_and_chunk_browser(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                import_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Forwarder trust guidance",
+                        "asset_type": "connected_system_context",
+                        "source_label": "Forwarder trust path",
+                        "description": "Support note for certificate and dependency review.",
+                        "tags": ["forwarders", "certificates"],
+                        "content": "## Dependency Summary\n- Universal forwarders depend on certificate trust and the indexer path.\n- Operators should review certificate status before escalating.\n",
+                    },
+                )
+                self.assertTrue(import_result.ok)
+
+                detail_result = manager.get_rag_asset_detail(
+                    "rag_chromadb",
+                    import_result.details["asset"]["asset_id"],
+                )
+
+                self.assertTrue(detail_result.ok)
+                self.assertEqual(detail_result.details["asset"]["title"], "Forwarder trust guidance")
+                self.assertGreaterEqual(len(detail_result.details["stored_sections"]), 3)
+                self.assertTrue(any(section["title"] == "Dependency Summary" for section in detail_result.details["stored_sections"]))
+                self.assertIn("certificate trust", detail_result.details["context_body"])
+                self.assertGreaterEqual(len(detail_result.details["chunk_sections"]), 1)
+                self.assertEqual(
+                    detail_result.details["chunk_sections"][0]["metadata"]["asset_type"],
+                    "connected_system_context",
+                )
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_import_file_asset_supports_pdf_uploads(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                import_result = manager.import_rag_file_asset(
+                    "rag_chromadb",
+                    filename="forwarder-trust.pdf",
+                    content_bytes=build_simple_pdf_bytes("Forwarders need certificate trust before data reaches the indexer tier."),
+                    payload={
+                        "title": "Forwarder PDF guidance",
+                        "asset_type": "connected_system_context",
+                        "source_label": "Forwarder PDF",
+                        "description": "PDF validation asset",
+                        "tags": ["forwarders", "pdf"],
+                    },
+                )
+
+                self.assertTrue(import_result.ok)
+                self.assertEqual(import_result.details["asset"]["original_filename"], "forwarder-trust.pdf")
+                self.assertEqual(import_result.details["asset"]["import_method"], "file_upload")
+                self.assertIn("Forwarders need certificate trust", import_result.details["asset"]["summary"])
+
+                detail_result = manager.get_rag_asset_detail(
+                    "rag_chromadb",
+                    import_result.details["asset"]["asset_id"],
+                )
+                self.assertTrue(detail_result.ok)
+                self.assertIn("PDF Page 1", detail_result.details["context_body"])
+                self.assertTrue(any(section["title"] == "PDF Page 1" for section in detail_result.details["stored_sections"]))
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_import_file_asset_supports_docx_uploads(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                import_result = manager.import_rag_file_asset(
+                    "rag_chromadb",
+                    filename="forwarder-escalation.docx",
+                    content_bytes=build_simple_docx_bytes(
+                        "Forwarder Escalation",
+                        [
+                            "Verify certificate trust before escalating indexer path issues.",
+                            "Confirm the forwarding queue is healthy before involving platform operations.",
+                        ],
+                        table_rows=[
+                            ["Owner", "Platform Operations"],
+                            ["Queue", "Forwarding Pipeline"],
+                        ],
+                    ),
+                    payload={
+                        "title": "Forwarder DOCX guidance",
+                        "asset_type": "runbook_context",
+                        "source_label": "Forwarder DOCX",
+                        "description": "DOCX validation asset",
+                        "tags": ["forwarders", "docx"],
+                    },
+                )
+
+                self.assertTrue(import_result.ok)
+                self.assertEqual(import_result.details["asset"]["original_filename"], "forwarder-escalation.docx")
+                self.assertEqual(import_result.details["asset"]["import_method"], "file_upload")
+                self.assertIn("Verify certificate trust", import_result.details["asset"]["summary"])
+
+                detail_result = manager.get_rag_asset_detail(
+                    "rag_chromadb",
+                    import_result.details["asset"]["asset_id"],
+                )
+                self.assertTrue(detail_result.ok)
+                self.assertIn("Forwarder Escalation", detail_result.details["context_body"])
+                self.assertTrue(any(section["title"] == "Forwarder Escalation" for section in detail_result.details["stored_sections"]))
+                self.assertTrue(any(section["title"] == "DOCX Table 1" for section in detail_result.details["stored_sections"]))
+            finally:
+                os.chdir(original_cwd)
+
+    def test_chroma_indexer_collects_knowledge_asset_metadata(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+                manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Updated Splunk auth notes",
+                        "asset_type": "splunk_documentation",
+                        "source_label": "Internal documentation",
+                        "tags": ["splunk", "authentication"],
+                        "content": "Search head authentication now depends on the enterprise IdP group sync job and the secret rotation schedule.",
+                    },
+                )
+
+                definition = manager.registry.get_definition("rag_chromadb")
+                config = manager.config_manager.get_capability("rag_chromadb")
+                indexer = ArtifactSourceIndexer(config=config, definition=definition)
+                documents = indexer.collect_documents()
+
+                knowledge_documents = [document for document in documents if document.source_type == "knowledge_asset"]
+                self.assertGreaterEqual(len(knowledge_documents), 1)
+                self.assertTrue(any(document.metadata.get("asset_id") for document in knowledge_documents))
+                self.assertTrue(any(document.metadata.get("asset_type") == "splunk_documentation" for document in knowledge_documents))
+                self.assertTrue(any(document.metadata.get("asset_focus_terms") for document in knowledge_documents))
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_context_preview_and_delete_flow_for_managed_assets(self):
+        if importlib.util.find_spec("chromadb") is None:
+            self.skipTest("chromadb is not installed in the active environment")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+
+                install_result = manager.install_capability("rag_chromadb")
+                self.assertTrue(install_result.ok)
+
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                enable_result = manager.enable_capability("rag_chromadb")
+                self.assertTrue(enable_result.ok)
+
+                import_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Payments platform integration notes",
+                        "asset_type": "integration_context",
+                        "source_label": "Payments API",
+                        "tags": ["payments", "api", "splunk"],
+                        "content": "The payments API sends structured JSON events through heavy forwarders, depends on the shared certificate rotation process, and escalates through the payments support group roster.",
+                    },
+                )
+                self.assertTrue(import_result.ok)
+                self.assertTrue(import_result.details["auto_reindexed"])
+
+                asset_path = output_dir / "rag" / "assets" / import_result.details["asset"]["content_path"]
+                stored_asset = asset_path.read_text(encoding="utf-8")
+                self.assertIn("## Focus Terms", stored_asset)
+                self.assertIn("## Key Points", stored_asset)
+                before_focus_terms, after_focus_terms = stored_asset.split("## Focus Terms", 1)
+                _, after_key_points_marker = after_focus_terms.split("## Key Points", 1)
+                asset_path.write_text(
+                    f"{before_focus_terms}## Focus Terms\n\n- the\n- payments\n\n## Key Points{after_key_points_marker}",
+                    encoding="utf-8",
+                )
+
+                preview_result = manager.build_rag_context_preview(
+                    "rag_chromadb",
+                    "What does Splunk need to know about the payments API integration?",
+                    max_chunks=3,
+                )
+                self.assertTrue(preview_result.ok)
+                self.assertIn("Knowledge asset context preview", preview_result.details["context_text"])
+                self.assertIn("Operator context brief", preview_result.details["operator_brief"])
+                self.assertGreaterEqual(len(preview_result.details["chunks"]), 1)
+                self.assertEqual(preview_result.details["chunks"][0]["metadata"].get("source_type"), "knowledge_asset")
+                self.assertTrue(preview_result.details["chunks"][0]["document_id"])
+                self.assertGreaterEqual(len(preview_result.details["matched_assets"]), 1)
+                self.assertTrue(preview_result.details["matched_assets"][0]["why_matched"])
+                self.assertGreaterEqual(len(preview_result.details["matched_assets"][0]["key_points"]), 1)
+                self.assertGreaterEqual(len(preview_result.details["matched_assets"][0]["matched_chunk_ids"]), 1)
+                self.assertGreaterEqual(len(preview_result.details["matched_assets"][0]["matched_chunks"]), 1)
+                self.assertNotIn("the", [term.lower() for term in preview_result.details["matched_assets"][0]["focus_terms"]])
+                self.assertGreaterEqual(len(preview_result.details["recommended_uses"]), 1)
+                self.assertGreaterEqual(len(preview_result.details["retrieved_key_points"]), 1)
+                self.assertIn(
+                    "Use for ownership, escalation, and support-routing questions.",
+                    preview_result.details["operator_brief"],
+                )
+
+                asset_id = import_result.details["asset"]["asset_id"]
+                detail_result = manager.get_rag_asset_detail("rag_chromadb", asset_id)
+                self.assertTrue(detail_result.ok)
+                preview_chunk_ids = set(preview_result.details["matched_assets"][0]["matched_chunk_ids"])
+                detail_chunk_ids = {section["document_id"] for section in detail_result.details["chunk_sections"]}
+                self.assertTrue(preview_chunk_ids.issubset(detail_chunk_ids))
+
+                refreshed_asset = asset_path.read_text(encoding="utf-8")
+                self.assertNotIn("\n- the\n", refreshed_asset)
+
+                delete_result = manager.delete_rag_asset("rag_chromadb", asset_id)
+                self.assertTrue(delete_result.ok)
+                self.assertTrue(delete_result.details["deleted"])
+                self.assertEqual(delete_result.details["asset_summary"]["asset_count"], 0)
+            finally:
+                os.chdir(original_cwd)
+
     def test_deeplink_provider_derives_web_base_url_from_mcp_url(self):
         definition = CapabilityRegistry().get_definition("splunk_deeplink_tools")
         config = CapabilityConfig(
@@ -387,8 +865,14 @@ class CapabilityFrameworkTests(unittest.TestCase):
         self.assertEqual(line_preview["y_field"], "count")
         self.assertEqual(len(line_preview["points"]), 3)
         self.assertEqual(bar_preview["chart_type"], "bar")
+        self.assertEqual(bar_preview["x_field"], "sourcetype")
         self.assertEqual(bar_preview["y_field"], "count")
         self.assertGreaterEqual(len(bar_preview["points"]), 2)
+        self.assertEqual(
+            bar_preview["points"][1]["full_label"],
+            "XmlWinEventLog:Microsoft-Windows-Sysmon/Operational",
+        )
+        self.assertTrue(bar_preview["points"][1]["label"].endswith("..."))
 
     def test_visualization_install_enable_test_and_build_flow(self):
         with tempfile.TemporaryDirectory() as temp_dir:

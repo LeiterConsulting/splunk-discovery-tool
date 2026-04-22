@@ -7,7 +7,7 @@ analysis, pattern detection, and summarization locally.
 """
 
 from typing import Dict, List, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 
 

@@ -5,12 +5,13 @@ A modern web-based interface providing real-time progress tracking,
 animated progress indicators, and comprehensive report management.
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, Request, HTTPException
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import asyncio
+import base64
 import json
 import os
 import re
@@ -35,9 +36,11 @@ from llm.factory import (
     LLMClientFactory,
     filter_openai_generation_models,
     get_openai_model_capabilities,
+    is_openai_image_generation_model,
     normalize_provider_name,
 )
 from discovery.context_manager import get_context_manager
+from frontend_legacy import get_frontend_html
 
 # Ensure console/log prints do not crash on Windows code pages (cp1252, etc.)
 try:
@@ -56,6 +59,56 @@ capability_manager = CapabilityManager(config_manager, registry=capability_regis
 # Module-level LLM client cache for performance
 _cached_llm_client = None
 _cached_config_hash = None
+
+
+def should_enable_rag_context_by_default() -> bool:
+    """Return True when any persisted optional RAG capability is installed and enabled."""
+    capability_configs = config_manager.list_capabilities()
+    for definition in capability_registry.rag_definitions():
+        config = capability_configs.get(definition.name)
+        if config and config.installed and config.enabled:
+            return True
+    return False
+
+
+def build_default_chat_settings() -> Dict[str, Any]:
+    """Build default session chat settings, including capability-aware RAG defaults."""
+    return {
+        # Discovery Settings
+        "max_execution_time": 90,
+        "max_iterations": 5,
+        "discovery_freshness_days": 7,
+
+        # LLM Behavior
+        "max_tokens": 16000,
+        "temperature": 0.7,
+        "context_history": 6,
+
+        # Performance Tuning
+        "max_retry_delay": 300,
+        "max_retries": 5,
+        "query_sample_size": 2,
+
+        # Quality Control
+        "quality_threshold": 70,
+        "convergence_detection": 5,
+
+        # Demo Augmentation
+        "enable_splunk_augmentation": True,
+        "enable_rag_context": should_enable_rag_context_by_default(),
+        "rag_max_chunks": 3,
+    }
+
+
+chat_settings_explicit_overrides = {
+    "enable_rag_context": False,
+}
+
+
+def sync_chat_settings_with_capability_defaults() -> None:
+    """Refresh capability-aware chat defaults unless explicitly changed this session."""
+    if not chat_settings_explicit_overrides.get("enable_rag_context", False):
+        chat_session_settings["enable_rag_context"] = should_enable_rag_context_by_default()
 
 def get_or_create_llm_client(config):
     """Get cached LLM client or create new one if config changed."""
@@ -92,6 +145,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
+FRONTEND_STATIC_DIR = Path(__file__).with_name("static")
+FRONTEND_INDEX_PATH = FRONTEND_STATIC_DIR / "index.html"
+
+app.mount("/static", StaticFiles(directory=str(FRONTEND_STATIC_DIR), check_dir=False), name="static")
+
 # Security: Allow external access for development/testing
 app.add_middleware(
     TrustedHostMiddleware,
@@ -121,31 +179,7 @@ debug_connections: List[WebSocket] = []  # WebSocket connections for debug log s
 debug_log_queue = asyncio.Queue()  # Queue for debug messages
 
 # Session-based chat settings (reset on server restart)
-chat_session_settings = {
-    # Discovery Settings
-    "max_execution_time": 90,        # seconds
-    "max_iterations": 5,             # count
-    "discovery_freshness_days": 7,   # days
-    
-    # LLM Behavior
-    "max_tokens": 16000,             # tokens per request
-    "temperature": 0.7,              # 0.0-2.0
-    "context_history": 6,            # messages
-    
-    # Performance Tuning
-    "max_retry_delay": 300,          # seconds
-    "max_retries": 5,                # count
-    "query_sample_size": 2,          # rows
-    
-    # Quality Control
-    "quality_threshold": 70,         # 0-100 score
-    "convergence_detection": 5,      # iterations
-
-    # Demo Augmentation
-    "enable_splunk_augmentation": True,
-    "enable_rag_context": False,
-    "rag_max_chunks": 3,
-}
+chat_session_settings = build_default_chat_settings()
 
 MCP_TOOL_ALIASES = {
     "splunk_run_query": ["splunk_run_query", "run_splunk_query"],
@@ -184,6 +218,12 @@ _cached_mcp_tools = {
 }
 
 DISCOVERY_PIPELINE_VERSION = "v2"
+OPENAI_IMAGE_MODEL = "gpt-image-2"
+MAX_INFOGRAPHIC_SUMMARY_CHARS = 32000
+MAX_INFOGRAPHIC_BRIEF_CHARS = 12000
+SUMMARY_INFOGRAPHIC_DIRNAME = "summary_infographics"
+SUMMARY_INFOGRAPHIC_PREFIX = "summary_infographic_"
+IMAGE_ARTIFACT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 chat_agent_memory: Dict[str, Dict[str, Any]] = {}
 
@@ -302,6 +342,14 @@ def _extract_memory_signals(text: str) -> Dict[str, List[str]]:
     sourcetypes = re.findall(r'sourcetype=([\w\*\-:\.]+)', text, flags=re.IGNORECASE)
     hosts = re.findall(r'host=([\w\*\-\.]+)', text, flags=re.IGNORECASE)
     sources = re.findall(r'source=([^\s\|]+)', text, flags=re.IGNORECASE)
+
+    natural_language_index = extract_index_from_message(text)
+    if natural_language_index:
+        indexes.append(natural_language_index)
+
+    natural_language_host = extract_host_or_ip_from_message(text)
+    if natural_language_host:
+        hosts.append(natural_language_host)
 
     time_preferences = []
     for token in [
@@ -452,6 +500,69 @@ def _make_follow_on_action(label: str, prompt: str, kind: str) -> Dict[str, str]
         "prompt": prompt,
         "kind": kind,
     }
+
+
+def _normalize_response_follow_on_text(action_text: str) -> str:
+    cleaned = re.sub(r'\s+', ' ', str(action_text or '')).strip(" \t\r\n:-*•")
+    cleaned = cleaned.strip("`'\"")
+    cleaned = re.sub(r'^to\s+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'^also\s+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+(?:for you|if helpful|if that helps|if you want)$', '', cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.rstrip(' .;:')
+    if not cleaned:
+        return ""
+    return cleaned[0].upper() + cleaned[1:]
+
+
+def _build_response_follow_on_label(prompt: str, limit: int = 72) -> str:
+    label = str(prompt or '').strip().rstrip('.')
+    if len(label) <= limit:
+        return label
+    shortened = label[:limit].rsplit(' ', 1)[0].strip()
+    return f"{shortened or label[:limit].strip()}..."
+
+
+def _extract_response_follow_on_actions(assistant_response: str) -> List[Dict[str, str]]:
+    cleaned_response = sanitize_llm_response_text(str(assistant_response or ''))
+    if not cleaned_response:
+        return []
+
+    patterns = [
+        r"\ba good follow[ -]?up(?: question| step| action)?\s+(?:would be(?: to)?|is|might be|could be)\s+(?P<action>[^.!?\n]+)",
+        r"\bif you(?:'d|’d|\swould)? like,?\s+i can\s+(?P<action>[^.!?\n]+)",
+        r"\bif you want(?:\s+[^,.!?\n]+)?[,;]?\s+i can\s+(?P<action>[^.!?\n]+)",
+        r"\bif helpful,?\s+i can\s+(?P<action>[^.!?\n]+)",
+        r"\bor i can\s+(?P<action>[^.!?\n]+)",
+        r"\bi can also\s+(?P<action>[^.!?\n]+)",
+        r"\bi can\s+(?P<action>(?:list|show|compare|check|validate|investigate|review|summarize|break down|trend|prototype|measure|explain|help you find)[^.!?\n]+)",
+    ]
+    ignored_prefixes = (
+        'do that',
+        'help with that',
+        'continue',
+        'keep going',
+        'take it further',
+        'go deeper',
+    )
+
+    actions: List[Dict[str, str]] = []
+    seen_prompts = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, cleaned_response, flags=re.IGNORECASE):
+            prompt = _normalize_response_follow_on_text(match.group('action'))
+            lowered_prompt = prompt.lower()
+            if len(prompt.split()) < 3 or lowered_prompt.startswith(ignored_prefixes):
+                continue
+            if lowered_prompt in seen_prompts:
+                continue
+            seen_prompts.add(lowered_prompt)
+            actions.append(_make_follow_on_action(
+                _build_response_follow_on_label(prompt),
+                prompt,
+                'assistant_response_follow_up',
+            ))
+
+    return _dedupe_follow_on_actions(actions, limit=3)
 
 
 def _extract_top_dimension_context(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -877,6 +988,7 @@ def update_chat_memory(
     assistant_response: Optional[str] = None,
     report_intent: Optional[str] = None,
     record_user_turn: bool = True,
+    update_focus: bool = True,
 ) -> Dict[str, Any]:
     """Update chat memory with latest user message, optional tool activity, and optional assistant response."""
     memory = load_chat_memory(chat_session_id)
@@ -927,15 +1039,16 @@ def update_chat_memory(
         memory["last_assistant_response"] = _compact_memory_text(assistant_response, limit=400)
         _append_recent_turn(memory, "assistant", assistant_response)
 
-    focus = _detect_conversation_focus(
-        user_message,
-        memory,
-        tool_calls=tool_calls,
-        assistant_response=assistant_response or "",
-        report_intent=report_intent,
-    )
-    if focus:
-        memory["current_focus"] = focus
+    if update_focus:
+        focus = _detect_conversation_focus(
+            user_message,
+            memory,
+            tool_calls=tool_calls,
+            assistant_response=assistant_response or "",
+            report_intent=report_intent,
+        )
+        if focus:
+            memory["current_focus"] = focus
 
     memory["entities"] = entities
     save_chat_memory(chat_session_id, memory)
@@ -997,7 +1110,202 @@ def build_chat_memory_context(memory: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_follow_on_actions(user_message: str, memory: Dict[str, Any], tool_calls: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+def _format_last_result_context_for_prompt(memory: Dict[str, Any]) -> str:
+    """Render the last result context in a compact single-line form for prompt continuity."""
+    if not isinstance(memory, dict):
+        return ""
+
+    last_result = memory.get("last_result", {}) if isinstance(memory.get("last_result", {}), dict) else {}
+    if not last_result:
+        return ""
+
+    parts: List[str] = []
+    for key in ("index", "host", "sourcetype", "source"):
+        value = str(last_result.get(key) or "").strip()
+        if value:
+            parts.append(f"{key}={value}")
+
+    if last_result.get("row_count") is not None:
+        parts.append(f"row_count={_safe_int(last_result.get('row_count'))}")
+
+    earliest_time = str(last_result.get("earliest_time") or "").strip()
+    latest_time = str(last_result.get("latest_time") or "now").strip() or "now"
+    if earliest_time:
+        parts.append(f"window={earliest_time} to {latest_time}")
+
+    query = _compact_memory_text(last_result.get("query", ""), limit=140)
+    if query:
+        parts.append(f"query={query}")
+
+    findings = [
+        _compact_memory_text(finding, limit=90)
+        for finding in (last_result.get("findings", []) if isinstance(last_result.get("findings", []), list) else [])[:3]
+        if isinstance(finding, str) and finding.strip()
+    ]
+    if findings:
+        parts.append(f"findings={'; '.join(findings)}")
+
+    return ", ".join(parts)
+
+
+def _build_llm_recent_context_turns(
+    history: Any,
+    memory: Dict[str, Any],
+    limit: int = 6,
+) -> List[Dict[str, str]]:
+    """Return recent turns for LLM continuity, preferring normalized live history over persisted memory."""
+    recent_history = _compact_chat_role_history(history, limit=limit, include_system=False)
+    if recent_history:
+        return [
+            {
+                "role": entry.get("role", "user"),
+                "content": _compact_memory_text(entry.get("content", ""), limit=180),
+            }
+            for entry in recent_history
+            if isinstance(entry, dict) and _compact_memory_text(entry.get("content", ""), limit=180)
+        ]
+
+    turns = memory.get("recent_turns", []) if isinstance(memory, dict) and isinstance(memory.get("recent_turns", []), list) else []
+    normalized: List[Dict[str, str]] = []
+    for turn in turns[-limit:]:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = _compact_memory_text(turn.get("content", ""), limit=180)
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def build_llm_continuity_context(
+    user_message: str,
+    history: Any,
+    memory: Dict[str, Any],
+    limit: int = 6,
+) -> str:
+    """Build a provider-agnostic continuity gate so the LLM sees the live session state on every turn."""
+    memory = memory if isinstance(memory, dict) else {}
+    recent_turns = _build_llm_recent_context_turns(history, memory, limit=limit)
+    user_text = _compact_memory_text(user_message, limit=320)
+    last_result_context = _format_last_result_context_for_prompt(memory)
+    entities = memory.get("entities", {}) if isinstance(memory.get("entities", {}), dict) else {}
+
+    state_lines: List[str] = []
+    primary_intent = str(memory.get("primary_intent") or "").strip()
+    if primary_intent:
+        state_lines.append(f"- Primary intent: {primary_intent}")
+
+    current_focus = str(memory.get("current_focus") or "").strip()
+    if current_focus:
+        state_lines.append(f"- Active focus: {current_focus}")
+
+    remembered_indexes = [str(item).strip() for item in entities.get("indexes", [])[-6:] if isinstance(item, str) and item.strip()]
+    if remembered_indexes:
+        state_lines.append(f"- Remembered indexes: {', '.join(remembered_indexes)}")
+
+    remembered_hosts = [str(item).strip() for item in entities.get("hosts", [])[-4:] if isinstance(item, str) and item.strip()]
+    if remembered_hosts:
+        state_lines.append(f"- Remembered hosts: {', '.join(remembered_hosts)}")
+
+    remembered_sourcetypes = [str(item).strip() for item in entities.get("sourcetypes", [])[-4:] if isinstance(item, str) and item.strip()]
+    if remembered_sourcetypes:
+        state_lines.append(f"- Remembered sourcetypes: {', '.join(remembered_sourcetypes)}")
+
+    if last_result_context:
+        state_lines.append(f"- Last result context: {last_result_context}")
+
+    last_assistant_response = _compact_memory_text(memory.get("last_assistant_response", ""), limit=200)
+    if last_assistant_response:
+        state_lines.append(f"- Last assistant response: {last_assistant_response}")
+
+    if not state_lines and not recent_turns and not user_text:
+        return ""
+
+    lines = [
+        "SESSION CONTINUITY GATE:",
+        "- Treat the current user message as a continuation of the active investigation unless the user clearly changes topic.",
+        "- Resolve pronouns, shorthand, omitted nouns, and aliases using the active focus, remembered entities, last result, and recent turns before answering.",
+        "- Prefer the current Splunk/DT4SMS session context over generic interpretations when the request is ambiguous.",
+    ]
+
+    if state_lines:
+        lines.append("Active session state:")
+        lines.extend(state_lines)
+
+    if recent_turns:
+        lines.append("Recent conversation:")
+        for turn in recent_turns[-4:]:
+            role = str(turn.get("role") or "user").strip().capitalize()
+            content = _compact_memory_text(turn.get("content", ""), limit=180)
+            if content:
+                lines.append(f"- {role}: {content}")
+
+    if user_text:
+        lines.append(f"Current request to interpret in-session: {user_text}")
+
+    return "\n".join(lines)
+
+
+def _compact_chat_role_history(
+    history: Any,
+    limit: int = 12,
+    include_system: bool = False,
+) -> List[Dict[str, str]]:
+    """Normalize chat history into compact role/content pairs for safe follow-up reuse."""
+    if not isinstance(history, list):
+        return []
+
+    normalized: List[Dict[str, str]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("role") or "").strip().lower()
+        if role not in {"user", "assistant", "system"}:
+            continue
+        if role == "system" and not include_system:
+            continue
+        content = str(entry.get("content") or "").strip()
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+
+    if include_system:
+        system_entries = [item for item in normalized if item.get("role") == "system"][:1]
+        non_system_entries = [item for item in normalized if item.get("role") != "system"]
+        return system_entries + (non_system_entries[-limit:] if limit > 0 else non_system_entries)
+
+    return normalized[-limit:] if limit > 0 else normalized
+
+
+def _build_follow_up_conversation_history(
+    history: Any,
+    user_message: str,
+    assistant_response: str,
+    limit: int = 12,
+) -> List[Dict[str, str]]:
+    """Return compact user/assistant history for deterministic and report-backed chat turns."""
+    compact_history = _compact_chat_role_history(history, limit=limit, include_system=False)
+
+    cleaned_user_message = str(user_message or "").strip()
+    if cleaned_user_message:
+        compact_history.append({"role": "user", "content": cleaned_user_message})
+
+    cleaned_response = sanitize_llm_response_text(str(assistant_response or ""))
+    if cleaned_response:
+        compact_history.append({"role": "assistant", "content": cleaned_response})
+
+    return _compact_chat_role_history(compact_history, limit=limit, include_system=False)
+
+
+def build_follow_on_actions(
+    user_message: str,
+    memory: Dict[str, Any],
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    assistant_response: str = "",
+) -> List[Dict[str, Any]]:
     """Generate executable, context-aware follow-on action suggestions."""
     actions: List[Dict[str, Any]] = []
     remembered_index = _remembered_entity(memory, "index")
@@ -1007,14 +1315,18 @@ def build_follow_on_actions(user_message: str, memory: Dict[str, Any], tool_call
     latest_time = str(last_result.get("latest_time") or "").strip() or "now"
     time_window_label = _describe_time_window(earliest_time, latest_time)
     row_count = _safe_int(last_result.get("row_count"))
-    focus = _detect_conversation_focus(user_message, memory, tool_calls=tool_calls)
+    effective_assistant_response = str(assistant_response or memory.get("last_assistant_response", ""))
+    focus = _detect_conversation_focus(user_message, memory, tool_calls=tool_calls, assistant_response=effective_assistant_response)
     latest_summary = {}
     if tool_calls:
         last_call = next((call for call in reversed(tool_calls) if isinstance(call, dict)), {})
         latest_summary = last_call.get("summary", {}) if isinstance(last_call.get("summary", {}), dict) else {}
 
+    response_actions = _extract_response_follow_on_actions(effective_assistant_response)
     output_actions = _build_output_follow_on_actions(latest_summary, remembered_index, remembered_host, time_window_label)
     focus_actions = _build_focus_follow_on_actions(focus, remembered_index, remembered_host, time_window_label)
+
+    actions.extend(response_actions)
 
     if output_actions:
         actions.extend(output_actions)
@@ -1427,6 +1739,32 @@ def build_capability_usage_from_rag_result(rag_result: Dict[str, Any]) -> List[D
     ]
 
 
+def build_capability_usage_brief(capability_usage: Optional[List[Dict[str, Any]]], limit: int = 2) -> str:
+    """Render a brief retrieved-context section for report-backed responses."""
+    if not isinstance(capability_usage, list):
+        return ""
+
+    lines: List[str] = []
+    for usage in capability_usage:
+        if not isinstance(usage, dict):
+            continue
+        chunks = usage.get("chunks", []) if isinstance(usage.get("chunks", []), list) else []
+        for chunk in chunks[:limit]:
+            if not isinstance(chunk, dict):
+                continue
+            source = Path(str(chunk.get("source") or "artifact")).name or "artifact"
+            snippet = _compact_memory_text(chunk.get("snippet"), limit=180)
+            if snippet:
+                lines.append(f"- {source}: {snippet}")
+        if lines:
+            break
+
+    if not lines:
+        return ""
+
+    return "Indexed context signals:\n" + "\n".join(lines)
+
+
 def get_optional_rag_context(user_message: str, max_chunks: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
     """Return optional RAG context and normalized capability usage details."""
     rag_result = capability_manager.get_rag_context(user_message=user_message, max_chunks=max_chunks)
@@ -1477,14 +1815,29 @@ def detect_basic_inventory_intent(user_message: str, memory: Optional[Dict[str, 
     return None
 
 
+def should_bypass_basic_inventory_intent(request: Optional[Dict[str, Any]]) -> bool:
+    """Allow specialized chat launches to bypass short deterministic inventory routes."""
+    if not isinstance(request, dict):
+        return False
+
+    investigation_mode = str(request.get("investigation_mode") or "").strip().lower()
+    return investigation_mode in {"unknown_entity_context_builder", "context_explorer"}
+
+
 def extract_index_from_message(user_message: str) -> Optional[str]:
     """Extract index target from natural language."""
     if not isinstance(user_message, str):
         return None
+    quoted_name = r"['\"]?([a-zA-Z0-9_][a-zA-Z0-9_.-]*)['\"]?"
     patterns = [
-        r"index\s*[=:]?\s*([a-zA-Z0-9_\-.]+)",
-        r"in\s+index\s+([a-zA-Z0-9_\-.]+)",
-        r"for\s+index\s+([a-zA-Z0-9_\-.]+)",
+        rf"\bindex\s*[=:]\s*{quoted_name}\b",
+        rf"\bindex\s+{quoted_name}(?=\s*(?:\||earliest\s*=|latest\s*=|$))",
+        rf"\bin\s+index\s+{quoted_name}\b",
+        rf"\bfor\s+index\s+{quoted_name}\b",
+        rf"\bin(?:\s+the)?\s+{quoted_name}\s+index\b",
+        rf"\bfor(?:\s+the)?\s+{quoted_name}\s+index\b",
+        rf"\bfrom(?:\s+the)?\s+{quoted_name}\s+index\b",
+        rf"\bthe\s+{quoted_name}\s+index\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, user_message, flags=re.IGNORECASE)
@@ -1634,6 +1987,113 @@ def extract_spl_from_response_text(response_text: str) -> Optional[str]:
             return candidate
 
     return None
+
+
+def user_requested_spl_explanation(user_message: str) -> bool:
+    """Return True when the user explicitly asks to explain or understand a query before/while running it."""
+    if not isinstance(user_message, str) or not user_message.strip():
+        return False
+
+    message = user_message.lower()
+    explicit_phrases = [
+        "explain this query",
+        "explain this spl",
+        "understand this query",
+        "understand this spl",
+        "help me understand this query",
+        "help me understand this spl",
+        "walk me through this query",
+        "walk me through this spl",
+        "break down this query",
+        "break down this spl",
+        "what does this query do",
+        "what does this spl do",
+    ]
+    if any(phrase in message for phrase in explicit_phrases):
+        return True
+
+    asks_for_explanation = any(
+        phrase in message
+        for phrase in ["explain", "understand", "walk me through", "break down", "what does"]
+    )
+    references_query = any(token in message for token in [" query", " spl", "search ", "|"])
+    return asks_for_explanation and references_query
+
+
+def response_addresses_spl_explanation(response_text: str) -> bool:
+    """Heuristic check for whether a response actually explains what the SPL is doing."""
+    if not isinstance(response_text, str) or not response_text.strip():
+        return False
+
+    text = response_text.lower()
+    explanation_anchors = [
+        "this query",
+        "this spl",
+        "the query",
+        "the spl",
+    ]
+    explanation_actions = [
+        "searches",
+        "filters",
+        "limits",
+        "groups",
+        "counts",
+        "calculates",
+        "uses",
+        "looks for",
+        "narrows",
+        "aggregates",
+        "then it",
+        "the first part",
+        "the next part",
+        "the final part",
+        "in plain english",
+    ]
+
+    return (
+        any(phrase in text for phrase in explanation_anchors)
+        and any(phrase in text for phrase in explanation_actions)
+    )
+
+
+def build_spl_explanation_requirement(require_spl_explanation: bool) -> str:
+    """Return extra guidance for chat turns that must explain an SPL query."""
+    if not require_spl_explanation:
+        return ""
+
+    return """\nEXPLANATION REQUIREMENT:
+- The user explicitly asked you to explain or help them understand the SPL.
+- Your final answer must start with a plain-English explanation of what the SPL is doing.
+- Call out the major search terms, filters, pipes, and transforming commands.
+- Then summarize what happened when it ran, even if it returned no data or hit an error.
+"""
+
+
+def build_final_user_answer_prompt(
+    user_message: str,
+    insights_summary: str,
+    require_spl_explanation: bool = False,
+) -> str:
+    """Build the final user-facing answer prompt for post-tool chat responses."""
+    if require_spl_explanation:
+        instructions = """1. Start by explaining in plain English what the SPL is doing step by step.
+2. Call out the major search terms, filters, pipes, and transforming commands.
+3. Then summarize what happened when it ran, including specific data/numbers if available.
+4. End with any relevant context, caveats, or recommendations."""
+    else:
+        instructions = """1. Direct answer to their question with specific data/numbers
+2. Key findings and patterns you discovered
+3. Any relevant context or recommendations"""
+
+    return f"""You successfully investigated the user's question: \"{user_message}\"
+
+ACCUMULATED FINDINGS:
+{insights_summary}
+
+Now provide a COMPLETE, USER-FACING answer that includes:
+{instructions}
+
+Write as if speaking directly to the user (avoid phrases like \"I investigated\", \"I found\", \"I will\", etc.)."""
 
 
 def _recover_tool_call_from_tagged_payload(
@@ -1810,14 +2270,322 @@ Available tools:
 {available_tools_text}
 
 Rules:
-1) For data requests, execute tools rather than guessing.
-2) If one query returns no data, broaden time range once and try a nearby index.
-3) If still no data, explicitly say no data found and show what was tried.
-4) Keep answers concise and factual.
+1) Your primary expertise is DT4SMS, Splunk, discovery outputs, optional capabilities, and RAG context.
+2) You may answer broader questions directly, but do not claim tool-backed or environment-specific evidence unless it comes from the provided context or executed tools.
+3) When a session continuity gate is present, treat the current request as a follow-up unless the user clearly changes topic.
+4) For data requests, execute tools rather than guessing.
+5) If one query returns no data, broaden time range once and try a nearby index.
+6) If still no data, explicitly say no data found and show what was tried.
+7) Keep answers concise and factual.
 
 Tool call format (required when querying):
 <TOOL_CALL>{{"tool": "{query_tool_name}", "args": {{"query": "search index=main | head 5", "earliest_time": "-24h", "latest_time": "now"}}}}</TOOL_CALL>
 """
+
+
+BASIC_UTILITY_UNIT_TOKENS = (
+    "kb",
+    "mb",
+    "gb",
+    "tb",
+    "kib",
+    "mib",
+    "gib",
+    "tib",
+    "byte",
+    "bytes",
+    "second",
+    "seconds",
+    "sec",
+    "secs",
+    "minute",
+    "minutes",
+    "min",
+    "mins",
+    "hour",
+    "hours",
+    "hr",
+    "hrs",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+    "percent",
+    "percentage",
+)
+
+CHAT_SCOPE_PATTERNS = (
+    r"\bsplunk\b",
+    r"\bdt4sms\b",
+    r"\bmcp\b",
+    r"\brag\b",
+    r"\bartifact(?:s)?\b",
+    r"\bknowledge asset(?:s)?\b",
+    r"\bcontext preview\b",
+    r"\bcapabilit(?:y|ies)\b",
+    r"\bdeeplink(?:s)?\b",
+    r"\bvisualization(?: tools)?\b",
+    r"\bexport(?: tools| bundle| package)?\b",
+    r"\bdiscovery(?: artifact| artifacts| report| reports| finding| findings| summary| session| sessions)?\b",
+    r"\brunbook(?:s)?\b",
+    r"\boperator runbook\b",
+    r"\bsearch head\b",
+    r"\bforwarder(?:s)?\b",
+    r"\bindexer(?:s)?\b",
+    r"\bkv store\b",
+    r"\bsaved search(?:es)?\b",
+    r"\bdata model(?:s)?\b",
+    r"\bsourcetype(?:s)?\b",
+    r"\blookups?\b",
+    r"\bmacros?\b",
+    r"\bingestion\b",
+    r"\bscheduler\b",
+    r"\blicense\b",
+    r"\b_internal\b",
+    r"\b_audit\b",
+    r"\b_introspection\b",
+    r"\bwhat can (?:this tool|you) do\b",
+    r"\bwhat is (?:this tool|dt4sms) for\b",
+    r"\bwhat are you for\b",
+    r"\byour purpose\b",
+)
+
+CONTEXTUAL_ANALYSIS_TOKENS = (
+    "retention",
+    "disk",
+    "size",
+    "status",
+    "temperature",
+    "temp",
+    "alert",
+    "alerts",
+    "drift",
+    "sensor",
+    "healthy",
+    "online",
+    "offline",
+    "device",
+    "current",
+    "right now",
+    "volume",
+    "count",
+    "trend",
+    "breakdown",
+    "compare",
+    "query",
+    "search",
+    "event",
+    "events",
+    "host",
+    "index",
+    "sourcetype",
+    "latency",
+    "queue",
+    "queues",
+    "error",
+    "errors",
+    "failure",
+    "failures",
+    "exact",
+    "estimate",
+    "estimated",
+    "last seen",
+    "spike",
+    "spikes",
+)
+
+CONTEXTUAL_FOLLOW_UP_PATTERNS = (
+    r"\bwhat about\b",
+    r"\bhow about\b",
+    r"\btell me more\b",
+    r"\bgo deeper\b",
+    r"\bexpand that\b",
+    r"\bdrill into\b",
+    r"\bbreak that down\b",
+    r"\b(?:that|this|same)\s+(?:index|host|sourcetype|query|search|retention|disk|size|volume|count|trend|breakdown|window)\b",
+    r"\b(?:its|their|that|this)\s+(?:retention|disk|size|volume|count|trend|breakdown|last seen|latency|errors|failures)\b",
+    r"\b(?:7|14|30|60|90)-?day\b",
+)
+
+
+def is_basic_utility_chat_request(user_message: str) -> bool:
+    """Allow simple utility requests without turning chat into a general-purpose assistant."""
+    if not isinstance(user_message, str):
+        return False
+
+    lowered = re.sub(r"\s+", " ", user_message.lower()).strip()
+    if not lowered:
+        return False
+
+    if any(token in lowered for token in (
+        "splunk",
+        "dt4sms",
+        "rag",
+        "_internal",
+        "_audit",
+        "_introspection",
+        "index=",
+        "sourcetype",
+        "host=",
+        "knowledge asset",
+        "capability",
+        "ingestion",
+    )):
+        return False
+
+    expression_candidate = lowered.rstrip(" ?")
+    if re.fullmatch(r"(?:what(?:'s| is)\s+)?[-+/*().,%x=0-9\s]+", expression_candidate) and re.search(r"\d", expression_candidate):
+        return True
+
+    numeric_count = len(re.findall(r"\b\d+(?:\.\d+)?\b", lowered))
+    has_unit_token = any(token in lowered for token in BASIC_UTILITY_UNIT_TOKENS)
+    has_utility_keyword = any(re.search(pattern, lowered) for pattern in (
+        r"^what(?:'s| is)\b",
+        r"\bconvert\b",
+        r"\bconversion\b",
+        r"\bcalculate\b",
+        r"\bmath\b",
+        r"\bpercentage\b",
+        r"\bpercent\b",
+        r"\bdifference\b",
+        r"\bsum\b",
+        r"\baverage\b",
+        r"\bmean\b",
+        r"\bmedian\b",
+        r"\bmultiply\b",
+        r"\bdivide\b",
+        r"\bplus\b",
+        r"\bminus\b",
+        r"\btimes\b",
+        r"\bhow many\b",
+    ))
+
+    if numeric_count >= 2 and has_utility_keyword:
+        return True
+    if numeric_count >= 1 and has_unit_token and has_utility_keyword:
+        return True
+    if has_unit_token and re.match(r"^(what(?:'s| is)?|how many)\b", lowered):
+        return True
+    return False
+
+
+def is_contextual_follow_up_for_active_scope(user_message: str, memory: Optional[Dict[str, Any]] = None) -> bool:
+    """Allow ambiguous follow-ups to reach the LLM when an active Splunk investigation is already in progress."""
+    if not isinstance(user_message, str) or not isinstance(memory, dict):
+        return False
+
+    lowered = re.sub(r"\s+", " ", user_message.lower()).strip()
+    if not lowered:
+        return False
+
+    active_focus = str(memory.get("current_focus") or memory.get("primary_intent") or "").strip().lower()
+    entities = memory.get("entities", {}) if isinstance(memory.get("entities", {}), dict) else {}
+    has_scope_anchor = (
+        active_focus not in {"", "general"}
+        or any(entities.get(key) for key in ("indexes", "hosts", "sourcetypes", "sources"))
+        or bool(memory.get("last_result"))
+    )
+    if not has_scope_anchor:
+        return False
+
+    has_follow_up_shape = any(re.search(pattern, lowered) for pattern in CONTEXTUAL_FOLLOW_UP_PATTERNS)
+    has_analysis_token = any(token in lowered for token in CONTEXTUAL_ANALYSIS_TOKENS)
+    memory_anchor_candidates: List[str] = []
+    memory_anchor_candidates.extend(
+        item for item in memory.get("locations", [])[-6:]
+        if isinstance(item, str) and item.strip()
+    )
+    entities = memory.get("entities", {}) if isinstance(memory.get("entities", {}), dict) else {}
+    for key in ("indexes", "hosts", "sourcetypes", "sources"):
+        memory_anchor_candidates.extend(
+            item for item in entities.get(key, [])[-6:]
+            if isinstance(item, str) and item.strip()
+        )
+    memory_anchor_match = any(
+        candidate.lower() in lowered
+        for candidate in memory_anchor_candidates
+        if isinstance(candidate, str) and len(candidate.strip()) >= 3
+    )
+
+    if has_follow_up_shape and has_analysis_token:
+        return True
+
+    if memory_anchor_match and (has_analysis_token or len(lowered.split()) <= 10):
+        return True
+
+    # Very short analytic follow-ups often omit the noun entirely after a scoped turn.
+    if len(lowered.split()) <= 8 and active_focus not in {"", "general"} and has_analysis_token:
+        return True
+
+    return False
+
+
+def is_scope_relevant_chat_request(
+    user_message: str,
+    report_knowledge: Optional[Dict[str, Any]] = None,
+    memory: Optional[Dict[str, Any]] = None,
+    report_intent: Optional[str] = None,
+) -> bool:
+    """Return True when a chat request is within DT4SMS/Splunk scope."""
+    if not isinstance(user_message, str):
+        return False
+
+    if report_intent:
+        return True
+    if detect_basic_inventory_intent(user_message, memory):
+        return True
+    if is_contextual_follow_up_for_active_scope(user_message, memory):
+        return True
+    if detect_latest_entry_index_request(user_message) or detect_last_offline_target(user_message) or detect_edge_processor_template_request(user_message):
+        return True
+    if extract_index_from_message(user_message) or extract_host_or_ip_from_message(user_message):
+        return True
+
+    lowered = user_message.lower()
+    if any(re.search(pattern, lowered) for pattern in CHAT_SCOPE_PATTERNS):
+        return True
+
+    if isinstance(report_knowledge, dict):
+        known_entities = report_knowledge.get("known_entities", {}) if isinstance(report_knowledge.get("known_entities", {}), dict) else {}
+        for key in ("indexes", "sourcetypes", "hosts", "sources"):
+            if _known_entity_matches(user_message, known_entities.get(key, []), limit=1):
+                return True
+
+    return False
+
+
+def build_scope_redirect_response() -> str:
+    """Return a concise reminder that chat is scoped to DT4SMS and Splunk work."""
+    return (
+        "I'm here to help with DT4SMS, Splunk investigations, discovery findings, optional capabilities, RAG context, and related operational questions. "
+        "Small utility asks like basic math or unit conversions are fine, but this chat is not meant to be a general-purpose AI resource. "
+        "Ask me about searches, indexes, sourcetypes, platform health, discovery recommendations, RAG assets, or capability configuration."
+    )
+
+
+def build_scope_redirect_follow_on_actions() -> List[Dict[str, str]]:
+    """Provide a few in-scope prompts when chat redirects an unrelated request."""
+    return [
+        _make_follow_on_action(
+            "Explain DT4SMS scope",
+            "What can this tool help me do across Splunk, discovery outputs, capabilities, and the RAG workspace?",
+            "scope_redirect",
+        ),
+        _make_follow_on_action(
+            "Check platform health",
+            "Check Splunk platform health in _internal, _audit, and _introspection over the last 24 hours and summarize ingestion issues, search failures, and license signals.",
+            "scope_redirect",
+        ),
+        _make_follow_on_action(
+            "List available indexes",
+            "List the Splunk indexes available in this environment.",
+            "scope_redirect",
+        ),
+    ]
 
 
 def _discovery_session_manifest_path() -> Path:
@@ -1826,23 +2594,277 @@ def _discovery_session_manifest_path() -> Path:
     return output_dir / "discovery_sessions.json"
 
 
+def _summary_infographic_dir() -> Path:
+    return Path("output") / SUMMARY_INFOGRAPHIC_DIRNAME
+
+
+def _extract_session_timestamp_from_artifact_name(filename: str) -> Optional[str]:
+    safe_name = Path(str(filename or "")).name
+    infographic_match = re.match(
+        rf"^{SUMMARY_INFOGRAPHIC_PREFIX}(\d{{8}}_\d{{6}})(?:_\d{{8}}_\d{{6}})?\.[A-Za-z0-9]+$",
+        safe_name,
+    )
+    if infographic_match:
+        return infographic_match.group(1)
+
+    if safe_name.startswith(SUMMARY_INFOGRAPHIC_PREFIX):
+        return None
+
+    generic_matches = re.findall(r"(\d{8}_\d{6})", safe_name)
+    if generic_matches:
+        return generic_matches[0]
+    return None
+
+
+def _build_artifact_metadata(file_path: Path) -> Dict[str, Any]:
+    modified_iso = datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+    size_bytes = file_path.stat().st_size
+    artifact_name = file_path.name
+    artifact_suffix = file_path.suffix[1:].lower() if file_path.suffix else "unknown"
+    artifact_kind = "infographic" if artifact_name.startswith(SUMMARY_INFOGRAPHIC_PREFIX) else "report"
+    return {
+        "name": artifact_name,
+        "path": str(file_path),
+        "size": size_bytes,
+        "size_bytes": size_bytes,
+        "modified": modified_iso,
+        "modified_at": modified_iso,
+        "type": artifact_suffix,
+        "artifact_kind": artifact_kind,
+        "session_timestamp": _extract_session_timestamp_from_artifact_name(artifact_name),
+    }
+
+
+def _iter_catalog_artifact_paths() -> List[Path]:
+    output_dir = Path("output")
+    artifact_paths: List[Path] = []
+    if output_dir.exists():
+        artifact_paths.extend(path for path in output_dir.glob("v2_*") if path.is_file())
+
+    infographic_dir = _summary_infographic_dir()
+    if infographic_dir.exists():
+        artifact_paths.extend(
+            path
+            for path in infographic_dir.glob(f"{SUMMARY_INFOGRAPHIC_PREFIX}*")
+            if path.is_file()
+            and path.suffix.lower() in IMAGE_ARTIFACT_EXTENSIONS
+            and _extract_session_timestamp_from_artifact_name(path.name)
+        )
+
+    return sorted(artifact_paths, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def _resolve_output_artifact_path(filename: str) -> Path:
+    safe_filename = sanitize_filename(filename)
+    output_dir = Path("output").resolve()
+    candidate_paths = [
+        (Path("output") / safe_filename).resolve(),
+        (_summary_infographic_dir() / safe_filename).resolve(),
+    ]
+    for candidate in candidate_paths:
+        if not candidate.is_relative_to(output_dir):
+            continue
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    raise HTTPException(status_code=404, detail="Report not found")
+
+
+def _find_existing_summary_infographic(timestamp: str) -> Optional[Path]:
+    safe_timestamp = str(timestamp or "").strip()
+    if not safe_timestamp:
+        return None
+
+    infographic_dir = _summary_infographic_dir()
+    if not infographic_dir.exists():
+        return None
+
+    matches = sorted(
+        infographic_dir.glob(f"{SUMMARY_INFOGRAPHIC_PREFIX}{safe_timestamp}_*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for match in matches:
+        if match.is_file() and match.suffix.lower() in IMAGE_ARTIFACT_EXTENSIONS:
+            return match
+    return None
+
+
+def _ensure_session_artifact_registered(timestamp: str, artifact_name: str) -> None:
+    safe_timestamp = str(timestamp or "").strip()
+    safe_artifact_name = Path(str(artifact_name or "")).name
+    if not safe_timestamp or not safe_artifact_name:
+        return
+    if _extract_session_timestamp_from_artifact_name(safe_artifact_name) != safe_timestamp:
+        return
+
+    sessions = load_discovery_sessions()
+    changed = False
+    session_record = next((session for session in sessions if str(session.get("timestamp") or "") == safe_timestamp), None)
+    if session_record is None:
+        session_record = {
+            "timestamp": safe_timestamp,
+            "created_at": datetime.now().isoformat(),
+            "overview": {},
+            "report_paths": [],
+            "mcp_capabilities": {},
+            "stats": {
+                "discovery_steps": 0,
+                "classification_groups": 0,
+                "recommendation_count": 0,
+                "suggested_use_case_count": 0,
+            },
+        }
+        sessions.append(session_record)
+        changed = True
+
+    report_paths = session_record.setdefault("report_paths", [])
+    if safe_artifact_name not in report_paths:
+        report_paths.append(safe_artifact_name)
+        changed = True
+
+    if changed:
+        sessions = sorted(sessions, key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+        save_discovery_sessions(sessions[:100])
+
+
+def _session_has_meaningful_discovery_data(session: Dict[str, Any]) -> bool:
+    if not isinstance(session, dict):
+        return False
+
+    overview = session.get("overview", {})
+    if isinstance(overview, dict) and any(value not in (None, "", [], {}, 0) for value in overview.values()):
+        return True
+
+    personas = session.get("personas", {})
+    if isinstance(personas, dict) and any(personas.values()):
+        return True
+
+    mcp_capabilities = session.get("mcp_capabilities", {})
+    if isinstance(mcp_capabilities, dict) and any(mcp_capabilities.values()):
+        return True
+
+    readiness_score = session.get("readiness_score")
+    if readiness_score not in (None, "", 0):
+        return True
+
+    stats = session.get("stats", {})
+    if isinstance(stats, dict):
+        for value in stats.values():
+            try:
+                if int(value) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+
+    return False
+
+
+def _normalize_discovery_sessions(sessions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+    normalized_sessions: List[Dict[str, Any]] = []
+    changed = False
+
+    for session in sessions:
+        if not isinstance(session, dict):
+            changed = True
+            continue
+
+        timestamp = str(session.get("timestamp") or "").strip()
+        if not timestamp:
+            changed = True
+            continue
+
+        raw_report_paths = session.get("report_paths", [])
+        report_paths = raw_report_paths if isinstance(raw_report_paths, list) else []
+        clean_report_paths: List[str] = []
+
+        for report_name in report_paths:
+            safe_report_name = Path(str(report_name or "")).name
+            if not safe_report_name:
+                changed = True
+                continue
+            if _extract_session_timestamp_from_artifact_name(safe_report_name) != timestamp:
+                changed = True
+                continue
+            try:
+                _resolve_output_artifact_path(safe_report_name)
+            except HTTPException:
+                changed = True
+                continue
+            if safe_report_name not in clean_report_paths:
+                clean_report_paths.append(safe_report_name)
+            else:
+                changed = True
+
+        normalized_session = dict(session)
+        if clean_report_paths != report_paths:
+            normalized_session["report_paths"] = clean_report_paths
+            changed = True
+
+        if not clean_report_paths and not _session_has_meaningful_discovery_data(normalized_session):
+            changed = True
+            continue
+
+        normalized_sessions.append(normalized_session)
+
+    normalized_sessions.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    if len(normalized_sessions) > 100:
+        changed = True
+    return normalized_sessions[:100], changed
+
+
+def _augment_sessions_with_catalog_artifacts(sessions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+    sessions, changed = _normalize_discovery_sessions(sessions)
+    sessions_by_timestamp: Dict[str, Dict[str, Any]] = {
+        str(session.get("timestamp") or ""): session
+        for session in sessions
+        if isinstance(session, dict) and str(session.get("timestamp") or "").strip()
+    }
+
+    for artifact_path in _iter_catalog_artifact_paths():
+        timestamp = _extract_session_timestamp_from_artifact_name(artifact_path.name)
+        if not timestamp:
+            continue
+        session_entry = sessions_by_timestamp.get(timestamp)
+        if session_entry is None:
+            session_entry = {
+                "timestamp": timestamp,
+                "created_at": datetime.fromtimestamp(artifact_path.stat().st_mtime).isoformat(),
+                "overview": {},
+                "report_paths": [],
+                "mcp_capabilities": {},
+                "stats": {
+                    "discovery_steps": 0,
+                    "classification_groups": 0,
+                    "recommendation_count": 0,
+                    "suggested_use_case_count": 0,
+                },
+            }
+            sessions.append(session_entry)
+            sessions_by_timestamp[timestamp] = session_entry
+            changed = True
+
+        report_paths = session_entry.setdefault("report_paths", [])
+        if artifact_path.name not in report_paths:
+            report_paths.append(artifact_path.name)
+            changed = True
+
+    sessions.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    return sessions[:100], changed
+
+
 def load_discovery_sessions() -> List[Dict[str, Any]]:
     """Load persisted discovery session catalog."""
     manifest_path = _discovery_session_manifest_path()
     if not manifest_path.exists():
         # Backfill from existing report files for legacy runs
-        output_dir = Path("output")
-        if not output_dir.exists():
+        if not Path("output").exists():
             return []
 
         sessions_by_timestamp: Dict[str, Dict[str, Any]] = {}
-        for file_path in output_dir.glob("*"):
-            if not file_path.is_file():
+        for file_path in _iter_catalog_artifact_paths():
+            timestamp = _extract_session_timestamp_from_artifact_name(file_path.name)
+            if not timestamp:
                 continue
-            match = re.search(r"_(\d{8}_\d{6})\.", file_path.name)
-            if not match:
-                continue
-            timestamp = match.group(1)
             entry = sessions_by_timestamp.setdefault(timestamp, {
                 "timestamp": timestamp,
                 "created_at": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
@@ -1858,7 +2880,9 @@ def load_discovery_sessions() -> List[Dict[str, Any]]:
             })
             entry["report_paths"].append(file_path.name)
 
-        reconstructed = sorted(sessions_by_timestamp.values(), key=lambda x: x.get("timestamp", ""), reverse=True)
+        reconstructed, changed = _augment_sessions_with_catalog_artifacts(
+            sorted(sessions_by_timestamp.values(), key=lambda x: x.get("timestamp", ""), reverse=True)
+        )
         if reconstructed:
             save_discovery_sessions(reconstructed)
         return reconstructed
@@ -1867,7 +2891,10 @@ def load_discovery_sessions() -> List[Dict[str, Any]]:
         with open(manifest_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return data
+            augmented_sessions, changed = _augment_sessions_with_catalog_artifacts(data)
+            if changed:
+                save_discovery_sessions(augmented_sessions)
+            return augmented_sessions
     except Exception:
         pass
 
@@ -1967,6 +2994,176 @@ def compute_discovery_readiness_score(
     score += min(15, recommendation_count * 2)
     score += min(10, use_case_count * 2)
     return max(0, min(100, score))
+
+
+def build_context_explorer_payload(
+    discovery_data: Optional[Dict[str, Any]],
+    unknown_questions: Optional[List[Dict[str, Any]]] = None,
+    admin_tasks: Optional[List[Dict[str, Any]]] = None,
+    coverage_gaps: Optional[List[Dict[str, Any]]] = None,
+    risk_register: Optional[List[Dict[str, Any]]] = None,
+    readiness_score: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build a session-scoped context explorer payload from discovery artifacts."""
+    if not isinstance(discovery_data, dict):
+        return {
+            "overview": {},
+            "anchors": {"indexes": [], "sourcetypes": [], "hosts": []},
+            "patterns": [],
+            "lanes": {
+                "unknown_entities": [],
+                "coverage_gaps": [],
+                "risks": [],
+                "priority_tasks": [],
+            },
+        }
+
+    overview = discovery_data.get("overview", {}) if isinstance(discovery_data.get("overview", {}), dict) else {}
+    finding_ledger = discovery_data.get("finding_ledger", []) if isinstance(discovery_data.get("finding_ledger", []), list) else []
+
+    indexes: List[Dict[str, Any]] = []
+    sourcetypes: List[Dict[str, Any]] = []
+    hosts: List[Dict[str, Any]] = []
+    seen_index_names: set[str] = set()
+    seen_sourcetype_names: set[str] = set()
+    seen_host_names: set[str] = set()
+
+    for entry in finding_ledger:
+        if not isinstance(entry, dict):
+            continue
+
+        data = entry.get("data", {}) if isinstance(entry.get("data", {}), dict) else {}
+        if not data:
+            continue
+
+        index_name = str(data.get("title", "")).strip()
+        if index_name and "totalEventCount" in data and str(data.get("disabled", "0")) != "1":
+            lowered_index = index_name.lower()
+            if lowered_index not in seen_index_names:
+                seen_index_names.add(lowered_index)
+                indexes.append({
+                    "name": index_name,
+                    "events": _safe_int(data.get("totalEventCount", 0)),
+                    "size_mb": float(data.get("currentDBSizeMB", 0) or 0),
+                    "datatype": str(data.get("datatype", "event") or "event"),
+                    "max_time": data.get("maxTime") or data.get("lastTimeIso") or "",
+                })
+
+        sourcetype_name = data.get("sourcetype")
+        if not sourcetype_name and str(data.get("type", "")).lower() in {"sourcetypes", "source_types"}:
+            sourcetype_name = data.get("title")
+        if isinstance(sourcetype_name, str) and sourcetype_name.strip():
+            normalized_sourcetype = sourcetype_name.strip()
+            lowered_sourcetype = normalized_sourcetype.lower()
+            if lowered_sourcetype not in seen_sourcetype_names:
+                seen_sourcetype_names.add(lowered_sourcetype)
+                sourcetypes.append({
+                    "name": normalized_sourcetype,
+                    "events": _safe_int(data.get("totalCount") or data.get("count") or data.get("eventCount")),
+                    "recent_time": data.get("recentTimeIso") or data.get("lastTimeIso") or "",
+                })
+
+        host_name = data.get("host") or data.get("hostname")
+        descriptor = str(entry.get("title") or entry.get("description") or "")
+        if not host_name and "Analyzing host:" in descriptor:
+            host_name = data.get("title")
+        if isinstance(host_name, str) and host_name.strip():
+            normalized_host = host_name.strip()
+            lowered_host = normalized_host.lower()
+            if lowered_host not in seen_host_names:
+                seen_host_names.add(lowered_host)
+                hosts.append({
+                    "name": normalized_host,
+                    "events": _safe_int(data.get("totalCount") or data.get("count") or data.get("eventCount")),
+                })
+
+    indexes.sort(key=lambda item: item.get("events", 0), reverse=True)
+    sourcetypes.sort(key=lambda item: item.get("events", 0), reverse=True)
+    hosts.sort(key=lambda item: item.get("events", 0), reverse=True)
+
+    normalized_patterns: List[Dict[str, str]] = []
+    raw_patterns = overview.get("notable_patterns", []) if isinstance(overview.get("notable_patterns", []), list) else []
+    seen_pattern_titles = set()
+    for raw_pattern in raw_patterns:
+        payload = raw_pattern
+        if isinstance(raw_pattern, str):
+            try:
+                payload = json.loads(raw_pattern)
+            except Exception:
+                payload = {"patterns": [{"title": raw_pattern}]}
+
+        if isinstance(payload, dict) and isinstance(payload.get("patterns"), list):
+            pattern_items = payload.get("patterns", [])
+        else:
+            pattern_items = [payload]
+
+        for pattern in pattern_items:
+            title = ""
+            description = ""
+            signal = ""
+            if isinstance(pattern, dict):
+                title = str(pattern.get("title") or pattern.get("name") or pattern.get("pattern") or pattern.get("signal") or "").strip()
+                description = str(pattern.get("description") or pattern.get("summary") or pattern.get("insight") or "").strip()
+                evidence = pattern.get("evidence")
+                if isinstance(evidence, list):
+                    signal = ", ".join([str(item).strip() for item in evidence[:2] if str(item).strip()])
+                elif isinstance(evidence, str):
+                    signal = evidence.strip()
+            elif isinstance(pattern, str):
+                title = pattern.strip()
+
+            if not title:
+                continue
+
+            lowered_title = title.lower()
+            if lowered_title in seen_pattern_titles:
+                continue
+            seen_pattern_titles.add(lowered_title)
+            normalized_patterns.append({
+                "title": title,
+                "description": description,
+                "signal": signal,
+            })
+            if len(normalized_patterns) >= 6:
+                break
+        if len(normalized_patterns) >= 6:
+            break
+
+    safe_unknowns = [item for item in (unknown_questions or []) if isinstance(item, dict)]
+    safe_gaps = [item for item in (coverage_gaps or discovery_data.get("coverage_gaps", []) or []) if isinstance(item, dict)]
+    safe_risks = [item for item in (risk_register or discovery_data.get("risk_register", []) or []) if isinstance(item, dict)]
+    safe_tasks = [item for item in (admin_tasks or []) if isinstance(item, dict)]
+
+    return {
+        "overview": {
+            "readiness_score": _safe_int(readiness_score if readiness_score is not None else discovery_data.get("readiness_score")),
+            "total_indexes": _safe_int(overview.get("total_indexes", len(indexes))),
+            "total_sourcetypes": _safe_int(overview.get("total_sourcetypes", len(sourcetypes))),
+            "total_hosts": _safe_int(overview.get("total_hosts", len(hosts))),
+            "data_volume_24h": str(overview.get("data_volume_24h", "unknown") or "unknown"),
+            "license_state": str(overview.get("license_state", "unknown") or "unknown"),
+        },
+        "anchors": {
+            "indexes": indexes[:8],
+            "sourcetypes": sourcetypes[:8],
+            "hosts": hosts[:8],
+        },
+        "patterns": normalized_patterns[:6],
+        "lanes": {
+            "unknown_entities": safe_unknowns[:6],
+            "coverage_gaps": safe_gaps[:6],
+            "risks": safe_risks[:6],
+            "priority_tasks": [
+                {
+                    "title": str(task.get("title") or "Untitled task"),
+                    "priority": str(task.get("priority") or "MEDIUM"),
+                    "category": str(task.get("category") or "General"),
+                    "finding_reference": str(task.get("finding_reference") or ""),
+                }
+                for task in safe_tasks[:6]
+            ],
+        },
+    }
 
 
 def build_persona_playbooks(
@@ -2408,21 +3605,7 @@ def build_v2_artifact_catalog() -> Dict[str, Any]:
     if not output_dir.exists():
         return {"has_data": False, "artifacts": []}
 
-    artifacts = []
-    for file_path in sorted(output_dir.glob("v2_*"), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not file_path.is_file():
-            continue
-        modified_iso = datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
-        size_bytes = file_path.stat().st_size
-        artifacts.append({
-            "name": file_path.name,
-            "type": file_path.suffix[1:] if file_path.suffix else "unknown",
-            "size": size_bytes,
-            "size_bytes": size_bytes,
-            "modified": modified_iso,
-            "modified_at": modified_iso,
-            "path": str(file_path)
-        })
+    artifacts = [_build_artifact_metadata(file_path) for file_path in _iter_catalog_artifact_paths()]
 
     return {
         "has_data": len(artifacts) > 0,
@@ -2614,7 +3797,7 @@ def sanitize_filename(filename: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid filename format")
     
     # Validate file extension
-    allowed_extensions = ['.md', '.json', '.txt']
+    allowed_extensions = ['.md', '.json', '.txt', '.png', '.jpg', '.jpeg', '.webp', '.gif']
     if not any(filename.endswith(ext) for ext in allowed_extensions):
         raise HTTPException(status_code=400, detail="Invalid file extension")
     
@@ -3036,7 +4219,6 @@ async def run_discovery():
         display.info("🔄 Generating report files...")
         
         # Generate timestamp for this session
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Create output directory if it doesn't exist
@@ -3452,16 +4634,7 @@ async def list_reports():
     if not output_dir.exists():
         return {"reports": [], "sessions": []}
     
-    reports = []
-    for file_path in output_dir.glob("v2_*"):
-        if file_path.is_file():
-            reports.append({
-                "name": file_path.name,
-                "path": str(file_path),
-                "size": file_path.stat().st_size,
-                "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
-                "type": file_path.suffix[1:] if file_path.suffix else "unknown"
-            })
+    reports = [_build_artifact_metadata(file_path) for file_path in _iter_catalog_artifact_paths()]
     
     sessions = load_discovery_sessions()
     return {
@@ -3488,15 +4661,19 @@ async def get_discovery_session(timestamp: str):
     if not session:
         raise HTTPException(status_code=404, detail="Discovery session not found")
 
-    output_dir = Path("output")
     files = []
     for report_name in session.get("report_paths", []):
-        report_path = output_dir / report_name
+        try:
+            report_path = _resolve_output_artifact_path(report_name)
+        except HTTPException:
+            report_path = None
         files.append({
             "name": report_name,
-            "exists": report_path.exists(),
-            "size": report_path.stat().st_size if report_path.exists() else 0,
-            "modified": datetime.fromtimestamp(report_path.stat().st_mtime).isoformat() if report_path.exists() else None
+            "exists": report_path.exists() if report_path else False,
+            "size": report_path.stat().st_size if report_path and report_path.exists() else 0,
+            "modified": datetime.fromtimestamp(report_path.stat().st_mtime).isoformat() if report_path and report_path.exists() else None,
+            "type": report_path.suffix[1:].lower() if report_path and report_path.suffix else "unknown",
+            "artifact_kind": "infographic" if report_name.startswith(SUMMARY_INFOGRAPHIC_PREFIX) else "report",
         })
 
     return {
@@ -3561,21 +4738,19 @@ async def get_discovery_results():
 async def get_report(filename: str):
     """Get a specific report file with security validation."""
     try:
-        # Security: Sanitize filename to prevent path traversal
-        safe_filename = sanitize_filename(filename)
-        file_path = Path("output") / safe_filename
-        
-        # Security: Ensure file is within output directory
-        if not file_path.resolve().is_relative_to(Path("output").resolve()):
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        if not file_path.exists():
-            raise HTTPException(status_code=404, detail="Report not found")
+        file_path = _resolve_output_artifact_path(filename)
         
         if file_path.suffix.lower() == ".json":
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = json.load(f)
             return {"content": content, "type": "json"}
+        if file_path.suffix.lower() in IMAGE_ARTIFACT_EXTENSIONS:
+            image_format = 'jpeg' if file_path.suffix.lower() == '.jpg' else file_path.suffix[1:].lower()
+            return {
+                "type": "image",
+                "mime_type": f"image/{image_format}",
+                "content_base64": base64.b64encode(file_path.read_bytes()).decode('ascii'),
+            }
         else:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -3684,6 +4859,190 @@ class CapabilityExportBuildRequest(BaseModel):
     runbook_markdown: Optional[str] = None
     runbook_filename: Optional[str] = None
 
+
+class RAGKnowledgeAssetImportRequest(BaseModel):
+    title: str
+    content: str
+    asset_type: str = "reference_document"
+    source_label: Optional[str] = None
+    description: Optional[str] = None
+    tags: List[str] = []
+
+
+class RAGContextPreviewRequest(BaseModel):
+    query: str
+    limit: int = 4
+
+
+class SummaryInfographicRequest(BaseModel):
+    timestamp: str
+    summary_data: Dict[str, Any] = {}
+
+
+def _parse_knowledge_asset_tags(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in re.split(r"[,\n]", str(value or "")) if item.strip()]
+
+
+def normalize_openai_api_base_url(endpoint_url: Optional[str]) -> str:
+    """Normalize an OpenAI endpoint to a reusable API base path."""
+    normalized_base = (endpoint_url or "https://api.openai.com/v1").rstrip("/")
+    for suffix in ["/chat/completions", "/responses", "/models", "/images/generations"]:
+        if normalized_base.endswith(suffix):
+            normalized_base = normalized_base[:-len(suffix)]
+    return normalized_base
+
+
+def build_openai_api_url(endpoint_url: Optional[str], path: str) -> str:
+    """Build a full OpenAI REST URL while tolerating base or full-path config values."""
+    normalized_path = "/" + str(path or "").lstrip("/")
+    base_url = normalize_openai_api_base_url(endpoint_url)
+    if base_url.endswith("/v1"):
+        return f"{base_url}{normalized_path}"
+    return f"{base_url}/v1{normalized_path}"
+
+
+def openai_model_ids_include(model_ids: Any, target_model: str) -> bool:
+    """Return True when the target model ID exists in an OpenAI models payload."""
+    target = str(target_model or "").strip().lower()
+    if not target:
+        return False
+
+    for model_id in model_ids or []:
+        if isinstance(model_id, str) and model_id.strip().lower() == target:
+            return True
+    return False
+
+
+def _compact_summary_entries(items: Any, limit: int, keys: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    compact_items: List[Dict[str, Any]] = []
+    if not isinstance(items, list):
+        return compact_items
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        compact_item: Dict[str, Any] = {}
+        for key in keys:
+            value = item.get(key)
+            if value in (None, "", [], {}):
+                continue
+            compact_item[key] = value
+        if compact_item:
+            compact_items.append(compact_item)
+        if len(compact_items) >= limit:
+            break
+    return compact_items
+
+
+def truncate_prompt_text(value: str, max_chars: int, suffix: str = "\n... [truncated for API safety]") -> str:
+    """Trim prompt fragments to a safe size while leaving a visible truncation marker."""
+    text = str(value or "")
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(suffix):
+        return text[:max_chars]
+    return text[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def build_summary_infographic_brief(timestamp: str, summary_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Create a compact, image-oriented brief from the full summary payload."""
+    payload = summary_data if isinstance(summary_data, dict) else {}
+    v2_context = payload.get("v2_context") if isinstance(payload.get("v2_context"), dict) else {}
+    context_explorer = payload.get("context_explorer") if isinstance(payload.get("context_explorer"), dict) else {}
+    context_anchors = context_explorer.get("anchors") if isinstance(context_explorer.get("anchors"), dict) else {}
+    context_lanes = context_explorer.get("lanes") if isinstance(context_explorer.get("lanes"), dict) else {}
+
+    return {
+        "session_id": timestamp,
+        "report_title": "DT4SMS Executive Summary",
+        "readiness_score": payload.get("readiness_score", v2_context.get("readiness_score")),
+        "executive_summary": str(payload.get("ai_summary") or "").strip(),
+        "stats": payload.get("stats") if isinstance(payload.get("stats"), dict) else {},
+        "trend_signals": payload.get("trend_signals") if isinstance(payload.get("trend_signals"), dict) else {},
+        "risk_register": _compact_summary_entries(payload.get("risk_register"), 6, ("severity", "domain", "risk", "impact", "mitigation")),
+        "coverage_gaps": _compact_summary_entries(payload.get("coverage_gaps"), 6, ("priority", "domain", "gap", "recommended_action", "impact")),
+        "priority_tasks": _compact_summary_entries(payload.get("admin_tasks"), 6, ("priority", "category", "title", "description", "impact")),
+        "unknown_data": _compact_summary_entries(payload.get("unknown_data"), 8, ("type", "name", "question")),
+        "spl_queries": _compact_summary_entries(payload.get("spl_queries"), 8, ("title", "category", "finding_reference", "query_source", "spl")),
+        "context_explorer": {
+            "overview": context_explorer.get("overview") if isinstance(context_explorer.get("overview"), dict) else {},
+            "patterns": context_explorer.get("patterns", [])[:6] if isinstance(context_explorer.get("patterns"), list) else [],
+            "anchors": {
+                "indexes": _compact_summary_entries(context_anchors.get("indexes"), 8, ("name", "volume_category", "count", "reason")),
+                "sourcetypes": _compact_summary_entries(context_anchors.get("sourcetypes"), 8, ("name", "volume_category", "count", "reason")),
+                "hosts": _compact_summary_entries(context_anchors.get("hosts"), 8, ("name", "count", "reason")),
+            },
+            "lanes": {
+                "unknown_entities": _compact_summary_entries(context_lanes.get("unknown_entities"), 6, ("type", "name", "question")),
+                "coverage_gaps": _compact_summary_entries(context_lanes.get("coverage_gaps"), 6, ("priority", "gap", "recommended_action")),
+                "risks": _compact_summary_entries(context_lanes.get("risks"), 6, ("severity", "risk", "impact")),
+                "priority_tasks": _compact_summary_entries(context_lanes.get("priority_tasks"), 6, ("priority", "title", "category", "impact")),
+            },
+        },
+    }
+
+
+def build_summary_infographic_prompt(timestamp: str, summary_data: Optional[Dict[str, Any]]) -> str:
+    """Build a rich prompt for turning the summary into a single infographic."""
+    payload = summary_data if isinstance(summary_data, dict) else {}
+    brief = build_summary_infographic_brief(timestamp, payload)
+    brief_json = truncate_prompt_text(
+        json.dumps(brief, indent=2, ensure_ascii=False),
+        MAX_INFOGRAPHIC_BRIEF_CHARS,
+    )
+    prompt_prefix = f"""Create a polished single-page infographic poster for a Splunk discovery executive report.
+
+Goal:
+- Turn the supplied DT4SMS summary into an executive-ready infographic.
+- Keep every fact anchored to the provided summary.
+- Prefer clear sectioning, concise labels, and high information density.
+- Do not invent vendors, data sources, metrics, logos, incident claims, or counts that are not in the source material.
+
+Design direction:
+- Modern enterprise operations and security briefing board
+- One-page landscape infographic
+- Strong title hierarchy, summary KPI band, risks, coverage gaps, action queue, and next review loop
+- Mix cards, labeled callouts, a simple process band, and tasteful analytical visuals where useful
+- Use a restrained palette with indigo, slate, amber, red, and emerald accents
+- Make it visually impressive but operational, not playful
+- Render all text cleanly and legibly in English
+
+Must include when available:
+- Session identifier
+- Readiness score and top operating signals
+- Priority actions and quick wins
+- Risk register highlights
+- Coverage gaps
+- Priority tasks and action queue
+- Context explorer anchors or patterns
+- Recursive or next-loop guidance
+
+Output constraints:
+- Single image only
+- No screenshots, browser chrome, or fake application UI
+- No fabricated percentages or extra counts
+- If an item is unclear, omit it rather than hallucinating
+- Keep names of indexes, sourcetypes, tasks, and control areas exact
+
+Session ID: {timestamp}
+
+Curated brief:
+{brief_json}
+
+Full summary payload (truncated only if needed for API safety):
+"""
+    full_payload_budget = max(0, MAX_INFOGRAPHIC_SUMMARY_CHARS - len(prompt_prefix))
+    full_payload = truncate_prompt_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        full_payload_budget,
+        "\n... [summary payload truncated for API safety]",
+    )
+    return f"{prompt_prefix}{full_payload}"
+
 @app.get("/api/config")
 async def get_config():
     """Get current configuration (safe export with masked secrets)"""
@@ -3788,6 +5147,103 @@ async def get_capability_health():
             for name, state in capabilities.items()
         },
     }
+
+
+@app.get("/api/capabilities/rag/assets")
+async def list_rag_assets():
+    """List user-managed knowledge assets for indexed retrieval."""
+    result = capability_manager.list_rag_assets("rag_chromadb").to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.get("/api/capabilities/rag/assets/{asset_id}")
+async def get_rag_asset_detail(asset_id: str):
+    """Load stored-section and chunk-browser detail for one managed knowledge asset."""
+    result = capability_manager.get_rag_asset_detail("rag_chromadb", asset_id).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/rag/assets/import/text")
+async def import_rag_text_asset(import_request: RAGKnowledgeAssetImportRequest):
+    """Import a pasted text asset into the managed RAG asset plane."""
+    result = capability_manager.import_rag_text_asset(
+        "rag_chromadb",
+        {
+            "title": import_request.title,
+            "content": import_request.content,
+            "asset_type": import_request.asset_type,
+            "source_label": import_request.source_label,
+            "description": import_request.description,
+            "tags": list(import_request.tags or []),
+        },
+    ).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/rag/assets/import/file")
+async def import_rag_file_asset(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(default=None),
+    asset_type: str = Form(default="reference_document"),
+    source_label: Optional[str] = Form(default=None),
+    description: Optional[str] = Form(default=None),
+    tags: str = Form(default=""),
+):
+    """Import a supported file as a managed RAG knowledge asset."""
+    payload = await file.read()
+    result = capability_manager.import_rag_file_asset(
+        "rag_chromadb",
+        filename=file.filename or "knowledge_asset.txt",
+        content_bytes=payload,
+        payload={
+            "title": title,
+            "asset_type": asset_type,
+            "source_label": source_label,
+            "description": description,
+            "tags": _parse_knowledge_asset_tags(tags),
+        },
+    ).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/rag/assets/{asset_id}/delete")
+async def delete_rag_asset(asset_id: str):
+    """Delete a managed RAG knowledge asset and refresh the index when configured."""
+    result = capability_manager.delete_rag_asset("rag_chromadb", asset_id).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/rag/assets/{asset_id}/check-in")
+async def check_in_rag_asset(asset_id: str):
+    """Check a managed RAG knowledge asset into indexed library circulation."""
+    result = capability_manager.check_in_rag_asset("rag_chromadb", asset_id).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/rag/assets/{asset_id}/check-out")
+async def check_out_rag_asset(asset_id: str):
+    """Check a managed RAG knowledge asset out of indexed library circulation."""
+    result = capability_manager.check_out_rag_asset("rag_chromadb", asset_id).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/rag/context/build")
+async def build_rag_context_preview(build_request: RAGContextPreviewRequest):
+    """Build a retrieval context preview from managed RAG knowledge assets."""
+    result = capability_manager.build_rag_context_preview(
+        "rag_chromadb",
+        build_request.query,
+        max_chunks=build_request.limit,
+    ).to_dict()
+    _raise_for_capability_result(result)
+    return result
 
 
 @app.post("/api/capabilities/{name}/install")
@@ -4166,6 +5622,7 @@ async def test_saved_mcp_connection(name: str):
 @app.get("/api/chat/settings")
 async def get_chat_settings():
     """Get current chat session settings"""
+    sync_chat_settings_with_capability_defaults()
     return chat_session_settings.copy()
 
 @app.post("/api/chat/settings")
@@ -4178,6 +5635,8 @@ async def update_chat_settings(settings: Dict[str, Any]):
     for key, value in settings.items():
         if key in valid_keys:
             chat_session_settings[key] = value
+            if key == "enable_rag_context":
+                chat_settings_explicit_overrides["enable_rag_context"] = True
     
     return {"status": "success", "settings": chat_session_settings.copy()}
 
@@ -4186,31 +5645,8 @@ async def reset_chat_settings():
     """Reset chat settings to defaults"""
     global chat_session_settings
     
-    chat_session_settings = {
-        # Discovery Settings
-        "max_execution_time": 90,
-        "max_iterations": 5,
-        "discovery_freshness_days": 7,
-        
-        # LLM Behavior
-        "max_tokens": 16000,
-        "temperature": 0.7,
-        "context_history": 6,
-        
-        # Performance Tuning
-        "max_retry_delay": 300,
-        "max_retries": 5,
-        "query_sample_size": 2,
-        
-        # Quality Control
-        "quality_threshold": 70,
-        "convergence_detection": 5,
-
-        # Demo Augmentation
-        "enable_splunk_augmentation": True,
-        "enable_rag_context": False,
-        "rag_max_chunks": 3,
-    }
+    chat_settings_explicit_overrides["enable_rag_context"] = False
+    chat_session_settings = build_default_chat_settings()
     
     return {"status": "success", "settings": chat_session_settings.copy()}
 
@@ -4385,6 +5821,192 @@ async def list_models(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch models: {str(e)}")
 
+
+@app.get("/api/summary/infographic-capability")
+async def get_summary_infographic_capability(timestamp: Optional[str] = None):
+    """Return whether the active OpenAI credential can access gpt-image-2."""
+    existing_artifact = _find_existing_summary_infographic(timestamp) if timestamp else None
+    config = config_manager.get()
+    provider = normalize_provider_name(config.llm.provider)
+
+    if provider != "openai":
+        return {
+            "available": existing_artifact is not None,
+            "can_generate": False,
+            "has_existing": existing_artifact is not None,
+            "existing_artifact": _build_artifact_metadata(existing_artifact) if existing_artifact else None,
+            "checked": False,
+            "provider": provider,
+            "model": OPENAI_IMAGE_MODEL,
+            "reason": "Active provider is not OpenAI",
+        }
+
+    if not config.llm.api_key:
+        return {
+            "available": existing_artifact is not None,
+            "can_generate": False,
+            "has_existing": existing_artifact is not None,
+            "existing_artifact": _build_artifact_metadata(existing_artifact) if existing_artifact else None,
+            "checked": False,
+            "provider": provider,
+            "model": OPENAI_IMAGE_MODEL,
+            "reason": "OpenAI API key is not configured",
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                build_openai_api_url(config.llm.endpoint_url, "/models"),
+                headers={"Authorization": f"Bearer {config.llm.api_key}"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+        model_ids = [
+            item.get("id")
+            for item in payload.get("data", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        can_generate = openai_model_ids_include(model_ids, OPENAI_IMAGE_MODEL)
+        return {
+            "available": can_generate or existing_artifact is not None,
+            "can_generate": can_generate,
+            "has_existing": existing_artifact is not None,
+            "existing_artifact": _build_artifact_metadata(existing_artifact) if existing_artifact else None,
+            "checked": True,
+            "provider": provider,
+            "model": OPENAI_IMAGE_MODEL,
+        }
+    except Exception as exc:
+        return {
+            "available": existing_artifact is not None,
+            "can_generate": False,
+            "has_existing": existing_artifact is not None,
+            "existing_artifact": _build_artifact_metadata(existing_artifact) if existing_artifact else None,
+            "checked": False,
+            "provider": provider,
+            "model": OPENAI_IMAGE_MODEL,
+            "reason": f"Capability probe failed: {exc}",
+        }
+
+
+@app.post("/api/summary/generate-infographic")
+async def generate_summary_infographic(request: SummaryInfographicRequest):
+    """Generate an infographic image from the current summary using gpt-image-2."""
+    config = config_manager.get()
+    provider = normalize_provider_name(config.llm.provider)
+
+    if provider != "openai":
+        raise HTTPException(status_code=400, detail="Summary infographic generation requires the OpenAI provider")
+    if not config.llm.api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key is not configured")
+
+    timestamp = str(request.timestamp or "").strip()
+    if not timestamp:
+        raise HTTPException(status_code=400, detail="timestamp is required")
+
+    existing_infographic = _find_existing_summary_infographic(timestamp)
+    if existing_infographic is not None:
+        _ensure_session_artifact_registered(timestamp, existing_infographic.name)
+        image_format = 'jpeg' if existing_infographic.suffix.lower() == '.jpg' else existing_infographic.suffix[1:].lower()
+        return {
+            "status": "success",
+            "model": OPENAI_IMAGE_MODEL,
+            "mime_type": f"image/{image_format}",
+            "image_base64": base64.b64encode(existing_infographic.read_bytes()).decode("ascii"),
+            "filename": existing_infographic.name,
+            "artifact_path": str(existing_infographic),
+            "reused_existing": True,
+        }
+
+    prompt = build_summary_infographic_prompt(timestamp, request.summary_data)
+    payload = {
+        "model": OPENAI_IMAGE_MODEL,
+        "prompt": prompt,
+        "size": "1536x1024",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(420.0, connect=30.0)) as client:
+            response = await client.post(
+                build_openai_api_url(config.llm.endpoint_url, "/images/generations"),
+                headers={
+                    "Authorization": f"Bearer {config.llm.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            response_payload = response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="OpenAI image generation timed out while waiting for gpt-image-2 to finish")
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=exc.response.status_code if exc.response is not None else 502, detail=f"OpenAI image generation failed: {detail}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI image generation failed: {exc}")
+
+    image_items = response_payload.get("data", []) if isinstance(response_payload, dict) else []
+    first_image = image_items[0] if image_items and isinstance(image_items[0], dict) else {}
+    image_base64 = first_image.get("b64_json") if isinstance(first_image.get("b64_json"), str) else ""
+    image_url = first_image.get("url") if isinstance(first_image.get("url"), str) else ""
+
+    if image_base64:
+        output_dir = _summary_infographic_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe_timestamp = re.sub(r"[^0-9A-Za-z_-]", "_", timestamp)
+        filename = f"summary_infographic_{safe_timestamp}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        artifact_path = output_dir / filename
+        artifact_path.write_bytes(base64.b64decode(image_base64))
+        _ensure_session_artifact_registered(timestamp, filename)
+        return {
+            "status": "success",
+            "model": OPENAI_IMAGE_MODEL,
+            "mime_type": "image/png",
+            "image_base64": image_base64,
+            "filename": filename,
+            "artifact_path": str(artifact_path),
+            "reused_existing": False,
+        }
+
+    if image_url:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+                image_response = await client.get(image_url)
+                image_response.raise_for_status()
+            content_type = str(image_response.headers.get("content-type") or "image/png").split(";", 1)[0].strip().lower() or "image/png"
+            extension = {
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+            }.get(content_type, ".png")
+            output_dir = _summary_infographic_dir()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            safe_timestamp = re.sub(r"[^0-9A-Za-z_-]", "_", timestamp)
+            filename = f"summary_infographic_{safe_timestamp}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{extension}"
+            artifact_path = output_dir / filename
+            artifact_bytes = image_response.content
+            artifact_path.write_bytes(artifact_bytes)
+            _ensure_session_artifact_registered(timestamp, filename)
+            return {
+                "status": "success",
+                "model": OPENAI_IMAGE_MODEL,
+                "mime_type": content_type,
+                "image_base64": base64.b64encode(artifact_bytes).decode("ascii"),
+                "filename": filename,
+                "artifact_path": str(artifact_path),
+                "reused_existing": False,
+            }
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"OpenAI image download failed: {exc}")
+        return {
+            "status": "success",
+            "model": OPENAI_IMAGE_MODEL,
+            "image_url": image_url,
+        }
+
+    raise HTTPException(status_code=502, detail="OpenAI image generation returned no image payload")
+
 @app.get("/api/dependencies")
 async def get_dependencies():
     """Get installed Python packages and their versions"""
@@ -4414,14 +6036,35 @@ async def get_dependencies():
         raise HTTPException(status_code=500, detail=f"Failed to get dependencies: {str(e)}")
 
 @app.post("/api/llm/assess-max-tokens")
-async def assess_max_tokens():
+async def assess_max_tokens(request: Request):
     """Assess the actual max_tokens limit by testing the LLM API"""
     try:
+        payload = {}
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+
         config = config_manager.get()
-        provider = normalize_provider_name(config.llm.provider)
+        llm_payload = payload.get("llm", {}) if isinstance(payload.get("llm"), dict) else payload
+
+        provider = normalize_provider_name(llm_payload.get("provider", config.llm.provider))
+        api_key = llm_payload.get("api_key", config.llm.api_key)
+        model = llm_payload.get("model", config.llm.model)
+        endpoint_url = llm_payload.get("endpoint_url", config.llm.endpoint_url)
         
-        if provider in {"openai", "azure", "anthropic", "gemini"} and not config.llm.api_key:
+        if provider in {"openai", "azure", "anthropic", "gemini"} and not api_key:
             raise HTTPException(status_code=400, detail="LLM API key not configured")
+
+        if provider == "openai" and is_openai_image_generation_model(model):
+            return {
+                "recommended_max_tokens": None,
+                "applicable": False,
+                "status": "info",
+                "message": f"{model} uses the OpenAI images API. max_tokens is not required for summary infographic execution; output is limited by image size instead.",
+            }
 
         if provider != "openai":
             defaults = {
@@ -4439,9 +6082,9 @@ async def assess_max_tokens():
         
         llm_client = LLMClientFactory.create_client(
             provider=provider,
-            custom_endpoint=config.llm.endpoint_url,
-            api_key=config.llm.api_key,
-            model=config.llm.model,
+            custom_endpoint=endpoint_url,
+            api_key=api_key,
+            model=model,
         )
         
         # Try progressively larger max_tokens until we hit the limit
@@ -4553,8 +6196,13 @@ async def test_llm_connection(request: Request):
             "tests": {}
         }
 
+        openai_model_capabilities = {}
+        openai_model_ids = []
         if provider == "openai":
-            results["model_capabilities"] = get_openai_model_capabilities(model)
+            openai_model_capabilities = get_openai_model_capabilities(model)
+            results["model_capabilities"] = openai_model_capabilities
+
+        uses_openai_image_generation = provider == "openai" and openai_model_capabilities.get("supports_image_generation", False)
 
         # Test 1: Connectivity probe
         try:
@@ -4572,6 +6220,12 @@ async def test_llm_connection(request: Request):
                         headers={"Authorization": f"Bearer {api_key}"}
                     )
                     probe.raise_for_status()
+                    probe_payload = probe.json() if hasattr(probe, "json") else {}
+                    openai_model_ids = [
+                        item.get("id")
+                        for item in probe_payload.get("data", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
                     results["tests"]["connection"] = {"status": "success", "message": "OpenAI models endpoint reachable"}
 
                 elif provider == "azure":
@@ -4638,23 +6292,37 @@ async def test_llm_connection(request: Request):
 
         # Test 2: Model generation
         try:
-            llm_client = LLMClientFactory.create_client(
-                provider=provider,
-                custom_endpoint=endpoint_url,
-                api_key=api_key,
-                model=model
-            )
+            if uses_openai_image_generation:
+                if openai_model_ids and not openai_model_ids_include(openai_model_ids, model):
+                    results["tests"]["model"] = {
+                        "status": "error",
+                        "message": f"Image model '{model}' is not listed for this OpenAI credential"
+                    }
+                    results["status"] = "error"
+                    return results
 
-            model_response = await llm_client.generate_response(
-                messages=[{"role": "user", "content": "Reply with exactly: test successful"}],
-                max_tokens=min(max_tokens, 64),
-                temperature=0.0,
-            )
-            results["tests"]["model"] = {
-                "status": "success",
-                "message": "Model responded successfully",
-                "response_preview": str(model_response)[:120]
-            }
+                results["tests"]["model"] = {
+                    "status": "info",
+                    "message": f"{model} uses the OpenAI images API. Skipped text completion probe; summary infographic generation should use the dedicated image endpoint.",
+                }
+            else:
+                llm_client = LLMClientFactory.create_client(
+                    provider=provider,
+                    custom_endpoint=endpoint_url,
+                    api_key=api_key,
+                    model=model
+                )
+
+                model_response = await llm_client.generate_response(
+                    messages=[{"role": "user", "content": "Reply with exactly: test successful"}],
+                    max_tokens=min(max_tokens, 64),
+                    temperature=0.0,
+                )
+                results["tests"]["model"] = {
+                    "status": "success",
+                    "message": "Model responded successfully",
+                    "response_preview": str(model_response)[:120]
+                }
         except Exception as model_error:
             results["tests"]["model"] = {
                 "status": "error",
@@ -4665,26 +6333,38 @@ async def test_llm_connection(request: Request):
             return results
 
         # Test 3: Recommended token configuration
-        recommended_max = max(512, min(max_tokens, 16000))
-        if provider == "gemini":
-            recommended_max = max(512, min(max_tokens, 8192))
-        elif provider == "anthropic":
-            recommended_max = max(512, min(max_tokens, 8192))
-        elif provider == "custom":
-            recommended_max = max(512, min(max_tokens, 4096))
+        if uses_openai_image_generation:
+            results["tests"]["max_tokens"] = {
+                "status": "info",
+                "detected_max": None,
+                "message": f"max_tokens is not used for {model}. Summary infographic generation is constrained by image output size instead.",
+            }
+        else:
+            recommended_max = max(512, min(max_tokens, 16000))
+            if provider == "gemini":
+                recommended_max = max(512, min(max_tokens, 8192))
+            elif provider == "anthropic":
+                recommended_max = max(512, min(max_tokens, 8192))
+            elif provider == "custom":
+                recommended_max = max(512, min(max_tokens, 4096))
 
-        results["tests"]["max_tokens"] = {
-            "status": "info",
-            "detected_max": recommended_max,
-            "message": f"Using provider-safe recommended max_tokens={recommended_max}"
-        }
+            results["tests"]["max_tokens"] = {
+                "status": "info",
+                "detected_max": recommended_max,
+                "message": f"Using provider-safe recommended max_tokens={recommended_max}"
+            }
 
         results["status"] = "success"
         results["message"] = "All provider tests passed"
-        results["recommended_config"] = {
-            "max_tokens": recommended_max,
-            "temperature": temperature
-        }
+        if uses_openai_image_generation:
+            results["recommended_config"] = {
+                "temperature": temperature
+            }
+        else:
+            results["recommended_config"] = {
+                "max_tokens": recommended_max,
+                "temperature": temperature
+            }
         return results
 
     except Exception as e:
@@ -4742,9 +6422,16 @@ async def summarize_session(request: Dict[str, Any]):
 
     # Normalize to validated timestamp for all downstream file operations
     timestamp = safe_timestamp
+
+    output_dir = Path("output")
+
+    # Load V2 session artifacts only (legacy artifacts intentionally ignored)
+    json_file = output_dir / f"v2_intelligence_blueprint_{timestamp}.json"
+    detailed_file = output_dir / f"v2_operator_runbook_{timestamp}.md"
+    classification_file = output_dir / f"v2_developer_handoff_{timestamp}.md"
+    executive_file = output_dir / f"v2_insights_brief_{timestamp}.md"
     
     # Check if summary already exists
-    output_dir = Path("output")
     summary_file = output_dir / f"v2_ai_summary_{safe_timestamp}.json"
     
     if summary_file.exists():
@@ -4757,18 +6444,28 @@ async def summarize_session(request: Dict[str, Any]):
                 for key in ["schema_version", "trend_signals", "risk_register", "recursive_investigations"]
             )
             if has_v2_panels:
+                if "context_explorer" not in existing_summary and json_file.exists():
+                    try:
+                        with open(json_file, 'r', encoding='utf-8') as cached_discovery_file:
+                            cached_discovery_data = json.load(cached_discovery_file)
+                        existing_summary["context_explorer"] = build_context_explorer_payload(
+                            cached_discovery_data,
+                            unknown_questions=existing_summary.get("unknown_data"),
+                            admin_tasks=existing_summary.get("admin_tasks"),
+                            coverage_gaps=existing_summary.get("coverage_gaps"),
+                            risk_register=existing_summary.get("risk_register"),
+                            readiness_score=existing_summary.get("readiness_score"),
+                        )
+                        with open(summary_file, 'w', encoding='utf-8') as summary_out:
+                            json.dump(existing_summary, summary_out, indent=2)
+                    except Exception as cache_patch_error:
+                        print(f"Error backfilling context explorer for cached summary: {cache_patch_error}")
                 existing_summary['from_cache'] = True
                 return existing_summary
             print(f"Cached summary {summary_file.name} missing V2 fields; regenerating...")
         except Exception as e:
             print(f"Error loading cached summary: {e}")
             # Continue to regenerate
-    
-    # Load V2 session artifacts only (legacy artifacts intentionally ignored)
-    json_file = output_dir / f"v2_intelligence_blueprint_{timestamp}.json"
-    detailed_file = output_dir / f"v2_operator_runbook_{timestamp}.md"
-    classification_file = output_dir / f"v2_developer_handoff_{timestamp}.md"
-    executive_file = output_dir / f"v2_insights_brief_{timestamp}.md"
 
     if not json_file.exists():
         return {"error": "V2 session data not found"}
@@ -5833,6 +7530,15 @@ Return ONLY the JSON array, no other text."""
         admin_tasks = [_normalize_task_item(task, idx, finding_pool) for idx, task in enumerate(context_engine_tasks[:3])]
 
     print(f"📋 Task Status: ai_raw={len(normalized_task_candidates) - len(context_engine_tasks)}, context_engine={len(context_engine_tasks)}, final={len(admin_tasks)}")
+
+    context_explorer = build_context_explorer_payload(
+        discovery_data,
+        unknown_questions=unknown_questions,
+        admin_tasks=admin_tasks,
+        coverage_gaps=coverage_gaps,
+        risk_register=risk_register,
+        readiness_score=readiness_score,
+    )
     
     # Prepare response
     response_data = {
@@ -5849,6 +7555,7 @@ Return ONLY the JSON array, no other text."""
         "trend_signals": trend_signals,
         "vulnerability_hypotheses": vulnerability_hypotheses,
         "recursive_investigations": recursive_investigations,
+        "context_explorer": context_explorer,
         "v2_context": {
             "readiness_score": readiness_score,
             "coverage_gaps": len(coverage_gaps),
@@ -6877,6 +8584,49 @@ def build_query_plan_brief(user_message: str, report_knowledge: Optional[Dict[st
     return '\n'.join(lines)
 
 
+def extract_structured_report_request(user_message: str) -> Optional[Dict[str, str]]:
+    """Parse structured summary-to-chat prompts so routing can honor the clicked context."""
+    if not isinstance(user_message, str) or not user_message.strip():
+        return None
+
+    def _extract_field(field_name: str) -> str:
+        match = re.search(
+            rf'{field_name}\s*:\s*(.*?)(?=\n[A-Za-z][A-Za-z ]*:\s|\Z)',
+            user_message,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return str(match.group(1)).strip() if match else ""
+
+    lowered = user_message.lower()
+    if 'risk:' in lowered:
+        title = _extract_field('risk')
+        if title:
+            return {
+                'kind': 'risk',
+                'title': title,
+                'impact': _extract_field('impact'),
+                'mitigation': _extract_field('mitigation'),
+            }
+
+    return None
+
+
+def _match_report_item(items: List[Dict[str, Any]], key: str, focus_text: str = '') -> Optional[Dict[str, Any]]:
+    """Return the first matching report item for a focused prompt, falling back to the first populated item."""
+    candidates = [item for item in items if isinstance(item, dict) and item.get(key)] if isinstance(items, list) else []
+    if not candidates:
+        return None
+
+    lowered_focus = str(focus_text or '').strip().lower()
+    if lowered_focus:
+        for item in candidates:
+            candidate_value = str(item.get(key) or '').strip()
+            if candidate_value and candidate_value.lower() in lowered_focus:
+                return item
+
+    return candidates[0]
+
+
 def detect_report_intent(user_message: str, report_knowledge: Optional[Dict[str, Any]]) -> Optional[str]:
     """Detect strategic report-backed questions that should be answered directly from discovery knowledge."""
     if not isinstance(user_message, str) or not report_knowledge:
@@ -6890,6 +8640,9 @@ def detect_report_intent(user_message: str, report_knowledge: Optional[Dict[str,
         return None
     if detect_basic_inventory_intent(user_message):
         return None
+    structured_request = extract_structured_report_request(user_message)
+    if structured_request and structured_request.get('kind') == 'risk':
+        return 'top_risks'
     if re.search(r'\b(index|host|sourcetype|source)\s*[=:]', message):
         return None
     if any(token in message for token in ['how many', 'count', 'latest event', 'last seen', 'timechart', 'break down', 'show events', 'run query', 'search for']):
@@ -7002,14 +8755,121 @@ def build_report_intent_response(intent: str, report_knowledge: Dict[str, Any]) 
     return '\n'.join([line for line in lines if isinstance(line, str)]).strip(), insights[:8]
 
 
-def build_report_follow_on_actions(intent: str, report_knowledge: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_focused_report_response(
+    intent: str,
+    report_knowledge: Dict[str, Any],
+    focus_request: Optional[Dict[str, str]],
+) -> Optional[Tuple[str, List[str]]]:
+    """Build a targeted report-backed response for structured summary-to-chat prompts."""
+    if intent != 'top_risks' or not isinstance(focus_request, dict) or focus_request.get('kind') != 'risk':
+        return None
+
+    risk_register = report_knowledge.get('risk_register', []) if isinstance(report_knowledge.get('risk_register', []), list) else []
+    recommendations = report_knowledge.get('recommendations', []) if isinstance(report_knowledge.get('recommendations', []), list) else []
+    coverage_gaps = report_knowledge.get('coverage_gaps', []) if isinstance(report_knowledge.get('coverage_gaps', []), list) else []
+    title = str(focus_request.get('title') or '').strip()
+    matched_risk = _match_report_item(risk_register, 'risk', title)
+    matched_recommendation = _match_report_item(recommendations, 'title', title)
+    matched_gap = _match_report_item(coverage_gaps, 'gap', title)
+
+    if not title:
+        return None
+
+    severity = str((matched_risk or {}).get('severity') or 'medium').strip().upper()
+    domain = str((matched_risk or {}).get('domain') or 'general').strip()
+    impact = str((matched_risk or {}).get('impact') or focus_request.get('impact') or 'No explicit impact statement was captured.').strip()
+    mitigation = str((matched_risk or {}).get('mitigation') or focus_request.get('mitigation') or 'Use live validation to confirm the fastest remediation path.').strip()
+
+    lines = [
+        f"Focused risk investigation: {title}",
+        f"Severity: {severity} | Domain: {domain}",
+        f"Why this matters: {impact}",
+        f"Mitigation path: {mitigation}",
+    ]
+
+    if isinstance(matched_recommendation, dict) and matched_recommendation.get('description'):
+        lines.append(f"Related recommendation: {str(matched_recommendation.get('title')).strip()} - {str(matched_recommendation.get('description')).strip()}")
+    if isinstance(matched_gap, dict) and matched_gap.get('why_it_matters'):
+        lines.append(f"Related coverage gap: {str(matched_gap.get('gap')).strip()} - {str(matched_gap.get('why_it_matters')).strip()}")
+
+    lines.extend([
+        '',
+        'Use MCP queries to validate the current severity, check whether the risk is already visible in live telemetry, and confirm whether mitigation work should start with platform health, data quality, or coverage expansion.',
+    ])
+
+    insights = [title]
+    if isinstance(matched_recommendation, dict) and matched_recommendation.get('title'):
+        insights.append(str(matched_recommendation.get('title')).strip())
+
+    return '\n'.join([line for line in lines if isinstance(line, str) and line.strip()]).strip(), insights[:8]
+
+
+def build_report_follow_on_actions(
+    intent: str,
+    report_knowledge: Dict[str, Any],
+    focus_text: str = '',
+    assistant_response: str = '',
+) -> List[Dict[str, Any]]:
     """Return live validation prompts that naturally follow a strategic report-backed answer."""
-    actions: List[Dict[str, Any]] = []
+    actions: List[Dict[str, Any]] = _extract_response_follow_on_actions(assistant_response)
+    recommendations = report_knowledge.get('recommendations', []) if isinstance(report_knowledge.get('recommendations', []), list) else []
+    coverage_gaps = report_knowledge.get('coverage_gaps', []) if isinstance(report_knowledge.get('coverage_gaps', []), list) else []
+    risk_register = report_knowledge.get('risk_register', []) if isinstance(report_knowledge.get('risk_register', []), list) else []
+    suggested_use_cases = report_knowledge.get('suggested_use_cases', []) if isinstance(report_knowledge.get('suggested_use_cases', []), list) else []
     recommendation_titles = [
         str(rec.get('title')).lower()
-        for rec in report_knowledge.get('recommendations', [])[:6]
+        for rec in recommendations[:6]
         if isinstance(rec, dict) and rec.get('title')
     ]
+    top_recommendation = _match_report_item(recommendations, 'title', focus_text)
+    top_gap = _match_report_item(coverage_gaps, 'gap', focus_text)
+    top_risk = _match_report_item(risk_register, 'risk', focus_text)
+    top_use_case = _match_report_item(suggested_use_cases, 'title', focus_text)
+
+    if intent == 'recommendations' and isinstance(top_recommendation, dict):
+        actions.append(_make_follow_on_action(
+            'Validate the top recommendation',
+            (
+                f"Validate this discovery recommendation with live Splunk data and summarize drift from the report snapshot: "
+                f"{str(top_recommendation.get('title')).strip()}. "
+                f"Context: {str(top_recommendation.get('description') or 'No additional recommendation context was captured.').strip()}"
+            ),
+            'validate_top_recommendation',
+        ))
+
+    if intent == 'top_risks' and isinstance(top_risk, dict):
+        actions.append(_make_follow_on_action(
+            'Investigate the top risk live',
+            (
+                f"Investigate this discovery risk in Splunk and show whether it is visible right now: "
+                f"{str(top_risk.get('risk')).strip()}. "
+                f"Impact: {str(top_risk.get('impact') or 'No impact statement was captured.').strip()} "
+                f"Mitigation: {str(top_risk.get('mitigation') or 'Identify the most direct validation path.').strip()}"
+            ),
+            'investigate_top_risk',
+        ))
+
+    if intent == 'coverage_gaps' and isinstance(top_gap, dict):
+        actions.append(_make_follow_on_action(
+            'Validate the highest-priority gap',
+            (
+                f"Validate this coverage gap with live Splunk data and state whether the environment is ready to close it: "
+                f"{str(top_gap.get('gap')).strip()}. "
+                f"Why it matters: {str(top_gap.get('why_it_matters') or 'No impact summary was captured.').strip()}"
+            ),
+            'validate_top_gap',
+        ))
+
+    if intent == 'use_cases' and isinstance(top_use_case, dict):
+        actions.append(_make_follow_on_action(
+            'Prototype the strongest use case',
+            (
+                f"Prototype the strongest report-backed use case with the current data and explain the validation path: "
+                f"{str(top_use_case.get('title')).strip()}. "
+                f"Scenario: {str(top_use_case.get('scenario') or top_use_case.get('description') or 'No scenario details were captured.').strip()}"
+            ),
+            'prototype_top_use_case',
+        ))
 
     if any('windows security' in title for title in recommendation_titles):
         actions.append(_make_follow_on_action(
@@ -7043,6 +8903,16 @@ def build_report_follow_on_actions(intent: str, report_knowledge: Dict[str, Any]
             'live_use_case_candidate',
         ))
 
+    if intent == 'readiness' and isinstance(top_gap, dict):
+        actions.append(_make_follow_on_action(
+            'Measure readiness against the top blocker',
+            (
+                f"Measure current readiness against this blocker and explain the next implementation step: "
+                f"{str(top_gap.get('gap')).strip()}."
+            ),
+            'measure_readiness_blocker',
+        ))
+
     if not actions:
         actions.append(_make_follow_on_action(
             'Validate the top gap live',
@@ -7050,7 +8920,7 @@ def build_report_follow_on_actions(intent: str, report_knowledge: Dict[str, Any]
             'validate_top_gap',
         ))
 
-    return actions[:3]
+    return _dedupe_follow_on_actions(actions, limit=3)
 
 
 def _is_numeric_like(value: Any) -> bool:
@@ -7221,6 +9091,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                         Signature: async def callback(action: str, iteration: int, time: float)
     """
     try:
+        sync_chat_settings_with_capability_defaults()
         print(f"🔵 [CHAT] Request received: {request.get('message', '')[:50]}")
         user_message = request.get('message', '')
         history = request.get('history', [])
@@ -7284,14 +9155,32 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         else:
             discovery_age_warning = "⚠️ No discovery data found. Run a discovery first to get environment context."
 
+        report_intent = detect_report_intent(user_message, report_knowledge) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+
         query_plan_context = build_query_plan_brief(user_message, report_knowledge, chat_memory)
 
-        report_intent = detect_report_intent(user_message, report_knowledge) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
         if report_intent:
             report_status_timeline: List[Dict[str, Any]] = []
+            report_capability_usage: List[Dict[str, Any]] = []
+            structured_report_request = extract_structured_report_request(user_message)
             await push_status(report_status_timeline, "📚 Synthesizing discovery knowledge", 0)
-            response_text, report_insights = build_report_intent_response(report_intent, report_knowledge)
-            follow_on_actions = build_report_follow_on_actions(report_intent, report_knowledge)
+            if bool(chat_session_settings.get("enable_rag_context", False)):
+                rag_max_chunks = _safe_int(chat_session_settings.get("rag_max_chunks", 3))
+                _, report_capability_usage = get_optional_rag_context(user_message, max_chunks=rag_max_chunks)
+            focused_report_response = build_focused_report_response(report_intent, report_knowledge, structured_report_request)
+            if focused_report_response:
+                response_text, report_insights = focused_report_response
+            else:
+                response_text, report_insights = build_report_intent_response(report_intent, report_knowledge)
+            report_context_brief = build_capability_usage_brief(report_capability_usage)
+            if report_context_brief:
+                response_text = f"{response_text}\n\n{report_context_brief}"
+            follow_on_actions = build_report_follow_on_actions(
+                report_intent,
+                report_knowledge,
+                focus_text=user_message,
+                assistant_response=response_text,
+            )
             updated_memory = update_chat_memory(
                 chat_session_id,
                 user_message,
@@ -7312,6 +9201,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "conversation_history": _build_follow_up_conversation_history(history, user_message, response_text),
+                "capability_usage": report_capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions,
             }
@@ -7411,7 +9302,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                     assistant_response=response_text,
                     record_user_turn=False,
                 )
-                follow_on_actions = build_follow_on_actions(user_message, updated_memory, latest_tool_calls)
+                follow_on_actions = build_follow_on_actions(
+                    user_message,
+                    updated_memory,
+                    latest_tool_calls,
+                    assistant_response=response_text,
+                )
                 await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
                 visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
                 return {
@@ -7427,6 +9323,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                     "discovery_age_warning": discovery_age_warning,
                     "chat_session_id": chat_session_id,
                     "chat_memory": updated_memory,
+                    "conversation_history": _build_follow_up_conversation_history(history, user_message, response_text),
                     "capability_usage": capability_usage,
                     "has_follow_on": len(follow_on_actions) > 0,
                     "follow_on_actions": follow_on_actions
@@ -7498,7 +9395,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 assistant_response=response_text,
                 record_user_turn=False,
             )
-            follow_on_actions = build_follow_on_actions(user_message, updated_memory, latest_tool_calls)
+            follow_on_actions = build_follow_on_actions(
+                user_message,
+                updated_memory,
+                latest_tool_calls,
+                assistant_response=response_text,
+            )
             await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
             return {
@@ -7514,6 +9416,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "conversation_history": _build_follow_up_conversation_history(history, user_message, response_text),
                 "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
@@ -7645,7 +9548,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 assistant_response=response_text,
                 record_user_turn=False,
             )
-            follow_on_actions = build_follow_on_actions(user_message, updated_memory, skill_tool_calls)
+            follow_on_actions = build_follow_on_actions(
+                user_message,
+                updated_memory,
+                skill_tool_calls,
+                assistant_response=response_text,
+            )
             await push_status(skill_status_timeline, "✅ Finalizing response", max(1, len(skill_tool_calls)))
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(skill_tool_calls)
             return {
@@ -7661,6 +9569,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "conversation_history": _build_follow_up_conversation_history(history, user_message, response_text),
                 "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
@@ -7776,7 +9685,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 assistant_response=response_text,
                 record_user_turn=False,
             )
-            follow_on_actions = build_follow_on_actions(user_message, updated_memory, offline_tool_calls)
+            follow_on_actions = build_follow_on_actions(
+                user_message,
+                updated_memory,
+                offline_tool_calls,
+                assistant_response=response_text,
+            )
             await push_status(offline_status_timeline, "✅ Finalizing response", max(1, len(offline_tool_calls)))
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(offline_tool_calls)
             return {
@@ -7792,12 +9706,15 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "conversation_history": _build_follow_up_conversation_history(history, user_message, response_text),
                 "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
             }
 
-        basic_intent = detect_basic_inventory_intent(user_message, chat_memory) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+        basic_intent = None
+        if bool(chat_session_settings.get("enable_splunk_augmentation", True)) and not should_bypass_basic_inventory_intent(request):
+            basic_intent = detect_basic_inventory_intent(user_message, chat_memory)
         if basic_intent:
             basic_status_timeline: List[Dict[str, Any]] = []
             basic_tool_calls: List[Dict[str, Any]] = []
@@ -8155,7 +10072,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 assistant_response=response_text,
                 record_user_turn=False,
             )
-            follow_on_actions = build_follow_on_actions(user_message, updated_memory, basic_tool_calls)
+            follow_on_actions = build_follow_on_actions(
+                user_message,
+                updated_memory,
+                basic_tool_calls,
+                assistant_response=response_text,
+            )
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(basic_tool_calls)
             return {
                 "response": response_text,
@@ -8170,6 +10092,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
+                "conversation_history": _build_follow_up_conversation_history(history, user_message, response_text),
                 "capability_usage": capability_usage,
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
@@ -8388,38 +10311,49 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 discovery_age_warning=discovery_age_warning
             )
 
+        context_limit = chat_session_settings["context_history"]
+        continuity_context = build_llm_continuity_context(
+            user_message=user_message,
+            history=history,
+            memory=chat_memory,
+            limit=context_limit,
+        )
+        has_session_context = bool(_build_llm_recent_context_turns(history, chat_memory, limit=max(2, context_limit)))
+        requires_spl_explanation = user_requested_spl_explanation(user_message)
+        spl_explanation_requirement = build_spl_explanation_requirement(requires_spl_explanation)
+
         query_lower = user_message.lower().strip()
         is_greeting = any(phrase in query_lower for phrase in ['hi', 'hello', 'hey', 'how are you', 'thanks', 'thank you', 'bye', 'goodbye'])
         
-        if is_custom_provider and is_greeting:
+        if is_custom_provider and is_greeting and not has_session_context:
             # Bare minimum for greetings - just the user message
             messages = [{"role": "user", "content": user_message}]
         else:
-            # Check if history is already in server format (has 'role' key) or UI format (has 'type' key)
-            if history and len(history) > 0 and 'role' in history[0]:
-                # Server conversation history - use directly (already has system messages and reasoning)
-                messages = history.copy()
-                if query_plan_context:
-                    messages.append({"role": "system", "content": query_plan_context})
-                # Add current user message
-                messages.append({"role": "user", "content": user_message})
-            else:
-                # UI history - needs conversion and system prompt
-                messages = [{"role": "system", "content": system_prompt}]
-                
-                # Add recent history for context (use session setting)
-                context_limit = chat_session_settings["context_history"]
-                for msg in history[-context_limit:] if context_limit > 0 else []:
-                    if msg.get('type') == 'user':
-                        messages.append({"role": "user", "content": msg['content']})
-                    elif msg.get('type') == 'assistant':
-                        messages.append({"role": "assistant", "content": msg['content']})
+            # Always rebuild the prompt gate so the latest memory, discovery context, and continuity rules are fresh.
+            has_role_history = bool(history and len(history) > 0 and isinstance(history[0], dict) and 'role' in history[0])
+            messages = [{"role": "system", "content": system_prompt}]
+            if continuity_context:
+                messages.append({"role": "system", "content": continuity_context})
 
-                if query_plan_context:
-                    messages.append({"role": "system", "content": query_plan_context})
-                
-                # Add current user message
-                messages.append({"role": "user", "content": user_message})
+            normalized_history = []
+            if has_role_history:
+                normalized_history = _compact_chat_role_history(history, limit=context_limit, include_system=False)
+            else:
+                normalized_history = history[-context_limit:] if context_limit > 0 else []
+
+            for msg in normalized_history:
+                if has_role_history:
+                    messages.append({"role": msg["role"], "content": msg["content"]})
+                elif msg.get('type') == 'user':
+                    messages.append({"role": "user", "content": msg['content']})
+                elif msg.get('type') == 'assistant':
+                    messages.append({"role": "assistant", "content": msg['content']})
+
+            if query_plan_context:
+                messages.append({"role": "system", "content": query_plan_context})
+
+            # Add current user message
+            messages.append({"role": "user", "content": user_message})
         
         # Get LLM response - use session max_tokens setting (with 15% limit for initial chat)
         status_timeline: List[Dict[str, Any]] = []
@@ -8873,7 +10807,7 @@ Discovery has been stopped to avoid repeated failed attempts."""
 Error: {error_msg}
 
 ACCUMULATED INSIGHTS SO FAR:
-{insights_summary}{analysis_section}{context_section}
+{insights_summary}{analysis_section}{context_section}{spl_explanation_requirement}
 
 REFINED USER INTENT: "{user_intent}"
 
@@ -8910,7 +10844,7 @@ If you need to clarify the user's intent, ask a clarifying question WITHOUT tool
 {result_analysis_brief or result_summary.get('findings', [])}
 
 ACCUMULATED INSIGHTS:
-{insights_summary}{context_section}
+{insights_summary}{context_section}{spl_explanation_requirement}
 
 {data_label}:
 {json.dumps(result_snippet.get('data'), indent=2)[:2000]}
@@ -8935,7 +10869,7 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
 The query executed successfully but returned no results.
 
 ACCUMULATED INSIGHTS:
-{insights_summary}{analysis_section}{context_section}
+{insights_summary}{analysis_section}{context_section}{spl_explanation_requirement}
 
 STRATEGIC OPTIONS:
 1. 🔍 Try different index from discovery context
@@ -8973,6 +10907,11 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
                     default_latest=str(tool_args.get('latest_time', '') or 'now'),
                 )
                 next_tool_match = bool(next_tool_call)
+                missing_spl_explanation = (
+                    requires_spl_explanation
+                    and not next_tool_match
+                    and not response_addresses_spl_explanation(next_response)
+                )
                 
                 # Assess answer quality (independent of whether LLM wants to continue)
                 has_actionable_data = result_summary.get('row_count', 0) > 0 and 'No data' not in str(result_summary.get('findings', []))
@@ -9016,20 +10955,17 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
                                           ['iteration', 'i will', "i'll try", 'let me check', 'next step', 
                                            'investigation', 'i should', 'perhaps i']))
                         
-                        if is_internal:
-                            print(f"📝 [Iteration {iteration}] High quality but internal reasoning - requesting final user answer")
+                        if is_internal or missing_spl_explanation:
+                            if missing_spl_explanation:
+                                print(f"📝 [Iteration {iteration}] High quality but missing required SPL explanation - requesting final user answer")
+                            else:
+                                print(f"📝 [Iteration {iteration}] High quality but internal reasoning - requesting final user answer")
                             
-                            final_prompt = f"""You successfully investigated the user's question: "{user_message}"
-
-ACCUMULATED FINDINGS:
-{insights_summary}
-
-Now provide a COMPLETE, USER-FACING answer that includes:
-1. Direct answer to their question with specific data/numbers
-2. Key findings and patterns you discovered  
-3. Any relevant context or recommendations
-
-Write as if speaking directly to the user (avoid phrases like "I investigated", "I found", etc.)."""
+                            final_prompt = build_final_user_answer_prompt(
+                                user_message,
+                                insights_summary,
+                                require_spl_explanation=requires_spl_explanation,
+                            )
                             
                             conversation_history.append({"role": "system", "content": final_prompt})
                             
@@ -9098,8 +11034,27 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                         final_answer = "Investigation incomplete due to malformed query format."
                                     break
                             else:
-                                print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
-                                final_answer = sanitize_llm_response_text(next_response)
+                                if missing_spl_explanation:
+                                    print(f"📝 [Iteration {iteration}] High quality answer still missing SPL explanation - requesting final user answer")
+                                    final_prompt = build_final_user_answer_prompt(
+                                        user_message,
+                                        insights_summary,
+                                        require_spl_explanation=requires_spl_explanation,
+                                    )
+
+                                    conversation_history.append({"role": "system", "content": final_prompt})
+
+                                    final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                    final_response = await llm_client.generate_response(
+                                        messages=conversation_history,
+                                        max_tokens=final_max_tokens,
+                                        temperature=config.llm.temperature
+                                    )
+                                    final_answer = final_response
+                                    print(f"✅ [Iteration {iteration}] Final user answer with SPL explanation generated ({len(final_response)} chars)")
+                                else:
+                                    print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
+                                    final_answer = sanitize_llm_response_text(next_response)
                     
                     if final_answer:
                         break
@@ -9293,20 +11248,17 @@ Based on your previous response, provide your next query NOW using the proper fo
                                                   ['iteration', 'i will', "i'll try", 'let me check', 'next step', 
                                                    'i will adjust', 'i will refine', "i'll refine", 'i should']))
                                 
-                                if is_internal:
-                                    print(f"📝 [Iteration {iteration}] Moderate quality with data but internal reasoning - requesting final answer")
+                                if is_internal or missing_spl_explanation:
+                                    if missing_spl_explanation:
+                                        print(f"📝 [Iteration {iteration}] Moderate quality with data but missing SPL explanation - requesting final answer")
+                                    else:
+                                        print(f"📝 [Iteration {iteration}] Moderate quality with data but internal reasoning - requesting final answer")
                                     
-                                    final_prompt = f"""You successfully investigated the user's question: "{user_message}"
-
-ACCUMULATED FINDINGS:
-{insights_summary}
-
-Now provide a COMPLETE, USER-FACING answer that includes:
-1. Direct answer to their question with specific data/numbers
-2. Key findings and patterns you discovered  
-3. Any relevant context or recommendations
-
-Write as if speaking directly to the user (avoid phrases like "I investigated", "I found", "I will", etc.)."""
+                                    final_prompt = build_final_user_answer_prompt(
+                                        user_message,
+                                        insights_summary,
+                                        require_spl_explanation=requires_spl_explanation,
+                                    )
                                     
                                     conversation_history.append({"role": "system", "content": final_prompt})
                                     
@@ -9342,8 +11294,27 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                                 final_answer = "Investigation incomplete due to malformed query format."
                                             break
                                     else:
-                                        print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                                        final_answer = sanitize_llm_response_text(next_response)
+                                        if missing_spl_explanation:
+                                            print(f"📝 [Iteration {iteration}] Moderate quality answer still missing SPL explanation - requesting final answer")
+                                            final_prompt = build_final_user_answer_prompt(
+                                                user_message,
+                                                insights_summary,
+                                                require_spl_explanation=requires_spl_explanation,
+                                            )
+
+                                            conversation_history.append({"role": "system", "content": final_prompt})
+
+                                            final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                            final_response = await llm_client.generate_response(
+                                                messages=conversation_history,
+                                                max_tokens=final_max_tokens,
+                                                temperature=config.llm.temperature
+                                            )
+                                            final_answer = final_response
+                                            print(f"✅ [Iteration {iteration}] Final user answer with SPL explanation generated ({len(final_response)} chars)")
+                                        else:
+                                            print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
+                                            final_answer = sanitize_llm_response_text(next_response)
                             else:
                                 # No data - accept response as-is, but check for tool calls
                                 if '<TOOL_CALL>' in next_response:
@@ -9368,8 +11339,27 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                                             final_answer = "Investigation incomplete due to malformed query format."
                                         break
                                 else:
-                                    print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                                    final_answer = sanitize_llm_response_text(next_response)
+                                    if missing_spl_explanation:
+                                        print(f"📝 [Iteration {iteration}] Moderate quality no-data answer missing SPL explanation - requesting final answer")
+                                        final_prompt = build_final_user_answer_prompt(
+                                            user_message,
+                                            insights_summary,
+                                            require_spl_explanation=requires_spl_explanation,
+                                        )
+
+                                        conversation_history.append({"role": "system", "content": final_prompt})
+
+                                        final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                        final_response = await llm_client.generate_response(
+                                            messages=conversation_history,
+                                            max_tokens=final_max_tokens,
+                                            temperature=config.llm.temperature
+                                        )
+                                        final_answer = final_response
+                                        print(f"✅ [Iteration {iteration}] Final no-data answer with SPL explanation generated ({len(final_response)} chars)")
+                                    else:
+                                        print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
+                                        final_answer = sanitize_llm_response_text(next_response)
                             break
             
             # CRITICAL SAFETY CHECK: If final_answer contains <TOOL_CALL>, the LLM isn't done
@@ -9391,7 +11381,12 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
                 assistant_response=final_answer or "Investigation complete. See findings above.",
                 record_user_turn=False,
             )
-            follow_on_actions = build_follow_on_actions(user_message, updated_memory, all_tool_calls)
+            follow_on_actions = build_follow_on_actions(
+                user_message,
+                updated_memory,
+                all_tool_calls,
+                assistant_response=final_answer or "Investigation complete. See findings above.",
+            )
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(all_tool_calls, capability_usage)
             return {
                 "response": sanitize_llm_response_text(final_answer or "Investigation complete. See findings above."),
@@ -9429,7 +11424,11 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
             assistant_response=clean_response,
             record_user_turn=False,
         )
-        follow_on_actions = build_follow_on_actions(user_message, updated_memory)
+        follow_on_actions = build_follow_on_actions(
+            user_message,
+            updated_memory,
+            assistant_response=clean_response,
+        )
         return {
             "response": sanitize_llm_response_text(clean_response),
             "spl_in_text": spl_in_text,
@@ -9439,6 +11438,7 @@ Write as if speaking directly to the user (avoid phrases like "I investigated", 
             "discovery_age_warning": discovery_age_warning,
             "chat_session_id": chat_session_id,
             "chat_memory": updated_memory,
+            "conversation_history": _build_follow_up_conversation_history(history, user_message, clean_response),
             "capability_usage": capability_usage,
             "has_follow_on": len(follow_on_actions) > 0,
             "follow_on_actions": follow_on_actions
@@ -9697,7859 +11697,9 @@ async def get_llm_health():
 @app.get("/")
 async def serve_frontend():
     """Serve the frontend HTML."""
+    if FRONTEND_INDEX_PATH.exists():
+        return FileResponse(FRONTEND_INDEX_PATH)
     return HTMLResponse(content=get_frontend_html())
-
-
-def get_frontend_html():
-    """Generate the frontend HTML with embedded React app."""
-    return """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Splunk MCP Discovery Tool</title>
-    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <style>
-        .animated-gradient {
-            background: linear-gradient(-45deg, #667eea, #764ba2, #667eea, #764ba2);
-            background-size: 400% 400%;
-            animation: gradientShift 3s ease infinite;
-        }
-        
-        @keyframes gradientShift {
-            0% { background-position: 0% 50%; }
-            50% { background-position: 100% 50%; }
-            100% { background-position: 0% 50%; }
-        }
-        
-        .pulse-ring {
-            animation: pulse-ring 1.25s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
-        }
-        
-        @keyframes pulse-ring {
-            0% { transform: scale(0.33); }
-            80%, 100% { opacity: 0; }
-        }
-        
-        .progress-bar {
-            transition: width 0.3s ease;
-        }
-        
-        .fade-in {
-            animation: fadeIn 0.5s ease-in;
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        .slide-in {
-            animation: slideIn 0.5s ease-out;
-        }
-        
-        @keyframes slideIn {
-            from { transform: translateX(-100%); }
-            to { transform: translateX(0); }
-        }
-        
-        .scroll-container {
-            scrollbar-width: thin;
-            scrollbar-color: #667eea #f1f5f9;
-        }
-        
-        .scroll-container::-webkit-scrollbar {
-            width: 8px;
-        }
-        
-        .scroll-container::-webkit-scrollbar-track {
-            background: #f1f5f9;
-            border-radius: 4px;
-        }
-        
-        .scroll-container::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 4px;
-        }
-        
-        .scroll-container::-webkit-scrollbar-thumb:hover {
-            background: #5a67d8;
-        }
-
-        button:focus-visible,
-        [role='button']:focus-visible,
-        [role='tab']:focus-visible,
-        summary:focus-visible,
-        a:focus-visible,
-        input:focus-visible,
-        textarea:focus-visible,
-        select:focus-visible {
-            outline: 2px solid #4338ca;
-            outline-offset: 2px;
-        }
-
-        /* Compatibility shim for utility tokens not present in the Tailwind 2.2 CDN stylesheet. */
-        .bg-slate-100 { background-color: #f1f5f9 !important; }
-        .bg-slate-700 { background-color: #334155 !important; }
-        .bg-slate-800 { background-color: #1e293b !important; }
-        .text-slate-100 { color: #f1f5f9 !important; }
-        .text-slate-200 { color: #e2e8f0 !important; }
-        .text-slate-800 { color: #1e293b !important; }
-        .border-slate-300 { border-color: #cbd5e1 !important; }
-        .border-slate-600 { border-color: #475569 !important; }
-        .border-slate-700 { border-color: #334155 !important; }
-
-        .bg-sky-100 { background-color: #e0f2fe !important; }
-        .bg-sky-600 { background-color: #0369a1 !important; }
-        .bg-sky-700 { background-color: #075985 !important; }
-        .bg-sky-800 { background-color: #075985 !important; }
-        .bg-sky-900 { background-color: #0c4a6e !important; }
-        .text-sky-100 { color: #e0f2fe !important; }
-        .text-sky-200 { color: #bae6fd !important; }
-        .text-sky-600 { color: #0369a1 !important; }
-        .text-sky-800 { color: #075985 !important; }
-        .border-sky-300 { border-color: #7dd3fc !important; }
-        .border-sky-700 { border-color: #0369a1 !important; }
-
-        .bg-amber-50 { background-color: #fffbeb !important; }
-        .bg-amber-100 { background-color: #fef3c7 !important; }
-        .bg-amber-400 { background-color: #fbbf24 !important; }
-        .bg-amber-500 { background-color: #f59e0b !important; }
-        .bg-amber-600 { background-color: #b45309 !important; }
-        .bg-amber-700 { background-color: #92400e !important; }
-        .bg-amber-900 { background-color: #78350f !important; }
-        .text-amber-100 { color: #fef3c7 !important; }
-        .text-amber-200 { color: #fde68a !important; }
-        .text-amber-300 { color: #fcd34d !important; }
-        .text-amber-600 { color: #b45309 !important; }
-        .text-amber-700 { color: #92400e !important; }
-        .text-amber-800 { color: #78350f !important; }
-        .text-amber-900 { color: #451a03 !important; }
-        .border-amber-200 { border-color: #fde68a !important; }
-        .border-amber-300 { border-color: #fcd34d !important; }
-        .border-amber-400 { border-color: #fbbf24 !important; }
-        .border-amber-500 { border-color: #f59e0b !important; }
-        .border-amber-600 { border-color: #d97706 !important; }
-        .border-amber-700 { border-color: #b45309 !important; }
-
-        .bg-cyan-100 { background-color: #cffafe !important; }
-        .bg-cyan-500 { background-color: #06b6d4 !important; }
-        .bg-cyan-600 { background-color: #0891b2 !important; }
-        .bg-cyan-700 { background-color: #0e7490 !important; }
-        .bg-cyan-800 { background-color: #155e75 !important; }
-        .bg-cyan-900 { background-color: #164e63 !important; }
-        .text-cyan-100 { color: #cffafe !important; }
-        .text-cyan-300 { color: #67e8f9 !important; }
-        .text-cyan-700 { color: #0e7490 !important; }
-        .text-cyan-800 { color: #155e75 !important; }
-        .text-cyan-900 { color: #164e63 !important; }
-        .border-cyan-300 { border-color: #67e8f9 !important; }
-        .border-cyan-700 { border-color: #0e7490 !important; }
-
-        .bg-emerald-50 { background-color: #ecfdf5 !important; }
-        .bg-emerald-100 { background-color: #d1fae5 !important; }
-        .bg-emerald-600 { background-color: #047857 !important; }
-        .bg-emerald-700 { background-color: #065f46 !important; }
-        .bg-emerald-900 { background-color: #064e3b !important; }
-        .text-emerald-100 { color: #d1fae5 !important; }
-        .text-emerald-200 { color: #a7f3d0 !important; }
-        .text-emerald-300 { color: #6ee7b7 !important; }
-        .text-emerald-600 { color: #059669 !important; }
-        .text-emerald-700 { color: #047857 !important; }
-        .text-emerald-800 { color: #065f46 !important; }
-        .text-emerald-900 { color: #064e3b !important; }
-        .border-emerald-200 { border-color: #a7f3d0 !important; }
-        .border-emerald-300 { border-color: #6ee7b7 !important; }
-        .border-emerald-500 { border-color: #10b981 !important; }
-        .border-emerald-700 { border-color: #047857 !important; }
-        .border-emerald-800 { border-color: #065f46 !important; }
-
-        .bg-rose-600 { background-color: #e11d48 !important; }
-        .bg-rose-700 { background-color: #be123c !important; }
-
-        .bg-violet-600 { background-color: #7c3aed !important; }
-        .bg-violet-700 { background-color: #6d28d9 !important; }
-
-        .bg-fuchsia-100 { background-color: #fae8ff !important; }
-        .bg-fuchsia-900 { background-color: #701a75 !important; }
-        .text-fuchsia-100 { color: #fae8ff !important; }
-        .text-fuchsia-900 { color: #701a75 !important; }
-        .border-fuchsia-300 { border-color: #f0abfc !important; }
-        .border-fuchsia-700 { border-color: #a21caf !important; }
-
-        .bg-gray-950 { background-color: #030712 !important; }
-        .bg-indigo-950 { background-color: #1e1b4b !important; }
-        .bg-indigo-950\/70 { background-color: rgba(30, 27, 75, 0.7) !important; }
-        .bg-emerald-950 { background-color: #022c22 !important; }
-        .bg-red-950 { background-color: #450a0a !important; }
-        .bg-amber-950 { background-color: #451a03 !important; }
-        .bg-blue-950 { background-color: #172554 !important; }
-        .bg-purple-950 { background-color: #3b0764 !important; }
-        .bg-green-950 { background-color: #052e16 !important; }
-        .bg-orange-950 { background-color: #431407 !important; }
-        .bg-yellow-950 { background-color: #422006 !important; }
-
-        .from-slate-800 {
-            --tw-gradient-from: #1e293b !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(30, 41, 59, 0)) !important;
-        }
-
-        .from-amber-50 {
-            --tw-gradient-from: #fffbeb !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(255, 251, 235, 0)) !important;
-        }
-
-        .from-amber-400 {
-            --tw-gradient-from: #fbbf24 !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(251, 191, 36, 0)) !important;
-        }
-
-        .from-amber-500 {
-            --tw-gradient-from: #f59e0b !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(245, 158, 11, 0)) !important;
-        }
-
-        .to-emerald-50 { --tw-gradient-to: #ecfdf5 !important; }
-        .bg-green-500 { background-color: #15803d !important; }
-        .bg-green-600 { background-color: #15803d !important; }
-        .bg-green-700 { background-color: #166534 !important; }
-
-        .from-green-600 {
-            --tw-gradient-from: #15803d !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(21, 128, 61, 0)) !important;
-        }
-
-        .to-emerald-600 { --tw-gradient-to: #047857 !important; }
-        .to-emerald-700 { --tw-gradient-to: #065f46 !important; }
-
-        .from-indigo-950 {
-            --tw-gradient-from: #1e1b4b !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(30, 27, 75, 0)) !important;
-        }
-
-        .to-indigo-950 { --tw-gradient-to: #1e1b4b !important; }
-        .to-purple-950 { --tw-gradient-to: #3b0764 !important; }
-        .to-violet-50 { --tw-gradient-to: #f5f3ff !important; }
-
-        .hover\:bg-sky-700:hover { background-color: #0369a1 !important; }
-        .hover\:bg-sky-800:hover { background-color: #075985 !important; }
-        .hover\:bg-amber-700:hover { background-color: #92400e !important; }
-        .hover\:bg-cyan-800:hover { background-color: #155e75 !important; }
-        .hover\:bg-emerald-700:hover { background-color: #065f46 !important; }
-        .hover\:bg-green-700:hover { background-color: #166534 !important; }
-        .hover\:bg-rose-700:hover { background-color: #be123c !important; }
-        .hover\:bg-violet-700:hover { background-color: #6d28d9 !important; }
-        .hover\:from-amber-600:hover {
-            --tw-gradient-from: #d97706 !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(217, 119, 6, 0)) !important;
-        }
-        .hover\:from-green-700:hover {
-            --tw-gradient-from: #166534 !important;
-            --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgba(22, 101, 52, 0)) !important;
-        }
-        .hover\:to-emerald-700:hover { --tw-gradient-to: #065f46 !important; }
-        .hover\:text-sky-800:hover { color: #075985 !important; }
-        .hover\:text-amber-800:hover { color: #78350f !important; }
-        .hover\:text-cyan-100:hover { color: #cffafe !important; }
-        .hover\:text-cyan-900:hover { color: #164e63 !important; }
-        .hover\:text-emerald-800:hover { color: #065f46 !important; }
-        .hover\:text-emerald-900:hover { color: #064e3b !important; }
-
-        .bg-gray-200.text-gray-500,
-        .bg-gray-200.text-gray-600 { color: #4b5563 !important; }
-
-        .bg-gray-300.text-gray-500 { color: #374151 !important; }
-
-        .bg-gray-700.text-gray-500,
-        .bg-gray-700.text-gray-400,
-        .bg-gray-800.text-gray-500 {
-            color: #d1d5db !important;
-        }
-
-        [data-theme='dark'] .settings-modal-shell {
-            color: #e5e7eb;
-        }
-
-        [data-theme='dark'] .settings-modal-shell .text-gray-900 { color: #f3f4f6 !important; }
-        [data-theme='dark'] .settings-modal-shell .text-gray-800 { color: #e5e7eb !important; }
-        [data-theme='dark'] .settings-modal-shell .text-gray-700 { color: #d1d5db !important; }
-        [data-theme='dark'] .settings-modal-shell .text-gray-600 { color: #cbd5e1 !important; }
-        [data-theme='dark'] .settings-modal-shell .text-gray-500 { color: #94a3b8 !important; }
-        [data-theme='dark'] .settings-modal-shell .text-gray-400 { color: #94a3b8 !important; }
-
-        [data-theme='dark'] .settings-modal-shell .bg-white { background-color: #1f2937 !important; }
-        [data-theme='dark'] .settings-modal-shell .bg-gray-50 { background-color: #111827 !important; }
-        [data-theme='dark'] .settings-modal-shell .bg-gray-100 { background-color: #1f2937 !important; }
-        [data-theme='dark'] .settings-modal-shell .bg-amber-50 { background-color: #3f2c12 !important; }
-        [data-theme='dark'] .settings-modal-shell .bg-emerald-50 { background-color: #0f3b30 !important; }
-        [data-theme='dark'] .settings-modal-shell .from-green-50,
-        [data-theme='dark'] .settings-modal-shell .to-emerald-50,
-        [data-theme='dark'] .settings-modal-shell .from-purple-50,
-        [data-theme='dark'] .settings-modal-shell .to-indigo-50 { background-image: none !important; background-color: #1f2937 !important; }
-
-        [data-theme='dark'] .settings-modal-shell .border-gray-100,
-        [data-theme='dark'] .settings-modal-shell .border-gray-200,
-        [data-theme='dark'] .settings-modal-shell .border-gray-300 { border-color: #4b5563 !important; }
-
-        [data-theme='dark'] .settings-modal-shell input,
-        [data-theme='dark'] .settings-modal-shell select,
-        [data-theme='dark'] .settings-modal-shell textarea {
-            background-color: #111827 !important;
-            color: #f3f4f6 !important;
-            border-color: #4b5563 !important;
-        }
-
-        [data-theme='dark'] .settings-modal-shell input::placeholder,
-        [data-theme='dark'] .settings-modal-shell textarea::placeholder {
-            color: #94a3b8 !important;
-        }
-
-        [data-theme='dark'] .settings-modal-shell code {
-            background-color: #0f172a !important;
-            color: #e2e8f0 !important;
-        }
-
-        [data-theme='dark'] .connection-popover {
-            border: 1px solid #4b5563;
-        }
-
-        [data-theme='dark'] .connection-popover .text-gray-900 { color: #f3f4f6 !important; }
-        [data-theme='dark'] .connection-popover .text-gray-800 { color: #e5e7eb !important; }
-        [data-theme='dark'] .connection-popover .text-gray-700 { color: #d1d5db !important; }
-        [data-theme='dark'] .connection-popover .text-gray-600 { color: #cbd5e1 !important; }
-        [data-theme='dark'] .connection-popover .text-gray-500 { color: #94a3b8 !important; }
-        [data-theme='dark'] .connection-popover .bg-white { background-color: #1f2937 !important; }
-        [data-theme='dark'] .connection-popover .bg-gray-50 { background-color: #111827 !important; }
-        [data-theme='dark'] .connection-popover .from-purple-50,
-        [data-theme='dark'] .connection-popover .to-indigo-50,
-        [data-theme='dark'] .connection-popover .from-green-50,
-        [data-theme='dark'] .connection-popover .to-emerald-50,
-        [data-theme='dark'] .connection-popover .from-blue-50,
-        [data-theme='dark'] .connection-popover .to-cyan-50 { background-image: none !important; background-color: #111827 !important; }
-        [data-theme='dark'] .connection-popover .border-gray-200,
-        [data-theme='dark'] .connection-popover .border-gray-100,
-        [data-theme='dark'] .connection-popover .border-indigo-100,
-        [data-theme='dark'] .connection-popover .border-green-100,
-        [data-theme='dark'] .connection-popover .border-blue-100 { border-color: #374151 !important; }
-
-        [data-theme='dark'] .chat-settings-modal-shell {
-            color: #e5e7eb;
-        }
-
-        [data-theme='dark'] .chat-settings-modal-shell .text-gray-900 { color: #f3f4f6 !important; }
-        [data-theme='dark'] .chat-settings-modal-shell .text-gray-800 { color: #e5e7eb !important; }
-        [data-theme='dark'] .chat-settings-modal-shell .text-gray-700 { color: #d1d5db !important; }
-        [data-theme='dark'] .chat-settings-modal-shell .text-gray-600 { color: #cbd5e1 !important; }
-        [data-theme='dark'] .chat-settings-modal-shell .text-gray-500 { color: #94a3b8 !important; }
-
-        [data-theme='dark'] .chat-settings-modal-shell .bg-white { background-color: #1f2937 !important; }
-        [data-theme='dark'] .chat-settings-modal-shell .bg-gray-50 { background-color: #111827 !important; }
-
-        [data-theme='dark'] .chat-settings-modal-shell .from-green-50,
-        [data-theme='dark'] .chat-settings-modal-shell .to-emerald-50,
-        [data-theme='dark'] .chat-settings-modal-shell .from-purple-50,
-        [data-theme='dark'] .chat-settings-modal-shell .to-indigo-50,
-        [data-theme='dark'] .chat-settings-modal-shell .from-amber-50,
-        [data-theme='dark'] .chat-settings-modal-shell .to-yellow-50,
-        [data-theme='dark'] .chat-settings-modal-shell .from-blue-50,
-        [data-theme='dark'] .chat-settings-modal-shell .to-cyan-50,
-        [data-theme='dark'] .chat-settings-modal-shell .from-indigo-50,
-        [data-theme='dark'] .chat-settings-modal-shell .to-violet-50 {
-            background-image: none !important;
-            background-color: #111827 !important;
-        }
-
-        [data-theme='dark'] .chat-settings-modal-shell .border-gray-200,
-        [data-theme='dark'] .chat-settings-modal-shell .border-gray-300,
-        [data-theme='dark'] .chat-settings-modal-shell .border-green-200,
-        [data-theme='dark'] .chat-settings-modal-shell .border-purple-200,
-        [data-theme='dark'] .chat-settings-modal-shell .border-amber-200,
-        [data-theme='dark'] .chat-settings-modal-shell .border-blue-200,
-        [data-theme='dark'] .chat-settings-modal-shell .border-indigo-200,
-        [data-theme='dark'] .chat-settings-modal-shell .border-indigo-100 {
-            border-color: #4b5563 !important;
-        }
-
-        [data-theme='dark'] .chat-settings-modal-shell input,
-        [data-theme='dark'] .chat-settings-modal-shell select,
-        [data-theme='dark'] .chat-settings-modal-shell textarea {
-            background-color: #111827 !important;
-            color: #f3f4f6 !important;
-            border-color: #4b5563 !important;
-        }
-    </style>
-</head>
-<body class="bg-gray-50">
-    <div id="root"></div>
-    
-    <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
-
-        const generateChatSessionId = () => {
-            const now = new Date();
-            const stamp = now.toISOString().replace(/[-:T\\.Z]/g, '').slice(0, 14);
-            const rand = Math.random().toString(36).slice(2, 8);
-            return `chat_${stamp}_${rand}`;
-        };
-
-        const CHAT_STATE_STORAGE_KEY = 'dt4sms_chat_state_v1';
-
-        const compactPersistedChatMessages = (items) => {
-            if (!Array.isArray(items)) return [];
-            return items.slice(-24).map((msg, idx) => ({
-                id: msg?.id || `persisted_${idx}_${Date.now()}`,
-                type: msg?.type || 'assistant',
-                content: typeof msg?.content === 'string' ? msg.content : '',
-                timestamp: msg?.timestamp || new Date().toISOString(),
-                spl_query: typeof msg?.spl_query === 'string' ? msg.spl_query : undefined,
-                spl_in_text: typeof msg?.spl_in_text === 'string' ? msg.spl_in_text : undefined,
-                visualization_spec: msg?.visualization_spec && typeof msg.visualization_spec === 'object'
-                    ? {
-                        chart_type: typeof msg.visualization_spec?.chart_type === 'string' ? msg.visualization_spec.chart_type : undefined,
-                        title: typeof msg.visualization_spec?.title === 'string' ? msg.visualization_spec.title : undefined,
-                        summary_text: typeof msg.visualization_spec?.summary_text === 'string' ? msg.visualization_spec.summary_text : undefined,
-                        x_field: typeof msg.visualization_spec?.x_field === 'string' ? msg.visualization_spec.x_field : undefined,
-                        y_field: typeof msg.visualization_spec?.y_field === 'string' ? msg.visualization_spec.y_field : undefined,
-                        point_count: typeof msg.visualization_spec?.point_count === 'number' ? msg.visualization_spec.point_count : undefined,
-                        points: Array.isArray(msg.visualization_spec?.points)
-                            ? msg.visualization_spec.points.slice(0, 8).map((point) => ({
-                                label: typeof point?.label === 'string' ? point.label : '',
-                                full_label: typeof point?.full_label === 'string' ? point.full_label : undefined,
-                                value: Number.isFinite(Number(point?.value)) ? Number(point.value) : undefined,
-                            })).filter((point) => Number.isFinite(point.value))
-                            : [],
-                    }
-                    : undefined,
-                capability_usage: Array.isArray(msg?.capability_usage)
-                    ? msg.capability_usage.slice(0, 2).map((usage, usageIdx) => ({
-                        name: typeof usage?.name === 'string' ? usage.name : `capability_${usageIdx}`,
-                        title: typeof usage?.title === 'string' ? usage.title : (typeof usage?.name === 'string' ? usage.name : 'Capability'),
-                        category: typeof usage?.category === 'string' ? usage.category : undefined,
-                        used_in: typeof usage?.used_in === 'string' ? usage.used_in : undefined,
-                        contribution: typeof usage?.contribution === 'string' ? usage.contribution : '',
-                        chunks: Array.isArray(usage?.chunks)
-                            ? usage.chunks.slice(0, 3).map((chunk, chunkIdx) => ({
-                                source: typeof chunk?.source === 'string' ? chunk.source : `artifact_${chunkIdx + 1}`,
-                                score: typeof chunk?.score === 'number' ? chunk.score : undefined,
-                                snippet: typeof chunk?.snippet === 'string' ? chunk.snippet : '',
-                                source_type: typeof chunk?.source_type === 'string' ? chunk.source_type : undefined,
-                            })).filter((chunk) => chunk.snippet)
-                            : [],
-                    }))
-                    : [],
-                has_follow_on: !!msg?.has_follow_on,
-                follow_on_actions: Array.isArray(msg?.follow_on_actions) ? msg.follow_on_actions.slice(0, 3) : [],
-                status_timeline: Array.isArray(msg?.status_timeline) ? msg.status_timeline.slice(-8) : [],
-                iterations: typeof msg?.iterations === 'number' ? msg.iterations : 0,
-                execution_time: typeof msg?.execution_time === 'string' ? msg.execution_time : undefined,
-            }));
-        };
-
-        const compactPersistedConversationHistory = (history) => {
-            if (!Array.isArray(history)) return null;
-            return history.slice(-16)
-                .filter(entry => entry && typeof entry === 'object')
-                .map(entry => ({
-                    role: typeof entry.role === 'string' ? entry.role : 'user',
-                    content: typeof entry.content === 'string' ? entry.content : '',
-                }))
-                .filter(entry => entry.content);
-        };
-
-        const loadPersistedChatState = () => {
-            try {
-                if (typeof window === 'undefined' || !window.localStorage) {
-                    return {};
-                }
-                const raw = window.localStorage.getItem(CHAT_STATE_STORAGE_KEY);
-                if (!raw) {
-                    return {};
-                }
-                const parsed = JSON.parse(raw);
-                return parsed && typeof parsed === 'object' ? parsed : {};
-            } catch (error) {
-                console.warn('Failed to load persisted chat state', error);
-                return {};
-            }
-        };
-
-        const savePersistedChatState = (state) => {
-            try {
-                if (typeof window === 'undefined' || !window.localStorage) {
-                    return;
-                }
-                window.localStorage.setItem(CHAT_STATE_STORAGE_KEY, JSON.stringify(state));
-            } catch (error) {
-                console.warn('Failed to save persisted chat state', error);
-            }
-        };
-
-        const clearPersistedChatState = () => {
-            try {
-                if (typeof window === 'undefined' || !window.localStorage) {
-                    return;
-                }
-                window.localStorage.removeItem(CHAT_STATE_STORAGE_KEY);
-            } catch (error) {
-                console.warn('Failed to clear persisted chat state', error);
-            }
-        };
-
-        const normalizeProvider = (provider) => {
-            const value = String(provider || 'openai').toLowerCase().trim();
-            if (value === 'custom endpoint') return 'custom';
-            if (value === 'azure openai') return 'azure';
-            if (value === 'claude') return 'anthropic';
-            if (value === 'google' || value === 'google ai') return 'gemini';
-            return value;
-        };
-        
-        // Error Boundary to catch React rendering errors
-        class ErrorBoundary extends React.Component {
-            constructor(props) {
-                super(props);
-                this.state = { hasError: false, error: null, errorInfo: null };
-            }
-            
-            static getDerivedStateFromError(error) {
-                return { hasError: true };
-            }
-            
-            componentDidCatch(error, errorInfo) {
-                console.error('React Error Boundary caught:', error, errorInfo);
-                this.setState({ error, errorInfo });
-            }
-            
-            render() {
-                if (this.state.hasError) {
-                    return (
-                        <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                            <div className="bg-white rounded-lg shadow-xl p-8 max-w-2xl">
-                                <h1 className="text-2xl font-bold text-red-600 mb-4">
-                                    <i className="fas fa-exclamation-triangle mr-2"></i>
-                                    Application Error
-                                </h1>
-                                <p className="text-gray-700 mb-4">
-                                    Something went wrong. Please refresh the page to continue.
-                                </p>
-                                <div className="bg-gray-100 p-4 rounded mb-4 overflow-auto max-h-64">
-                                    <pre className="text-sm text-red-600">
-                                        {this.state.error && this.state.error.toString()}
-                                    </pre>
-                                </div>
-                                <button
-                                    onClick={() => window.location.reload()}
-                                    className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"
-                                >
-                                    <i className="fas fa-sync-alt mr-2"></i>
-                                    Reload Page
-                                </button>
-                            </div>
-                        </div>
-                    );
-                }
-                return this.props.children;
-            }
-        }
-        
-        function App() {
-            const THEME_PREFERENCE_KEY = 'dt4sms_theme_preference';
-            const initialChatState = useRef(loadPersistedChatState()).current || {};
-            const [isConnected, setIsConnected] = useState(false);
-            const [discoveryStatus, setDiscoveryStatus] = useState('idle');
-            const [messages, setMessages] = useState([]);
-            const [progress, setProgress] = useState({ percentage: 0, description: '' });
-            const [reports, setReports] = useState([]);
-            const [sessionCatalog, setSessionCatalog] = useState([]);
-            const [discoveryDashboard, setDiscoveryDashboard] = useState(null);
-            const [v2Intelligence, setV2Intelligence] = useState(null);
-            const [v2Artifacts, setV2Artifacts] = useState({ has_data: false, artifacts: [], count: 0 });
-            const [workflowTab, setWorkflowTab] = useState('admin');
-            const [compareSelection, setCompareSelection] = useState({ current: 'latest', baseline: 'previous' });
-            const [discoveryCompare, setDiscoveryCompare] = useState(null);
-            const [runbookPayload, setRunbookPayload] = useState(null);
-            const [selectedReport, setSelectedReport] = useState(null);
-            const [reportContent, setReportContent] = useState(null);
-            const [expandedSessions, setExpandedSessions] = useState({});
-            const [expandedYears, setExpandedYears] = useState({});
-            const [expandedMonths, setExpandedMonths] = useState({});
-            const [expandedDays, setExpandedDays] = useState({});
-            const [isChatOpen, setIsChatOpen] = useState(false);
-            const [chatMessages, setChatMessages] = useState(() => Array.isArray(initialChatState.chatMessages) ? initialChatState.chatMessages : []);
-            const [chatInput, setChatInput] = useState('');
-            const [isTyping, setIsTyping] = useState(false);
-            const [chatStatus, setChatStatus] = useState(''); // Real-time status during investigation
-            const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
-            const [chatSettings, setChatSettings] = useState(null); // Loaded from API
-            const [serverConversationHistory, setServerConversationHistory] = useState(() => Array.isArray(initialChatState.serverConversationHistory) ? initialChatState.serverConversationHistory : null); // Server's full conversation with reasoning
-            const [chatSessionId, setChatSessionId] = useState(() => {
-                const persistedId = typeof initialChatState.chatSessionId === 'string' ? initialChatState.chatSessionId.trim() : '';
-                return persistedId || generateChatSessionId();
-            });
-            const [workspaceTab, setWorkspaceTab] = useState('mission');
-
-            const [connectionInfo, setConnectionInfo] = useState(null);
-            
-            // Discovery timer state
-            const [discoveryStartTime, setDiscoveryStartTime] = useState(null);
-            const [elapsedTime, setElapsedTime] = useState(0);
-            
-            // Summary modal state
-            const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
-            const [summaryData, setSummaryData] = useState(null);
-            const [isLoadingSummary, setIsLoadingSummary] = useState(false);
-            const [currentSessionId, setCurrentSessionId] = useState(null);
-            const [activeTab, setActiveTab] = useState('summary'); // 'summary', 'queries', 'tasks'
-            const [queryFilter, setQueryFilter] = useState('all'); // 'all', 'ai_finding', 'template'
-            const [summaryProgress, setSummaryProgress] = useState({
-                stage: 'idle',
-                progress: 0,
-                message: 'Not started'
-            });
-            
-            // Settings modal state
-            const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-            const [config, setConfig] = useState(null);
-            const [selectedProvider, setSelectedProvider] = useState('openai');
-            const [isCredentialModalOpen, setIsCredentialModalOpen] = useState(false);
-            const [isConnectionModalOpen, setIsConnectionModalOpen] = useState(false);
-            const [connectionModalPosition, setConnectionModalPosition] = useState({ top: 72, left: 16, pointerLeft: 28 });
-            const [credentialName, setCredentialName] = useState('');
-            const [savedCredentials, setSavedCredentials] = useState({});
-            const [loadedCredentialName, setLoadedCredentialName] = useState(null); // Track which credential is currently loaded
-            const [isUpdateMode, setIsUpdateMode] = useState(false); // Track if modal is in update mode
-            const [isLoadingCredential, setIsLoadingCredential] = useState(false); // Flag to prevent clearing during load
-            const [apiKeyPlaceholder, setApiKeyPlaceholder] = useState('Enter API key'); // Track placeholder state
-            const [showConfigForm, setShowConfigForm] = useState(false); // Show/hide configuration form
-            const [availableModels, setAvailableModels] = useState([]); // Available models from API
-            const [isLoadingModels, setIsLoadingModels] = useState(false); // Loading state for model fetch
-            const [selectedModel, setSelectedModel] = useState(''); // Currently selected model
-            const [capabilitiesData, setCapabilitiesData] = useState({
-                status: 'idle',
-                summary: { total: 0, installed: 0, enabled: 0, ready: 0, restart_required: 0 },
-                capabilities: {},
-                error: ''
-            });
-            const [capabilityDrafts, setCapabilityDrafts] = useState({});
-            const [capabilityActionState, setCapabilityActionState] = useState({});
-            const [capabilityNotice, setCapabilityNotice] = useState(null);
-            const [deeplinkDrafts, setDeeplinkDrafts] = useState({
-                splunk_deeplink_tools: {
-                    query: 'search index=_internal | head 20',
-                    earliest: '-24h',
-                    latest: 'now',
-                    app: 'search',
-                }
-            });
-            const [deeplinkBuildResults, setDeeplinkBuildResults] = useState({});
-            const [exportBuildState, setExportBuildState] = useState({
-                status: 'idle',
-                bundle: null,
-                error: ''
-            });
-            
-            // MCP Configuration Vault State
-            const [savedMCPConfigs, setSavedMCPConfigs] = useState({});
-            const [loadedMCPConfigName, setLoadedMCPConfigName] = useState(null); // Track which MCP config is currently loaded
-            const [isMCPSaveModalOpen, setIsMCPSaveModalOpen] = useState(false); // MCP save modal visibility
-            const [mcpConfigName, setMCPConfigName] = useState(''); // MCP config name for saving
-            const [mcpConfigDescription, setMCPConfigDescription] = useState(''); // MCP config description
-            const [showMCPConfigForm, setShowMCPConfigForm] = useState(false); // Show/hide MCP configuration form
-            const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState('Enter token'); // Track token placeholder state
-            const [showSuggestedQueries, setShowSuggestedQueries] = useState(false);
-            const [themePreference, setThemePreference] = useState(() => {
-                try {
-                    const savedTheme = localStorage.getItem(THEME_PREFERENCE_KEY);
-                    if (savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'system') {
-                        return savedTheme;
-                    }
-                } catch (error) {
-                    console.error('Failed to read theme preference:', error);
-                }
-                return 'system';
-            });
-            const [resolvedTheme, setResolvedTheme] = useState('light');
-
-            const isMissionTab = workspaceTab === 'mission';
-            const isIntelligenceTab = workspaceTab === 'intelligence';
-            const isArtifactsTab = workspaceTab === 'artifacts';
-            const isCapabilitiesTab = workspaceTab === 'capabilities';
-            const isDarkTheme = resolvedTheme === 'dark';
-            const panelClass = isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200';
-            const panelMutedClass = isDarkTheme ? 'bg-gray-700 border-gray-600' : 'bg-gray-50 border-gray-200';
-            const headingClass = isDarkTheme ? 'text-gray-100' : 'text-gray-900';
-            const subtextClass = isDarkTheme ? 'text-gray-300' : 'text-gray-600';
-            const mutedTextClass = isDarkTheme ? 'text-gray-300' : 'text-gray-600';
-            const capabilityList = Object.values(capabilitiesData?.capabilities || {});
-            const deeplinkCapability = capabilitiesData?.capabilities?.splunk_deeplink_tools || null;
-            const exportCapability = capabilitiesData?.capabilities?.export_tools || null;
-            const canUseSplunkDeeplinks = !!deeplinkCapability?.installed
-                && !!deeplinkCapability?.enabled
-                && !deeplinkCapability?.restart_required
-                && String(deeplinkCapability?.health_status || '').toLowerCase() === 'ready';
-            const canUseExportTools = !!exportCapability?.installed
-                && !!exportCapability?.enabled
-                && !exportCapability?.restart_required
-                && String(exportCapability?.health_status || '').toLowerCase() === 'ready';
-            const v2Blueprint = v2Intelligence?.blueprint || null;
-            const v2Overview = v2Blueprint?.overview || {};
-            const v2CapabilityGraph = v2Blueprint?.capability_graph || {};
-            const v2CoverageGaps = Array.isArray(v2Blueprint?.coverage_gaps) ? v2Blueprint.coverage_gaps : [];
-            const v2FindingLedger = Array.isArray(v2Blueprint?.finding_ledger) ? v2Blueprint.finding_ledger : [];
-            const v2UseCases = Array.isArray(v2Blueprint?.suggested_use_cases) ? v2Blueprint.suggested_use_cases : [];
-            const summaryStageOrder = {
-                idle: 0,
-                loading: 1,
-                loading_reports: 1,
-                generating_queries: 2,
-                identifying_unknowns: 2,
-                generating_summary: 3,
-                creating_summary: 3,
-                generating_tasks: 4,
-                saving: 5,
-                complete: 6,
-                error: 0
-            };
-            const currentSummaryStep = summaryStageOrder[summaryProgress.stage] || 0;
-            const isSummaryStepDone = (step) => summaryProgress.stage === 'complete' || currentSummaryStep > step;
-            const isSummaryStepActive = (step) => summaryProgress.stage !== 'complete' && currentSummaryStep === step;
-
-            const suggestedChatQueries = [
-                'Give me a narrative overview of what our Splunk environment appears to prioritize operationally.',
-                'What story do the current data sources tell about platform usage, reliability, and potential blind spots?',
-                'If you were onboarding a new security lead, what should they review first and why?',
-                'Describe likely risk trends we should monitor weekly, and how to validate whether they are improving.',
-                'Identify where data quality issues could silently undermine detections or reporting confidence.',
-                'Propose a practical 30-day hardening plan with quick wins, medium-term tasks, and measurable outcomes.',
-                'Suggest a recursive analysis loop we can run each week to catch drift, anomalies, and hidden failure modes.',
-                'Translate the discovery output into executive-ready priorities with business impact and verification steps.'
-            ];
-            
-            // Function to track when settings have been modified
-            const handleSettingsChange = () => {
-                // Don't clear the loaded credential name - we need it to show "Update Active Connection" button
-                // The button logic will handle whether it's an update or new save
-            };
-            
-            // Function specifically for API key changes
-            const handleApiKeyChange = () => {
-                setApiKeyPlaceholder('Enter API key');
-                handleSettingsChange();
-            };
-
-            const handleKeyActivate = (event, callback) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    callback();
-                }
-            };
-
-            const handleDialogKeyDown = (event, onClose) => {
-                if (event.key === 'Escape') {
-                    event.preventDefault();
-                    onClose();
-                }
-            };
-            
-            // Poll for summarization progress
-            useEffect(() => {
-                if (!isLoadingSummary || !currentSessionId) return;
-                
-                const interval = setInterval(async () => {
-                    try {
-                        const response = await fetch(`/summarize-progress/${currentSessionId}`);
-                        const progress = await response.json();
-                        setSummaryProgress((prev) => {
-                            if (!progress || typeof progress !== 'object') {
-                                return prev;
-                            }
-                            const monotonicProgress = Math.max(prev?.progress || 0, progress?.progress || 0);
-                            return {
-                                ...progress,
-                                progress: monotonicProgress
-                            };
-                        });
-                    } catch (error) {
-                        console.error('Progress check failed:', error);
-                    }
-                }, 500); // Poll every 500ms
-                
-                return () => clearInterval(interval);
-            }, [isLoadingSummary, currentSessionId]);
-            
-            // Task tracking state - stored in localStorage
-            const [taskProgress, setTaskProgress] = useState(() => {
-                const saved = localStorage.getItem('splunk_task_progress');
-                return saved ? JSON.parse(saved) : {};
-            });
-            
-            // Save task progress to localStorage whenever it changes
-            useEffect(() => {
-                localStorage.setItem('splunk_task_progress', JSON.stringify(taskProgress));
-            }, [taskProgress]);
-
-            useEffect(() => {
-                try {
-                    localStorage.setItem(THEME_PREFERENCE_KEY, themePreference);
-                } catch (error) {
-                    console.error('Failed to persist theme preference:', error);
-                }
-            }, [themePreference]);
-
-            useEffect(() => {
-                const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-
-                const updateResolvedTheme = () => {
-                    const nextTheme = themePreference === 'system'
-                        ? (mediaQuery.matches ? 'dark' : 'light')
-                        : themePreference;
-                    setResolvedTheme(nextTheme);
-                };
-
-                updateResolvedTheme();
-
-                if (themePreference === 'system') {
-                    const handleMediaChange = () => updateResolvedTheme();
-                    if (mediaQuery.addEventListener) {
-                        mediaQuery.addEventListener('change', handleMediaChange);
-                    } else {
-                        mediaQuery.addListener(handleMediaChange);
-                    }
-
-                    return () => {
-                        if (mediaQuery.removeEventListener) {
-                            mediaQuery.removeEventListener('change', handleMediaChange);
-                        } else {
-                            mediaQuery.removeListener(handleMediaChange);
-                        }
-                    };
-                }
-            }, [themePreference]);
-
-            useEffect(() => {
-                document.documentElement.setAttribute('data-theme', resolvedTheme);
-            }, [resolvedTheme]);
-            
-            // Toggle step completion
-            const toggleStepCompletion = (sessionId, taskIndex, stepNumber) => {
-                setTaskProgress(prev => {
-                    const key = `${sessionId}_task${taskIndex}`;
-                    const current = prev[key] || { completedSteps: [], status: 'not-started' };
-                    const completedSteps = new Set(current.completedSteps);
-                    
-                    if (completedSteps.has(stepNumber)) {
-                        completedSteps.delete(stepNumber);
-                    } else {
-                        completedSteps.add(stepNumber);
-                    }
-                    
-                    const totalSteps = summaryData?.admin_tasks?.[taskIndex]?.steps?.length || 0;
-                    const status = completedSteps.size === 0 ? 'not-started' :
-                                   completedSteps.size === totalSteps ? 'completed' : 'in-progress';
-                    
-                    return {
-                        ...prev,
-                        [key]: {
-                            completedSteps: Array.from(completedSteps),
-                            status,
-                            lastUpdated: new Date().toISOString()
-                        }
-                    };
-                });
-            };
-            
-            // Get task progress
-            const getTaskProgress = (sessionId, taskIndex) => {
-                const key = `${sessionId}_task${taskIndex}`;
-                return taskProgress[key] || { completedSteps: [], status: 'not-started' };
-            };
-            
-            // Calculate completion percentage
-            const getTaskCompletionPercentage = (sessionId, taskIndex, totalSteps) => {
-                const progress = getTaskProgress(sessionId, taskIndex);
-                if (totalSteps === 0) return 0;
-                return Math.round((progress.completedSteps.length / totalSteps) * 100);
-            };
-            
-            // Verification state
-            const [verificationResults, setVerificationResults] = useState({});
-            const [verifyingTask, setVerifyingTask] = useState(null);
-            
-            // Remediation state
-            const [remediationData, setRemediationData] = useState({});
-            const [loadingRemediation, setLoadingRemediation] = useState(null);
-            const [verificationHistory, setVerificationHistory] = useState({});
-            const [showHistory, setShowHistory] = useState(null);
-            
-            // Get remediation for failed/partial verification
-            const getRemediation = async (sessionId, taskIndex, taskDetails, verificationResult) => {
-                setLoadingRemediation(taskIndex);
-                
-                try {
-                    const response = await fetch('/get-remediation', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            session_id: sessionId,
-                            task_index: taskIndex,
-                            task_details: taskDetails,
-                            verification_result: verificationResult
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    setRemediationData(prev => ({
-                        ...prev,
-                        [`${sessionId}_task${taskIndex}`]: result
-                    }));
-                    
-                } catch (error) {
-                    console.error('Failed to get remediation:', error);
-                } finally {
-                    setLoadingRemediation(null);
-                }
-            };
-            
-            // Load verification history
-            const loadVerificationHistory = async (sessionId, taskIndex) => {
-                try {
-                    const response = await fetch(`/verification-history/${sessionId}/${taskIndex}`);
-                    const result = await response.json();
-                    
-                    setVerificationHistory(prev => ({
-                        ...prev,
-                        [`${sessionId}_task${taskIndex}`]: result
-                    }));
-                    
-                } catch (error) {
-                    console.error('Failed to load verification history:', error);
-                }
-            };
-            
-            // Run verification for a task
-            const runVerification = async (sessionId, taskIndex, task) => {
-                setVerifyingTask(taskIndex);
-                
-                try {
-                    const response = await fetch('/verify-task', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            session_id: sessionId,
-                            task_index: taskIndex,
-                            verification_spl: task.verification_spl,
-                            expected_outcome: task.expected_outcome
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    // Store verification result
-                    setVerificationResults(prev => ({
-                        ...prev,
-                        [`${sessionId}_task${taskIndex}`]: result
-                    }));
-                    
-                } catch (error) {
-                    console.error('Verification failed:', error);
-                    setVerificationResults(prev => ({
-                        ...prev,
-                        [`${sessionId}_task${taskIndex}`]: {
-                            status: 'error',
-                            message: `Failed to run verification: ${error.message}`,
-                            results: null
-                        }
-                    }));
-                } finally {
-                    setVerifyingTask(null);
-                }
-            };
-            
-            // Get verification result for a task
-            const getVerificationResult = (sessionId, taskIndex) => {
-                return verificationResults[`${sessionId}_task${taskIndex}`];
-            };
-            
-            // Resizable panel state
-            const [discoveryLogHeight, setDiscoveryLogHeight] = useState(480); // 50% taller than original 320px
-            const [reportViewerHeight, setReportViewerHeight] = useState(560); // 70vh ≈ 560px
-            const [isResizingLog, setIsResizingLog] = useState(false);
-            const [isResizingReport, setIsResizingReport] = useState(false);
-            
-            const wsRef = useRef(null);
-            const messagesEndRef = useRef(null);
-            const chatEndRef = useRef(null);
-            const chatInputRef = useRef(null);
-            
-            const scrollToBottom = () => {
-                messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-            };
-            
-            useEffect(scrollToBottom, [messages]);
-            
-            // Auto-focus chat input when chat opens
-            useEffect(() => {
-                if (isChatOpen) {
-                    setTimeout(() => {
-                        chatEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-                        chatInputRef.current?.focus();
-                    }, 100);
-                }
-            }, [isChatOpen]);
-
-            useEffect(() => {
-                savePersistedChatState({
-                    chatSessionId,
-                    chatMessages: compactPersistedChatMessages(chatMessages),
-                    serverConversationHistory: compactPersistedConversationHistory(serverConversationHistory),
-                });
-            }, [chatSessionId, chatMessages, serverConversationHistory]);
-            
-            useEffect(() => {
-                connectWebSocket();
-                loadReports();
-                loadDiscoveryDashboard();
-                loadV2Intelligence();
-                loadV2Artifacts();
-                loadCapabilities();
-                loadDiscoveryCompare('latest', 'previous');
-                loadRunbookPayload('latest', 'admin');
-                loadConfig(); // Load config to get active LLM connection info
-                loadCapabilities();
-                
-                return () => {
-                    if (wsRef.current) {
-                        wsRef.current.close();
-                    }
-                };
-            }, []);
-
-            useEffect(() => {
-                if (discoveryDashboard && discoveryDashboard.has_data) {
-                    loadRunbookPayload(compareSelection.current, workflowTab);
-                }
-            }, [workflowTab]);
-
-            useEffect(() => {
-                if (isIntelligenceTab) {
-                    loadV2Intelligence();
-                }
-                if (isArtifactsTab) {
-                    loadV2Artifacts();
-                }
-                if (isCapabilitiesTab) {
-                    loadCapabilities();
-                }
-            }, [workspaceTab]);
-            
-            // Timer effect - updates elapsed time every second when discovery is running
-            useEffect(() => {
-                if (discoveryStatus === 'running' && discoveryStartTime) {
-                    const interval = setInterval(() => {
-                        const elapsed = Math.floor((Date.now() - discoveryStartTime) / 1000);
-                        setElapsedTime(elapsed);
-                    }, 1000);
-                    
-                    return () => clearInterval(interval);
-                } else if (discoveryStatus !== 'running') {
-                    setElapsedTime(0);
-                }
-            }, [discoveryStatus, discoveryStartTime]);
-            
-            const connectWebSocket = () => {
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = `${protocol}//${window.location.host}/ws`;
-                
-                wsRef.current = new WebSocket(wsUrl);
-                
-                wsRef.current.onopen = () => {
-                    setIsConnected(true);
-                    addMessage('system', 'Connected to discovery engine');
-                };
-                
-                wsRef.current.onmessage = (event) => {
-                    const message = JSON.parse(event.data);
-                    handleWebSocketMessage(message);
-                };
-                
-                wsRef.current.onclose = () => {
-                    setIsConnected(false);
-                    setTimeout(connectWebSocket, 3000); // Reconnect after 3s
-                };
-            };
-            
-            const handleWebSocketMessage = (message) => {
-                switch (message.type) {
-                    case 'banner':
-                        addMessage('banner', message.data);
-                        break;
-                    case 'phase':
-                        addMessage('phase', message.data);
-                        break;
-                    case 'success':
-                    case 'error':
-                    case 'warning':
-                    case 'info':
-                        addMessage(message.type, message.data);
-                        break;
-                    case 'progress':
-                        setProgress(message.data);
-                        break;
-                    case 'overview':
-                        addMessage('overview', message.data);
-                        break;
-                    case 'classification':
-                        addMessage('classification', message.data);
-                        break;
-                    case 'recommendations':
-                        addMessage('recommendations', message.data);
-                        break;
-                    case 'use_cases':
-                        addMessage('use_cases', message.data);
-                        break;
-                    case 'completion':
-                        addMessage('completion', message.data);
-                        setProgress({ percentage: 100, description: 'Discovery completed. Finalizing UI...' });
-                        setDiscoveryStatus('completed');
-                        setDiscoveryStartTime(null);
-                        setElapsedTime(0);
-                        loadReports();
-                        loadDiscoveryDashboard();
-                        loadV2Intelligence();
-                        loadV2Artifacts();
-                        loadDiscoveryCompare('latest', 'previous');
-                        loadRunbookPayload('latest', workflowTab);
-                        break;
-                    case 'rate_limit':
-                        addMessage('rate_limit', message.data);
-                        break;
-                }
-            };
-            
-            const addMessage = (type, data) => {
-                setMessages(prev => [...prev, {
-                    id: Date.now() + Math.random(),
-                    type,
-                    data,
-                    timestamp: new Date().toISOString()
-                }]);
-            };
-            
-            const startDiscovery = async () => {
-                // Check if using local LLM by examining endpoint URL
-                // Local = localhost, 127.0.0.1, or credential name hints
-                const endpointUrl = config?.llm?.endpoint_url?.toLowerCase() || '';
-                const credentialName = config?.active_credential_name?.toLowerCase() || '';
-                
-                const isLocalLLM = endpointUrl.includes('localhost') ||
-                                   endpointUrl.includes('127.0.0.1') ||
-                                   endpointUrl.includes(':8000') ||  // Common vLLM port
-                                   endpointUrl.includes(':11434') || // Common Ollama port
-                                   credentialName.includes('local') ||
-                                   credentialName.includes('vllm') ||
-                                   credentialName.includes('ollama');
-                
-                if (isLocalLLM) {
-                    const confirmed = window.confirm(
-                        '⚠️ Local LLM Detected\\n\\n' +
-                        'Discovery with local LLMs can take 5-10 minutes or more depending on your hardware. ' +
-                        'You can abort the operation at any time using the "Abort" button.\\n\\n' +
-                        'For faster results, consider using OpenAI or Anthropic.\\n\\n' +
-                        'Continue with discovery?'
-                    );
-                    
-                    if (!confirmed) {
-                        return;
-                    }
-                }
-                
-                setDiscoveryStatus('starting');
-                setMessages([]);
-                setProgress({ percentage: 0, description: 'Initializing...' });
-                setDiscoveryStartTime(Date.now());
-                setElapsedTime(0);
-                
-                try {
-                    const response = await fetch('/start-discovery', { method: 'POST' });
-                    const result = await response.json();
-                    
-                    if (result.error) {
-                        addMessage('error', { message: result.error });
-                        setDiscoveryStatus('error');
-                        setDiscoveryStartTime(null);
-                    } else {
-                        setDiscoveryStatus('running');
-                    }
-                } catch (error) {
-                    addMessage('error', { message: `Failed to start discovery: ${error.message}` });
-                    setDiscoveryStatus('error');
-                    setDiscoveryStartTime(null);
-                }
-            };
-            
-            const abortDiscovery = async () => {
-                const confirmed = window.confirm('Are you sure you want to abort the discovery process?');
-                
-                if (!confirmed) {
-                    return;
-                }
-                
-                try {
-                    const response = await fetch('/abort-discovery', { method: 'POST' });
-                    const result = await response.json();
-                    
-                    if (result.error) {
-                        addMessage('error', { message: result.error });
-                    } else {
-                        addMessage('warning', { message: '⚠️ Discovery aborted by user' });
-                        setDiscoveryStatus('idle');
-                        setDiscoveryStartTime(null);
-                        setElapsedTime(0);
-                    }
-                } catch (error) {
-                    addMessage('error', { message: `Failed to abort discovery: ${error.message}` });
-                }
-            };
-            
-            // Format elapsed time as MM:SS
-            const formatElapsedTime = (seconds) => {
-                const mins = Math.floor(seconds / 60);
-                const secs = seconds % 60;
-                return `${mins}:${secs.toString().padStart(2, '0')}`;
-            };
-            
-            const loadReports = async () => {
-                try {
-                    const response = await fetch('/reports');
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    const result = await response.json();
-                    console.log('Loaded reports:', result);
-                    setReports(result.reports || []);
-                    setSessionCatalog(result.sessions || []);
-                } catch (error) {
-                    console.error('Failed to load reports:', error);
-                    // Don't crash the UI - just show empty reports
-                    setReports([]);
-                    setSessionCatalog([]);
-                }
-            };
-
-            const loadDiscoveryDashboard = async () => {
-                try {
-                    const response = await fetch('/api/discovery/dashboard');
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    const result = await response.json();
-                    setDiscoveryDashboard(result);
-                } catch (error) {
-                    console.error('Failed to load discovery dashboard:', error);
-                    setDiscoveryDashboard(null);
-                }
-            };
-
-            const loadV2Intelligence = async () => {
-                try {
-                    const response = await fetch('/api/v2/intelligence');
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    const result = await response.json();
-                    setV2Intelligence(result);
-                } catch (error) {
-                    console.error('Failed to load V2 intelligence:', error);
-                    setV2Intelligence({ has_data: false, message: error.message || 'Failed to load V2 intelligence.' });
-                }
-            };
-
-            const loadV2Artifacts = async () => {
-                try {
-                    const response = await fetch('/api/v2/artifacts');
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    const result = await response.json();
-                    setV2Artifacts(result);
-                } catch (error) {
-                    console.error('Failed to load V2 artifacts:', error);
-                    setV2Artifacts({ has_data: false, artifacts: [], count: 0, message: error.message || 'Failed to load V2 artifacts.' });
-                }
-            };
-
-            const refreshIntelligenceWorkspace = () => {
-                loadDiscoveryDashboard();
-                loadV2Intelligence();
-            };
-
-            const refreshArtifactsWorkspace = () => {
-                loadReports();
-                loadV2Artifacts();
-                loadCapabilities();
-            };
-
-            const loadCapabilities = async () => {
-                try {
-                    const response = await fetch('/api/capabilities');
-                    const result = await response.json();
-                    if (!response.ok) {
-                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
-                    }
-
-                    setCapabilitiesData({
-                        status: 'success',
-                        summary: result.summary || { total: 0, installed: 0, enabled: 0, ready: 0, restart_required: 0 },
-                        capabilities: result.capabilities || {},
-                        error: ''
-                    });
-
-                    const nextDrafts = {};
-                    Object.entries(result.capabilities || {}).forEach(([name, capability]) => {
-                        nextDrafts[name] = JSON.stringify(capability?.config || {}, null, 2);
-                    });
-                    setCapabilityDrafts(nextDrafts);
-
-                    const deeplinkConfig = result?.capabilities?.splunk_deeplink_tools?.config || {};
-                    setDeeplinkDrafts(prev => ({
-                        ...prev,
-                        splunk_deeplink_tools: {
-                            query: prev?.splunk_deeplink_tools?.query || 'search index=_internal | head 20',
-                            earliest: prev?.splunk_deeplink_tools?.earliest || deeplinkConfig.default_earliest || '-24h',
-                            latest: prev?.splunk_deeplink_tools?.latest || deeplinkConfig.default_latest || 'now',
-                            app: prev?.splunk_deeplink_tools?.app || deeplinkConfig.default_app || 'search',
-                        }
-                    }));
-                } catch (error) {
-                    console.error('Failed to load capabilities:', error);
-                    setCapabilitiesData(prev => ({
-                        ...prev,
-                        status: 'error',
-                        error: error.message || 'Failed to load capabilities.'
-                    }));
-                }
-            };
-
-            const refreshCapabilitiesWorkspace = () => {
-                loadCapabilities();
-            };
-
-            const getCapabilityStatusClasses = (status) => {
-                switch (String(status || '').toLowerCase()) {
-                    case 'ready':
-                        return isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-emerald-100 text-emerald-800 border border-emerald-300';
-                    case 'degraded':
-                        return isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-100 text-amber-900 border border-amber-300';
-                    case 'restart-required':
-                        return isDarkTheme ? 'bg-orange-900 text-orange-100 border border-orange-700' : 'bg-orange-100 text-orange-900 border border-orange-300';
-                    case 'disabled':
-                        return isDarkTheme ? 'bg-slate-800 text-slate-100 border border-slate-600' : 'bg-slate-100 text-slate-800 border border-slate-300';
-                    case 'not_installed':
-                        return isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-800 border border-gray-300';
-                    case 'unavailable':
-                        return isDarkTheme ? 'bg-fuchsia-900 text-fuchsia-100 border border-fuchsia-700' : 'bg-fuchsia-100 text-fuchsia-900 border border-fuchsia-300';
-                    default:
-                        return isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-800 border border-gray-300';
-                }
-            };
-
-            const formatTokenLabel = (value) => {
-                const cleaned = String(value || '').trim();
-                if (!cleaned) {
-                    return '';
-                }
-
-                return cleaned
-                    .split(/[_-]+/)
-                    .filter(Boolean)
-                    .map((part) => {
-                        const normalized = part.toLowerCase();
-                        if (normalized === 'rag') return 'RAG';
-                        if (normalized === 'llm') return 'LLM';
-                        if (normalized === 'mcp') return 'MCP';
-                        return normalized.charAt(0).toUpperCase() + normalized.slice(1);
-                    })
-                    .join(' ');
-            };
-
-            const formatCapabilityStatusLabel = (status) => {
-                switch (String(status || '').toLowerCase()) {
-                    case 'degraded':
-                        return 'Needs attention';
-                    case 'not_installed':
-                        return 'Not installed';
-                    case 'restart-required':
-                        return 'Restart required';
-                    case 'unavailable':
-                        return 'Planned';
-                    default:
-                        return formatTokenLabel(status) || 'Unknown';
-                }
-            };
-
-            const formatCapabilityCategoryLabel = (category) => {
-                switch (String(category || '').toLowerCase()) {
-                    case 'rag':
-                        return 'Retrieval';
-                    case 'tool_pack':
-                        return 'Operator Toolset';
-                    case 'capability':
-                        return 'Capability';
-                    default:
-                        return formatTokenLabel(category) || 'Capability';
-                }
-            };
-
-            const formatCapabilityInstallMethodLabel = (method) => {
-                switch (String(method || '').toLowerCase()) {
-                    case 'internal':
-                        return 'Built In';
-                    case 'pip':
-                        return 'Optional Download';
-                    default:
-                        return formatTokenLabel(method) || 'Unknown';
-                }
-            };
-
-            const formatCapabilityMaturityLabel = (maturity) => {
-                switch (String(maturity || '').toLowerCase()) {
-                    case 'foundation':
-                        return 'Core';
-                    case 'phase4':
-                        return 'Expanded';
-                    case 'phase5':
-                        return 'Advanced';
-                    default:
-                        return formatTokenLabel(maturity) || 'Experimental';
-                }
-            };
-
-            const formatCapabilityUsageContextLabel = (usedIn) => {
-                switch (String(usedIn || '').toLowerCase()) {
-                    case 'chat_preview':
-                        return 'Chat Response';
-                    case 'llm_prompt':
-                        return 'Prompt Context';
-                    default:
-                        return formatTokenLabel(usedIn) || 'Capability Use';
-                }
-            };
-
-            const formatCapabilitySourceTypeLabel = (sourceType) => {
-                switch (String(sourceType || '').toLowerCase()) {
-                    case 'query_result_preview':
-                        return 'Query Result Preview';
-                    case 'discovery_artifact':
-                        return 'Discovery Artifact';
-                    case 'generated_summary':
-                        return 'Generated Summary';
-                    case 'runbook':
-                        return 'Runbook';
-                    case 'handoff':
-                        return 'Developer Handoff';
-                    case 'uploaded_document':
-                        return 'Reference Document';
-                    case 'chat_memory_derived':
-                        return 'Conversation Memory';
-                    case 'tool_result_snapshot':
-                        return 'Tool Result Snapshot';
-                    default:
-                        return formatTokenLabel(sourceType) || 'Artifact';
-                }
-            };
-
-            const formatExportOutputLabel = (output) => {
-                switch (String(output || '').toLowerCase()) {
-                    case 'bundle_zip':
-                        return 'ZIP Package';
-                    case 'manifest_json':
-                        return 'Manifest';
-                    case 'summary_markdown':
-                        return 'Summary Note';
-                    default:
-                        return formatTokenLabel(output) || 'Export Output';
-                }
-            };
-
-            const formatPackageFileLabel = (filename) => {
-                const raw = String(filename || '').trim();
-                if (!raw) {
-                    return 'Unavailable';
-                }
-
-                const basename = raw.replace(/\.zip$/i, '');
-                const match = basename.match(/^dt4sms_(?:export|report_package)_(\d{8})_(\d{6})_([a-z]+)(?:_(.+))?$/i);
-                if (!match) {
-                    return formatTokenLabel(basename.replace(/bundle/gi, 'package')) || raw;
-                }
-
-                const [, datePart, timePart, persona, titlePart] = match;
-                const formattedTimestamp = `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)} ${timePart.slice(0, 2)}:${timePart.slice(2, 4)}:${timePart.slice(4, 6)}`;
-                const labelParts = ['Report Package', formattedTimestamp, formatTokenLabel(persona) || 'Persona'];
-                const normalizedTitle = String(titlePart || '').replace(/bundle/gi, 'package');
-                if (normalizedTitle) {
-                    labelParts.push(formatTokenLabel(normalizedTitle));
-                }
-                return labelParts.join(' - ');
-            };
-
-            const updateCapabilityDraft = (name, value) => {
-                setCapabilityDrafts(prev => ({
-                    ...prev,
-                    [name]: value
-                }));
-            };
-
-            const updateDeeplinkDraft = (name, field, value) => {
-                setDeeplinkDrafts(prev => ({
-                    ...prev,
-                    [name]: {
-                        ...(prev[name] || {}),
-                        [field]: value,
-                    }
-                }));
-            };
-
-            const runCapabilityAction = async (name, action, payload = null) => {
-                setCapabilityActionState(prev => ({
-                    ...prev,
-                    [name]: action
-                }));
-
-                try {
-                    const response = await fetch(`/api/capabilities/${name}/${action}`, {
-                        method: 'POST',
-                        headers: payload ? { 'Content-Type': 'application/json' } : undefined,
-                        body: payload ? JSON.stringify(payload) : undefined,
-                    });
-                    const result = await response.json();
-                    if (!response.ok) {
-                        throw new Error(result?.detail || result?.message || `${action} failed`);
-                    }
-
-                    setCapabilityNotice({
-                        type: 'success',
-                        message: result?.message || `${name} ${action} completed successfully.`
-                    });
-                    await loadCapabilities();
-                } catch (error) {
-                    console.error(`Capability action failed (${name}/${action}):`, error);
-                    setCapabilityNotice({
-                        type: 'error',
-                        message: `${name}: ${error.message || `${action} failed`}`
-                    });
-                } finally {
-                    setCapabilityActionState(prev => {
-                        const next = { ...prev };
-                        delete next[name];
-                        return next;
-                    });
-                    setTimeout(() => setCapabilityNotice(null), 3500);
-                }
-            };
-
-            const buildCapabilityDeeplink = async (payload, options = {}) => {
-                const capabilityName = options.name || 'splunk_deeplink_tools';
-                const openedWindow = options.openAfterBuild ? window.open('', '_blank') : null;
-                if (openedWindow) {
-                    try {
-                        openedWindow.opener = null;
-                    } catch (error) {
-                        console.warn('Unable to detach deeplink popup opener:', error);
-                    }
-                }
-                setCapabilityActionState(prev => ({
-                    ...prev,
-                    [capabilityName]: 'build'
-                }));
-
-                try {
-                    const response = await fetch('/api/capabilities/deeplinks/build', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload || {}),
-                    });
-                    const result = await response.json();
-                    if (!response.ok) {
-                        throw new Error(result?.detail || result?.message || 'Failed to build deeplink.');
-                    }
-
-                    const deeplink = result?.details?.deeplink || null;
-                    if (options.storeResult !== false && deeplink) {
-                        setDeeplinkBuildResults(prev => ({
-                            ...prev,
-                            [capabilityName]: deeplink,
-                        }));
-                    }
-                    if (options.openAfterBuild && deeplink?.url) {
-                        if (openedWindow && !openedWindow.closed) {
-                            openedWindow.location.href = deeplink.url;
-                        } else {
-                            window.open(deeplink.url, '_blank', 'noopener,noreferrer');
-                        }
-                    }
-                    if (!options.suppressNotice) {
-                        setCapabilityNotice({
-                            type: 'success',
-                            message: result?.message || 'Splunk deeplink generated.'
-                        });
-                        setTimeout(() => setCapabilityNotice(null), 3500);
-                    }
-                    return deeplink;
-                } catch (error) {
-                    if (openedWindow && !openedWindow.closed) {
-                        openedWindow.close();
-                    }
-                    console.error('Failed to build deeplink:', error);
-                    setCapabilityNotice({
-                        type: 'error',
-                        message: error.message || 'Failed to build deeplink.'
-                    });
-                    setTimeout(() => setCapabilityNotice(null), 3500);
-                    return null;
-                } finally {
-                    setCapabilityActionState(prev => {
-                        const next = { ...prev };
-                        delete next[capabilityName];
-                        return next;
-                    });
-                }
-            };
-
-            const openSplunkSearchFromChat = async (splQuery) => {
-                if (!splQuery || !canUseSplunkDeeplinks) {
-                    return;
-                }
-
-                const capabilityConfig = deeplinkCapability?.config || {};
-                await buildCapabilityDeeplink(
-                    {
-                        query: splQuery,
-                        earliest: capabilityConfig.default_earliest || '-24h',
-                        latest: capabilityConfig.default_latest || 'now',
-                        app: capabilityConfig.default_app || 'search',
-                    },
-                    {
-                        name: 'splunk_deeplink_tools',
-                        openAfterBuild: true,
-                        suppressNotice: true,
-                        storeResult: false,
-                    }
-                );
-            };
-
-            const extractAssistantSplQuery = (result) => {
-                if (typeof result?.spl_query === 'string' && result.spl_query.trim()) {
-                    return result.spl_query.trim();
-                }
-
-                const toolCalls = Array.isArray(result?.tool_calls) ? result.tool_calls : [];
-                for (let index = toolCalls.length - 1; index >= 0; index -= 1) {
-                    const toolCall = toolCalls[index];
-                    if (typeof toolCall?.spl_query === 'string' && toolCall.spl_query.trim()) {
-                        return toolCall.spl_query.trim();
-                    }
-                    if (typeof toolCall?.args?.query === 'string' && toolCall.args.query.trim()) {
-                        return toolCall.args.query.trim();
-                    }
-                }
-
-                return undefined;
-            };
-
-            const formatVisualizationNumber = (value) => {
-                const numericValue = Number(value);
-                if (!Number.isFinite(numericValue)) {
-                    return String(value ?? '');
-                }
-                if (Math.abs(numericValue) >= 1000) {
-                    return numericValue.toLocaleString();
-                }
-                if (Math.abs(numericValue) >= 10 || Number.isInteger(numericValue)) {
-                    return numericValue.toFixed(0);
-                }
-                return numericValue.toFixed(2).replace(/\\.00$/, '');
-            };
-
-            const renderVisualizationPreview = (spec) => {
-                const rawPoints = Array.isArray(spec?.points) ? spec.points : [];
-                const points = rawPoints
-                    .map((point) => {
-                        const numericValue = Number(point?.value);
-                        if (!Number.isFinite(numericValue)) {
-                            return null;
-                        }
-                        return {
-                            label: typeof point?.label === 'string' ? point.label : '',
-                            fullLabel: typeof point?.full_label === 'string'
-                                ? point.full_label
-                                : (typeof point?.label === 'string' ? point.label : ''),
-                            value: numericValue,
-                        };
-                    })
-                    .filter(Boolean);
-
-                if (points.length === 0) {
-                    return null;
-                }
-
-                const maxValue = Math.max(...points.map((point) => point.value), 1);
-                const width = 480;
-                const height = 180;
-                const padding = 18;
-                const innerWidth = width - (padding * 2);
-                const innerHeight = height - (padding * 2);
-
-                if (String(spec?.chart_type || '').toLowerCase() === 'line') {
-                    const polylinePoints = points.map((point, index) => {
-                        const x = points.length === 1
-                            ? padding + (innerWidth / 2)
-                            : padding + ((innerWidth * index) / (points.length - 1));
-                        const y = padding + innerHeight - ((point.value / maxValue) * innerHeight);
-                        return `${x},${y}`;
-                    }).join(' ');
-
-                    return (
-                        <div className={`mt-2 rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
-                            <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
-                                <div>
-                                    <div className={`text-sm font-semibold ${headingClass}`}>{spec?.title || 'Trend Preview'}</div>
-                                    <div className={`text-xs ${subtextClass}`}>{spec?.summary_text || 'Generated from chartable query results.'}</div>
-                                </div>
-                                <div className="flex flex-wrap gap-2 text-[11px]">
-                                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-sky-900 text-sky-100 border-sky-700' : 'bg-sky-100 text-sky-800 border-sky-300'}`}>
-                                        line
-                                    </span>
-                                    {spec?.y_field && (
-                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-gray-50 text-gray-700 border-gray-300'}`}>
-                                            {spec.y_field}
-                                        </span>
-                                    )}
-                                </div>
-                            </div>
-                            <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-40 overflow-visible">
-                                {[0.25, 0.5, 0.75].map((ratio) => {
-                                    const y = padding + (innerHeight * ratio);
-                                    return (
-                                        <line
-                                            key={ratio}
-                                            x1={padding}
-                                            y1={y}
-                                            x2={width - padding}
-                                            y2={y}
-                                            stroke={isDarkTheme ? '#374151' : '#e5e7eb'}
-                                            strokeDasharray="4 4"
-                                            strokeWidth="1"
-                                        />
-                                    );
-                                })}
-                                <polyline
-                                    fill="none"
-                                    stroke={isDarkTheme ? '#38bdf8' : '#0284c7'}
-                                    strokeWidth="3"
-                                    strokeLinejoin="round"
-                                    strokeLinecap="round"
-                                    points={polylinePoints}
-                                />
-                                {points.map((point, index) => {
-                                    const x = points.length === 1
-                                        ? padding + (innerWidth / 2)
-                                        : padding + ((innerWidth * index) / (points.length - 1));
-                                    const y = padding + innerHeight - ((point.value / maxValue) * innerHeight);
-                                    return (
-                                        <g key={`${point.fullLabel || point.label}-${index}`}>
-                                            <circle cx={x} cy={y} r="4" fill={isDarkTheme ? '#0f172a' : '#ffffff'} stroke={isDarkTheme ? '#38bdf8' : '#0284c7'} strokeWidth="2" />
-                                            <title>{`${point.fullLabel || point.label}: ${formatVisualizationNumber(point.value)}`}</title>
-                                        </g>
-                                    );
-                                })}
-                            </svg>
-                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
-                                {points.slice(0, 8).map((point, index) => (
-                                    <div key={`${point.fullLabel || point.label}-${index}`} className={`rounded border px-2 py-1 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-gray-50 border-gray-200'}`} title={point.fullLabel || point.label}>
-                                        <div className={`text-[10px] uppercase tracking-wide ${mutedTextClass}`}>{point.label}</div>
-                                        <div className={`text-xs font-semibold ${headingClass}`}>{formatVisualizationNumber(point.value)}</div>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    );
-                }
-
-                return (
-                    <div className={`mt-2 rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
-                        <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
-                            <div>
-                                <div className={`text-sm font-semibold ${headingClass}`}>{spec?.title || 'Breakdown Preview'}</div>
-                                <div className={`text-xs ${subtextClass}`}>{spec?.summary_text || 'Generated from chartable query results.'}</div>
-                            </div>
-                            <div className="flex flex-wrap gap-2 text-[11px]">
-                                <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-cyan-900 text-cyan-100 border-cyan-700' : 'bg-cyan-100 text-cyan-800 border-cyan-300'}`}>
-                                    bar
-                                </span>
-                                {spec?.y_field && (
-                                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-gray-50 text-gray-700 border-gray-300'}`}>
-                                        {spec.y_field}
-                                    </span>
-                                )}
-                            </div>
-                        </div>
-                        <div className="flex items-end gap-2 h-40">
-                            {points.map((point, index) => {
-                                const heightPercent = Math.max(14, Math.round((point.value / maxValue) * 100));
-                                return (
-                                    <div key={`${point.fullLabel || point.label}-${index}`} className="flex-1 min-w-0 flex flex-col items-center justify-end" title={`${point.fullLabel || point.label}: ${formatVisualizationNumber(point.value)}`}>
-                                        <div className={`text-[10px] mb-1 ${mutedTextClass}`}>{formatVisualizationNumber(point.value)}</div>
-                                        <div className={`w-full rounded-t ${isDarkTheme ? 'bg-cyan-500' : 'bg-cyan-600'}`} style={{ height: `${heightPercent}%` }}></div>
-                                        <div className={`mt-2 text-[10px] leading-tight text-center ${subtextClass}`}>{point.label}</div>
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    </div>
-                );
-            };
-
-            const saveCapabilityConfig = async (name) => {
-                try {
-                    const parsed = JSON.parse(capabilityDrafts[name] || '{}');
-                    await runCapabilityAction(name, 'config', { config: parsed });
-                } catch (error) {
-                    setCapabilityNotice({
-                        type: 'error',
-                        message: `${name}: capability config must be valid JSON before saving.`
-                    });
-                    setTimeout(() => setCapabilityNotice(null), 3500);
-                }
-            };
-
-            const loadDiscoveryCompare = async (current = 'latest', baseline = 'previous') => {
-                try {
-                    const params = new URLSearchParams();
-                    if (current) params.set('current', current);
-                    if (baseline) params.set('baseline', baseline);
-                    const response = await fetch(`/api/discovery/compare?${params.toString()}`);
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    const result = await response.json();
-                    setDiscoveryCompare(result);
-                } catch (error) {
-                    console.error('Failed to load discovery compare:', error);
-                    setDiscoveryCompare({ has_data: false, message: error.message || 'Failed to load compare data.' });
-                }
-            };
-
-            const loadRunbookPayload = async (timestamp = 'latest', persona = workflowTab) => {
-                try {
-                    const params = new URLSearchParams();
-                    if (timestamp) params.set('timestamp', timestamp);
-                    if (persona) params.set('persona', persona);
-                    const response = await fetch(`/api/discovery/runbook?${params.toString()}`);
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    const result = await response.json();
-                    setRunbookPayload(result);
-                } catch (error) {
-                    console.error('Failed to load runbook payload:', error);
-                    setRunbookPayload({ has_data: false, message: error.message || 'Failed to load runbook.' });
-                }
-            };
-
-            const refreshCompareSelection = () => {
-                loadDiscoveryCompare(compareSelection.current, compareSelection.baseline);
-            };
-
-            const refreshRunbook = () => {
-                loadRunbookPayload(compareSelection.current, workflowTab);
-            };
-
-            const downloadCapabilityExport = (filename) => {
-                if (!filename) {
-                    return;
-                }
-
-                const link = document.createElement('a');
-                link.href = `/api/capabilities/exports/download/${encodeURIComponent(filename)}`;
-                link.target = '_blank';
-                link.rel = 'noreferrer';
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-            };
-
-            const buildCapabilityExport = async (payload = {}, options = {}) => {
-                setExportBuildState({ status: 'loading', bundle: null, error: '' });
-
-                try {
-                    const response = await fetch('/api/capabilities/exports/build', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    const result = await response.json();
-                    if (!response.ok) {
-                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
-                    }
-
-                    const exportBundle = result?.details?.export || null;
-                    if (!exportBundle) {
-                        throw new Error('Report package details were not returned by the server.');
-                    }
-
-                    setExportBuildState({ status: 'success', bundle: exportBundle, error: '' });
-                    loadReports();
-                    loadV2Artifacts();
-                    loadCapabilities();
-
-                    if (options.downloadAfterBuild && exportBundle?.download_name) {
-                        downloadCapabilityExport(exportBundle.download_name);
-                    }
-
-                    return exportBundle;
-                } catch (error) {
-                    console.error('Failed to build report package:', error);
-                    setExportBuildState({
-                        status: 'error',
-                        bundle: null,
-                        error: error?.message || 'Failed to build report package.'
-                    });
-                    return null;
-                }
-            };
-            
-            const loadConnectionInfo = async () => {
-                try {
-                    const response = await fetch('/connection-info');
-                    const result = await response.json();
-                    setConnectionInfo(result);
-                } catch (error) {
-                    console.error('Failed to load connection info:', error);
-                }
-            };
-            
-            // Settings functions
-            const openSettings = async () => {
-                await loadConfig();
-                setIsSettingsOpen(true);
-                // Load credentials and MCP configs after modal opens
-                setTimeout(() => {
-                    loadCredentials();
-                    loadMCPConfigs();
-                }, 100);
-            };
-            
-            const closeSettings = () => {
-                setIsSettingsOpen(false);
-            };
-            
-            const loadConfig = async () => {
-                try {
-                    const response = await fetch('/api/config');
-                    const data = await response.json();
-                    setConfig(data);
-                    // Initialize selected provider from config
-                    setSelectedProvider(normalizeProvider(data.llm.provider || 'openai'));
-                    // Set API key placeholder based on whether key exists
-                    setApiKeyPlaceholder(data.llm.api_key === '***' ? '(Already Configured)' : 'Enter API key');
-                    // Set MCP token placeholder based on whether token exists
-                    setMCPTokenPlaceholder(data.mcp.token === '***' ? '(Already Configured)' : 'Enter token');
-                    
-                    // Auto-load active credential if one is set (but prevent infinite loop)
-                    if (data.active_credential_name && !isLoadingCredential) {
-                        await loadCredentialIntoSettings(data.active_credential_name);
-                    }
-                    
-                    // Auto-load active MCP config if one is set (just show it's active, don't auto-open form)
-                    if (data.active_mcp_config_name) {
-                        setLoadedMCPConfigName(data.active_mcp_config_name);
-                    }
-                } catch (error) {
-                    console.error('Failed to load config:', error);
-                }
-            };
-            
-            const loadCredentials = async () => {
-                try {
-                    const response = await fetch('/api/credentials');
-                    const credentials = await response.json();
-                    setSavedCredentials(credentials);
-                    
-                    const credList = document.getElementById('credentials-list');
-                    if (!credList) return;
-                    
-                    if (Object.keys(credentials).length === 0) {
-                        credList.innerHTML = `
-                            <div class="text-center py-12 bg-white rounded-lg border-2 border-dashed border-gray-300">
-                                <i class="fas fa-plug text-purple-300 text-5xl mb-4"></i>
-                                <p class="text-base font-bold text-gray-700 mb-2">No Connections Yet</p>
-                                <p class="text-sm text-gray-500 mb-4">Get started by creating your first AI model connection</p>
-                                <p class="text-xs text-gray-400 italic">Click "Create New Connection" above</p>
-                            </div>
-                        `;
-                        return;
-                    }
-                    
-                    // Sort credentials to show active one first
-                    const activeCredName = config?.active_credential_name;
-                    const credArray = Object.values(credentials).sort((a, b) => {
-                        if (a.name === activeCredName) return -1;
-                        if (b.name === activeCredName) return 1;
-                        return 0;
-                    });
-                    
-                    credList.innerHTML = credArray.map(cred => {
-                        const provider = normalizeProvider(cred.provider);
-                        const providerIcon = provider === 'openai' ? 'fa-openai' :
-                                           provider === 'azure' ? 'fa-cloud' :
-                                           provider === 'anthropic' ? 'fa-robot' :
-                                           provider === 'gemini' ? 'fa-gem' :
-                                           provider === 'custom' ? 'fa-server' : 'fa-brain';
-                        const providerColor = provider === 'openai' ? 'text-green-600' :
-                                              provider === 'azure' ? 'text-blue-600' :
-                                              provider === 'anthropic' ? 'text-orange-600' :
-                                              provider === 'gemini' ? 'text-indigo-600' : 'text-purple-600';
-                        const isActive = cred.name === activeCredName;
-                        
-                        return `
-                            <div class="group bg-white rounded-lg p-4 border-2 ${isActive ? 'border-amber-500 shadow-lg' : 'border-gray-200 hover:border-purple-400'} hover:shadow-lg transition-all">
-                                <div class="flex items-start justify-between gap-4">
-                                    <div class="flex-1 min-w-0">
-                                        <div class="flex items-center gap-2 mb-2">
-                                            <i class="fab ${providerIcon} ${providerColor} text-lg"></i>
-                                            <h5 class="text-base font-bold text-gray-900 truncate">${cred.name}</h5>
-                                            ${isActive ? '<span class="ml-2 px-2 py-0.5 bg-amber-500 text-gray-900 text-xs font-bold rounded-full uppercase">Active</span>' : ''}
-                                        </div>
-                                        <div class="text-sm text-gray-600 space-y-1.5 pl-1">
-                                            <div class="flex items-center gap-2">
-                                                <i class="fas fa-cog w-4 text-gray-400"></i>
-                                                <span><span class="font-semibold text-gray-700">Provider:</span> ${cred.provider}</span>
-                                            </div>
-                                            <div class="flex items-center gap-2">
-                                                <i class="fas fa-brain w-4 text-gray-400"></i>
-                                                <span><span class="font-semibold text-gray-700">Model:</span> ${cred.model}</span>
-                                            </div>
-                                            ${cred.endpoint_url ? `
-                                            <div class="flex items-center gap-2">
-                                                <i class="fas fa-link w-4 text-gray-400"></i>
-                                                <span class="truncate"><span class="font-semibold text-gray-700">Endpoint:</span> <code class="text-xs bg-gray-100 px-1 rounded">${cred.endpoint_url}</code></span>
-                                            </div>` : ''}
-                                            <div class="flex items-center gap-2">
-                                                <i class="fas fa-sliders-h w-4 text-gray-400"></i>
-                                                <span><span class="font-semibold text-gray-700">Settings:</span> ${cred.max_tokens} tokens, ${cred.temperature} temp</span>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div class="flex flex-col gap-2 shrink-0">
-                                        <button
-                                            onclick="loadCredentialIntoSettings('${cred.name.replace(/'/g, "\\'")}')"
-                                            class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
-                                            title="Load this credential into the settings form above"
-                                        >
-                                            <i class="fas fa-download mr-2"></i>Load
-                                        </button>
-                                        <button
-                                            onclick="deleteCredential('${cred.name.replace(/'/g, "\\'")}')"
-                                            class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
-                                            title="Permanently delete this saved credential"
-                                        >
-                                            <i class="fas fa-trash-alt mr-2"></i>Delete
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    }).join('');
-                } catch (error) {
-                    console.error('Failed to load credentials:', error);
-                    const credList = document.getElementById('credentials-list');
-                    if (credList) {
-                        credList.innerHTML = `
-                            <div class="text-center py-10">
-                                <i class="fas fa-exclamation-triangle text-red-400 text-4xl mb-4"></i>
-                                <p class="text-base font-semibold text-red-700">Failed to load credentials</p>
-                                <p class="text-sm text-gray-600 mt-2">${error.message}</p>
-                            </div>
-                        `;
-                    }
-                }
-            };
-            
-            window.loadCredentialIntoSettings = async (name) => {
-                try {
-                    // Set flag to prevent clearing during load
-                    setIsLoadingCredential(true);
-                    
-                    // Show loading indicator only if credentials list is visible (settings panel open)
-                    const credList = document.getElementById('credentials-list');
-                    let originalHTML = '';
-                    if (credList) {
-                        originalHTML = credList.innerHTML;
-                        credList.innerHTML = `
-                            <div class="text-center py-10">
-                                <i class="fas fa-spinner fa-spin text-purple-600 text-4xl mb-4"></i>
-                                <p class="text-base font-semibold text-gray-700">Loading credential...</p>
-                                <p class="text-sm text-gray-500 mt-2">${name}</p>
-                            </div>
-                        `;
-                    }
-                    
-                    const response = await fetch(`/api/credentials/${name}/load`, { method: 'POST' });
-                    const result = await response.json();
-                    
-                    if (response.ok) {
-                        // Update form fields with smooth transition
-                        const newConfig = result.config;
-                        
-                        // Update React state first to trigger re-render
-                        setConfig(newConfig);
-                        setSelectedProvider(normalizeProvider(newConfig.llm.provider));
-                        setLoadedCredentialName(name); // Track which credential is loaded
-                        setApiKeyPlaceholder('(Already Configured)'); // Update placeholder
-                        setShowConfigForm(true); // Show the config form when loading a credential
-                        setSelectedModel(newConfig.llm.model); // Set the selected model
-                        setAvailableModels([]); // Clear fetched models when loading credential
-                        
-                        // Then update form fields
-                        setTimeout(() => {
-                            const normalizedProvider = normalizeProvider(newConfig.llm.provider);
-                            const providerInput = document.getElementById('llm-provider');
-                            if (providerInput) {
-                                providerInput.value = normalizedProvider;
-                            }
-                            const modelInput = document.getElementById('llm-model');
-                            if (modelInput) {
-                                modelInput.value = newConfig.llm.model;
-                            }
-                            const maxTokensInput = document.getElementById('llm-max-tokens');
-                            if (maxTokensInput) {
-                                maxTokensInput.value = newConfig.llm.max_tokens;
-                            }
-                            const temperatureInput = document.getElementById('llm-temperature');
-                            if (temperatureInput) {
-                                temperatureInput.value = newConfig.llm.temperature;
-                            }
-                            
-                            // Update API Key field - force placeholder update
-                            const apiKeyInput = document.getElementById('llm-api-key');
-                            if (apiKeyInput) {
-                                apiKeyInput.value = '';
-                            }
-                            
-                            // Update endpoint URL if custom provider
-                            if (newConfig.llm.endpoint_url && document.getElementById('llm-endpoint-url')) {
-                                document.getElementById('llm-endpoint-url').value = newConfig.llm.endpoint_url;
-                            }
-                            
-                        }, 50);
-                        
-                        // Reload config and credentials list to update active status
-                        await loadConfig();
-                        await loadCredentials();
-                        
-                        // Clear loading flag after config is reloaded to prevent infinite loop
-                        setIsLoadingCredential(false);
-                        
-                        // Show success message
-                        const successDiv = document.createElement('div');
-                        successDiv.className = 'fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce';
-                        successDiv.innerHTML = `
-                            <div class="flex items-center gap-3">
-                                <i class="fas fa-check-circle text-2xl"></i>
-                                <div>
-                                    <p class="font-bold text-base">Credential Loaded!</p>
-                                    <p class="text-sm opacity-90">${name}</p>
-                                </div>
-                            </div>
-                        `;
-                        document.body.appendChild(successDiv);
-                        setTimeout(() => {
-                            successDiv.style.animation = 'none';
-                            successDiv.style.opacity = '0';
-                            successDiv.style.transition = 'opacity 0.3s';
-                            setTimeout(() => successDiv.remove(), 300);
-                        }, 2500);
-                    } else {
-                        if (credList) {
-                            credList.innerHTML = originalHTML;
-                        }
-                        setIsLoadingCredential(false);
-                        alert(`Failed to load credential: ${result.detail}`);
-                    }
-                } catch (error) {
-                    if (credList) {
-                        credList.innerHTML = originalHTML;
-                    }
-                    setIsLoadingCredential(false);
-                    alert(`Error loading credential: ${error.message}`);
-                    await loadCredentials();
-                }
-            };
-            
-            window.deleteCredential = async (name) => {
-                // Custom confirmation dialog
-                const confirmed = confirm(`⚠️ Delete Credential\\n\\nAre you sure you want to delete '${name}'?\\n\\nThis action cannot be undone.`);
-                if (!confirmed) return;
-                
-                try {
-                    const response = await fetch(`/api/credentials/${name}`, { method: 'DELETE' });
-                    if (response.ok) {
-                        await loadCredentials();
-                        
-                        // Show success message
-                        const successDiv = document.createElement('div');
-                        successDiv.className = 'fixed top-6 right-6 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
-                        successDiv.innerHTML = `
-                            <div class="flex items-center gap-3">
-                                <i class="fas fa-trash-alt text-2xl"></i>
-                                <div>
-                                    <p class="font-bold text-base">Credential Deleted</p>
-                                    <p class="text-sm opacity-90">${name}</p>
-                                </div>
-                            </div>
-                        `;
-                        document.body.appendChild(successDiv);
-                        setTimeout(() => {
-                            successDiv.style.opacity = '0';
-                            successDiv.style.transition = 'opacity 0.3s';
-                            setTimeout(() => successDiv.remove(), 300);
-                        }, 2500);
-                    } else {
-                        const error = await response.json();
-                        alert(`Failed to delete: ${error.detail}`);
-                    }
-                } catch (error) {
-                    alert(`Error: ${error.message}`);
-                }
-            };
-            
-            // MCP Configuration Vault Functions
-            const loadMCPConfigs = async () => {
-                try {
-                    const response = await fetch('/api/mcp-configs');
-                    const mcpConfigs = await response.json();
-                    setSavedMCPConfigs(mcpConfigs);
-                    
-                    const mcpList = document.getElementById('mcp-configs-list');
-                    if (!mcpList) return;
-                    
-                    if (Object.keys(mcpConfigs).length === 0) {
-                        mcpList.innerHTML = `
-                            <div class="text-center py-12 bg-white rounded-lg border-2 border-dashed border-gray-300">
-                                <i class="fas fa-server text-green-300 text-5xl mb-4"></i>
-                                <p class="text-base font-bold text-gray-700 mb-2">No Saved Configurations</p>
-                                <p class="text-sm text-gray-500 mb-4">Save your current MCP server settings for quick access</p>
-                                <p class="text-xs text-gray-400 italic">Click "Save Current Config" above</p>
-                            </div>
-                        `;
-                        return;
-                    }
-                    
-                    // Sort configs to show active one first
-                    const activeMCPName = config?.active_mcp_config_name;
-                    const mcpArray = Object.values(mcpConfigs).sort((a, b) => {
-                        if (a.name === activeMCPName) return -1;
-                        if (b.name === activeMCPName) return 1;
-                        return a.name.localeCompare(b.name);
-                    });
-                    
-                    mcpList.innerHTML = mcpArray.map(mcp => `
-                        <div class="group bg-white rounded-lg p-4 border-2 ${mcp.name === activeMCPName ? 'border-green-400 shadow-lg' : 'border-gray-200'} hover:border-green-400 hover:shadow-lg transition-all">
-                            <div class="flex items-start justify-between gap-4">
-                                <div class="flex-1 min-w-0">
-                                    <div class="flex items-center gap-2 mb-2">
-                                        <i class="fas fa-server text-green-600 text-lg"></i>
-                                        <h5 class="text-base font-bold text-gray-900 truncate">${mcp.name}</h5>
-                                        ${mcp.name === activeMCPName ? '<span class="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-bold rounded-full">ACTIVE</span>' : ''}
-                                    </div>
-                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${mcp.description}</p>` : ''}
-                                    <div class="text-sm text-gray-600 space-y-1.5 pl-1">
-                                        <div class="flex items-center gap-2">
-                                            <i class="fas fa-link w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">URL:</span> ${mcp.url}</span>
-                                        </div>
-                                        <div class="flex items-center gap-2">
-                                            <i class="fas fa-shield-alt w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">SSL:</span> ${mcp.verify_ssl ? 'Enabled' : 'Disabled'}</span>
-                                        </div>
-                                    </div>
-                                </div>
-                                <div class="flex flex-col gap-2 shrink-0">
-                                    <button 
-                                        onclick="testMCPConfig('${mcp.name}')"
-                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
-                                        title="Test connection to this MCP server"
-                                    >
-                                        <i class="fas fa-network-wired mr-2"></i>Test
-                                    </button>
-                                    <button 
-                                        onclick="loadMCPConfigIntoSettings('${mcp.name}')"
-                                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
-                                        title="Load this configuration into active settings"
-                                    >
-                                        <i class="fas fa-download mr-2"></i>Load
-                                    </button>
-                                    <button 
-                                        onclick="deleteMCPConfig('${mcp.name}')"
-                                        class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
-                                        title="Permanently delete this saved configuration"
-                                    >
-                                        <i class="fas fa-trash-alt mr-2"></i>Delete
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    `).join('');
-                } catch (error) {
-                    console.error('Failed to load MCP configs:', error);
-                    const mcpList = document.getElementById('mcp-configs-list');
-                    if (mcpList) {
-                        mcpList.innerHTML = `
-                            <div class="text-center py-10">
-                                <i class="fas fa-exclamation-triangle text-red-400 text-4xl mb-4"></i>
-                                <p class="text-base font-semibold text-red-700">Failed to load MCP configurations</p>
-                                <p class="text-sm text-gray-600 mt-2">${error.message}</p>
-                            </div>
-                        `;
-                    }
-                }
-            };
-            
-            window.loadMCPConfigIntoSettings = async (name) => {
-                try {
-                    const mcpList = document.getElementById('mcp-configs-list');
-                    const originalHTML = mcpList.innerHTML;
-                    mcpList.innerHTML = `
-                        <div class="text-center py-10">
-                            <i class="fas fa-spinner fa-spin text-green-600 text-4xl mb-4"></i>
-                            <p class="text-base font-semibold text-gray-700">Loading configuration...</p>
-                            <p class="text-sm text-gray-500 mt-2">${name}</p>
-                        </div>
-                    `;
-                    
-                    const response = await fetch(`/api/mcp-configs/${name}/load`, { method: 'POST' });
-                    if (response.ok) {
-                        const result = await response.json();
-                        const newConfig = result.config;
-                        
-                        // Update React state first
-                        setConfig(newConfig);
-                        setLoadedMCPConfigName(name);
-                        setShowMCPConfigForm(true); // Show the form when loading a config
-                        setMCPTokenPlaceholder('(Already Configured)'); // Set placeholder for loaded config
-                        
-                        // Update form fields with the loaded config
-                        setTimeout(() => {
-                            const mcpUrlInput = document.getElementById('mcp-url');
-                            const mcpTokenInput = document.getElementById('mcp-token');
-                            
-                            if (mcpUrlInput) mcpUrlInput.value = newConfig.mcp.url;
-                            if (mcpTokenInput) mcpTokenInput.value = ''; // Clear token field (masked in backend)
-                            // verify_ssl checkbox is now controlled by React state
-                        }, 50);
-                        
-                        await loadConfig();
-                        await loadMCPConfigs();
-                        
-                        // Show success notification
-                        const successDiv = document.createElement('div');
-                        successDiv.className = 'fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce';
-                        successDiv.innerHTML = `
-                            <div class="flex items-center gap-3">
-                                <i class="fas fa-check-circle text-2xl"></i>
-                                <div>
-                                    <p class="font-bold text-base">Configuration Loaded!</p>
-                                    <p class="text-sm opacity-90">${name}</p>
-                                </div>
-                            </div>
-                        `;
-                        document.body.appendChild(successDiv);
-                        setTimeout(() => {
-                            successDiv.style.animation = 'none';
-                            successDiv.style.opacity = '0';
-                            successDiv.style.transition = 'opacity 0.3s';
-                            setTimeout(() => successDiv.remove(), 300);
-                        }, 2500);
-                    } else {
-                        mcpList.innerHTML = originalHTML;
-                        const result = await response.json();
-                        alert(`Failed to load configuration: ${result.detail}`);
-                    }
-                } catch (error) {
-                    alert(`Error loading configuration: ${error.message}`);
-                    await loadMCPConfigs();
-                }
-            };
-            
-            window.deleteMCPConfig = async (name) => {
-                const confirmed = confirm(`⚠️ Delete MCP Configuration\\n\\nAre you sure you want to delete '${name}'?\\n\\nThis action cannot be undone.`);
-                if (!confirmed) return;
-                
-                try {
-                    const response = await fetch(`/api/mcp-configs/${name}`, { method: 'DELETE' });
-                    if (response.ok) {
-                        await loadMCPConfigs();
-                        
-                        // Show success message
-                        const successDiv = document.createElement('div');
-                        successDiv.className = 'fixed top-6 right-6 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
-                        successDiv.innerHTML = `
-                            <div class="flex items-center gap-3">
-                                <i class="fas fa-trash-alt text-2xl"></i>
-                                <div>
-                                    <p class="font-bold text-base">Configuration Deleted</p>
-                                    <p class="text-sm opacity-90">${name}</p>
-                                </div>
-                            </div>
-                        `;
-                        document.body.appendChild(successDiv);
-                        setTimeout(() => {
-                            successDiv.style.opacity = '0';
-                            successDiv.style.transition = 'opacity 0.3s';
-                            setTimeout(() => successDiv.remove(), 300);
-                        }, 2500);
-                    } else {
-                        const error = await response.json();
-                        alert(`Failed to delete: ${error.detail}`);
-                    }
-                } catch (error) {
-                    alert(`Error: ${error.message}`);
-                }
-            };
-            
-            window.testMCPConfig = async (name) => {
-                const mcpList = document.getElementById('mcp-configs-list');
-                const originalHTML = mcpList.innerHTML;
-                
-                try {
-                    // Show testing state
-                    const testingDiv = document.createElement('div');
-                    testingDiv.className = 'fixed top-6 right-6 bg-blue-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
-                    testingDiv.innerHTML = `
-                        <div class="flex items-center gap-3">
-                            <i class="fas fa-spinner fa-spin text-2xl"></i>
-                            <div>
-                                <p class="font-bold text-base">Testing Connection...</p>
-                                <p class="text-sm opacity-90">${name}</p>
-                            </div>
-                        </div>
-                    `;
-                    document.body.appendChild(testingDiv);
-                    
-                    const response = await fetch(`/api/mcp-configs/${name}/test`, { method: 'POST' });
-                    const result = await response.json();
-                    
-                    // Remove testing notification
-                    testingDiv.remove();
-                    
-                    // Show result notification
-                    const resultDiv = document.createElement('div');
-                    let bgColor = 'bg-green-600';
-                    let icon = 'fa-check-circle';
-                    
-                    if (result.status === 'error') {
-                        bgColor = 'bg-red-600';
-                        icon = 'fa-times-circle';
-                    } else if (result.status === 'warning') {
-                        bgColor = 'bg-yellow-600';
-                        icon = 'fa-exclamation-triangle';
-                    }
-                    
-                    resultDiv.className = `fixed top-6 right-6 ${bgColor} text-white px-6 py-4 rounded-xl shadow-2xl z-50`;
-                    resultDiv.innerHTML = `
-                        <div class="flex items-center gap-3">
-                            <i class="fas ${icon} text-2xl"></i>
-                            <div>
-                                <p class="font-bold text-base">${result.status === 'success' ? 'Connection Successful!' : result.status === 'warning' ? 'Connection Warning' : 'Connection Failed'}</p>
-                                <p class="text-sm opacity-90">${result.message}</p>
-                            </div>
-                        </div>
-                    `;
-                    document.body.appendChild(resultDiv);
-                    setTimeout(() => {
-                        resultDiv.style.opacity = '0';
-                        resultDiv.style.transition = 'opacity 0.3s';
-                        setTimeout(() => resultDiv.remove(), 300);
-                    }, 4000);
-                    
-                } catch (error) {
-                    const errorDiv = document.createElement('div');
-                    errorDiv.className = 'fixed top-6 right-6 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
-                    errorDiv.innerHTML = `
-                        <div class="flex items-center gap-3">
-                            <i class="fas fa-times-circle text-2xl"></i>
-                            <div>
-                                <p class="font-bold text-base">Test Failed</p>
-                                <p class="text-sm opacity-90">${error.message}</p>
-                            </div>
-                        </div>
-                    `;
-                    document.body.appendChild(errorDiv);
-                    setTimeout(() => {
-                        errorDiv.style.opacity = '0';
-                        errorDiv.style.transition = 'opacity 0.3s';
-                        setTimeout(() => errorDiv.remove(), 300);
-                    }, 4000);
-                }
-            };
-            
-            const saveSettings = async (settings) => {
-                try {
-                    const response = await fetch('/api/config', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(settings)
-                    });
-                    
-                    if (response.ok) {
-                        alert('Settings saved successfully!');
-                        closeSettings();
-                        await loadConfig();
-                    } else {
-                        const error = await response.json();
-                        alert(`Failed to save settings: ${error.detail || 'Unknown error'}`);
-                    }
-                } catch (error) {
-                    alert(`Error: ${error.message}`);
-                }
-            };
-            
-            const openConnectionModal = (event) => {
-                const target = event?.currentTarget;
-                const modalWidth = 320;
-                const viewportPadding = 12;
-
-                if (target && typeof target.getBoundingClientRect === 'function') {
-                    const rect = target.getBoundingClientRect();
-                    const preferredLeft = rect.left + (rect.width / 2) - (modalWidth / 2);
-                    const maxLeft = Math.max(viewportPadding, window.innerWidth - modalWidth - viewportPadding);
-                    const clampedLeft = Math.min(Math.max(preferredLeft, viewportPadding), maxLeft);
-                    const anchorCenterX = rect.left + (rect.width / 2);
-                    const pointerOffset = anchorCenterX - clampedLeft - 8;
-                    const pointerLeft = Math.min(Math.max(pointerOffset, 16), modalWidth - 24);
-
-                    setConnectionModalPosition({
-                        top: rect.bottom + 10,
-                        left: clampedLeft,
-                        pointerLeft
-                    });
-                }
-
-                loadConnectionInfo();
-                setIsConnectionModalOpen(true);
-            };
-
-            const isSummaryArtifact = (reportName) => {
-                if (!reportName || typeof reportName !== 'string') return false;
-                return reportName.startsWith('v2_ai_summary_') || reportName.startsWith('ai_summary_');
-            };
-            
-            // Group reports hierarchically by Year > Month > Day > Session
-            const groupReportsByHierarchy = (reports) => {
-                const sessions = {};
-                
-                reports.forEach(report => {
-                    // Extract timestamp from filename (e.g., "recommendations_20251026_181253.md")
-                    const match = report.name.match(/_([0-9]{8}_[0-9]{6})\\./);
-                    if (match) {
-                        const timestamp = match[1];
-                        if (!sessions[timestamp]) {
-                            sessions[timestamp] = {
-                                timestamp,
-                                displayName: formatSessionName(timestamp),
-                                reports: [],
-                                hasSummary: false,
-                                date: parseTimestamp(timestamp)
-                            };
-                        }
-                        sessions[timestamp].reports.push(report);
-                        
-                        // Check if this is a summary artifact
-                        if (isSummaryArtifact(report.name)) {
-                            sessions[timestamp].hasSummary = true;
-                        }
-                    }
-                });
-                
-                // Build hierarchy: Year > Month > Day > Sessions
-                const hierarchy = {};
-                const today = new Date();
-                const currentYear = today.getFullYear();
-                const currentMonth = today.getMonth();
-                const currentDay = today.getDate();
-                
-                Object.values(sessions).forEach(session => {
-                    const date = session.date;
-                    const year = date.getFullYear();
-                    const month = date.getMonth();
-                    const day = date.getDate();
-                    
-                    // Determine if we need to show year
-                    const showYear = year !== currentYear;
-                    
-                    // Determine if we need to show month (show if not current month or if showing year)
-                    const showMonth = showYear || month !== currentMonth;
-                    
-                    // Create keys
-                    const yearKey = `year_${year}`;
-                    const monthKey = `${yearKey}_month_${month}`;
-                    const dayKey = `${monthKey}_day_${day}`;
-                    
-                    // Initialize hierarchy levels
-                    if (!hierarchy[yearKey]) {
-                        hierarchy[yearKey] = {
-                            type: 'year',
-                            year: year,
-                            display: year.toString(),
-                            visible: showYear,
-                            months: {}
-                        };
-                    }
-                    
-                    if (!hierarchy[yearKey].months[monthKey]) {
-                        hierarchy[yearKey].months[monthKey] = {
-                            type: 'month',
-                            month: month,
-                            display: date.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
-                            visible: showMonth,
-                            days: {}
-                        };
-                    }
-                    
-                    if (!hierarchy[yearKey].months[monthKey].days[dayKey]) {
-                        const isToday = year === currentYear && month === currentMonth && day === currentDay;
-                        const dayName = isToday ? 'Today' : date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-                        
-                        hierarchy[yearKey].months[monthKey].days[dayKey] = {
-                            type: 'day',
-                            day: day,
-                            display: dayName,
-                            isToday: isToday,
-                            sessions: []
-                        };
-                    }
-                    
-                    hierarchy[yearKey].months[monthKey].days[dayKey].sessions.push(session);
-                });
-                
-                return hierarchy;
-            };
-            
-            const parseTimestamp = (timestamp) => {
-                // Convert "20251026_181253" to Date object
-                const dateStr = timestamp.substring(0, 8);
-                const timeStr = timestamp.substring(9);
-                
-                const year = parseInt(dateStr.substring(0, 4));
-                const month = parseInt(dateStr.substring(4, 6)) - 1;
-                const day = parseInt(dateStr.substring(6, 8));
-                const hour = parseInt(timeStr.substring(0, 2));
-                const minute = parseInt(timeStr.substring(2, 4));
-                
-                return new Date(year, month, day, hour, minute);
-            };
-            
-            // Group reports by session timestamp (legacy - for backward compatibility)
-            const groupReportsBySession = (reports) => {
-                const sessions = {};
-                
-                reports.forEach(report => {
-                    // Extract timestamp from filename (e.g., "recommendations_20251026_181253.md")
-                    const match = report.name.match(/_([0-9]{8}_[0-9]{6})\\./);
-                    if (match) {
-                        const timestamp = match[1];
-                        if (!sessions[timestamp]) {
-                            sessions[timestamp] = {
-                                timestamp,
-                                displayName: formatSessionName(timestamp),
-                                reports: [],
-                                hasSummary: false
-                            };
-                        }
-                        sessions[timestamp].reports.push(report);
-                        
-                        // Check if this is a summary artifact
-                        if (isSummaryArtifact(report.name)) {
-                            sessions[timestamp].hasSummary = true;
-                        }
-                    } else {
-                        // Handle reports without timestamp
-                        const sessionKey = 'other';
-                        if (!sessions[sessionKey]) {
-                            sessions[sessionKey] = {
-                                timestamp: sessionKey,
-                                displayName: 'Other Reports',
-                                reports: [],
-                                hasSummary: false
-                            };
-                        }
-                        sessions[sessionKey].reports.push(report);
-                    }
-                });
-                
-                // Sort sessions by timestamp (newest first)
-                const sortedSessions = Object.values(sessions).sort((a, b) => {
-                    if (a.timestamp === 'other') return 1;
-                    if (b.timestamp === 'other') return -1;
-                    return b.timestamp.localeCompare(a.timestamp);
-                });
-                
-                return sortedSessions;
-            };
-            
-            const formatSessionName = (timestamp) => {
-                // Convert "20251026_181253" to "Oct 26, 2025, 6:12 PM"
-                const dateStr = timestamp.substring(0, 8);
-                const timeStr = timestamp.substring(9);
-                
-                const year = dateStr.substring(0, 4);
-                const month = dateStr.substring(4, 6);
-                const day = dateStr.substring(6, 8);
-                const hour = timeStr.substring(0, 2);
-                const minute = timeStr.substring(2, 4);
-                
-                const date = new Date(year, month - 1, day, hour, minute);
-                return date.toLocaleDateString('en-US', { 
-                    month: 'short', 
-                    day: 'numeric', 
-                    year: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit'
-                });
-            };
-            
-            const formatSessionTime = (timestamp) => {
-                // Convert "20251026_181253" to just "6:12 PM"
-                const timeStr = timestamp.substring(9);
-                const dateStr = timestamp.substring(0, 8);
-                
-                const year = dateStr.substring(0, 4);
-                const month = dateStr.substring(4, 6);
-                const day = dateStr.substring(6, 8);
-                const hour = timeStr.substring(0, 2);
-                const minute = timeStr.substring(2, 4);
-                
-                const date = new Date(year, month - 1, day, hour, minute);
-                return date.toLocaleTimeString('en-US', { 
-                    hour: '2-digit',
-                    minute: '2-digit'
-                });
-            };
-            
-            const toggleSession = (timestamp) => {
-                setExpandedSessions(prev => ({
-                    ...prev,
-                    [timestamp]: !prev[timestamp]
-                }));
-            };
-            
-            const toggleYear = (yearKey) => {
-                setExpandedYears(prev => ({
-                    ...prev,
-                    [yearKey]: !prev[yearKey]
-                }));
-            };
-            
-            const toggleMonth = (monthKey) => {
-                setExpandedMonths(prev => ({
-                    ...prev,
-                    [monthKey]: !prev[monthKey]
-                }));
-            };
-            
-            const toggleDay = (dayKey) => {
-                setExpandedDays(prev => ({
-                    ...prev,
-                    [dayKey]: !prev[dayKey]
-                }));
-            };
-            
-            // Auto-scroll chat messages to bottom
-            useEffect(() => {
-                if (isChatOpen && chatMessages.length > 0) {
-                    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-                }
-            }, [chatMessages, isChatOpen]);
-            
-            // Load chat settings when settings modal opens
-            useEffect(() => {
-                if (isChatSettingsOpen && !chatSettings) {
-                    loadChatSettings();
-                }
-            }, [isChatSettingsOpen]);
-            
-            const loadChatSettings = async () => {
-                try {
-                    const response = await fetch('/api/chat/settings');
-                    const data = await response.json();
-                    setChatSettings(data);
-                } catch (error) {
-                    console.error('Error loading chat settings:', error);
-                }
-            };
-            
-            const updateSetting = async (key, value) => {
-                const updatedSettings = { ...chatSettings, [key]: value };
-                setChatSettings(updatedSettings);
-                
-                // Save to backend immediately
-                try {
-                    await fetch('/api/chat/settings', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ [key]: value })
-                    });
-                } catch (error) {
-                    console.error('Error updating setting:', error);
-                }
-            };
-            
-            const resetChatSettings = async () => {
-                try {
-                    const response = await fetch('/api/chat/settings/reset', {
-                        method: 'POST'
-                    });
-                    const data = await response.json();
-                    setChatSettings(data.settings);
-                } catch (error) {
-                    console.error('Error resetting settings:', error);
-                }
-            };
-            
-            const sendChatMessage = async (overrideMessage = null) => {
-                if (isTyping) return;
-
-                const resolvedOverride = typeof overrideMessage === 'string' ? overrideMessage : '';
-                const userMessage = (resolvedOverride || chatInput || '').trim();
-                if (!userMessage) return;
-                setChatInput('');
-                setIsTyping(true);
-                
-                // Add user message
-                setChatMessages(prev => [...prev, {
-                    id: Date.now(),
-                    type: 'user',
-                    content: userMessage,
-                    timestamp: new Date().toISOString()
-                }]);
-                
-                try {
-                    // Use streaming endpoint for real-time status updates
-                    // If we have server conversation history (includes reasoning), use that instead of UI messages
-                    const historyToSend = serverConversationHistory || 
-                                         chatMessages.slice(-10).map(msg => ({
-                                             type: msg.type,
-                                             content: msg.content
-                                         }));
-                    
-                    const response = await fetch('/chat/stream', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            message: userMessage,
-                            history: historyToSend,
-                            chat_session_id: chatSessionId
-                        })
-                    });
-                    
-                    // Handle Server-Sent Events
-                    const reader = response.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-                        
-                        buffer += decoder.decode(value, {stream: true});
-                        const lines = buffer.split('\\n');
-                        buffer = lines.pop(); // Keep incomplete line in buffer
-                        
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                const data = JSON.parse(line.slice(6));
-                                
-                                if (data.type === 'status') {
-                                    // Update live status
-                                    setChatStatus(data.action);
-                                } else if (data.type === 'response') {
-                                    // Final response received
-                                    const result = data.data;
-                                    setChatStatus(''); // Clear status
-                                    
-                                    if (result.error) {
-                                        setChatMessages(prev => [...prev, {
-                                            id: Date.now() + 1,
-                                            type: 'error',
-                                            content: result.error,
-                                            timestamp: new Date().toISOString()
-                                        }]);
-                                    } else {
-                                        // Add discovery age warning if present
-                                        const messages = [];
-                                        
-                                        if (result.discovery_age_warning) {
-                                            messages.push({
-                                                id: Date.now() + 0.5,
-                                                type: 'warning',
-                                                content: result.discovery_age_warning,
-                                                timestamp: new Date().toISOString()
-                                            });
-                                        }
-                                        
-                                        messages.push({
-                                            id: Date.now() + 1,
-                                            type: 'assistant',
-                                            content: result.response,
-                                            timestamp: new Date().toISOString(),
-                                            mcp_data: result.mcp_data,
-                                            tool_used: result.tool_used,
-                                            spl_query: extractAssistantSplQuery(result),
-                                            visualization_spec: result.visualization_spec,
-                                            spl_in_text: result.spl_in_text,
-                                            capability_usage: Array.isArray(result.capability_usage) ? result.capability_usage : [],
-                                            has_follow_on: result.has_follow_on,
-                                            follow_on_actions: result.follow_on_actions,
-                                            status_timeline: result.status_timeline,
-                                            iterations: result.iterations,
-                                            execution_time: result.execution_time
-                                        });
-                                        
-                                        // Store server's conversation history for follow-up queries
-                                        if (result.conversation_history) {
-                                            setServerConversationHistory(result.conversation_history);
-                                        }
-                                        if (result.chat_session_id) {
-                                            setChatSessionId(result.chat_session_id);
-                                        }
-                                        
-                                        setChatMessages(prev => [...prev, ...messages]);
-                                    }
-                                } else if (data.type === 'error') {
-                                    // Error received
-                                    setChatStatus('');
-                                    setChatMessages(prev => [...prev, {
-                                        id: Date.now() + 1,
-                                        type: 'error',
-                                        content: data.error,
-                                        timestamp: new Date().toISOString()
-                                    }]);
-                                }
-                            }
-                        }
-                    }
-                    
-                } catch (error) {
-                    console.error('Chat error:', error);
-                    setChatStatus('');
-                    setChatMessages(prev => [...prev, {
-                        id: Date.now() + 1,
-                        type: 'error',
-                        content: `Failed to send message: ${error.message}`,
-                        timestamp: new Date().toISOString()
-                    }]);
-                } finally {
-                    setIsTyping(false);
-                    setChatStatus('');
-                    // Re-focus input after sending
-                    setTimeout(() => chatInputRef.current?.focus(), 100);
-                }
-            };
-
-            const useSuggestedQuery = (query) => {
-                setChatInput(query);
-                if (chatInputRef.current) {
-                    setTimeout(() => chatInputRef.current.focus(), 0);
-                }
-            };
-
-            const sendSuggestedQuery = async (query) => {
-                await sendChatMessage(query);
-            };
-            
-            const loadReport = async (filename) => {
-                try {
-                    const response = await fetch(`/reports/${filename}`);
-                    const result = await response.json();
-                    
-                    if (result.error) {
-                        addMessage('error', { message: result.error });
-                        return;
-                    }
-                    
-                    // Force re-render by clearing first, then setting
-                    setSelectedReport(null);
-                    setReportContent(null);
-                    
-                    // Use setTimeout to ensure state updates are processed
-                    setTimeout(() => {
-                        setSelectedReport(filename);
-                        setReportContent(result);
-                    }, 10);
-                } catch (error) {
-                    console.error('Error loading report:', error);
-                    addMessage('error', { message: `Failed to load report: ${error.message}` });
-                }
-            };
-            
-            // Summary modal functions
-            const openSummaryModal = async (sessionId) => {
-                // Check if using local LLM by examining endpoint URL
-                // Local = localhost, 127.0.0.1, or credential name hints
-                const endpointUrl = config?.llm?.endpoint_url?.toLowerCase() || '';
-                const credentialName = config?.active_credential_name?.toLowerCase() || '';
-                
-                const isLocalLLM = endpointUrl.includes('localhost') ||
-                                   endpointUrl.includes('127.0.0.1') ||
-                                   endpointUrl.includes(':8000') ||  // Common vLLM port
-                                   endpointUrl.includes(':11434') || // Common Ollama port
-                                   credentialName.includes('local') ||
-                                   credentialName.includes('vllm') ||
-                                   credentialName.includes('ollama');
-                
-                if (isLocalLLM) {
-                    const confirmed = window.confirm(
-                        '⚠️ Local LLM Detected\\n\\n' +
-                        'AI-powered summarization with local LLMs can take 3-5 minutes or more. ' +
-                        'Progress updates will show estimated times for each stage.\\n\\n' +
-                        'For faster results, consider using OpenAI or Anthropic.\\n\\n' +
-                        'Continue with summarization?'
-                    );
-                    
-                    if (!confirmed) {
-                        return;
-                    }
-                }
-                
-                setCurrentSessionId(sessionId);
-                setIsSummaryModalOpen(true);
-                setIsLoadingSummary(true);
-                setSummaryData(null);
-                
-                try {
-                    const response = await fetch('/summarize-session', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ timestamp: sessionId })
-                    });
-
-                    let result = null;
-                    const contentType = response.headers.get('content-type') || '';
-
-                    if (contentType.includes('application/json')) {
-                        result = await response.json();
-                    } else {
-                        const rawText = await response.text();
-                        try {
-                            result = JSON.parse(rawText);
-                        } catch {
-                            throw new Error(`Summarization failed (${response.status}): ${rawText.slice(0, 200) || 'Non-JSON server response'}`);
-                        }
-                    }
-
-                    if (!response.ok) {
-                        throw new Error(result?.error || result?.detail || `Summarization failed (${response.status})`);
-                    }
-
-                    if (result?.error) {
-                        addMessage('error', { message: result.error });
-                        setIsSummaryModalOpen(false);
-                        return;
-                    }
-                    
-                    setSummaryData(result);
-                } catch (error) {
-                    console.error('Error loading summary:', error);
-                    addMessage('error', { message: `Failed to generate summary: ${error.message}` });
-                    setIsSummaryModalOpen(false);
-                } finally {
-                    setIsLoadingSummary(false);
-                }
-            };
-            
-            const closeSummaryModal = () => {
-                setIsSummaryModalOpen(false);
-                setSummaryData(null);
-                setCurrentSessionId(null);
-            };
-            
-            const copyToClipboard = (text) => {
-                navigator.clipboard.writeText(text).then(() => {
-                    addMessage('success', { message: 'Copied to clipboard!' });
-                }).catch(err => {
-                    console.error('Failed to copy:', err);
-                    addMessage('error', { message: 'Failed to copy to clipboard' });
-                });
-            };
-            
-            const exportReport = (filename, content) => {
-                const blob = new Blob([content], { type: 'text/plain' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-            };
-            
-            // Resize handlers for panels
-            const handleLogMouseDown = (e) => {
-                setIsResizingLog(true);
-                e.preventDefault();
-            };
-            
-            const handleReportMouseDown = (e) => {
-                setIsResizingReport(true);
-                e.preventDefault();
-            };
-            
-            useEffect(() => {
-                const handleMouseMove = (e) => {
-                    if (isResizingLog) {
-                        const newHeight = Math.max(200, Math.min(800, e.clientY - 300)); // Min 200px, max 800px
-                        setDiscoveryLogHeight(newHeight);
-                    }
-                    if (isResizingReport) {
-                        const newHeight = Math.max(300, Math.min(1000, e.clientY - 400)); // Min 300px, max 1000px
-                        setReportViewerHeight(newHeight);
-                    }
-                };
-                
-                const handleMouseUp = () => {
-                    setIsResizingLog(false);
-                    setIsResizingReport(false);
-                };
-                
-                if (isResizingLog || isResizingReport) {
-                    document.addEventListener('mousemove', handleMouseMove);
-                    document.addEventListener('mouseup', handleMouseUp);
-                    document.body.style.cursor = 'ns-resize';
-                    document.body.style.userSelect = 'none';
-                }
-                
-                return () => {
-                    document.removeEventListener('mousemove', handleMouseMove);
-                    document.removeEventListener('mouseup', handleMouseUp);
-                    document.body.style.cursor = '';
-                    document.body.style.userSelect = '';
-                };
-            }, [isResizingLog, isResizingReport]);
-            
-            const renderMessage = (message) => {
-                const { type, data } = message;
-                
-                switch (type) {
-                    case 'banner':
-                        return (
-                            <div className="bg-gradient-to-r from-purple-600 to-blue-600 text-white p-6 rounded-lg fade-in">
-                                <h1 className="text-2xl font-bold">{data.title}</h1>
-                                <p className="text-purple-100">{data.subtitle}</p>
-                                <p className="text-sm text-purple-200 mt-2">Started: {data.start_time}</p>
-                            </div>
-                        );
-                    
-                    case 'phase':
-                        return (
-                            <div className={`border-l-4 p-4 slide-in ${isDarkTheme ? 'bg-indigo-950 border-indigo-500' : 'bg-indigo-50 border-indigo-500'}`}>
-                                <h2 className={`text-lg font-semibold ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-900'}`}>{data.title}</h2>
-                            </div>
-                        );
-                    
-                    case 'success':
-                        return (
-                            <div className={`flex items-center p-2 rounded fade-in ${isDarkTheme ? 'text-emerald-300 bg-emerald-950' : 'text-green-700 bg-green-50'}`}>
-                                <i className="fas fa-check-circle mr-2"></i>
-                                <span>{data.message}</span>
-                            </div>
-                        );
-                    
-                    case 'error':
-                        return (
-                            <div className={`flex items-center p-3 rounded fade-in ${isDarkTheme ? 'text-red-200 bg-red-950' : 'text-red-700 bg-red-50'}`}>
-                                <i className="fas fa-exclamation-circle mr-2"></i>
-                                <span>{data.message}</span>
-                            </div>
-                        );
-                    
-                    case 'warning':
-                        return (
-                            <div className={`flex items-center p-3 rounded fade-in ${isDarkTheme ? 'text-amber-200 bg-amber-950' : 'text-yellow-700 bg-yellow-50'}`}>
-                                <i className="fas fa-exclamation-triangle mr-2"></i>
-                                <span>{data.message}</span>
-                            </div>
-                        );
-                    
-                    case 'info':
-                        return (
-                            <div className={`flex items-center p-2 rounded fade-in ${isDarkTheme ? 'text-blue-300 bg-blue-950' : 'text-blue-700'}`}>
-                                <i className="fas fa-info-circle mr-2"></i>
-                                <span>{data.message}</span>
-                            </div>
-                        );
-                    
-                    case 'overview':
-                        return (
-                            <div className={`p-4 rounded-lg fade-in border ${isDarkTheme ? 'bg-slate-800 border-slate-700' : 'bg-blue-50 border-blue-200'}`}>
-                                <h3 className={`font-semibold mb-2 ${isDarkTheme ? 'text-blue-200' : 'text-blue-900'}`}>Environment Overview</h3>
-                                <div className={`grid grid-cols-2 gap-2 text-sm ${isDarkTheme ? 'text-slate-200' : 'text-slate-800'}`}>
-                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Indexes: {data.total_indexes}</div>
-                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Source Types: {data.total_sourcetypes}</div>
-                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Data Volume: {data.data_volume_24h}</div>
-                                    <div className={isDarkTheme ? 'bg-slate-700 rounded px-2 py-1' : ''}>Active Sources: {data.active_sources}</div>
-                                </div>
-                            </div>
-                        );
-                    
-                    case 'rate_limit':
-                        if (data.event === 'rate_limit_start') {
-                            return (
-                                <div className={`border p-4 rounded-lg fade-in ${isDarkTheme ? 'bg-amber-950 border-amber-700' : 'bg-yellow-50 border-yellow-200'}`}>
-                                    <div className={`flex items-center ${isDarkTheme ? 'text-amber-200' : 'text-yellow-700'}`}>
-                                        <i className="fas fa-clock mr-2"></i>
-                                        <span>Rate limit encountered - waiting {data.details.delay}s (attempt {data.details.retry_count}/{data.details.max_retries})</span>
-                                    </div>
-                                </div>
-                            );
-                        } else if (data.event === 'rate_limit_countdown') {
-                            return (
-                                <div className={`p-3 rounded border ${isDarkTheme ? 'bg-amber-950 border-amber-700' : 'bg-yellow-50 border-yellow-200'}`}>
-                                    <div className={`flex items-center justify-between text-sm ${isDarkTheme ? 'text-amber-200' : 'text-yellow-700'}`}>
-                                        <span>Waiting...</span>
-                                        <span>{Math.ceil(data.details.remaining_seconds)}s remaining</span>
-                                    </div>
-                                    <div className={`w-full rounded-full h-2 mt-2 ${isDarkTheme ? 'bg-amber-900' : 'bg-yellow-200'}`}>
-                                        <div 
-                                            className={`h-2 rounded-full progress-bar ${isDarkTheme ? 'bg-amber-400' : 'bg-yellow-500'}`}
-                                            style={{ width: `${data.details.percentage}%` }}
-                                        ></div>
-                                    </div>
-                                </div>
-                            );
-                        } else if (data.event === 'rate_limit_complete') {
-                            return (
-                                <div className={`flex items-center p-2 rounded fade-in ${isDarkTheme ? 'text-emerald-300 bg-emerald-950' : 'text-green-700 bg-green-50'}`}>
-                                    <i className="fas fa-check-circle mr-2"></i>
-                                    <span>Rate limit wait complete - resuming</span>
-                                </div>
-                            );
-                        }
-                        break;
-                    
-                    case 'completion':
-                        return (
-                            <div className={`border p-4 rounded-lg fade-in ${isDarkTheme ? 'bg-emerald-950 border-emerald-700' : 'bg-green-50 border-green-200'}`}>
-                                <div className={`flex items-center mb-2 ${isDarkTheme ? 'text-emerald-200' : 'text-green-700'}`}>
-                                    <i className="fas fa-trophy mr-2"></i>
-                                    <span className="font-semibold">Discovery Complete!</span>
-                                </div>
-                                <p className={`text-sm ${isDarkTheme ? 'text-emerald-300' : 'text-green-600'}`}>Duration: {data.duration || 'N/A'}</p>
-                                <p className={`text-sm ${isDarkTheme ? 'text-emerald-300' : 'text-green-600'}`}>Generated {data.report_count || 0} reports</p>
-                            </div>
-                        );
-                    
-                    default:
-                        return (
-                            <div className={`fade-in ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                <pre className={`text-xs p-2 rounded ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-gray-50 border border-gray-200'}`}>{JSON.stringify(data, null, 2)}</pre>
-                            </div>
-                        );
-                }
-            };
-            
-            return (
-                <div className={`min-h-screen ${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900'}`}>
-                    {/* Unified Static Top Bar */}
-                    <header className={`${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} sticky top-0 z-50 shadow-sm border-b`}>
-                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                            <div className="flex flex-wrap lg:flex-nowrap justify-between items-center gap-3 py-2 sm:py-3">
-                                <div className="flex items-center">
-                                    <i className="fas fa-search text-xl sm:text-2xl text-indigo-600 mr-2 sm:mr-3"></i>
-                                    <h1 className={`text-lg sm:text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Splunk MCP Discovery Tool</h1>
-                                </div>
-
-                                <div className="flex-1 min-w-[320px] flex items-center justify-center">
-                                    <div className={`w-full max-w-3xl rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-indigo-950/70 border border-indigo-700' : 'bg-indigo-50 border border-indigo-200'}`}>
-                                        <div className="flex flex-wrap items-center justify-center gap-2">
-                                            <div className="inline-flex rounded-lg border border-indigo-300 overflow-hidden text-[11px] sm:text-xs bg-indigo-900" role="tablist" aria-label="Workspace views">
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-mission"
-                                                    role="tab"
-                                                    aria-selected={isMissionTab}
-                                                    tabIndex={isMissionTab ? 0 : -1}
-                                                    onClick={() => setWorkspaceTab('mission')}
-                                                    className={`px-3 sm:px-4 py-1.5 ${isMissionTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Mission tab: pipeline execution, progress, and live log"
-                                                >
-                                                    Mission
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-intelligence"
-                                                    role="tab"
-                                                    aria-selected={isIntelligenceTab}
-                                                    tabIndex={isIntelligenceTab ? 0 : -1}
-                                                    onClick={() => {
-                                                        setWorkspaceTab('intelligence');
-                                                        refreshIntelligenceWorkspace();
-                                                    }}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isIntelligenceTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Intelligence tab: KPI trends, compare, and persona workflows"
-                                                >
-                                                    Intelligence
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-artifacts"
-                                                    role="tab"
-                                                    aria-selected={isArtifactsTab}
-                                                    tabIndex={isArtifactsTab ? 0 : -1}
-                                                    onClick={() => {
-                                                        setWorkspaceTab('artifacts');
-                                                        refreshArtifactsWorkspace();
-                                                    }}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isArtifactsTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Artifacts tab: reports, exports, and summaries"
-                                                >
-                                                    Artifacts
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-capabilities"
-                                                    role="tab"
-                                                    aria-selected={isCapabilitiesTab}
-                                                    tabIndex={isCapabilitiesTab ? 0 : -1}
-                                                    onClick={() => {
-                                                        setWorkspaceTab('capabilities');
-                                                        refreshCapabilitiesWorkspace();
-                                                    }}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Capabilities tab: optional capability packs, health, and control surface"
-                                                >
-                                                    Capabilities
-                                                </button>
-                                            </div>
-
-                                            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs">
-                                                {isMissionTab && (
-                                                    <button
-                                                        onClick={discoveryStatus === 'running' ? abortDiscovery : startDiscovery}
-                                                        className={`px-2.5 sm:px-3 py-1.5 rounded ${discoveryStatus === 'running' ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
-                                                        title={discoveryStatus === 'running' ? 'Abort active discovery pipeline' : 'Run full V2 discovery pipeline'}
-                                                    >
-                                                        {discoveryStatus === 'running' ? (
-                                                            <><i className="fas fa-stop mr-1"></i>Abort Discovery</>
-                                                        ) : (
-                                                            <><i className="fas fa-rocket mr-1"></i>Run V2 Discovery</>
-                                                        )}
-                                                    </button>
-                                                )}
-                                                {isIntelligenceTab && (
-                                                    <button
-                                                        onClick={refreshIntelligenceWorkspace}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white"
-                                                        title="Refresh intelligence KPIs and trends"
-                                                    >
-                                                        <i className="fas fa-brain mr-1"></i>Refresh Intelligence
-                                                    </button>
-                                                )}
-                                                {isArtifactsTab && (
-                                                    <button
-                                                        onClick={refreshArtifactsWorkspace}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
-                                                        title="Reload exported artifacts and reports"
-                                                    >
-                                                        <i className="fas fa-folder-open mr-1"></i>Reload Artifacts
-                                                    </button>
-                                                )}
-                                                {isCapabilitiesTab && (
-                                                    <button
-                                                        onClick={refreshCapabilitiesWorkspace}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-violet-600 hover:bg-violet-700 text-white"
-                                                        title="Refresh optional capability inventory and health"
-                                                    >
-                                                        <i className="fas fa-puzzle-piece mr-1"></i>Refresh Capabilities
-                                                    </button>
-                                                )}
-                                                <button
-                                                    onClick={() => setIsChatOpen(true)}
-                                                    className="px-2.5 sm:px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white"
-                                                    title="Open chat workspace with deterministic query support"
-                                                >
-                                                    <i className="fas fa-comments mr-1"></i>Open Chat
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="flex items-center flex-wrap justify-end gap-2 sm:gap-3">
-                                    <button
-                                        type="button"
-                                        className={`flex items-center cursor-pointer px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg transition-colors ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
-                                        onClick={openConnectionModal}
-                                        title="View MCP connection details"
-                                        aria-label={isConnected ? 'View MCP connection details. MCP connected.' : 'View MCP connection details. MCP disconnected.'}
-                                        aria-haspopup="dialog"
-                                        aria-expanded={isConnectionModalOpen}
-                                        aria-controls="connection-details-popover"
-                                    >
-                                        <span aria-hidden="true" className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></span>
-                                        <span className={`text-xs sm:text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            {isConnected ? 'MCP Connected' : 'MCP Disconnected'}
-                                        </span>
-                                    </button>
-                                    <div 
-                                        className={`flex items-center px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border ${isDarkTheme ? 'bg-gray-800 border-purple-500' : 'bg-white border-purple-200'}`}
-                                        title="Active LLM connection"
-                                    >
-                                        <i className="fas fa-brain text-purple-600 mr-2"></i>
-                                        <div className="flex flex-col">
-                                            <span className={`text-xs leading-tight ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>LLM:</span>
-                                            <span className={`text-xs sm:text-sm font-medium leading-tight ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                {config?.active_credential_name || config?.llm?.model || 'Not configured'}
-                                            </span>
-                                        </div>
-                                    </div>
-                                    <button
-                                        onClick={openSettings}
-                                        className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border font-medium ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100 border-gray-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'}`}
-                                        title="Open settings"
-                                        aria-label="Open settings"
-                                    >
-                                        <i className="fas fa-cog"></i>
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </header>
-                    
-                    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-
-                        <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
-                            {/* Main Content Area */}
-                            <div className="lg:col-span-3">
-                                {/* Discovery Intelligence Hub */}
-                                {isMissionTab && (
-                                <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
-                                    <div className="flex items-center justify-between mb-4">
-                                        <div>
-                                            <h2 className={`text-lg font-semibold ${headingClass}`}>Discovery Intelligence Hub</h2>
-                                            <p className={`text-sm ${subtextClass}`}>Actionable view for admins, analysts, and executives</p>
-                                        </div>
-                                        <button
-                                            type="button"
-                                            onClick={loadDiscoveryDashboard}
-                                            className="text-indigo-600 hover:text-indigo-800"
-                                            title="Refresh intelligence view"
-                                            aria-label="Refresh discovery intelligence view"
-                                        >
-                                            <i className="fas fa-sync"></i>
-                                        </button>
-                                    </div>
-
-                                    {!discoveryDashboard || !discoveryDashboard.has_data ? (
-                                        <div className={`text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}`}>
-                                            No discovery intelligence available yet. Run discovery to generate KPI trends and persona playbooks.
-                                        </div>
-                                    ) : (
-                                        <>
-                                            <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-indigo-900 border border-indigo-700' : 'bg-indigo-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-800'}`}>Readiness</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-indigo-50' : 'text-indigo-900'}`}>{discoveryDashboard.kpis?.readiness_score || 0}/100</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-800'}`}>Δ {discoveryDashboard.trends?.readiness_delta ?? 0}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-blue-900 border border-blue-700' : 'bg-blue-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-blue-200' : 'text-blue-800'}`}>Indexes</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-blue-50' : 'text-blue-900'}`}>{discoveryDashboard.kpis?.total_indexes || 0}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>Δ {discoveryDashboard.trends?.indexes_delta ?? 0}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-green-900 border border-green-700' : 'bg-green-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-green-200' : 'text-green-800'}`}>Sourcetypes</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-green-50' : 'text-green-900'}`}>{discoveryDashboard.kpis?.total_sourcetypes || 0}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-green-300' : 'text-green-800'}`}>Δ {discoveryDashboard.trends?.sourcetypes_delta ?? 0}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-amber-900 border border-amber-700' : 'bg-amber-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-amber-200' : 'text-amber-900'}`}>Recommendations</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-amber-50' : 'text-amber-900'}`}>{discoveryDashboard.kpis?.recommendation_count || 0}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-amber-300' : 'text-amber-900'}`}>Δ {discoveryDashboard.trends?.recommendations_delta ?? 0}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-purple-900 border border-purple-700' : 'bg-purple-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-purple-200' : 'text-purple-800'}`}>Available Tools</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-purple-50' : 'text-purple-900'}`}>{discoveryDashboard.kpis?.tool_count || 0}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-purple-300' : 'text-purple-800'}`}>Available now</div>
-                                                </div>
-                                            </div>
-
-                                            <div className={`border rounded p-3 mb-4 ${isDarkTheme ? 'border-gray-600' : 'border-gray-200'}`}>
-                                                <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
-                                                    <div>
-                                                        <h3 className={`text-sm font-semibold ${headingClass}`}>Session Compare</h3>
-                                                        <p className={`text-xs ${mutedTextClass}`}>Track changes between two discovery runs</p>
-                                                    </div>
-                                                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                        <select
-                                                            value={compareSelection.current}
-                                                            onChange={(e) => setCompareSelection(prev => ({ ...prev, current: e.target.value }))}
-                                                            className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
-                                                        >
-                                                            <option value="latest">Latest Session</option>
-                                                            {sessionCatalog.map((session) => (
-                                                                <option key={`current-${session.timestamp}`} value={session.timestamp}>
-                                                                    {session.timestamp}
-                                                                </option>
-                                                            ))}
-                                                        </select>
-                                                        <span className={mutedTextClass}>vs</span>
-                                                        <select
-                                                            value={compareSelection.baseline}
-                                                            onChange={(e) => setCompareSelection(prev => ({ ...prev, baseline: e.target.value }))}
-                                                            className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
-                                                        >
-                                                            <option value="previous">Previous Session</option>
-                                                            {sessionCatalog.map((session) => (
-                                                                <option key={`baseline-${session.timestamp}`} value={session.timestamp}>
-                                                                    {session.timestamp}
-                                                                </option>
-                                                            ))}
-                                                        </select>
-                                                        <button
-                                                            onClick={refreshCompareSelection}
-                                                            className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded"
-                                                        >
-                                                            Compare
-                                                        </button>
-                                                    </div>
-                                                </div>
-
-                                                {!discoveryCompare || !discoveryCompare.has_data ? (
-                                                    <div className={`text-xs mt-3 ${mutedTextClass}`}>
-                                                        {discoveryCompare?.message || 'Compare data will appear once at least two sessions exist.'}
-                                                    </div>
-                                                ) : (
-                                                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-xs">
-                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                            <div className={mutedTextClass}>Readiness Δ</div>
-                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.readiness?.delta ?? 0}</div>
-                                                        </div>
-                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                            <div className={mutedTextClass}>Indexes Δ</div>
-                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.indexes?.delta ?? 0}</div>
-                                                        </div>
-                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                            <div className={mutedTextClass}>Sourcetypes Δ</div>
-                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.sourcetypes?.delta ?? 0}</div>
-                                                        </div>
-                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                            <div className={mutedTextClass}>Recommendations Δ</div>
-                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.recommendations?.delta ?? 0}</div>
-                                                        </div>
-                                                        <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                            <div className={mutedTextClass}>Tool Count Δ</div>
-                                                            <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.tools?.delta ?? 0}</div>
-                                                        </div>
-                                                    </div>
-                                                )}
-                                            </div>
-
-                                            <div className="border border-gray-200 rounded p-3">
-                                                <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-                                                    <div className="inline-flex rounded border border-gray-300 overflow-hidden text-xs" role="tablist" aria-label="Runbook personas">
-                                                        <button
-                                                            type="button"
-                                                            id="workflow-tab-admin"
-                                                            role="tab"
-                                                            aria-selected={workflowTab === 'admin'}
-                                                            aria-controls="workflow-panel-admin"
-                                                            tabIndex={workflowTab === 'admin' ? 0 : -1}
-                                                            onClick={() => setWorkflowTab('admin')}
-                                                            className={`px-3 py-1 ${workflowTab === 'admin' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
-                                                        >
-                                                            Admin
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            id="workflow-tab-analyst"
-                                                            role="tab"
-                                                            aria-selected={workflowTab === 'analyst'}
-                                                            aria-controls="workflow-panel-analyst"
-                                                            tabIndex={workflowTab === 'analyst' ? 0 : -1}
-                                                            onClick={() => setWorkflowTab('analyst')}
-                                                            className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'analyst' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
-                                                        >
-                                                            Analyst
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            id="workflow-tab-executive"
-                                                            role="tab"
-                                                            aria-selected={workflowTab === 'executive'}
-                                                            aria-controls="workflow-panel-executive"
-                                                            tabIndex={workflowTab === 'executive' ? 0 : -1}
-                                                            onClick={() => setWorkflowTab('executive')}
-                                                            className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'executive' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
-                                                        >
-                                                            Executive
-                                                        </button>
-                                                    </div>
-
-                                                    <div className="flex items-center gap-2 text-xs">
-                                                        <button
-                                                            onClick={refreshRunbook}
-                                                            className="px-3 py-1 bg-green-700 hover:bg-green-800 text-white rounded"
-                                                        >
-                                                            Generate Runbook
-                                                        </button>
-                                                        <button
-                                                            onClick={() => {
-                                                                if (runbookPayload?.markdown && runbookPayload?.filename) {
-                                                                    exportReport(runbookPayload.filename, runbookPayload.markdown);
-                                                                }
-                                                            }}
-                                                            disabled={!runbookPayload?.markdown}
-                                                            className={`px-3 py-1 rounded ${runbookPayload?.markdown ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
-                                                        >
-                                                            Export Runbook
-                                                        </button>
-                                                        <button
-                                                            onClick={() => buildCapabilityExport({
-                                                                timestamp: compareSelection.current || 'latest',
-                                                                persona: workflowTab,
-                                                                title: `${workflowTab} discovery package`,
-                                                                runbook_markdown: runbookPayload?.markdown || undefined,
-                                                                runbook_filename: runbookPayload?.filename || undefined,
-                                                            })}
-                                                            disabled={!canUseExportTools || exportBuildState.status === 'loading'}
-                                                            className={`px-3 py-1 rounded ${canUseExportTools && exportBuildState.status !== 'loading' ? 'bg-cyan-700 hover:bg-cyan-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
-                                                        >
-                                                            {exportBuildState.status === 'loading' ? 'Building Package...' : 'Build Report Package'}
-                                                        </button>
-                                                        <button
-                                                            onClick={() => downloadCapabilityExport(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name)}
-                                                            disabled={!(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name)}
-                                                            className={`px-3 py-1 rounded ${(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name) ? 'bg-slate-700 hover:bg-slate-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
-                                                        >
-                                                            Download Package
-                                                        </button>
-                                                    </div>
-                                                </div>
-
-                                                {exportBuildState.status === 'error' && (
-                                                    <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'border-red-800 bg-red-950 text-red-200' : 'border-red-200 bg-red-50 text-red-700'}`}>
-                                                        {exportBuildState.error}
-                                                    </div>
-                                                )}
-
-                                                {(exportBuildState.bundle || exportCapability?.latest_bundle) && (
-                                                    <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${subtextClass}`}>
-                                                        <div className="font-medium mb-1">Report Package</div>
-                                                        <div>
-                                                            Package: {formatPackageFileLabel(exportBuildState.bundle?.bundle_name || exportCapability?.latest_bundle?.name)}
-                                                        </div>
-                                                        {exportBuildState.bundle?.session_timestamp && (
-                                                            <div>Session: {exportBuildState.bundle.session_timestamp}</div>
-                                                        )}
-                                                        {exportBuildState.bundle?.artifact_count != null && (
-                                                            <div>Included artifacts: {exportBuildState.bundle.artifact_count}</div>
-                                                        )}
-                                                        {(exportBuildState.bundle?.bundle_size_bytes || exportCapability?.latest_bundle?.size_bytes) && (
-                                                            <div>Package size: {Number(exportBuildState.bundle?.bundle_size_bytes || exportCapability?.latest_bundle?.size_bytes).toLocaleString()} bytes</div>
-                                                        )}
-                                                        <div className={`mt-2 ${mutedTextClass}`}>
-                                                            Creates a downloadable zip package with the selected discovery session artifacts and the active persona runbook.
-                                                        </div>
-                                                    </div>
-                                                )}
-
-                                                {workflowTab === 'admin' && (
-                                                    <ul id="workflow-panel-admin" role="tabpanel" aria-labelledby="workflow-tab-admin" className="text-xs text-gray-700 space-y-2">
-                                                        {(discoveryDashboard.latest?.personas?.admin?.actions || []).slice(0, 6).map((action, idx) => (
-                                                            <li key={idx} className="bg-gray-50 rounded px-3 py-2">
-                                                                <div className="font-medium text-gray-900">{action.title}</div>
-                                                                <div className="text-gray-500">Effort: {action.effort || 'unknown'}</div>
-                                                                <div className="text-gray-600 mt-1">{action.next_step}</div>
-                                                            </li>
-                                                        ))}
-                                                    </ul>
-                                                )}
-
-                                                {workflowTab === 'analyst' && (
-                                                    <ul id="workflow-panel-analyst" role="tabpanel" aria-labelledby="workflow-tab-analyst" className="text-xs text-gray-700 space-y-2">
-                                                        {(discoveryDashboard.latest?.personas?.analyst?.hypotheses || []).slice(0, 6).map((track, idx) => (
-                                                            <li key={idx} className="bg-gray-50 rounded px-3 py-2">
-                                                                <div className="font-medium text-gray-900">{track.title}</div>
-                                                                <div className="text-gray-600 mt-1">{track.question}</div>
-                                                                <div className="text-gray-500 mt-1">Metric: {track.success_metric || 'N/A'}</div>
-                                                            </li>
-                                                        ))}
-                                                    </ul>
-                                                )}
-
-                                                {workflowTab === 'executive' && (
-                                                    <div id="workflow-panel-executive" role="tabpanel" aria-labelledby="workflow-tab-executive" className={`text-xs ${subtextClass}`}>
-                                                        <div className={`${isDarkTheme ? 'bg-gray-700 text-gray-100' : 'bg-gray-50 text-gray-700'} rounded px-3 py-2 mb-2`}>
-                                                            {discoveryDashboard.latest?.personas?.executive?.headline || 'No executive brief available.'}
-                                                        </div>
-                                                        <ul className={`list-disc pl-4 space-y-1 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
-                                                            {(discoveryDashboard.latest?.personas?.executive?.next_90_day_focus || []).slice(0, 6).map((item, idx) => (
-                                                                <li key={idx}>{item}</li>
-                                                            ))}
-                                                        </ul>
-                                                    </div>
-                                                )}
-
-                                                {runbookPayload && runbookPayload.has_data && (
-                                                    <div className={`mt-3 text-xs ${mutedTextClass}`}>
-                                                        Ready: {runbookPayload.title || 'Runbook'} ({runbookPayload.filename || 'runbook.md'})
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </>
-                                    )}
-                                </div>
-                                )}
-
-                                {isIntelligenceTab && (
-                                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
-                                        <div className="flex items-center justify-between mb-4">
-                                            <div>
-                                                <h2 className={`text-lg font-semibold ${headingClass}`}>V2 Intelligence Blueprint</h2>
-                                                <p className={`text-sm ${subtextClass}`}>Coverage gaps, capability map, and evidence ledger from latest V2 run</p>
-                                            </div>
-                                            <button
-                                                type="button"
-                                                onClick={loadV2Intelligence}
-                                                className="text-indigo-600 hover:text-indigo-800"
-                                                title="Refresh V2 intelligence"
-                                                aria-label="Refresh V2 intelligence"
-                                            >
-                                                <i className="fas fa-sync"></i>
-                                            </button>
-                                        </div>
-
-                                        {!v2Intelligence || !v2Intelligence.has_data ? (
-                                            <div className={`text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}`}>
-                                                {v2Intelligence?.message || 'No V2 intelligence blueprint available yet. Run V2 discovery to generate the blueprint.'}
-                                            </div>
-                                        ) : (
-                                            <>
-                                                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-                                                    <div className={`${isDarkTheme ? 'bg-indigo-900 border border-indigo-700' : 'bg-indigo-50'} rounded p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'} text-xs`}>Indexes</div>
-                                                        <div className={`${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'} text-xl font-bold`}>{v2Overview.total_indexes || 0}</div>
-                                                    </div>
-                                                    <div className={`${isDarkTheme ? 'bg-blue-900 border border-blue-700' : 'bg-blue-50'} rounded p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-blue-200' : 'text-blue-700'} text-xs`}>Sourcetypes</div>
-                                                        <div className={`${isDarkTheme ? 'text-blue-100' : 'text-blue-900'} text-xl font-bold`}>{v2Overview.total_sourcetypes || 0}</div>
-                                                    </div>
-                                                    <div className={`${isDarkTheme ? 'bg-green-900 border border-green-700' : 'bg-green-50'} rounded p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-green-200' : 'text-green-700'} text-xs`}>Hosts</div>
-                                                        <div className={`${isDarkTheme ? 'text-green-100' : 'text-green-900'} text-xl font-bold`}>{v2Overview.total_hosts || 0}</div>
-                                                    </div>
-                                                    <div className={`${isDarkTheme ? 'bg-purple-900 border border-purple-700' : 'bg-purple-50'} rounded p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-purple-200' : 'text-purple-700'} text-xs`}>Splunk Version</div>
-                                                        <div className={`${isDarkTheme ? 'text-purple-100' : 'text-purple-900'} text-sm font-semibold truncate`}>{v2Overview.splunk_version || 'unknown'}</div>
-                                                    </div>
-                                                </div>
-
-                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Coverage Gaps</h3>
-                                                        {v2CoverageGaps.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No high-priority gaps were identified.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {v2CoverageGaps.slice(0, 6).map((gap, idx) => (
-                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                        <div className={`font-medium ${headingClass}`}>{gap.gap || 'Coverage gap'}</div>
-                                                                        <div className={`mt-1 ${subtextClass}`}>{gap.why_it_matters || 'No description provided.'}</div>
-                                                                        <div className={`mt-1 uppercase ${mutedTextClass}`}>Priority: {gap.priority || 'medium'}</div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-
-                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Capability Graph</h3>
-                                                        <div className={`text-xs space-y-2 ${subtextClass}`}>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                <div className={`font-medium mb-1 ${headingClass}`}>Data Surface</div>
-                                                                <div>Indexes: {v2CapabilityGraph?.data_surface?.indexes || 0}</div>
-                                                                <div>Sourcetypes: {v2CapabilityGraph?.data_surface?.sourcetypes || 0}</div>
-                                                                <div>Sources: {v2CapabilityGraph?.data_surface?.sources || 0}</div>
-                                                            </div>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                <div className={`font-medium mb-1 ${headingClass}`}>Operations Surface</div>
-                                                                <div>Users: {v2CapabilityGraph?.operations_surface?.users || 0}</div>
-                                                                <div>Knowledge Objects: {v2CapabilityGraph?.operations_surface?.knowledge_objects || 0}</div>
-                                                                <div>KV Collections: {v2CapabilityGraph?.operations_surface?.kv_collections || 0}</div>
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                </div>
-
-                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Finding Ledger</h3>
-                                                        {v2FindingLedger.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No ledger entries available.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {v2FindingLedger.slice(0, 6).map((entry, idx) => (
-                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                        <div className={`font-medium ${headingClass}`}>Step {entry.step || 0}: {entry.title || 'Discovery step'}</div>
-                                                                        <div className={`mt-1 ${subtextClass}`}>{(entry.findings || []).slice(0, 2).join(' | ') || 'No notable findings logged.'}</div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-
-                                                    <div className={`border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                                        <h3 className={`text-sm font-semibold mb-2 ${headingClass}`}>Suggested Use Cases</h3>
-                                                        {v2UseCases.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No suggested use cases were generated.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {v2UseCases.slice(0, 6).map((item, idx) => (
-                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                        <div className={`font-medium ${headingClass}`}>{item.title || item.name || `Use Case ${idx + 1}`}</div>
-                                                                        <div className={`mt-1 ${subtextClass}`}>{item.description || item.use_case || 'No description available.'}</div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                            </>
-                                        )}
-                                    </div>
-                                )}
-
-                                {isCapabilitiesTab && (
-                                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
-                                        <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-4">
-                                            <div>
-                                                <h2 className={`text-lg font-semibold ${headingClass}`}>Capability Management</h2>
-                                                <p className={`text-sm ${subtextClass}`}>Install, enable, test, inspect, and tune optional capabilities without leaving the app.</p>
-                                            </div>
-                                            <div className={`text-xs rounded-lg px-3 py-2 border ${panelMutedClass} ${mutedTextClass}`}>
-                                                Capability state is persisted in the encrypted application configuration.
-                                            </div>
-                                        </div>
-
-                                        {capabilityNotice && (
-                                            <div className={`mb-4 rounded-lg border px-3 py-2 text-sm ${capabilityNotice.type === 'error'
-                                                ? (isDarkTheme ? 'bg-red-950 border-red-800 text-red-100' : 'bg-red-50 border-red-200 text-red-800')
-                                                : (isDarkTheme ? 'bg-emerald-950 border-emerald-800 text-emerald-100' : 'bg-emerald-50 border-emerald-200 text-emerald-800')}`}>
-                                                {capabilityNotice.message}
-                                            </div>
-                                        )}
-
-                                        {capabilitiesData.status === 'error' ? (
-                                            <div className={`text-sm rounded p-4 border ${isDarkTheme ? 'bg-red-950 border-red-800 text-red-100' : 'bg-red-50 border-red-200 text-red-800'}`}>
-                                                {capabilitiesData.error || 'Failed to load capabilities.'}
-                                            </div>
-                                        ) : (
-                                            <>
-                                                <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
-                                                    <div className={`${isDarkTheme ? 'bg-indigo-900 border border-indigo-700' : 'bg-indigo-50'} rounded-lg p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'} text-xs uppercase tracking-wide`}>Registered</div>
-                                                        <div className={`${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.total || 0}</div>
-                                                    </div>
-                                                    <div className={`${isDarkTheme ? 'bg-blue-900 border border-blue-700' : 'bg-blue-50'} rounded-lg p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-blue-200' : 'text-blue-700'} text-xs uppercase tracking-wide`}>Installed</div>
-                                                        <div className={`${isDarkTheme ? 'text-blue-100' : 'text-blue-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.installed || 0}</div>
-                                                    </div>
-                                                    <div className={`${isDarkTheme ? 'bg-emerald-900 border border-emerald-700' : 'bg-emerald-50'} rounded-lg p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-emerald-200' : 'text-emerald-700'} text-xs uppercase tracking-wide`}>Enabled</div>
-                                                        <div className={`${isDarkTheme ? 'text-emerald-100' : 'text-emerald-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.enabled || 0}</div>
-                                                    </div>
-                                                    <div className={`${isDarkTheme ? 'bg-amber-900 border border-amber-700' : 'bg-amber-50'} rounded-lg p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-amber-200' : 'text-amber-700'} text-xs uppercase tracking-wide`}>Ready</div>
-                                                        <div className={`${isDarkTheme ? 'text-amber-100' : 'text-amber-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.ready || 0}</div>
-                                                    </div>
-                                                    <div className={`${isDarkTheme ? 'bg-purple-900 border border-purple-700' : 'bg-purple-50'} rounded-lg p-3`}>
-                                                        <div className={`${isDarkTheme ? 'text-purple-200' : 'text-purple-700'} text-xs uppercase tracking-wide`}>Restart Required</div>
-                                                        <div className={`${isDarkTheme ? 'text-purple-100' : 'text-purple-900'} text-2xl font-semibold`}>{capabilitiesData.summary?.restart_required || 0}</div>
-                                                    </div>
-                                                </div>
-
-                                                <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                                                    {capabilityList.map((capability) => {
-                                                        const actionInProgress = capabilityActionState[capability.name];
-                                                        const isBusy = !!actionInProgress;
-                                                        const statusLabel = capability.health_status || 'unknown';
-                                                        const canInstall = !!capability.runtime_available && !capability.installed;
-                                                        const canEnable = !!capability.installed && !capability.enabled && !capability.restart_required;
-                                                        const canDisable = !!capability.installed && !!capability.enabled;
-                                                        const canTest = !!capability.installed;
-                                                        const canReindex = capability.name === 'rag_chromadb' && !!capability.installed && !capability.restart_required;
-                                                        const canBuildDeeplink = capability.name === 'splunk_deeplink_tools'
-                                                            && !!capability.installed
-                                                            && !!capability.enabled
-                                                            && !capability.restart_required
-                                                            && String(statusLabel).toLowerCase() === 'ready';
-                                                        const indexSummary = capability?.index_summary && typeof capability.index_summary === 'object' ? capability.index_summary : null;
-                                                        const indexSourceTypes = indexSummary?.source_type_counts && typeof indexSummary.source_type_counts === 'object'
-                                                            ? Object.entries(indexSummary.source_type_counts)
-                                                            : [];
-                                                        const deeplinkDraft = deeplinkDrafts[capability.name] || {};
-                                                        const deeplinkBuildResult = deeplinkBuildResults[capability.name] || null;
-
-                                                        return (
-                                                            <div key={capability.name} className={`rounded-lg border p-4 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
-                                                                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-3">
-                                                                    <div>
-                                                                        <div className="flex flex-wrap items-center gap-2 mb-1">
-                                                                            <h3 className={`text-base font-semibold ${headingClass}`}>{capability.title || capability.name}</h3>
-                                                                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${getCapabilityStatusClasses(statusLabel)}`}>
-                                                                                {formatCapabilityStatusLabel(statusLabel)}
-                                                                            </span>
-                                                                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-700 border border-gray-300'}`}>
-                                                                                {formatCapabilityCategoryLabel(capability.category || 'capability')}
-                                                                            </span>
-                                                                        </div>
-                                                                        <p className={`text-sm ${subtextClass}`}>{capability.description || 'Optional capability package.'}</p>
-                                                                    </div>
-                                                                    <div className={`text-xs rounded-lg px-2.5 py-1.5 border ${panelMutedClass} ${mutedTextClass}`}>
-                                                                        {capability.runtime_available ? 'Available now' : 'Planned add-on'}
-                                                                    </div>
-                                                                </div>
-
-                                                                <div className="grid grid-cols-2 gap-2 text-xs mb-3">
-                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
-                                                                        <div className={mutedTextClass}>Setup</div>
-                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{formatCapabilityInstallMethodLabel(capability.install_method || 'unknown')}</div>
-                                                                    </div>
-                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
-                                                                        <div className={mutedTextClass}>Capability stage</div>
-                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{formatCapabilityMaturityLabel(capability.maturity || 'experimental')}</div>
-                                                                    </div>
-                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
-                                                                        <div className={mutedTextClass}>Installed</div>
-                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{capability.installed ? 'Yes' : 'No'}</div>
-                                                                    </div>
-                                                                    <div className={`rounded p-2 ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-50 text-gray-700'}`}>
-                                                                        <div className={mutedTextClass}>Enabled</div>
-                                                                        <div className={`font-medium mt-1 ${headingClass}`}>{capability.enabled ? 'Yes' : 'No'}</div>
-                                                                    </div>
-                                                                </div>
-
-                                                                <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
-                                                                    <div className="font-medium mb-1">Health</div>
-                                                                    <div>{capability.health_message || 'Capability has not been tested yet.'}</div>
-                                                                    {capability.last_tested_at && (
-                                                                        <div className={`mt-1 ${mutedTextClass}`}>Last checked: {new Date(capability.last_tested_at).toLocaleString()}</div>
-                                                                    )}
-                                                                    {capability.version && (
-                                                                        <div className={`mt-1 ${mutedTextClass}`}>Version: {capability.version}</div>
-                                                                    )}
-                                                                </div>
-
-                                                                {Array.isArray(capability.dependency_packages) && capability.dependency_packages.length > 0 && (
-                                                                    <div className="mb-3">
-                                                                        <div className={`text-xs font-medium mb-1 ${headingClass}`}>Dependencies</div>
-                                                                        <div className="flex flex-wrap gap-2 text-[11px]">
-                                                                            {capability.dependency_packages.map((pkg) => (
-                                                                                <span key={pkg} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-gray-50 text-gray-700 border-gray-300'}`}>
-                                                                                    {pkg}
-                                                                                </span>
-                                                                            ))}
-                                                                        </div>
-                                                                    </div>
-                                                                )}
-
-                                                                {capability.name === 'rag_chromadb' && (
-                                                                    <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
-                                                                        <div className="font-medium mb-1">Index Status</div>
-                                                                        <div>Documents indexed: {indexSummary?.document_count || 0}</div>
-                                                                        <div>Source files indexed: {indexSummary?.source_file_count || 0}</div>
-                                                                        {indexSummary?.last_indexed_at && (
-                                                                            <div className={`mt-1 ${mutedTextClass}`}>Last indexed: {new Date(indexSummary.last_indexed_at).toLocaleString()}</div>
-                                                                        )}
-                                                                        {indexSourceTypes.length > 0 && (
-                                                                            <div className="flex flex-wrap gap-2 mt-2">
-                                                                                {indexSourceTypes.map(([sourceType, count]) => (
-                                                                                    <span key={sourceType} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-white text-gray-700 border-gray-300'}`}>
-                                                                                        {formatCapabilitySourceTypeLabel(sourceType)}: {count}
-                                                                                    </span>
-                                                                                ))}
-                                                                            </div>
-                                                                        )}
-                                                                        {Array.isArray(indexSummary?.sample_sources) && indexSummary.sample_sources.length > 0 && (
-                                                                            <div className={`mt-2 ${mutedTextClass}`}>
-                                                                                Sample sources: {indexSummary.sample_sources.join(', ')}
-                                                                            </div>
-                                                                        )}
-                                                                    </div>
-                                                                )}
-
-                                                                {capability.name === 'visualization_tools' && (
-                                                                    <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
-                                                                        <div className="font-medium mb-1">Visualization Status</div>
-                                                                        <div>Preview enabled: {capability.preview_enabled ? 'Yes' : 'No'}</div>
-                                                                        <div>Chart types: {Array.isArray(capability.supported_chart_types) && capability.supported_chart_types.length > 0 ? capability.supported_chart_types.join(', ') : 'line, bar'}</div>
-                                                                        <div>Supported shapes: {Array.isArray(capability.supported_query_shapes) && capability.supported_query_shapes.length > 0 ? capability.supported_query_shapes.join(', ') : 'time_series, aggregation'}</div>
-                                                                        <div>Max preview points: {capability.max_preview_points || capability?.config?.max_preview_points || 8}</div>
-                                                                        <div className={`mt-2 ${mutedTextClass}`}>
-                                                                            Installed and enabled previews appear directly in assistant replies for chartable query results.
-                                                                        </div>
-                                                                    </div>
-                                                                )}
-
-                                                                {capability.name === 'export_tools' && (
-                                                                    <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
-                                                                        <div className="font-medium mb-1">Package Status</div>
-                                                                        <div>Source dir: {capability.output_dir || capability?.config?.source_dir || 'output'}</div>
-                                                                        <div>Export dir: {capability.export_dir || capability?.config?.export_dir || 'output/exports'}</div>
-                                                                        <div>Available sessions: {capability.available_session_count || 0}</div>
-                                                                        <div>Package count: {capability.bundle_count || 0}</div>
-                                                                        <div>Package contents: {Array.isArray(capability.supported_outputs) && capability.supported_outputs.length > 0 ? capability.supported_outputs.map((output) => formatExportOutputLabel(output)).join(', ') : 'ZIP Package, Manifest, Summary Note'}</div>
-                                                                        <div>Max files per package: {capability.max_bundle_files || capability?.config?.max_bundle_files || 12}</div>
-                                                                        {capability.latest_bundle?.name && (
-                                                                            <div className="mt-2 break-all">
-                                                                                Latest package:{' '}
-                                                                                <button
-                                                                                    type="button"
-                                                                                    onClick={() => downloadCapabilityExport(capability.latest_bundle.name)}
-                                                                                    className="text-sky-600 hover:text-sky-800 underline"
-                                                                                >
-                                                                                    {formatPackageFileLabel(capability.latest_bundle.name)}
-                                                                                </button>
-                                                                            </div>
-                                                                        )}
-                                                                        <div className={`mt-2 ${mutedTextClass}`}>
-                                                                            Build Report Package from the runbook workspace to package the active persona runbook with the selected discovery session artifacts.
-                                                                        </div>
-                                                                    </div>
-                                                                )}
-
-                                                                {capability.name === 'splunk_deeplink_tools' && (
-                                                                    <>
-                                                                        <div className={`text-xs rounded-lg border px-3 py-2 mb-3 ${panelMutedClass} ${subtextClass}`}>
-                                                                            <div className="font-medium mb-1">Deeplink Status</div>
-                                                                            <div>Resolved web URL: {capability.resolved_web_base_url || 'Unavailable'}</div>
-                                                                            <div>Source: {capability.base_url_source || 'unresolved'}</div>
-                                                                            <div>Default app: {capability.default_app || capability?.config?.default_app || 'search'}</div>
-                                                                            {capability.sample_search_url && (
-                                                                                <div className="mt-2 break-all">
-                                                                                    <a
-                                                                                        href={capability.sample_search_url}
-                                                                                        target="_blank"
-                                                                                        rel="noreferrer"
-                                                                                        className="text-sky-600 hover:text-sky-800 underline"
-                                                                                    >
-                                                                                        Open sample search
-                                                                                    </a>
-                                                                                </div>
-                                                                            )}
-                                                                        </div>
-
-                                                                        <div className={`rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>
-                                                                            <div className={`text-sm font-medium mb-2 ${headingClass}`}>Build Search Deeplink</div>
-                                                                            <textarea
-                                                                                value={deeplinkDraft.query || ''}
-                                                                                onChange={(event) => updateDeeplinkDraft(capability.name, 'query', event.target.value)}
-                                                                                rows={3}
-                                                                                placeholder="search index=_internal | head 20"
-                                                                                className={`w-full rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
-                                                                            />
-                                                                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
-                                                                                <input
-                                                                                    value={deeplinkDraft.earliest || ''}
-                                                                                    onChange={(event) => updateDeeplinkDraft(capability.name, 'earliest', event.target.value)}
-                                                                                    placeholder="-24h"
-                                                                                    className={`rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
-                                                                                />
-                                                                                <input
-                                                                                    value={deeplinkDraft.latest || ''}
-                                                                                    onChange={(event) => updateDeeplinkDraft(capability.name, 'latest', event.target.value)}
-                                                                                    placeholder="now"
-                                                                                    className={`rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
-                                                                                />
-                                                                                <input
-                                                                                    value={deeplinkDraft.app || ''}
-                                                                                    onChange={(event) => updateDeeplinkDraft(capability.name, 'app', event.target.value)}
-                                                                                    placeholder="search"
-                                                                                    className={`rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
-                                                                                />
-                                                                            </div>
-                                                                            {deeplinkBuildResult?.url && (
-                                                                                <div className={`mt-2 text-xs break-all ${subtextClass}`}>
-                                                                                    Latest build:{' '}
-                                                                                    <a
-                                                                                        href={deeplinkBuildResult.url}
-                                                                                        target="_blank"
-                                                                                        rel="noreferrer"
-                                                                                        className="text-sky-600 hover:text-sky-800 underline"
-                                                                                    >
-                                                                                        {deeplinkBuildResult.url}
-                                                                                    </a>
-                                                                                </div>
-                                                                            )}
-                                                                            <div className="flex flex-wrap gap-2 mt-3">
-                                                                                <button
-                                                                                    onClick={() => buildCapabilityDeeplink({
-                                                                                        query: deeplinkDraft.query || '',
-                                                                                        earliest: deeplinkDraft.earliest || undefined,
-                                                                                        latest: deeplinkDraft.latest || undefined,
-                                                                                        app: deeplinkDraft.app || undefined,
-                                                                                    }, { name: capability.name })}
-                                                                                    disabled={!canBuildDeeplink || isBusy}
-                                                                                    className={`px-3 py-1.5 rounded text-sm font-medium ${canBuildDeeplink && !isBusy ? 'bg-sky-600 hover:bg-sky-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                                >
-                                                                                    {actionInProgress === 'build' ? 'Building...' : 'Build Link'}
-                                                                                </button>
-                                                                                <button
-                                                                                    onClick={() => buildCapabilityDeeplink({
-                                                                                        query: deeplinkDraft.query || '',
-                                                                                        earliest: deeplinkDraft.earliest || undefined,
-                                                                                        latest: deeplinkDraft.latest || undefined,
-                                                                                        app: deeplinkDraft.app || undefined,
-                                                                                    }, { name: capability.name, openAfterBuild: true, suppressNotice: true })}
-                                                                                    disabled={!canBuildDeeplink || isBusy}
-                                                                                    className={`px-3 py-1.5 rounded text-sm font-medium ${canBuildDeeplink && !isBusy ? 'bg-cyan-700 hover:bg-cyan-800 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                                >
-                                                                                    Open Link
-                                                                                </button>
-                                                                            </div>
-                                                                        </div>
-                                                                    </>
-                                                                )}
-
-                                                                <details className={`mb-3 rounded-lg border ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>
-                                                                    <summary className={`cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}`}>Inspect Configuration</summary>
-                                                                    <div className="px-3 pb-3">
-                                                                        <textarea
-                                                                            value={capabilityDrafts[capability.name] || '{}'}
-                                                                            onChange={(event) => updateCapabilityDraft(capability.name, event.target.value)}
-                                                                            rows={8}
-                                                                            className={`w-full rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
-                                                                        />
-                                                                        {capability.name === 'rag_local' && (
-                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                                                To use local artifact search in chat, install and enable this capability here, then turn on Optional Local Search in Chat Settings.
-                                                                            </div>
-                                                                        )}
-                                                                        {capability.name === 'rag_chromadb' && (
-                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                                                Install the capability, restart the app if prompted, then enable and reindex it before using it in chat.
-                                                                            </div>
-                                                                        )}
-                                                                        {capability.name === 'splunk_deeplink_tools' && (
-                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                                                Set web_base_url to override automatic derivation from the MCP URL. Once installed and enabled, assistant SPL cards expose an Open in Splunk action.
-                                                                            </div>
-                                                                        )}
-                                                                        {capability.name === 'visualization_tools' && (
-                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                                                Keep preview_enabled on to let the assistant render inline chart previews for time-series and aggregation-style query results.
-                                                                            </div>
-                                                                        )}
-                                                                        {capability.name === 'export_tools' && (
-                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                                                Set source_dir and export_dir only if discovery output lives outside the default output folder. Once installed and enabled, Build Report Package creates a downloadable zip with a manifest, summary note, selected artifacts, and the current persona runbook.
-                                                                            </div>
-                                                                        )}
-                                                                    </div>
-                                                                </details>
-
-                                                                <div className="flex flex-wrap gap-2">
-                                                                    <button
-                                                                        onClick={() => runCapabilityAction(capability.name, 'install')}
-                                                                        disabled={!canInstall || isBusy}
-                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canInstall && !isBusy ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                    >
-                                                                        {actionInProgress === 'install' ? 'Installing...' : (capability.installed ? 'Installed' : (capability.runtime_available ? 'Install' : 'Planned'))}
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={() => runCapabilityAction(capability.name, 'enable')}
-                                                                        disabled={!canEnable || isBusy}
-                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canEnable && !isBusy ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                    >
-                                                                        {actionInProgress === 'enable' ? 'Enabling...' : 'Enable'}
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={() => runCapabilityAction(capability.name, 'disable')}
-                                                                        disabled={!canDisable || isBusy}
-                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canDisable && !isBusy ? 'bg-rose-600 hover:bg-rose-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                    >
-                                                                        {actionInProgress === 'disable' ? 'Disabling...' : 'Disable'}
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={() => runCapabilityAction(capability.name, 'test')}
-                                                                        disabled={!canTest || isBusy}
-                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${canTest && !isBusy ? 'bg-amber-600 hover:bg-amber-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                    >
-                                                                        {actionInProgress === 'test' ? 'Testing...' : 'Test'}
-                                                                    </button>
-                                                                    {capability.name === 'rag_chromadb' && (
-                                                                        <button
-                                                                            onClick={() => runCapabilityAction(capability.name, 'reindex')}
-                                                                            disabled={!canReindex || isBusy}
-                                                                            className={`px-3 py-1.5 rounded text-sm font-medium ${canReindex && !isBusy ? 'bg-violet-600 hover:bg-violet-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                        >
-                                                                            {actionInProgress === 'reindex' ? 'Reindexing...' : 'Reindex'}
-                                                                        </button>
-                                                                    )}
-                                                                    <button
-                                                                        onClick={() => saveCapabilityConfig(capability.name)}
-                                                                        disabled={isBusy}
-                                                                        className={`px-3 py-1.5 rounded text-sm font-medium ${!isBusy ? 'bg-slate-700 hover:bg-slate-800 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                                    >
-                                                                        {actionInProgress === 'config' ? 'Saving...' : 'Save Config'}
-                                                                    </button>
-                                                                </div>
-                                                            </div>
-                                                        );
-                                                    })}
-                                                </div>
-                                            </>
-                                        )}
-                                    </div>
-                                )}
-
-                                {/* Progress Bar */}
-                                {isMissionTab && discoveryStatus === 'running' && (
-                                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
-                                        <div className="flex items-center justify-between mb-2">
-                                            <h2 className={`text-lg font-medium ${headingClass}`}>Discovery Progress</h2>
-                                            <span className={`text-sm ${mutedTextClass}`}>{Math.round(progress.percentage)}%</span>
-                                        </div>
-                                        <div className="w-full bg-gray-200 rounded-full h-3 mb-2">
-                                            <div 
-                                                className="bg-indigo-600 h-3 rounded-full progress-bar"
-                                                style={{ width: `${progress.percentage}%` }}
-                                            ></div>
-                                        </div>
-                                        <p className={`text-sm ${subtextClass}`}>{progress.description}</p>
-                                    </div>
-                                )}
-                                
-                                {/* Messages */}
-                                {isMissionTab && (
-                                <div className={`rounded-lg shadow-sm mb-6 border ${panelClass}`}>
-                                    <div className={`p-6 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
-                                        <h2 className={`text-lg font-medium ${headingClass}`}>Discovery Log</h2>
-                                    </div>
-                                    <div 
-                                        className="p-6 overflow-y-auto scroll-container"
-                                        style={{ height: `${discoveryLogHeight}px` }}
-                                    >
-                                        <div className="space-y-4">
-                                            {messages.map((message) => (
-                                                <div key={message.id}>
-                                                    {renderMessage(message)}
-                                                </div>
-                                            ))}
-                                            <div ref={messagesEndRef} />
-                                        </div>
-                                    </div>
-                                    {/* Resize handle */}
-                                    <div 
-                                        className={`h-2 border-t cursor-ns-resize flex items-center justify-center group ${isDarkTheme ? 'bg-gray-700 border-gray-600 hover:bg-gray-600' : 'bg-gray-100 border-gray-200 hover:bg-gray-200'}`}
-                                        onMouseDown={handleLogMouseDown}
-                                    >
-                                        <div className="w-12 h-1 bg-gray-400 rounded group-hover:bg-gray-500"></div>
-                                    </div>
-                                </div>
-                                )}
-                                
-                                {/* Report Viewer */}
-                                {(isMissionTab || isArtifactsTab) && selectedReport && reportContent && (
-                                    <div className={`rounded-lg shadow-sm border ${panelClass}`}>
-                                        <div className={`p-6 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
-                                            <div className="flex justify-between items-center">
-                                                <h3 className={`text-lg font-medium ${headingClass}`}>{selectedReport}</h3>
-                                                <button
-                                                    onClick={() => exportReport(selectedReport, 
-                                                        reportContent.type === 'json' 
-                                                            ? JSON.stringify(reportContent.content, null, 2)
-                                                            : reportContent.content
-                                                    )}
-                                                    className="text-indigo-600 hover:text-indigo-800"
-                                                >
-                                                    <i className="fas fa-download mr-1"></i>
-                                                    Export
-                                                </button>
-                                            </div>
-                                        </div>
-                                        <div 
-                                            className="p-6 overflow-y-auto scroll-container"
-                                            style={{ height: `${reportViewerHeight}px` }}
-                                        >
-                                            {reportContent.type === 'json' ? (
-                                                <pre className={`text-sm whitespace-pre-wrap font-mono ${isDarkTheme ? 'text-gray-100' : 'text-gray-800'}`}>
-                                                    {JSON.stringify(reportContent.content, null, 2)}
-                                                </pre>
-                                            ) : (
-                                                <div className="prose prose-sm max-w-none">
-                                                    <pre className={`text-sm whitespace-pre-wrap font-sans leading-relaxed break-words ${isDarkTheme ? 'text-gray-100' : 'text-gray-800'}`}>
-                                                        {reportContent.content}
-                                                    </pre>
-                                                </div>
-                                            )}
-                                        </div>
-                                        {/* Resize handle */}
-                                        <div 
-                                            className={`h-2 border-t cursor-ns-resize flex items-center justify-center group ${isDarkTheme ? 'bg-gray-700 border-gray-600 hover:bg-gray-600' : 'bg-gray-100 border-gray-200 hover:bg-gray-200'}`}
-                                            onMouseDown={handleReportMouseDown}
-                                        >
-                                            <div className="w-12 h-1 bg-gray-400 rounded group-hover:bg-gray-500"></div>
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                            
-                            {/* Reports Sidebar */}
-                            {(isMissionTab || isArtifactsTab) && (
-                            <div className="lg:col-span-1 min-w-0">
-                                {/* Reports List */}
-                                <div className={`rounded-lg shadow-sm border overflow-hidden min-w-0 ${panelClass}`}>
-                                    <div className={`p-6 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
-                                        <div className="flex justify-between items-center">
-                                            <div>
-                                                <h2 className={`text-lg font-medium ${headingClass}`}>{isArtifactsTab ? 'V2 Artifacts' : 'Generated Reports'}</h2>
-                                                <p className={`text-xs mt-1 ${mutedTextClass}`}>
-                                                    {isArtifactsTab ? `${v2Artifacts?.count || 0} artifact(s)` : `${sessionCatalog.length} discovery session(s)`}
-                                                </p>
-                                            </div>
-                                            <button
-                                                type="button"
-                                                onClick={isArtifactsTab ? refreshArtifactsWorkspace : loadReports}
-                                                className="text-indigo-600 hover:text-indigo-800"
-                                                aria-label={isArtifactsTab ? 'Refresh V2 artifacts' : 'Refresh generated reports'}
-                                            >
-                                                <i className="fas fa-refresh"></i>
-                                            </button>
-                                        </div>
-                                    </div>
-                                    <div className={`divide-y overflow-x-hidden min-w-0 ${isDarkTheme ? 'divide-gray-700' : 'divide-gray-200'}`}>
-                                        {isArtifactsTab ? (
-                                            !v2Artifacts?.has_data || (v2Artifacts?.artifacts || []).length === 0 ? (
-                                                <p className={`p-6 text-center ${mutedTextClass}`}>No V2 artifacts generated yet</p>
-                                            ) : (
-                                                <div>
-                                                    {(v2Artifacts.artifacts || []).map((artifact) => (
-                                                        <div
-                                                            key={artifact.name}
-                                                            className={`p-4 border-b ${isDarkTheme ? 'border-gray-700 hover:bg-gray-700' : 'border-gray-200 hover:bg-gray-50'} ${selectedReport === artifact.name ? (isDarkTheme ? 'bg-indigo-900 border-r-4 border-indigo-400' : 'bg-indigo-50 border-r-4 border-indigo-500') : ''}`}
-                                                        >
-                                                            <div className="flex items-start justify-between gap-2">
-                                                                <button
-                                                                    onClick={() => loadReport(artifact.name)}
-                                                                    className="text-left flex-1"
-                                                                    title={`Open ${artifact.name}`}
-                                                                >
-                                                                    <div className={`text-sm font-medium break-all ${headingClass}`}>{artifact.name}</div>
-                                                                    <div className={`text-xs mt-1 ${mutedTextClass}`}>
-                                                                        {(((artifact.size_bytes ?? artifact.size ?? 0) / 1024).toFixed(1))} KB • {new Date(artifact.modified_at || artifact.modified || Date.now()).toLocaleString()}
-                                                                    </div>
-                                                                </button>
-                                                                <div className="flex items-center gap-2">
-                                                                    <span className={`px-2 py-1 text-xs rounded ${artifact.type === 'json' ? (isDarkTheme ? 'bg-blue-900 text-blue-100' : 'bg-blue-100 text-blue-800') : (isDarkTheme ? 'bg-green-900 text-green-100' : 'bg-green-100 text-green-800')}`}>
-                                                                        {(artifact.type || 'file').toUpperCase()}
-                                                                    </span>
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={() => copyToClipboard(artifact.path || artifact.name)}
-                                                                        className={`text-xs px-2 py-1 rounded ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'}`}
-                                                                        title="Copy file path"
-                                                                        aria-label={`Copy file path for ${artifact.name}`}
-                                                                    >
-                                                                        <i className="fas fa-copy"></i>
-                                                                    </button>
-                                                                </div>
-                                                            </div>
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            )
-                                        ) : reports.length === 0 ? (
-                                            <p className={`p-6 text-center ${mutedTextClass}`}>No reports generated yet</p>
-                                        ) : (
-                                            (() => {
-                                                const hierarchy = groupReportsByHierarchy(reports);
-                                                return Object.entries(hierarchy).sort((a, b) => b[1].year - a[1].year).map(([yearKey, yearData]) => (
-                                                    <div key={yearKey}>
-                                                        {/* Year Header - Only show if not current year */}
-                                                        {yearData.visible && (
-                                                            <button
-                                                                type="button"
-                                                                className={`w-full p-3 border-b text-left font-semibold ${isDarkTheme ? 'bg-indigo-900 border-gray-700 hover:bg-indigo-800' : 'bg-gradient-to-r from-indigo-100 to-purple-100 border-gray-200'}`}
-                                                                onClick={() => toggleYear(yearKey)}
-                                                                aria-expanded={!!expandedYears[yearKey]}
-                                                            >
-                                                                <div className="flex items-center">
-                                                                    <i className={`fas ${expandedYears[yearKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-600'}`}></i>
-                                                                    <span className={`text-sm ${isDarkTheme ? 'text-indigo-100' : 'text-indigo-900'}`}>{yearData.display}</span>
-                                                                </div>
-                                                            </button>
-                                                        )}
-                                                        
-                                                        {/* Month Level */}
-                                                        {(!yearData.visible || expandedYears[yearKey]) && Object.entries(yearData.months).sort((a, b) => b[1].month - a[1].month).map(([monthKey, monthData]) => (
-                                                            <div key={monthKey}>
-                                                                {/* Month Header - Only show if not current month or if year is visible */}
-                                                                {monthData.visible && (
-                                                                    <button
-                                                                        type="button"
-                                                                        className={`w-full p-3 border-b text-left ${isDarkTheme ? 'bg-blue-900 border-gray-700 hover:bg-blue-800' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-gray-200'}`}
-                                                                        onClick={() => toggleMonth(monthKey)}
-                                                                        style={{paddingLeft: yearData.visible ? '1.5rem' : '0.75rem'}}
-                                                                        aria-expanded={!!expandedMonths[monthKey]}
-                                                                    >
-                                                                        <div className="flex items-center">
-                                                                            <i className={`fas ${expandedMonths[monthKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${isDarkTheme ? 'text-blue-200' : 'text-blue-600'}`}></i>
-                                                                            <span className={`text-sm font-medium ${isDarkTheme ? 'text-blue-100' : 'text-blue-900'}`}>{monthData.display}</span>
-                                                                        </div>
-                                                                    </button>
-                                                                )}
-                                                                
-                                                                {/* Day Level */}
-                                                                {(!monthData.visible || expandedMonths[monthKey]) && Object.entries(monthData.days).sort((a, b) => b[1].day - a[1].day).map(([dayKey, dayData]) => (
-                                                                    <div key={dayKey}>
-                                                                        {/* Day Header */}
-                                                                        <button
-                                                                            type="button"
-                                                                            className={`w-full p-3 border-b text-left ${dayData.isToday ? (isDarkTheme ? 'bg-green-900' : 'bg-green-50') : (isDarkTheme ? 'bg-gray-800' : 'bg-gray-50')} ${isDarkTheme ? 'hover:bg-gray-700 border-gray-700' : 'hover:bg-gray-100 border-gray-200'}`}
-                                                                            onClick={() => toggleDay(dayKey)}
-                                                                            style={{paddingLeft: monthData.visible ? (yearData.visible ? '3rem' : '1.5rem') : (yearData.visible ? '1.5rem' : '0.75rem')}}
-                                                                            aria-expanded={!!expandedDays[dayKey]}
-                                                                        >
-                                                                            <div className="flex items-center">
-                                                                                <i className={`fas ${expandedDays[dayKey] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-2 text-xs ${dayData.isToday ? (isDarkTheme ? 'text-green-200' : 'text-green-600') : mutedTextClass}`}></i>
-                                                                                <span className={`text-sm ${dayData.isToday ? (isDarkTheme ? 'text-green-100 font-semibold' : 'text-green-900 font-semibold') : (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-900 font-medium')}`}>{dayData.display}</span>
-                                                                                <span className={`ml-2 text-xs ${mutedTextClass}`}>({dayData.sessions.length})</span>
-                                                                            </div>
-                                                                        </button>
-                                                                        
-                                                                        {/* Sessions under this day */}
-                                                                        {expandedDays[dayKey] && dayData.sessions.map((session) => {
-                                                                            const summaryArtifact = (session.reports || []).find((report) => isSummaryArtifact(report.name));
-                                                                            return (
-                                                                            <div key={session.timestamp}>
-                                                                                {/* Session Header */}
-                                                                                <div 
-                                                                                    className={`p-4 border-b cursor-pointer transition-colors overflow-hidden ${isDarkTheme ? 'bg-gray-800 hover:bg-gray-700 border-gray-700' : 'bg-white hover:bg-gray-50 border-gray-200'}`}
-                                                                                    onClick={() => toggleSession(session.timestamp)}
-                                                                                    onKeyDown={(event) => handleKeyActivate(event, () => toggleSession(session.timestamp))}
-                                                                                    style={{paddingLeft: monthData.visible ? (yearData.visible ? '3rem' : '2rem') : (yearData.visible ? '2rem' : '1.25rem')}}
-                                                                                    role="button"
-                                                                                    tabIndex={0}
-                                                                                    aria-expanded={!!expandedSessions[session.timestamp]}
-                                                                                >
-                                                                                    <div className="flex flex-col gap-2">
-                                                                                        <div className="flex items-start flex-1 min-w-0">
-                                                                                            <i className={`fas ${expandedSessions[session.timestamp] ? 'fa-chevron-down' : 'fa-chevron-right'} mr-3 text-xs mt-1 ${mutedTextClass}`}></i>
-                                                                                            <div className="flex-1 min-w-0">
-                                                                                                <h3 className={`text-sm font-semibold mb-1 tracking-wide ${headingClass}`}>{formatSessionTime(session.timestamp)}</h3>
-                                                                                                <div className={`flex items-center gap-2 text-xs flex-wrap ${mutedTextClass}`}>
-                                                                                                    <span className={`flex items-center px-2 py-0.5 rounded ${isDarkTheme ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
-                                                                                                        <i className="fas fa-file-alt mr-1"></i>
-                                                                                                        {session.reports.length} reports
-                                                                                                    </span>
-                                                                                                    {session.hasSummary && (
-                                                                                                        <span className={`flex items-center px-2 py-0.5 rounded-full font-medium ${isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-emerald-100 text-emerald-800 border border-emerald-200'}`}>
-                                                                                                            <i className="fas fa-check-circle mr-1"></i>
-                                                                                                            Summarized
-                                                                                                        </span>
-                                                                                                    )}
-                                                                                                    {summaryArtifact?.modified && (
-                                                                                                        <span className={`hidden xl:flex items-center px-2 py-0.5 rounded ${isDarkTheme ? 'bg-gray-700 text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
-                                                                                                            <i className="fas fa-clock mr-1"></i>
-                                                                                                            {new Date(summaryArtifact.modified).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                                                                                        </span>
-                                                                                                    )}
-                                                                                                </div>
-                                                                                            </div>
-                                                                                        </div>
-                                                                                        <div className="flex items-center w-full">
-                                                                                            <button
-                                                                                                onClick={(e) => {
-                                                                                                    e.stopPropagation();
-                                                                                                    openSummaryModal(session.timestamp);
-                                                                                                }}
-                                                                                                className={`w-full text-xs px-3 py-1.5 rounded-md font-medium inline-flex justify-center items-center space-x-1 whitespace-nowrap shadow-sm transition-colors ${session.hasSummary ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
-                                                                                                title={session.hasSummary ? 'View saved summary' : 'Generate summary with LLM'}
-                                                                                            >
-                                                                                                <i className={`fas ${session.hasSummary ? 'fa-eye' : 'fa-magic'}`}></i>
-                                                                                                <span>{session.hasSummary ? 'View Summary' : 'Summarize'}</span>
-                                                                                            </button>
-                                                                                        </div>
-                                                                                    </div>
-                                                                                </div>
-                                                                                
-                                                                                {/* Session Reports */}
-                                                                                {expandedSessions[session.timestamp] && (
-                                                                                    <div className={`divide-y ${isDarkTheme ? 'divide-gray-700' : 'divide-gray-100'}`}>
-                                                                                        {session.reports.map((report) => (
-                                                                                            <div
-                                                                                                key={report.name}
-                                                                                                className={`p-4 cursor-pointer ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-50'} ${
-                                                                                                    selectedReport === report.name ? (isDarkTheme ? 'bg-indigo-900 border-r-4 border-indigo-400' : 'bg-indigo-50 border-r-4 border-indigo-500') : ''
-                                                                                                }`}
-                                                                                                onClick={() => loadReport(report.name)}
-                                                                                                onKeyDown={(event) => handleKeyActivate(event, () => loadReport(report.name))}
-                                                                                                style={{paddingLeft: monthData.visible ? (yearData.visible ? '4rem' : '3rem') : (yearData.visible ? '3rem' : '2rem')}}
-                                                                                                role="button"
-                                                                                                tabIndex={0}
-                                                                                            >
-                                                                                                <div className="flex items-center justify-between gap-2 min-w-0">
-                                                                                                    <div className="flex-1 min-w-0">
-                                                                                                        <p className={`text-sm font-medium truncate ${headingClass}`} title={report.name}>
-                                                                                                            {report.name.replace(/_[0-9]{8}_[0-9]{6}/, '')}
-                                                                                                        </p>
-                                                                                                        <p className={`text-xs ${mutedTextClass}`}>{(report.size / 1024).toFixed(1)} KB</p>
-                                                                                                    </div>
-                                                                                                    <div className="flex items-center space-x-2 shrink-0">
-                                                                                                        <span className={`px-2 py-1 text-xs rounded ${
-                                                                                                            report.type === 'json'
-                                                                                                                ? (isDarkTheme ? 'bg-blue-900 text-blue-100' : 'bg-blue-100 text-blue-800')
-                                                                                                                : (isDarkTheme ? 'bg-green-900 text-green-100' : 'bg-green-100 text-green-800')
-                                                                                                        }`}>
-                                                                                                            {report.type.toUpperCase()}
-                                                                                                        </span>
-                                                                                                    </div>
-                                                                                                </div>
-                                                                                            </div>
-                                                                                        ))}
-                                                                                    </div>
-                                                                                )}
-                                                                            </div>
-                                                                        );})}
-                                                                    </div>
-                                                                ))}
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                ));
-                                            })()
-                                        )}
-                                    </div>
-                                </div>
-                            </div>
-                            )}
-                        </div>
-                    </div>
-                    
-                    {/* Connection Info Modal */}
-                    {isConnectionModalOpen && (
-                        <div 
-                            className="fixed inset-0 z-50" 
-                            onClick={() => setIsConnectionModalOpen(false)}
-                        >
-                            {/* Position modal directly below the connection indicator in the header */}
-                            <div 
-                                id="connection-details-popover"
-                                role="dialog"
-                                aria-modal="false"
-                                aria-labelledby="connection-details-title"
-                                className={`connection-popover absolute rounded-xl shadow-2xl w-80 ${isDarkTheme ? 'bg-gray-800 border border-gray-600' : 'bg-white border border-gray-200'}`}
-                                onClick={(e) => e.stopPropagation()}
-                                onKeyDown={(event) => handleDialogKeyDown(event, () => setIsConnectionModalOpen(false))}
-                                tabIndex={-1}
-                                style={{
-                                    top: `${connectionModalPosition.top}px`,
-                                    left: `${connectionModalPosition.left}px`,
-                                    boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)'
-                                }}
-                            >
-                                {/* Speech bubble pointer - pointing to connection indicator above */}
-                                <div
-                                    className={`absolute -top-2 w-4 h-4 rotate-45 border-l border-t ${isDarkTheme ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-200'}`}
-                                    style={{ left: `${connectionModalPosition.pointerLeft}px` }}
-                                ></div>
-                                
-                                {/* Modal Header */}
-                                <div className={`p-4 border-b flex justify-between items-center relative z-10 rounded-t-xl ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                    <div className="flex items-center">
-                                        <i className="fas fa-plug text-lg text-indigo-600 mr-2"></i>
-                                        <h2 id="connection-details-title" className={`text-base font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Connection Details</h2>
-                                    </div>
-                                    <button
-                                        type="button"
-                                        onClick={() => setIsConnectionModalOpen(false)}
-                                        className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-200' : 'text-gray-400 hover:text-gray-600'} transition-colors`}
-                                        aria-label="Close connection details"
-                                    >
-                                        <i className="fas fa-times"></i>
-                                    </button>
-                                </div>
-                                
-                                {/* Modal Content */}
-                                <div className="p-4 space-y-3">
-                                    {connectionInfo ? (
-                                        connectionInfo.error ? (
-                                            <div className="text-sm text-red-600">
-                                                <i className="fas fa-exclamation-triangle mr-2"></i>
-                                                {connectionInfo.error}
-                                            </div>
-                                        ) : (
-                                            <>
-                                                {/* LLM Section */}
-                                                <div className="bg-gradient-to-br from-purple-50 to-indigo-50 rounded-lg p-3 border border-indigo-100">
-                                                    <h3 className="text-sm font-semibold text-gray-900 mb-2 flex items-center">
-                                                        <i className="fas fa-brain text-purple-600 mr-2 text-xs"></i>
-                                                        LLM Configuration
-                                                    </h3>
-                                                    <div className="space-y-1.5">
-                                                        <div className="flex items-start">
-                                                            <span className="text-xs font-medium text-gray-500 w-16">Provider:</span>
-                                                            <span className="text-xs text-gray-900 font-semibold">{connectionInfo.llm?.provider || 'Unknown'}</span>
-                                                        </div>
-                                                        <div className="flex items-start">
-                                                            <span className="text-xs font-medium text-gray-500 w-16">Model:</span>
-                                                            <span className="text-xs text-gray-900 font-mono bg-white px-1.5 py-0.5 rounded border border-indigo-200">{connectionInfo.llm?.model || 'Unknown'}</span>
-                                                        </div>
-                                                        <div className="flex items-start">
-                                                            <span className="text-xs font-medium text-gray-500 w-16">Endpoint:</span>
-                                                            <span className="text-xs text-gray-700 break-all flex-1">{connectionInfo.llm?.endpoint || 'Unknown'}</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                                
-                                                {/* MCP Section - Simplified to just endpoint */}
-                                                <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-lg p-3 border border-green-100">
-                                                    <h3 className="text-sm font-semibold text-gray-900 mb-2 flex items-center">
-                                                        <i className="fas fa-server text-green-600 mr-2 text-xs"></i>
-                                                        MCP Server
-                                                    </h3>
-                                                    <div className="flex items-start">
-                                                        <span className="text-xs font-medium text-gray-500 w-16">Endpoint:</span>
-                                                        <span className="text-xs text-gray-700 font-mono bg-white px-1.5 py-0.5 rounded border border-green-200 break-all flex-1">{connectionInfo.mcp?.endpoint || 'Unknown'}</span>
-                                                    </div>
-                                                </div>
-                                                
-                                                {/* Status */}
-                                                <div className="flex items-center justify-center p-2.5 bg-green-50 rounded-lg border border-green-200">
-                                                    <i className="fas fa-check-circle text-green-600 mr-2"></i>
-                                                    <span className="text-xs font-medium text-green-800">All connections active</span>
-                                                </div>
-                                            </>
-                                        )
-                                    ) : (
-                                        <div className="flex items-center justify-center p-6">
-                                            <i className="fas fa-spinner fa-spin text-lg text-gray-400 mr-2"></i>
-                                            <span className="text-xs text-gray-500">Loading...</span>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                    
-                    {/* Chat Modal */}
-                    {isChatOpen && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                            <div className={`rounded-xl shadow-2xl w-full max-w-4xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`} role="dialog" aria-modal="true" aria-labelledby="chat-modal-title" onKeyDown={(event) => handleDialogKeyDown(event, () => setIsChatOpen(false))}>
-                                {/* Chat Header */}
-                                <div className={`p-6 border-b flex justify-between items-center ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
-                                    <div className="flex items-center">
-                                        <i className="fas fa-comments text-2xl text-green-600 mr-3"></i>
-                                        <h2 id="chat-modal-title" className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Chat with Splunk</h2>
-                                    </div>
-                                    <div className="flex items-center space-x-2">
-                                        <button
-                                            type="button"
-                                            onClick={() => setIsChatSettingsOpen(true)}
-                                            className={`px-3 py-1 text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}
-                                            title="Chat settings"
-                                            aria-label="Open chat settings"
-                                        >
-                                            <i className="fas fa-cog"></i>
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={() => {
-                                                clearPersistedChatState();
-                                                setChatMessages([]);
-                                                setChatInput('');
-                                                setChatStatus('');
-                                                setServerConversationHistory(null);
-                                                setChatSessionId(generateChatSessionId());
-                                            }}
-                                            className={`px-3 py-1 text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}
-                                            title="Clear chat"
-                                            aria-label="Clear chat history"
-                                        >
-                                            <i className="fas fa-trash"></i>
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={() => setIsChatOpen(false)}
-                                            className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-100' : 'text-gray-500 hover:text-gray-700'}`}
-                                            aria-label="Close chat"
-                                        >
-                                            <i className="fas fa-times text-xl"></i>
-                                        </button>
-                                    </div>
-                                </div>
-                                
-                                {/* Chat Messages */}
-                                <div className={`flex-1 overflow-y-auto p-6 space-y-4 ${isDarkTheme ? 'bg-gray-900' : 'bg-white'}`}>
-                                    {chatMessages.length === 0 && (
-                                        <div className={`text-center mt-12 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                            <i className="fas fa-robot text-4xl mb-4"></i>
-                                            <p className="text-lg">Start a conversation with your Splunk environment</p>
-                                            <p className="text-sm mt-2">Ask questions about your data, indexes, searches, or get help with SPL queries</p>
-                                        </div>
-                                    )}
-                                    
-                                    {chatMessages.map((msg) => (
-                                        <div key={msg.id} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                            <div className={`max-w-3xl p-4 rounded-lg ${
-                                                msg.type === 'user' 
-                                                    ? 'bg-indigo-600 text-white' 
-                                                    : msg.type === 'error'
-                                                    ? (isDarkTheme ? 'bg-red-900 text-red-100 border border-red-700' : 'bg-red-50 text-red-800 border border-red-200')
-                                                    : msg.type === 'warning'
-                                                    ? (isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-50 text-amber-900 border border-amber-200')
-                                                    : (isDarkTheme ? 'bg-gray-700 text-gray-100 border border-gray-600' : 'bg-gray-100 text-gray-800')
-                                            }`}>
-                                                {msg.type === 'user' && (
-                                                    <div className="flex items-start">
-                                                        <div className="flex-1">
-                                                            <p className="whitespace-pre-wrap">{msg.content}</p>
-                                                        </div>
-                                                        <i className="fas fa-user ml-3 mt-1"></i>
-                                                    </div>
-                                                )}
-                                                
-                                                {msg.type === 'assistant' && (
-                                                    <div className="flex items-start">
-                                                        <i className="fas fa-robot mr-3 mt-1 text-green-600"></i>
-                                                        <div className="flex-1">
-                                                            <p className="whitespace-pre-wrap">{msg.content}</p>
-                                                            
-                                                            {/* Show SPL Query from tool execution */}
-                                                            {msg.spl_query && (
-                                                                <details className="mt-3" open>
-                                                                    <summary className="cursor-pointer text-sm font-medium text-indigo-600 hover:text-indigo-800 flex items-center">
-                                                                        <i className="fas fa-code mr-2"></i>
-                                                                        SPL Query Executed
-                                                                    </summary>
-                                                                    <div className="mt-2 p-4 bg-gray-900 text-green-300 rounded-lg font-mono text-sm">
-                                                                        <div className="flex justify-between items-start mb-2">
-                                                                            <span className="text-xs text-gray-300 uppercase tracking-wide">Splunk Query</span>
-                                                                            <div className="flex items-center gap-2">
-                                                                                {canUseSplunkDeeplinks && (
-                                                                                    <button
-                                                                                        type="button"
-                                                                                        onClick={() => openSplunkSearchFromChat(msg.spl_query)}
-                                                                                        className="px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors"
-                                                                                        title="Open this search in Splunk Web"
-                                                                                    >
-                                                                                        <i className="fas fa-external-link-alt mr-1"></i>
-                                                                                        Open in Splunk
-                                                                                    </button>
-                                                                                )}
-                                                                                <button 
-                                                                                    type="button"
-                                                                                    onClick={(event) => {
-                                                                                        navigator.clipboard.writeText(msg.spl_query);
-                                                                                        const btn = event.currentTarget;
-                                                                                        const originalHTML = btn.innerHTML;
-                                                                                        btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-                                                                                        setTimeout(() => btn.innerHTML = originalHTML, 2000);
-                                                                                    }}
-                                                                                    className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
-                                                                                    title="Copy to clipboard"
-                                                                                    aria-label="Copy executed SPL query to clipboard"
-                                                                                >
-                                                                                    <i className="fas fa-copy mr-1"></i>
-                                                                                    Copy
-                                                                                </button>
-                                                                            </div>
-                                                                        </div>
-                                                                        <pre className="whitespace-pre-wrap break-all">{msg.spl_query}</pre>
-                                                                    </div>
-                                                                </details>
-                                                            )}
-                                                            
-                                                            {/* Show SPL mentioned in text (even if not executed) */}
-                                                            {!msg.spl_query && msg.spl_in_text && (
-                                                                <details className="mt-3">
-                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}>
-                                                                        <i className="fas fa-code mr-2"></i>
-                                                                        SPL Query (Not Executed)
-                                                                    </summary>
-                                                                    <div className="mt-2 p-4 bg-gray-900 text-amber-300 rounded-lg font-mono text-sm">
-                                                                        <div className="flex justify-between items-start mb-2">
-                                                                            <span className="text-xs text-gray-300 uppercase tracking-wide">Suggested Query</span>
-                                                                            <div className="flex items-center gap-2">
-                                                                                {canUseSplunkDeeplinks && (
-                                                                                    <button
-                                                                                        type="button"
-                                                                                        onClick={() => openSplunkSearchFromChat(msg.spl_in_text)}
-                                                                                        className="px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors"
-                                                                                        title="Open this search in Splunk Web"
-                                                                                    >
-                                                                                        <i className="fas fa-external-link-alt mr-1"></i>
-                                                                                        Open in Splunk
-                                                                                    </button>
-                                                                                )}
-                                                                                <button 
-                                                                                    type="button"
-                                                                                    onClick={(event) => {
-                                                                                        navigator.clipboard.writeText(msg.spl_in_text);
-                                                                                        const btn = event.currentTarget;
-                                                                                        const originalHTML = btn.innerHTML;
-                                                                                        btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-                                                                                        setTimeout(() => btn.innerHTML = originalHTML, 2000);
-                                                                                    }}
-                                                                                    className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
-                                                                                    title="Copy to clipboard"
-                                                                                    aria-label="Copy suggested SPL query to clipboard"
-                                                                                >
-                                                                                    <i className="fas fa-copy mr-1"></i>
-                                                                                    Copy
-                                                                                </button>
-                                                                            </div>
-                                                                        </div>
-                                                                        <pre className="whitespace-pre-wrap break-all">{msg.spl_in_text}</pre>
-                                                                    </div>
-                                                                </details>
-                                                            )}
-
-                                                            {msg.visualization_spec && (
-                                                                <details className="mt-3" open>
-                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-cyan-300 hover:text-cyan-100' : 'text-cyan-700 hover:text-cyan-900'}`}>
-                                                                        <i className="fas fa-chart-line mr-2"></i>
-                                                                        Visualization Preview
-                                                                    </summary>
-                                                                    {renderVisualizationPreview(msg.visualization_spec)}
-                                                                </details>
-                                                            )}
-
-                                                            {Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && (
-                                                                <details className="mt-3">
-                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-emerald-300 hover:text-emerald-100' : 'text-emerald-700 hover:text-emerald-900'}`}>
-                                                                        <i className="fas fa-puzzle-piece mr-2"></i>
-                                                                        Capability Evidence ({msg.capability_usage.length})
-                                                                    </summary>
-                                                                    <div className="mt-2 space-y-3">
-                                                                        {msg.capability_usage.map((usage, usageIdx) => (
-                                                                            <div key={usageIdx} className={`rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-emerald-50 border-emerald-200'}`}>
-                                                                                <div className="flex flex-wrap items-center gap-2 mb-2">
-                                                                                    <span className={`text-sm font-semibold ${headingClass}`}>{usage.title || usage.name || 'Capability'}</span>
-                                                                                    {usage.category && (
-                                                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-gray-900 text-gray-200 border border-gray-600' : 'bg-white text-gray-700 border border-gray-300'}`}>
-                                                                                            {formatCapabilityCategoryLabel(usage.category)}
-                                                                                        </span>
-                                                                                    )}
-                                                                                    {usage.used_in && (
-                                                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-emerald-100 text-emerald-800 border border-emerald-300'}`}>
-                                                                                            {formatCapabilityUsageContextLabel(usage.used_in)}
-                                                                                        </span>
-                                                                                    )}
-                                                                                </div>
-                                                                                {usage.contribution && (
-                                                                                    <div className={`text-sm mb-2 ${subtextClass}`}>{usage.contribution}</div>
-                                                                                )}
-                                                                                {Array.isArray(usage.chunks) && usage.chunks.length > 0 && (
-                                                                                    <div className="space-y-2">
-                                                                                        {usage.chunks.map((chunk, chunkIdx) => (
-                                                                                            <div key={chunkIdx} className={`rounded border p-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-emerald-200'}`}>
-                                                                                                <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
-                                                                                                    <div className="flex flex-wrap items-center gap-2">
-                                                                                                        <span className={`text-xs font-medium ${headingClass}`}>{chunk.source || `artifact_${chunkIdx + 1}`}</span>
-                                                                                                        {chunk.source_type && (
-                                                                                                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-emerald-100 text-emerald-800 border border-emerald-300'}`}>
-                                                                                                                {formatCapabilitySourceTypeLabel(chunk.source_type)}
-                                                                                                            </span>
-                                                                                                        )}
-                                                                                                    </div>
-                                                                                                    {typeof chunk.score === 'number' && (
-                                                                                                        <span className={`text-[11px] ${mutedTextClass}`}>score {chunk.score}</span>
-                                                                                                    )}
-                                                                                                </div>
-                                                                                                <div className={`text-xs whitespace-pre-wrap ${subtextClass}`}>{chunk.snippet}</div>
-                                                                                            </div>
-                                                                                        ))}
-                                                                                    </div>
-                                                                                )}
-                                                                            </div>
-                                                                        ))}
-                                                                    </div>
-                                                                </details>
-                                                            )}
-                                                            
-                                                            {/* Show investigation timeline if multi-turn */}
-                                                            {msg.status_timeline && msg.status_timeline.length > 0 && (
-                                                                <details className="mt-3">
-                                                                    <summary className="cursor-pointer text-sm font-medium text-blue-600 hover:text-blue-800 flex items-center">
-                                                                        <i className="fas fa-tasks mr-2"></i>
-                                                                        Investigation Timeline ({msg.iterations} iterations, {msg.execution_time})
-                                                                    </summary>
-                                                                    <div className="mt-2 space-y-2">
-                                                                        {msg.status_timeline.map((status, idx) => (
-                                                                            <div key={idx} className={`flex items-center justify-between px-3 py-2 rounded border-l-4 border-blue-400 ${isDarkTheme ? 'bg-gray-800' : 'bg-gradient-to-r from-blue-50 to-purple-50'}`}>
-                                                                                <span className={`text-sm ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{status.action}</span>
-                                                                                <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{status.time.toFixed(1)}s</span>
-                                                                            </div>
-                                                                        ))}
-                                                                    </div>
-                                                                </details>
-                                                            )}
-                                                            
-                                                            {/* Show raw MCP data if available */}
-                                                            {msg.mcp_data && (
-                                                                <details className="mt-3">
-                                                                    <summary className={`cursor-pointer text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}>
-                                                                        <i className="fas fa-database mr-1"></i>
-                                                                        View Raw Data
-                                                                    </summary>
-                                                                    <pre className={`mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-200 text-gray-800'}`}>
-                                                                        {JSON.stringify(msg.mcp_data, null, 2)}
-                                                                    </pre>
-                                                                </details>
-                                                            )}
-                                                            
-                                                            {/* Indicate if follow-on is expected */}
-                                                            {msg.has_follow_on && (
-                                                                <div className={`mt-3 p-3 border rounded ${isDarkTheme ? 'bg-indigo-900 border-indigo-700' : 'bg-indigo-50 border-indigo-200'}`}>
-                                                                    <div className={`text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'}`}>
-                                                                        <i className="fas fa-arrow-right mr-1"></i>
-                                                                        <span>Suggested next actions</span>
-                                                                    </div>
-                                                                    {Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? (
-                                                                        <div className="space-y-2">
-                                                                            {msg.follow_on_actions.map((action, idx) => {
-                                                                                const actionLabel = typeof action === 'string'
-                                                                                    ? action
-                                                                                    : (action.label || action.prompt || 'Follow-up action');
-                                                                                const actionPrompt = typeof action === 'string'
-                                                                                    ? action
-                                                                                    : (action.prompt || action.label || '');
-
-                                                                                return (
-                                                                                    <button
-                                                                                        key={idx}
-                                                                                        onClick={() => actionPrompt && sendSuggestedQuery(actionPrompt)}
-                                                                                        className={`w-full text-left rounded border px-3 py-2 transition-colors ${isDarkTheme ? 'bg-indigo-950 border-indigo-700 hover:bg-indigo-800 text-indigo-100' : 'bg-white border-indigo-200 hover:bg-indigo-100 text-indigo-900'}`}
-                                                                                        title="Run this follow-up in chat"
-                                                                                    >
-                                                                                        <div className="text-xs font-semibold">{actionLabel}</div>
-                                                                                        {typeof action !== 'string' && action.prompt && action.prompt !== actionLabel && (
-                                                                                            <div className={`text-[11px] mt-1 ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'}`}>
-                                                                                                {action.prompt}
-                                                                                            </div>
-                                                                                        )}
-                                                                                    </button>
-                                                                                );
-                                                                            })}
-                                                                        </div>
-                                                                    ) : (
-                                                                        <div className={`text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-800'}`}>Follow-up action available.</div>
-                                                                    )}
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    </div>
-                                                )}
-                                                
-                                                {msg.type === 'error' && (
-                                                    <div className="flex items-start">
-                                                        <i className="fas fa-exclamation-triangle mr-3 mt-1 text-red-600"></i>
-                                                        <p className="flex-1">{msg.content}</p>
-                                                    </div>
-                                                )}
-                                                
-                                                {msg.type === 'warning' && (
-                                                    <div className={`flex items-start border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? 'bg-amber-900' : 'bg-amber-50'}`}>
-                                                        <i className="fas fa-exclamation-circle mr-3 mt-1 text-amber-600"></i>
-                                                        <p className={`flex-1 ${isDarkTheme ? 'text-amber-100' : 'text-amber-800'}`}>{msg.content}</p>
-                                                    </div>
-                                                )}
-                                                
-                                                <div className="text-xs opacity-70 mt-2">
-                                                    {new Date(msg.timestamp).toLocaleTimeString()}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ))}
-                                    
-                                    {isTyping && (
-                                        <div className="flex justify-start">
-                                            <div className={`p-4 rounded-lg shadow-sm border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-700' : 'bg-gradient-to-r from-blue-50 to-green-50 text-gray-800 border-blue-100'}`}>
-                                                <div className="flex items-center space-x-3">
-                                                    <i className="fas fa-robot text-green-600"></i>
-                                                    <div className="flex space-x-1">
-                                                        <div className="w-2 h-2 bg-green-500 rounded-full animate-bounce"></div>
-                                                        <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></div>
-                                                        <div className="w-2 h-2 bg-purple-500 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
-                                                    </div>
-                                                    {chatStatus && (
-                                                        <span className={`text-sm ml-2 animate-pulse ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                                            {chatStatus}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-                                    
-                                    <div ref={chatEndRef} />
-                                </div>
-                                
-                                {/* Chat Input */}
-                                <div className={`p-6 border-t ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                    <div className="mb-4">
-                                        <div className="flex items-center justify-between mb-2">
-                                            <p className={`text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>Suggested Queries (Demo)</p>
-                                            <div className="flex items-center gap-3">
-                                                <span className={`text-xs ${isDarkTheme ? 'text-gray-500' : 'text-gray-400'}`}>Deterministic-friendly prompts</span>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => setShowSuggestedQueries(prev => !prev)}
-                                                    className="text-xs text-indigo-600 hover:text-indigo-800 flex items-center"
-                                                    title={showSuggestedQueries ? 'Collapse suggested queries' : 'Expand suggested queries'}
-                                                    aria-label={showSuggestedQueries ? 'Collapse suggested queries' : 'Expand suggested queries'}
-                                                    aria-expanded={showSuggestedQueries}
-                                                    aria-controls="suggested-queries-panel"
-                                                >
-                                                    <i className={`fas ${showSuggestedQueries ? 'fa-chevron-up' : 'fa-chevron-down'}`}></i>
-                                                </button>
-                                            </div>
-                                        </div>
-                                        {showSuggestedQueries && (
-                                            <div id="suggested-queries-panel" className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                                                {suggestedChatQueries.map((query, idx) => (
-                                                    <div key={idx} className={`flex items-center border rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => useSuggestedQuery(query)}
-                                                            className={`flex-1 text-left text-xs truncate ${isDarkTheme ? 'text-gray-200 hover:text-indigo-300' : 'text-gray-700 hover:text-indigo-700'}`}
-                                                            title={query}
-                                                        >
-                                                            {query}
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => sendSuggestedQuery(query)}
-                                                            disabled={isTyping}
-                                                            className={`ml-2 px-2 py-1 text-xs rounded ${isTyping ? (isDarkTheme ? 'bg-gray-700 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed') : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
-                                                            title="Run this query now"
-                                                        >
-                                                            <i className="fas fa-play"></i>
-                                                        </button>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-
-                                    <div className="flex space-x-4">
-                                        <textarea
-                                            ref={chatInputRef}
-                                            value={chatInput}
-                                            onChange={(e) => setChatInput(e.target.value)}
-                                            onKeyPress={(e) => {
-                                                if (e.key === 'Enter' && !e.shiftKey) {
-                                                    e.preventDefault();
-                                                    sendChatMessage();
-                                                }
-                                            }}
-                                            placeholder="Ask me about your Splunk environment..."
-                                            aria-label="Chat message input"
-                                            className={`flex-1 p-3 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
-                                            rows="3"
-                                            disabled={isTyping}
-                                        />
-                                        <button
-                                            type="button"
-                                            onClick={sendChatMessage}
-                                            disabled={!chatInput.trim() || isTyping}
-                                            aria-label={isTyping ? 'Sending chat message' : 'Send chat message'}
-                                            title={isTyping ? 'Sending chat message' : 'Send chat message'}
-                                            className={`px-6 py-3 rounded-lg font-medium ${
-                                                chatInput.trim() && !isTyping
-                                                    ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
-                                                    : (isDarkTheme ? 'bg-gray-700 text-gray-400 cursor-not-allowed' : 'bg-gray-300 text-gray-500 cursor-not-allowed')
-                                            }`}
-                                        >
-                                            <i className="fas fa-paper-plane"></i>
-                                        </button>
-                                    </div>
-                                    <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                        Press Enter to send, Shift+Enter for new line • Ask about indexes, searches, data sources, or get help with SPL queries
-                                        <span className="block mt-1">Conversation context is retained across reloads until you clear chat.</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                    
-                    {/* Chat Settings Modal */}
-                    {isChatSettingsOpen && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                            <div className={`chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`} role="dialog" aria-modal="true" aria-labelledby="chat-settings-title" onKeyDown={(event) => handleDialogKeyDown(event, () => setIsChatSettingsOpen(false))}>
-                                {/* Header */}
-                                <div className="p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-t-xl">
-                                    <div className="flex items-center">
-                                        <i className="fas fa-cog text-2xl mr-3"></i>
-                                        <h2 id="chat-settings-title" className="text-2xl font-bold">Chat Settings</h2>
-                                    </div>
-                                    <div className="flex items-center space-x-3">
-                                        <button
-                                            type="button"
-                                            onClick={resetChatSettings}
-                                            className="px-4 py-2 bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg text-sm font-medium transition-all"
-                                            title="Reset to defaults"
-                                        >
-                                            <i className="fas fa-undo mr-2"></i>
-                                            Reset
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={() => setIsChatSettingsOpen(false)}
-                                            className="text-white hover:text-gray-200"
-                                            aria-label="Close chat settings"
-                                        >
-                                            <i className="fas fa-times text-2xl"></i>
-                                        </button>
-                                    </div>
-                                </div>
-                                
-                                {/* Settings Content - Scrollable */}
-                                <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                                    {chatSettings && (
-                                        <>
-                                            {/* Discovery Settings */}
-                                            <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg p-5 border-2 border-green-200">
-                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                                                    <i className="fas fa-search text-green-600 mr-2"></i>
-                                                    Discovery Settings
-                                                </h3>
-                                                <div className="space-y-4">
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Max Execution Time: {chatSettings.max_execution_time}s
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="30"
-                                                            max="300"
-                                                            value={chatSettings.max_execution_time}
-                                                            onChange={(e) => updateSetting('max_execution_time', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>30s</span>
-                                                            <span>300s</span>
-                                                        </div>
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Max Iterations: {chatSettings.max_iterations}
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="1"
-                                                            max="10"
-                                                            value={chatSettings.max_iterations}
-                                                            onChange={(e) => updateSetting('max_iterations', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>1</span>
-                                                            <span>10</span>
-                                                        </div>
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Discovery Freshness: {chatSettings.discovery_freshness_days} days
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="1"
-                                                            max="30"
-                                                            value={chatSettings.discovery_freshness_days}
-                                                            onChange={(e) => updateSetting('discovery_freshness_days', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>1 day</span>
-                                                            <span>30 days</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            
-                                            {/* LLM Behavior */}
-                                            <div className="bg-gradient-to-r from-purple-50 to-indigo-50 rounded-lg p-5 border-2 border-purple-200">
-                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                                                    <i className="fas fa-brain text-purple-600 mr-2"></i>
-                                                    LLM Behavior
-                                                </h3>
-                                                <div className="space-y-4">
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Max Tokens: {chatSettings.max_tokens}
-                                                            {config?.llm?.max_tokens && (
-                                                                <span className="ml-2 text-xs text-purple-600">
-                                                                    (Profile: {config.llm.max_tokens})
-                                                                </span>
-                                                            )}
-                                                        </label>
-                                                        <input
-                                                            type="number"
-                                                            min="1000"
-                                                            max="128000"
-                                                            value={chatSettings.max_tokens}
-                                                            onChange={(e) => updateSetting('max_tokens', parseInt(e.target.value))}
-                                                            className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                        />
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Temperature: {chatSettings.temperature.toFixed(1)}
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="0"
-                                                            max="2"
-                                                            step="0.1"
-                                                            value={chatSettings.temperature}
-                                                            onChange={(e) => updateSetting('temperature', parseFloat(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>0.0 (Focused)</span>
-                                                            <span>2.0 (Creative)</span>
-                                                        </div>
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Context History: {chatSettings.context_history} messages
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="0"
-                                                            max="20"
-                                                            value={chatSettings.context_history}
-                                                            onChange={(e) => updateSetting('context_history', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>0</span>
-                                                            <span>20</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            
-                                            {/* Performance Tuning */}
-                                            <div className="bg-gradient-to-r from-amber-50 to-yellow-50 rounded-lg p-5 border-2 border-amber-200">
-                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                                                    <i className="fas fa-tachometer-alt text-amber-600 mr-2"></i>
-                                                    Performance Tuning
-                                                </h3>
-                                                <div className="space-y-4">
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Max Retry Delay: {chatSettings.max_retry_delay}s
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="10"
-                                                            max="600"
-                                                            value={chatSettings.max_retry_delay}
-                                                            onChange={(e) => updateSetting('max_retry_delay', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>10s</span>
-                                                            <span>600s</span>
-                                                        </div>
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Max Retries: {chatSettings.max_retries}
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="1"
-                                                            max="10"
-                                                            value={chatSettings.max_retries}
-                                                            onChange={(e) => updateSetting('max_retries', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>1</span>
-                                                            <span>10</span>
-                                                        </div>
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Query Sample Size: {chatSettings.query_sample_size} rows
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="1"
-                                                            max="10"
-                                                            value={chatSettings.query_sample_size}
-                                                            onChange={(e) => updateSetting('query_sample_size', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>1</span>
-                                                            <span>10</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            
-                                            {/* Quality Control */}
-                                            <div className="bg-gradient-to-r from-blue-50 to-cyan-50 rounded-lg p-5 border-2 border-blue-200">
-                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                                                    <i className="fas fa-check-circle text-blue-600 mr-2"></i>
-                                                    Quality Control
-                                                </h3>
-                                                <div className="space-y-4">
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Quality Threshold: {chatSettings.quality_threshold}
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="0"
-                                                            max="100"
-                                                            value={chatSettings.quality_threshold}
-                                                            onChange={(e) => updateSetting('quality_threshold', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>0 (Permissive)</span>
-                                                            <span>100 (Strict)</span>
-                                                        </div>
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Convergence Detection: {chatSettings.convergence_detection} iterations
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="3"
-                                                            max="10"
-                                                            value={chatSettings.convergence_detection}
-                                                            onChange={(e) => updateSetting('convergence_detection', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>3</span>
-                                                            <span>10</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </div>
-
-                                            <div className="bg-gradient-to-r from-indigo-50 to-violet-50 rounded-lg p-5 border-2 border-indigo-200">
-                                                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                                                    <i className="fas fa-magic text-indigo-600 mr-2"></i>
-                                                    Splunk IQ (Demo)
-                                                </h3>
-                                                <div className="space-y-4">
-                                                    <label className="flex items-center justify-between bg-white rounded p-3 border border-indigo-100">
-                                                        <div>
-                                                            <div className="text-sm font-medium text-gray-800">Enable Splunk Augmentation</div>
-                                                            <div className="text-xs text-gray-500">Use intent-specific deterministic skills for common Splunk questions</div>
-                                                        </div>
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={!!chatSettings.enable_splunk_augmentation}
-                                                            onChange={(e) => updateSetting('enable_splunk_augmentation', e.target.checked)}
-                                                            className="h-4 w-4"
-                                                        />
-                                                    </label>
-
-                                                    <label className="flex items-center justify-between bg-white rounded p-3 border border-indigo-100">
-                                                        <div>
-                                                            <div className="text-sm font-medium text-gray-800">Use Installed Optional RAG Capability</div>
-                                                            <div className="text-xs text-gray-500">Use the enabled optional RAG provider to retrieve matching snippets from indexed or recent discovery artifacts</div>
-                                                        </div>
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={!!chatSettings.enable_rag_context}
-                                                            onChange={(e) => updateSetting('enable_rag_context', e.target.checked)}
-                                                            className="h-4 w-4"
-                                                        />
-                                                    </label>
-
-                                                    <div>
-                                                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            RAG Snippet Chunks: {chatSettings.rag_max_chunks}
-                                                        </label>
-                                                        <input
-                                                            type="range"
-                                                            min="1"
-                                                            max="6"
-                                                            value={chatSettings.rag_max_chunks || 3}
-                                                            onChange={(e) => updateSetting('rag_max_chunks', parseInt(e.target.value))}
-                                                            className="w-full"
-                                                            disabled={!chatSettings.enable_rag_context}
-                                                        />
-                                                        <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                            <span>1</span>
-                                                            <span>6</span>
-                                                        </div>
-                                                        <div className="text-xs text-gray-500 mt-2">
-                                                            Install, enable, and test the capability from the Capabilities workspace before turning this on.
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </>
-                                    )}
-                                </div>
-                                
-                                {/* Footer */}
-                                <div className={`p-6 border-t rounded-b-xl ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
-                                    <p className="text-sm text-gray-600 text-center">
-                                        <i className="fas fa-info-circle mr-2"></i>
-                                        Settings apply immediately and reset to defaults on server restart
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                    
-                    {/* Summary Modal */}
-                    {isSummaryModalOpen && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                            <div className={`${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'} rounded-xl shadow-2xl w-full max-w-7xl h-5/6 flex flex-col`} role="dialog" aria-modal="true" aria-labelledby="summary-modal-title" onKeyDown={(event) => handleDialogKeyDown(event, closeSummaryModal)}>
-                                {/* Header */}
-                                <div className="p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-t-xl">
-                                    <div className="flex items-center">
-                                        <i className={`fas ${summaryData?.from_cache ? 'fa-eye' : 'fa-magic'} text-2xl mr-3`}></i>
-                                        <div>
-                                            <h2 id="summary-modal-title" className="text-2xl font-bold">
-                                                V2 Intelligence Report
-                                                {summaryData?.from_cache && (
-                                                    <span className="ml-3 text-sm font-normal bg-green-700 border border-green-300 px-3 py-1 rounded-full text-white">
-                                                        <i className="fas fa-check-circle mr-1"></i>
-                                                        Cached
-                                                    </span>
-                                                )}
-                                            </h2>
-                                            <p className="text-sm text-indigo-100 mt-1">Session: {currentSessionId}</p>
-                                        </div>
-                                    </div>
-                                    <button
-                                        type="button"
-                                        onClick={closeSummaryModal}
-                                        className="text-white hover:text-gray-200"
-                                        aria-label="Close V2 intelligence report"
-                                    >
-                                        <i className="fas fa-times text-2xl"></i>
-                                    </button>
-                                </div>
-                                
-                                {/* Tab Navigation */}
-                                {!isLoadingSummary && summaryData && (
-                                    <div className={`border-b ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
-                                        <div className="flex space-x-1 px-6" role="tablist" aria-label="Summary views">
-                                            <button
-                                                type="button"
-                                                id="summary-tab-summary"
-                                                role="tab"
-                                                aria-selected={activeTab === 'summary'}
-                                                aria-controls="summary-tabpanel-summary"
-                                                tabIndex={activeTab === 'summary' ? 0 : -1}
-                                                onClick={() => setActiveTab('summary')}
-                                                className={`px-6 py-3 font-medium text-sm transition-all ${
-                                                    activeTab === 'summary'
-                                                        ? (isDarkTheme ? 'border-b-2 border-indigo-400 text-indigo-300 bg-gray-900' : 'border-b-2 border-indigo-600 text-indigo-600 bg-white')
-                                                        : (isDarkTheme ? 'text-gray-300 hover:text-white hover:bg-gray-700' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100')
-                                                }`}
-                                            >
-                                                <i className="fas fa-brain mr-2"></i>
-                                                Executive Summary
-                                            </button>
-                                            <button
-                                                type="button"
-                                                id="summary-tab-queries"
-                                                role="tab"
-                                                aria-selected={activeTab === 'queries'}
-                                                aria-controls="summary-tabpanel-queries"
-                                                tabIndex={activeTab === 'queries' ? 0 : -1}
-                                                onClick={() => setActiveTab('queries')}
-                                                className={`px-6 py-3 font-medium text-sm transition-all ${
-                                                    activeTab === 'queries'
-                                                        ? (isDarkTheme ? 'border-b-2 border-indigo-400 text-indigo-300 bg-gray-900' : 'border-b-2 border-indigo-600 text-indigo-600 bg-white')
-                                                        : (isDarkTheme ? 'text-gray-300 hover:text-white hover:bg-gray-700' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100')
-                                                }`}
-                                            >
-                                                <i className="fas fa-code mr-2"></i>
-                                                SPL Queries ({summaryData.spl_queries?.length || 0})
-                                            </button>
-                                            <button
-                                                type="button"
-                                                id="summary-tab-tasks"
-                                                role="tab"
-                                                aria-selected={activeTab === 'tasks'}
-                                                aria-controls="summary-tabpanel-tasks"
-                                                tabIndex={activeTab === 'tasks' ? 0 : -1}
-                                                onClick={() => setActiveTab('tasks')}
-                                                className={`px-6 py-3 font-medium text-sm transition-all ${
-                                                    activeTab === 'tasks'
-                                                        ? (isDarkTheme ? 'border-b-2 border-indigo-400 text-indigo-300 bg-gray-900' : 'border-b-2 border-indigo-600 text-indigo-600 bg-white')
-                                                        : (isDarkTheme ? 'text-gray-300 hover:text-white hover:bg-gray-700' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100')
-                                                }`}
-                                            >
-                                                <i className="fas fa-tasks mr-2"></i>
-                                                Admin Tasks ({summaryData.admin_tasks?.length || 0})
-                                                {summaryData.admin_tasks?.length > 0 && (
-                                                    <span className="ml-2 px-2 py-0.5 text-xs bg-green-500 text-white rounded-full">New</span>
-                                                )}
-                                            </button>
-                                        </div>
-                                    </div>
-                                )}
-                                
-                                {/* Content */}
-                                <div className="flex-1 overflow-y-auto p-6">
-                                    {isLoadingSummary ? (
-                                        <div className="flex items-center justify-center h-full">
-                                            <div className="text-center max-w-md">
-                                                {/* Animated Icon */}
-                                                <div className="relative mb-8">
-                                                    <div className={`inline-block animate-spin rounded-full h-20 w-20 border-4 ${isDarkTheme ? 'border-indigo-900 border-t-indigo-400' : 'border-indigo-200 border-t-indigo-600'}`}></div>
-                                                    <i className={`fas fa-brain absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-3xl animate-pulse ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`}></i>
-                                                </div>
-                                                
-                                                {/* Main Message */}
-                                                <h3 className={`text-2xl font-bold mb-4 ${isDarkTheme ? 'text-gray-100' : 'text-gray-800'}`}>
-                                                    Analyzing Your Splunk Environment
-                                                </h3>
-                                                
-                                                {/* Progress Steps */}
-                                                <div className={`space-y-3 text-left rounded-lg shadow-sm border p-4 mb-4 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
-                                                    {/* Stage 1: Loading Reports */}
-                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(1) ? 'animate-pulse' : ''}`}>
-                                                        <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            isSummaryStepDone(1)
-                                                                ? 'bg-green-500'
-                                                                : isSummaryStepActive(1)
-                                                                    ? 'bg-indigo-500'
-                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
-                                                        }`}>
-                                                            {isSummaryStepDone(1) ? (
-                                                                <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : isSummaryStepActive(1) ? (
-                                                                <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
-                                                            ) : null}
-                                                        </div>
-                                                        <span className={isSummaryStepActive(1) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-300' : 'text-gray-700')}>
-                                                            Loading discovery reports...
-                                                        </span>
-                                                    </div>
-                                                    
-                                                    {/* Stage 2: Generating Queries */}
-                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(2) ? 'animate-pulse' : ''}`}>
-                                                        <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            isSummaryStepDone(2)
-                                                                ? 'bg-green-500'
-                                                                : isSummaryStepActive(2)
-                                                                    ? 'bg-indigo-500'
-                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
-                                                        }`}>
-                                                            {isSummaryStepDone(2) ? (
-                                                                <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : isSummaryStepActive(2) ? (
-                                                                <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
-                                                            ) : null}
-                                                        </div>
-                                                        <span className={isSummaryStepActive(2) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-400' : 'text-gray-500')}>
-                                                            Generating SPL queries...
-                                                        </span>
-                                                    </div>
-                                                    
-                                                    {/* Stage 3: Building Summary */}
-                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(3) ? 'animate-pulse' : ''}`}>
-                                                        <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            isSummaryStepDone(3)
-                                                                ? 'bg-green-500'
-                                                                : isSummaryStepActive(3)
-                                                                    ? 'bg-indigo-500'
-                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
-                                                        }`}>
-                                                            {isSummaryStepDone(3) ? (
-                                                                <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : isSummaryStepActive(3) ? (
-                                                                <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
-                                                            ) : null}
-                                                        </div>
-                                                        <span className={isSummaryStepActive(3) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-400' : 'text-gray-500')}>
-                                                            Building executive summary...
-                                                        </span>
-                                                    </div>
-                                                    
-                                                    {/* Stage 4: Creating Tasks */}
-                                                    <div className={`flex items-center text-sm ${isSummaryStepActive(4) ? 'animate-pulse' : ''}`}>
-                                                        <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${
-                                                            isSummaryStepDone(4)
-                                                                ? 'bg-green-500'
-                                                                : isSummaryStepActive(4)
-                                                                    ? 'bg-indigo-500'
-                                                                    : (isDarkTheme ? 'border-2 border-gray-600' : 'border-2 border-gray-300')
-                                                        }`}>
-                                                            {isSummaryStepDone(4) ? (
-                                                                <i className="fas fa-check text-white text-xs"></i>
-                                                            ) : isSummaryStepActive(4) ? (
-                                                                <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
-                                                            ) : null}
-                                                        </div>
-                                                        <span className={isSummaryStepActive(4) ? (isDarkTheme ? 'text-gray-100 font-medium' : 'text-gray-700 font-medium') : (isDarkTheme ? 'text-gray-400' : 'text-gray-500')}>
-                                                            Creating admin tasks...
-                                                        </span>
-                                                    </div>
-                                                </div>
-                                                
-                                                {/* Progress Bar */}
-                                                <div className="mb-4">
-                                                    <div className="flex justify-between items-center mb-1">
-                                                        <span className={`text-xs font-medium ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{summaryProgress.message}</span>
-                                                        <span className="text-xs font-semibold text-indigo-600">{summaryProgress.progress}%</span>
-                                                    </div>
-                                                    <div className={`w-full rounded-full h-2 ${isDarkTheme ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                                                        <div 
-                                                            className="bg-gradient-to-r from-indigo-500 to-purple-600 h-2 rounded-full transition-all duration-500 ease-out"
-                                                            style={{width: `${summaryProgress.progress}%`}}
-                                                        ></div>
-                                                    </div>
-                                                </div>
-                                                
-                                                {/* Fun Facts */}
-                                                <div className={`text-xs italic ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                                    <i className="fas fa-lightbulb mr-1 text-yellow-500"></i>
-                                                    This analysis uses AI to understand your data patterns and recommend optimizations
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ) : summaryData ? (
-                                        <div>
-                                            {/* Executive Summary Tab */}
-                                            {activeTab === 'summary' && (
-                                                <div id="summary-tabpanel-summary" role="tabpanel" aria-labelledby="summary-tab-summary" className="space-y-6">
-                                                    {/* AI Summary Section */}
-                                                    <div className={`border-l-4 p-6 rounded-r-lg ${isDarkTheme ? 'bg-gradient-to-r from-slate-800 to-indigo-950 border-indigo-400' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-indigo-600'}`}>
-                                                        <h3 className={`text-xl font-semibold mb-4 flex items-center ${isDarkTheme ? 'text-indigo-100' : 'text-gray-900'}`}>
-                                                            <i className="fas fa-brain text-indigo-600 mr-2"></i>
-                                                            Executive Summary
-                                                        </h3>
-                                                        <div className="prose max-w-none">
-                                                            <pre className={`whitespace-pre-wrap font-sans ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{summaryData.ai_summary}</pre>
-                                                        </div>
-                                                    </div>
-
-                                                    {/* V2 Intelligence KPIs */}
-                                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-indigo-950 border-indigo-700' : 'bg-indigo-100 border-indigo-300'}`}>
-                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-900'}`}>{summaryData.readiness_score ?? summaryData.v2_context?.readiness_score ?? 'N/A'}</div>
-                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-800'}`}>Readiness Score</div>
-                                                        </div>
-                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-red-950 border-red-700' : 'bg-red-100 border-red-300'}`}>
-                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-red-200' : 'text-red-900'}`}>{summaryData.risk_register?.length ?? summaryData.v2_context?.risk_register ?? 0}</div>
-                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-red-300' : 'text-red-800'}`}>Risk Register Items</div>
-                                                        </div>
-                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-amber-950 border-amber-700' : 'bg-amber-100 border-amber-300'}`}>
-                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-amber-200' : 'text-amber-900'}`}>{summaryData.coverage_gaps?.length ?? summaryData.v2_context?.coverage_gaps ?? 0}</div>
-                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-amber-300' : 'text-amber-800'}`}>Coverage Gaps</div>
-                                                        </div>
-                                                        <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-purple-950 border-purple-700' : 'bg-purple-100 border-purple-300'}`}>
-                                                            <div className={`text-3xl font-bold ${isDarkTheme ? 'text-purple-200' : 'text-purple-900'}`}>{summaryData.recursive_investigations?.length ?? summaryData.v2_context?.recursive_investigations ?? 0}</div>
-                                                            <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-purple-300' : 'text-purple-800'}`}>Recursive Loops</div>
-                                                        </div>
-                                                    </div>
-                                                    
-                                                    {/* Stats Section */}
-                                                    {summaryData.stats && (
-                                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                                            <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-green-950 border-green-700' : 'bg-green-100 border-green-300'}`}>
-                                                                <div className={`text-3xl font-bold ${isDarkTheme ? 'text-green-200' : 'text-green-900'}`}>{summaryData.stats.total_queries}</div>
-                                                                <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-green-300' : 'text-green-800'}`}>SPL Queries Generated</div>
-                                                            </div>
-                                                            <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-blue-950 border-blue-700' : 'bg-blue-100 border-blue-300'}`}>
-                                                                <div className={`text-3xl font-bold ${isDarkTheme ? 'text-blue-200' : 'text-blue-900'}`}>{summaryData.stats.categories?.length || 0}</div>
-                                                                <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>Use Case Categories</div>
-                                                            </div>
-                                                            <div className={`border rounded-lg p-4 text-center ${isDarkTheme ? 'bg-orange-950 border-orange-700' : 'bg-orange-100 border-orange-300'}`}>
-                                                                <div className={`text-3xl font-bold ${isDarkTheme ? 'text-orange-200' : 'text-orange-900'}`}>{summaryData.stats.unknown_items}</div>
-                                                                <div className={`text-sm mt-1 font-medium ${isDarkTheme ? 'text-orange-300' : 'text-orange-800'}`}>Data Sources Needing Review</div>
-                                                            </div>
-                                                        </div>
-                                                    )}
-
-                                                    {/* Trend Signals Panel */}
-                                                    {summaryData.trend_signals && (
-                                                        <div className={`${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} border rounded-lg p-5`}>
-                                                            <h3 className={`text-lg font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                                <i className="fas fa-chart-line text-blue-600 mr-2"></i>
-                                                                Trend & Usage Signals
-                                                            </h3>
-                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                                <div className={`${isDarkTheme ? 'bg-blue-950 border-blue-700' : 'bg-blue-100 border-blue-300'} border rounded p-3`}>
-                                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>Evidence Steps</div>
-                                                                    <div className={`text-2xl font-bold ${isDarkTheme ? 'text-blue-100' : 'text-blue-900'}`}>{summaryData.trend_signals.evidence_steps ?? 0}</div>
-                                                                </div>
-                                                                <div className={`${isDarkTheme ? 'bg-green-950 border-green-700' : 'bg-green-100 border-green-300'} border rounded p-3`}>
-                                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-green-300' : 'text-green-800'}`}>High Priority Recommendations</div>
-                                                                    <div className={`text-2xl font-bold ${isDarkTheme ? 'text-green-100' : 'text-green-900'}`}>{summaryData.trend_signals.high_priority_recommendations ?? 0}</div>
-                                                                </div>
-                                                            </div>
-                                                            {summaryData.trend_signals.recommendation_by_domain && (
-                                                                <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
-                                                                    {Object.entries(summaryData.trend_signals.recommendation_by_domain).map(([domain, count]) => (
-                                                                        <div key={domain} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded p-2 text-center`}>
-                                                                            <div className={`text-xs uppercase ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{domain.replace('_', ' ')}</div>
-                                                                            <div className={`text-lg font-bold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{count}</div>
-                                                                        </div>
-                                                                    ))}
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    )}
-
-                                                    {/* Risk Register Panel */}
-                                                    {summaryData.risk_register && summaryData.risk_register.length > 0 && (
-                                                        <div className={`${isDarkTheme ? 'bg-red-950 border-red-700' : 'bg-red-50 border-red-200'} border rounded-lg p-5`}>
-                                                            <h3 className={`text-lg font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-red-200' : 'text-red-900'}`}>
-                                                                <i className="fas fa-shield-alt text-red-600 mr-2"></i>
-                                                                Risk Register (Top {Math.min(summaryData.risk_register.length, 6)})
-                                                            </h3>
-                                                            <div className="space-y-3">
-                                                                {summaryData.risk_register.slice(0, 6).map((risk, idx) => (
-                                                                    <div key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-red-700' : 'bg-white border-red-200'} border rounded p-3`}>
-                                                                        <div className="flex items-start justify-between gap-3">
-                                                                            <div className="flex-1">
-                                                                                <div className="flex items-center gap-2 mb-1">
-                                                                                    <span className={`px-2 py-0.5 text-xs font-semibold rounded-full ${
-                                                                                        String(risk.severity || '').toLowerCase() === 'high' ? 'bg-red-600 text-white' :
-                                                                                        String(risk.severity || '').toLowerCase() === 'critical' ? 'bg-red-700 text-white' :
-                                                                                        String(risk.severity || '').toLowerCase() === 'medium' ? 'bg-orange-500 text-white' :
-                                                                                        'bg-gray-500 text-white'
-                                                                                    }`}>
-                                                                                        {(risk.severity || 'medium').toString().toUpperCase()}
-                                                                                    </span>
-                                                                                    <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{risk.domain || 'general'}</span>
-                                                                                </div>
-                                                                                <p className={`font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{risk.risk || 'Operational risk'}</p>
-                                                                                {risk.impact && <p className={`text-sm mt-1 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>{risk.impact}</p>}
-                                                                            </div>
-                                                                            <button
-                                                                                onClick={() => {
-                                                                                    setChatInput(`Help me investigate and mitigate this risk in Splunk:\n\n${risk.risk || ''}\nImpact: ${risk.impact || ''}\nMitigation: ${risk.mitigation || ''}`);
-                                                                                    setIsChatOpen(true);
-                                                                                    closeSummaryModal();
-                                                                                }}
-                                                                                className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs rounded"
-                                                                            >
-                                                                                Investigate
-                                                                            </button>
-                                                                        </div>
-                                                                    </div>
-                                                                ))}
-                                                            </div>
-                                                        </div>
-                                                    )}
-
-                                                    {/* Recursive Loop Panel */}
-                                                    {summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && (
-                                                        <div className={`${isDarkTheme ? 'bg-purple-950 border-purple-700' : 'bg-purple-50 border-purple-200'} border rounded-lg p-5`}>
-                                                            <h3 className={`text-lg font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-purple-200' : 'text-purple-900'}`}>
-                                                                <i className="fas fa-sync-alt text-purple-600 mr-2"></i>
-                                                                Recursive Discovery & Analysis Loops
-                                                            </h3>
-                                                            <div className="space-y-3">
-                                                                {summaryData.recursive_investigations.map((loop, idx) => (
-                                                                    <details key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-purple-700' : 'bg-white border-purple-200'} border rounded p-3`} open={idx === 0}>
-                                                                        <summary className={`cursor-pointer font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{loop.loop || `Loop ${idx + 1}`}</summary>
-                                                                        <div className={`mt-2 text-sm space-y-1 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>
-                                                                            <p><strong>Objective:</strong> {loop.objective || 'N/A'}</p>
-                                                                            <p><strong>Trigger:</strong> {loop.next_iteration_trigger || 'N/A'}</p>
-                                                                            <p><strong>Deliverable:</strong> {loop.output || 'N/A'}</p>
-                                                                        </div>
-                                                                    </details>
-                                                                ))}
-                                                            </div>
-                                                        </div>
-                                                    )}
-                                                    
-                                                    {/* Unknown Data Section */}
-                                                    {summaryData.unknown_data && summaryData.unknown_data.length > 0 && (
-                                                        <div className={`${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-orange-50 border-orange-200'} border rounded-lg p-4`}>
-                                                            <h3 className={`text-xl font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-orange-200' : 'text-gray-900'}`}>
-                                                                <i className="fas fa-question-circle text-orange-600 mr-2"></i>
-                                                                Help Us Understand Your Data ({summaryData.unknown_data.length})
-                                                            </h3>
-                                                            <p className={`text-sm mb-4 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                                                We found some data sources we're not familiar with. Your answers will help us provide better recommendations.
-                                                            </p>
-                                                            <div className="space-y-4">
-                                                                {summaryData.unknown_data.slice(0, 3).map((item, idx) => (
-                                                                    <div key={idx} className={`${isDarkTheme ? 'border-orange-700 bg-gray-900' : 'border-orange-200 bg-orange-50'} border rounded-lg p-4`}>
-                                                                        <div className="flex items-center justify-between">
-                                                                            <h4 className={`text-base font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                                                {item.type === 'index' ? '📦' : '📄'} 
-                                                                                <code className={`ml-2 px-2 py-1 rounded text-sm ${isDarkTheme ? 'bg-gray-800 text-orange-200' : 'bg-white text-gray-900'}`}>{item.name}</code>
-                                                                            </h4>
-                                                                            <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>{item.type}</span>
-                                                                        </div>
-                                                                        {item.reason && (
-                                                                            <p className={`text-sm mt-2 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>{item.reason}</p>
-                                                                        )}
-                                                                        <div className="mt-3 flex flex-wrap gap-2">
-                                                                            <button
-                                                                                onClick={() => {
-                                                                                    setChatInput(`Investigate this unknown Splunk ${item.type || 'entity'} and explain what it is, whether it is expected, and how to validate it:\n\nName: ${item.name || 'unknown'}\nReason: ${item.reason || 'not classified in current model'}`);
-                                                                                    setIsChatOpen(true);
-                                                                                    closeSummaryModal();
-                                                                                }}
-                                                                                className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 text-white text-xs rounded"
-                                                                            >
-                                                                                Investigate in Chat
-                                                                            </button>
-                                                                            <button
-                                                                                onClick={() => {
-                                                                                    const entityType = (item.type || '').toLowerCase();
-                                                                                    const entityName = item.name || '';
-                                                                                    const suggestedSPL = entityType === 'index'
-                                                                                        ? `index=${entityName} | stats count by sourcetype host | sort - count`
-                                                                                        : `index=* sourcetype=${entityName} | stats count by index host | sort - count`;
-                                                                                    setChatInput(`Create and explain a validation workflow for this unknown entity. Start with this SPL and improve it if needed:\n\n${suggestedSPL}`);
-                                                                                    setIsChatOpen(true);
-                                                                                    closeSummaryModal();
-                                                                                }}
-                                                                                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded"
-                                                                            >
-                                                                                Build Validation Query
-                                                                            </button>
-                                                                        </div>
-                                                                    </div>
-                                                                ))}
-                                                                {summaryData.unknown_data.length > 3 && (
-                                                                    <p className={`text-sm text-center ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                                                        And {summaryData.unknown_data.length - 3} more...
-                                                                    </p>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            )}
-                                            
-                                            {/* SPL Queries Tab */}
-                                            {activeTab === 'queries' && (
-                                                <div id="summary-tabpanel-queries" role="tabpanel" aria-labelledby="summary-tab-queries" className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
-                                                    {summaryData.risk_register && summaryData.risk_register.length > 0 && (
-                                                        <div className={`mb-4 rounded-lg p-4 border ${isDarkTheme ? 'bg-red-950 border-red-700' : 'bg-red-50 border-red-200'}`}>
-                                                            <h4 className={`text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-red-200' : 'text-red-900'}`}>
-                                                                <i className="fas fa-shield-alt mr-2"></i>
-                                                                Risk-Linked Query Focus
-                                                            </h4>
-                                                            <p className={`text-sm mb-3 ${isDarkTheme ? 'text-red-300' : 'text-red-800'}`}>
-                                                                Prioritize queries that validate or reduce the highest-severity risks discovered in this session.
-                                                            </p>
-                                                            <div className="space-y-1">
-                                                                {summaryData.risk_register.slice(0, 3).map((risk, idx) => (
-                                                                    <div key={idx} className={`text-xs rounded px-3 py-2 border ${isDarkTheme ? 'text-red-200 bg-gray-900 border-red-800' : 'text-red-900 bg-white border-red-200'}`}>
-                                                                        <span className="font-semibold">{(risk.severity || 'medium').toString().toUpperCase()}:</span> {risk.risk || 'Operational risk'}
-                                                                    </div>
-                                                                ))}
-                                                            </div>
-                                                        </div>
-                                                    )}
-
-                                                    <div className="flex items-center justify-between mb-4">
-                                                        <h3 className={`text-xl font-semibold flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                            <i className="fas fa-code text-purple-600 mr-2"></i>
-                                                            Ready-to-Use SPL Queries ({summaryData.spl_queries.filter(q => 
-                                                                queryFilter === 'all' || q.query_source === queryFilter
-                                                            ).length})
-                                                        </h3>
-                                                        
-                                                        {/* Filter Toggle */}
-                                                        <div className="flex items-center space-x-2">
-                                                            <button
-                                                                onClick={() => setQueryFilter('all')}
-                                                                className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors ${
-                                                                    queryFilter === 'all' 
-                                                                        ? 'bg-indigo-600 text-white' 
-                                                                        : (isDarkTheme ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')
-                                                                }`}
-                                                            >
-                                                                All ({summaryData.spl_queries.length})
-                                                            </button>
-                                                            <button
-                                                                onClick={() => setQueryFilter('ai_finding')}
-                                                                className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors flex items-center space-x-1 ${
-                                                                    queryFilter === 'ai_finding' 
-                                                                        ? 'bg-purple-600 text-white' 
-                                                                        : (isDarkTheme ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')
-                                                                }`}
-                                                            >
-                                                                <span>⚡</span>
-                                                                <span>AI-Generated ({summaryData.spl_queries.filter(q => q.query_source === 'ai_finding').length})</span>
-                                                            </button>
-                                                            <button
-                                                                onClick={() => setQueryFilter('template')}
-                                                                className={`px-3 py-1 text-sm font-medium rounded-lg transition-colors flex items-center space-x-1 ${
-                                                                    queryFilter === 'template' 
-                                                                        ? 'bg-blue-600 text-white' 
-                                                                        : (isDarkTheme ? 'bg-gray-700 text-gray-200 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')
-                                                                }`}
-                                                            >
-                                                                <span>📋</span>
-                                                                <span>Template-Based ({summaryData.spl_queries.filter(q => q.query_source === 'template').length})</span>
-                                                            </button>
-                                                        </div>
-                                                    </div>
-                                                    
-                                                    <div className="space-y-4">
-                                                        {summaryData.spl_queries
-                                                            .filter(query => queryFilter === 'all' || query.query_source === queryFilter)
-                                                            .map((query, idx) => (
-                                                            <div key={idx} className={`border rounded-lg p-5 hover:shadow-md transition-shadow ${
-                                                                query.priority?.startsWith('🔴') ? (isDarkTheme ? 'border-red-700 bg-red-950' : 'border-red-300 bg-red-50') :
-                                                                query.priority?.startsWith('🟠') ? (isDarkTheme ? 'border-orange-700 bg-orange-950' : 'border-orange-300 bg-orange-50') :
-                                                                query.priority?.startsWith('🟡') ? (isDarkTheme ? 'border-yellow-700 bg-yellow-950' : 'border-yellow-300 bg-yellow-50') :
-                                                                (isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white')
-                                                            }`}>
-                                                                {/* Priority Badge */}
-                                                                {query.priority && (
-                                                                    <div className="mb-2">
-                                                                        <span className={`px-3 py-1 text-xs font-bold rounded-full ${
-                                                                            query.priority.startsWith('🔴') ? 'bg-red-600 text-white' :
-                                                                            query.priority.startsWith('🟠') ? 'bg-orange-600 text-white' :
-                                                                            query.priority.startsWith('🟡') ? 'bg-yellow-500 text-gray-900' :
-                                                                            'bg-gray-600 text-white'
-                                                                        }`}>
-                                                                            {query.priority}
-                                                                        </span>
-                                                                        {query.query_source === 'ai_finding' && (
-                                                                            <span className="ml-2 px-2 py-1 text-xs bg-purple-600 text-white rounded-full">
-                                                                                ⚡ AI-Generated
-                                                                            </span>
-                                                                        )}
-                                                                        {query.query_source === 'template' && (
-                                                                            <span className="ml-2 px-2 py-1 text-xs bg-blue-600 text-white rounded-full">
-                                                                                📋 Template
-                                                                            </span>
-                                                                        )}
-                                                                    </div>
-                                                                )}
-                                                                
-                                                                <div className="flex justify-between items-start mb-3">
-                                                                    <div className="flex-1">
-                                                                        <div className="flex items-center space-x-2 mb-2">
-                                                                            <h4 className={`text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{query.title}</h4>
-                                                                            <span className={`px-2 py-1 text-xs rounded-full ${
-                                                                                query.category === 'Security & Compliance' ? (isDarkTheme ? 'bg-red-900 text-red-200' : 'bg-red-100 text-red-700') :
-                                                                                query.category === 'Infrastructure & Performance' ? (isDarkTheme ? 'bg-blue-900 text-blue-200' : 'bg-blue-100 text-blue-700') :
-                                                                                query.category === 'Capacity Planning' ? (isDarkTheme ? 'bg-green-900 text-green-200' : 'bg-green-100 text-green-700') :
-                                                                                (isDarkTheme ? 'bg-gray-700 text-gray-200' : 'bg-gray-100 text-gray-700')
-                                                                            }`}>
-                                                                                {query.category}
-                                                                            </span>
-                                                                            <span className={`px-2 py-1 text-xs rounded-full ${isDarkTheme ? 'bg-purple-900 text-purple-200' : 'bg-purple-100 text-purple-700'}`}>
-                                                                                {query.difficulty}
-                                                                            </span>
-                                                                        </div>
-                                                                        <p className={`text-sm mb-2 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>{query.description}</p>
-                                                                        
-                                                                        {/* Finding Reference */}
-                                                                        {query.finding_reference && (
-                                                                            <div className={`mt-2 p-2 border-l-2 rounded-r text-xs ${isDarkTheme ? 'bg-indigo-950 border-indigo-500 text-indigo-200' : 'bg-indigo-50 border-indigo-600 text-indigo-900'}`}>
-                                                                                <strong>📋 Discovery Finding:</strong> {query.finding_reference}
-                                                                            </div>
-                                                                        )}
-                                                                        {query.environment_evidence && query.environment_evidence.length > 0 && (
-                                                                            <div className="mt-2 flex flex-wrap gap-2">
-                                                                                {query.environment_evidence.map((evidence, evidenceIdx) => (
-                                                                                    <span key={evidenceIdx} className={`px-2 py-1 text-xs rounded-full border ${isDarkTheme ? 'bg-emerald-900 text-emerald-200 border-emerald-700' : 'bg-emerald-100 text-emerald-800 border-emerald-300'}`}>
-                                                                                        {evidence}
-                                                                                    </span>
-                                                                                ))}
-                                                                            </div>
-                                                                        )}
-                                                                        
-                                                                        <div className={`flex items-center space-x-4 text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                                                            <span><i className="fas fa-clock mr-1"></i>{query.execution_time}</span>
-                                                                            <span><i className="fas fa-chart-line mr-1"></i>{query.use_case}</span>
-                                                                        </div>
-                                                                    </div>
-                                                                    <div className="ml-4 flex space-x-2">
-                                                                        <button
-                                                                            onClick={() => {
-                                                                                setChatInput(`Can you help me understand this query and run it?\\n\\n${query.spl}`);
-                                                                                setIsChatOpen(true);
-                                                                                closeSummaryModal();
-                                                                                setTimeout(() => chatInputRef.current?.focus(), 300);
-                                                                            }}
-                                                                            className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white text-sm rounded flex items-center space-x-1"
-                                                                            title="Ask AI about this query"
-                                                                        >
-                                                                            <i className="fas fa-comments"></i>
-                                                                            <span>Ask AI</span>
-                                                                        </button>
-                                                                        <button
-                                                                            onClick={() => copyToClipboard(query.spl)}
-                                                                            className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded flex items-center space-x-1"
-                                                                            title="Copy to clipboard"
-                                                                        >
-                                                                            <i className="fas fa-copy"></i>
-                                                                            <span>Copy</span>
-                                                                        </button>
-                                                                    </div>
-                                                                </div>
-                                                                
-                                                                <details className="mt-3">
-                                                                    <summary className={`cursor-pointer text-sm font-medium ${isDarkTheme ? 'text-indigo-300 hover:text-indigo-200' : 'text-indigo-600 hover:text-indigo-800'}`}>
-                                                                        <i className="fas fa-code mr-1"></i>
-                                                                        View SPL Code
-                                                                    </summary>
-                                                                    <pre className="mt-2 p-4 bg-gray-900 text-green-400 rounded text-sm overflow-x-auto">
-{query.spl}
-                                                                    </pre>
-                                                                </details>
-                                                                
-                                                                {query.business_value && (
-                                                                    <div className={`mt-3 p-3 border-l-4 rounded-r ${isDarkTheme ? 'bg-yellow-950 border-yellow-600' : 'bg-yellow-50 border-yellow-400'}`}>
-                                                                        <p className={`text-sm ${isDarkTheme ? 'text-yellow-200' : 'text-yellow-900'}`}>
-                                                                            <i className="fas fa-lightbulb mr-1"></i>
-                                                                            <strong>Business Value:</strong> {query.business_value}
-                                                                        </p>
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                </div>
-                                            )}
-                                            
-                                            {/* Admin Tasks Tab */}
-                                            {activeTab === 'tasks' && (
-                                                <div id="summary-tabpanel-tasks" role="tabpanel" aria-labelledby="summary-tab-tasks" className={isDarkTheme ? 'text-gray-100' : 'text-gray-900'}>
-                                                    {summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && (
-                                                        <div className={`mb-5 rounded-lg p-4 border ${isDarkTheme ? 'bg-purple-950 border-purple-700' : 'bg-purple-50 border-purple-200'}`}>
-                                                            <h4 className={`text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-purple-200' : 'text-purple-900'}`}>
-                                                                <i className="fas fa-sync-alt mr-2"></i>
-                                                                Recursive Execution Guidance
-                                                            </h4>
-                                                            <div className="space-y-2">
-                                                                {summaryData.recursive_investigations.slice(0, 2).map((loop, idx) => (
-                                                                    <div key={idx} className={`rounded p-3 text-xs border ${isDarkTheme ? 'bg-gray-900 border-purple-800 text-purple-200' : 'bg-white border-purple-200 text-purple-900'}`}>
-                                                                        <div className="font-semibold">{loop.loop || `Loop ${idx + 1}`}</div>
-                                                                        <div className="mt-1"><strong>Trigger:</strong> {loop.next_iteration_trigger || 'N/A'}</div>
-                                                                    </div>
-                                                                ))}
-                                                            </div>
-                                                        </div>
-                                                    )}
-
-                                                    {summaryData.admin_tasks && summaryData.admin_tasks.length > 0 ? (
-                                                        <div>
-                                                            <div className="mb-6">
-                                                                <h3 className={`text-2xl font-bold mb-2 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                                    <i className="fas fa-tasks text-indigo-600 mr-3"></i>
-                                                                    Recommended Implementation Tasks
-                                                                </h3>
-                                                                <p className={isDarkTheme ? 'text-gray-300' : 'text-gray-600'}>
-                                                                    Prioritized tasks based on your environment analysis. Each includes step-by-step guidance and verification queries.
-                                                                </p>
-                                                            </div>
-                                                            
-                                                            <div className="space-y-4">
-                                                                {summaryData.admin_tasks.map((task, idx) => {
-                                                                    const progress = getTaskProgress(currentSessionId, idx);
-                                                                    const completionPct = getTaskCompletionPercentage(currentSessionId, idx, task.steps?.length || 0);
-                                                                    
-                                                                    return (
-                                                                    <div key={idx} className={`border-2 rounded-lg overflow-hidden transition-all ${
-                                                                        progress.status === 'completed' ? (isDarkTheme ? 'border-green-600 bg-green-950 opacity-95' : 'border-green-400 bg-green-50 opacity-90') :
-                                                                        progress.status === 'in-progress' ? (isDarkTheme ? 'border-indigo-600 bg-indigo-950' : 'border-indigo-400 bg-indigo-50') :
-                                                                        task.priority === 'HIGH' ? (isDarkTheme ? 'border-red-700 bg-red-950' : 'border-red-300 bg-red-50') :
-                                                                        task.priority === 'MEDIUM' ? (isDarkTheme ? 'border-orange-700 bg-orange-950' : 'border-orange-300 bg-orange-50') :
-                                                                        (isDarkTheme ? 'border-yellow-700 bg-yellow-950' : 'border-yellow-300 bg-yellow-50')
-                                                                    }`}>
-                                                                        {/* Task Header */}
-                                                                        <div className={`p-5 border-b ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
-                                                                            <div className="flex items-start justify-between mb-3">
-                                                                                <div className="flex-1">
-                                                                                    <div className="flex items-center gap-2 mb-2 flex-wrap">
-                                                                                        {/* Status Badge */}
-                                                                                        {progress.status === 'completed' && (
-                                                                                            <span className="px-3 py-1 text-xs font-bold rounded-full bg-green-600 text-white">
-                                                                                                ✓ COMPLETED
-                                                                                            </span>
-                                                                                        )}
-                                                                                        {progress.status === 'in-progress' && (
-                                                                                            <span className="px-3 py-1 text-xs font-bold rounded-full bg-indigo-600 text-white animate-pulse">
-                                                                                                ⟳ IN PROGRESS
-                                                                                            </span>
-                                                                                        )}
-                                                                                        
-                                                                                        {/* Priority Badge */}
-                                                                                        <span className={`px-3 py-1 text-xs font-bold rounded-full ${
-                                                                                            task.priority === 'HIGH' ? 'bg-red-600 text-white' :
-                                                                                            task.priority === 'MEDIUM' ? 'bg-orange-600 text-white' :
-                                                                                            'bg-yellow-500 text-gray-900'
-                                                                                        }`}>
-                                                                                            {task.priority === 'HIGH' ? '🔴 HIGH' : 
-                                                                                             task.priority === 'MEDIUM' ? '🟠 MEDIUM' : '🟡 LOW'} PRIORITY
-                                                                                        </span>
-                                                                                        
-                                                                                        {/* Category Badge */}
-                                                                                        <span className={`px-2 py-1 text-xs font-semibold rounded-full ${
-                                                                                            task.category === 'Security' ? (isDarkTheme ? 'bg-red-900 text-red-200' : 'bg-red-100 text-red-700') :
-                                                                                            task.category === 'Performance' ? (isDarkTheme ? 'bg-blue-900 text-blue-200' : 'bg-blue-100 text-blue-700') :
-                                                                                            task.category === 'Compliance' ? (isDarkTheme ? 'bg-purple-900 text-purple-200' : 'bg-purple-100 text-purple-700') :
-                                                                                            task.category === 'Data Quality' ? (isDarkTheme ? 'bg-green-900 text-green-200' : 'bg-green-100 text-green-700') :
-                                                                                            (isDarkTheme ? 'bg-gray-700 text-gray-200' : 'bg-gray-100 text-gray-700')
-                                                                                        }`}>
-                                                                                            {task.category}
-                                                                                        </span>
-                                                                                        
-                                                                                        {/* Time Estimate */}
-                                                                                        {task.estimated_time && (
-                                                                                            <span className={`px-2 py-1 text-xs rounded-full ${isDarkTheme ? 'bg-indigo-900 text-indigo-200' : 'bg-indigo-100 text-indigo-700'}`}>
-                                                                                                <i className="fas fa-clock mr-1"></i>
-                                                                                                {task.estimated_time}
-                                                                                            </span>
-                                                                                        )}
-                                                                                    </div>
-                                                                                    
-                                                                                    <h4 className={`text-xl font-bold mb-2 ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{task.title}</h4>
-                                                                                    <p className={`text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>{task.description}</p>
-                                                                                    
-                                                                                    {/* Progress Bar */}
-                                                                                    <div className="mt-3">
-                                                                                        <div className={`flex items-center justify-between text-xs mb-1 ${isDarkTheme ? 'text-gray-400' : 'text-gray-600'}`}>
-                                                                                            <span className="font-medium">Progress: {completionPct}%</span>
-                                                                                            <span>{progress.completedSteps.length} / {task.steps?.length || 0} steps</span>
-                                                                                        </div>
-                                                                                        <div className={`w-full rounded-full h-2 overflow-hidden ${isDarkTheme ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                                                                                            <div 
-                                                                                                className={`h-full rounded-full transition-all duration-500 ${
-                                                                                                    completionPct === 100 ? 'bg-green-500' :
-                                                                                                    completionPct > 0 ? 'bg-indigo-500' : 'bg-gray-300'
-                                                                                                }`}
-                                                                                                style={{width: `${completionPct}%`}}
-                                                                                            ></div>
-                                                                                        </div>
-                                                                                    </div>
-                                                                                </div>
-                                                                            </div>
-                                                                            
-                                                                            {/* Impact */}
-                                                                            {task.impact && (
-                                                                                <div className={`mt-3 p-3 border-l-4 rounded-r ${isDarkTheme ? 'bg-green-950 border-green-600' : 'bg-green-50 border-green-500'}`}>
-                                                                                    <p className={`text-sm ${isDarkTheme ? 'text-green-200' : 'text-green-900'}`}>
-                                                                                        <i className="fas fa-chart-line mr-2"></i>
-                                                                                        <strong>Impact:</strong> {task.impact}
-                                                                                    </p>
-                                                                                </div>
-                                                                            )}
-                                                                        </div>
-                                                                        
-                                                                        {/* Task Details - Expandable */}
-                                                                        <details className="group" open={progress.status === 'in-progress'}>
-                                                                            <summary className={`cursor-pointer px-5 py-3 transition-colors list-none flex items-center justify-between ${isDarkTheme ? 'bg-gradient-to-r from-indigo-950 to-purple-950 hover:from-indigo-900 hover:to-purple-900' : 'bg-gradient-to-r from-indigo-50 to-purple-50 hover:from-indigo-100 hover:to-purple-100'}`}>
-                                                                                <span className={`font-semibold flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                                                    <i className="fas fa-chevron-right mr-2 group-open:rotate-90 transition-transform"></i>
-                                                                                    Implementation Steps
-                                                                                </span>
-                                                                                <span className={`text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                                                                    {task.steps?.length || 0} steps
-                                                                                </span>
-                                                                            </summary>
-                                                                            
-                                                                            <div className={`p-5 space-y-4 ${isDarkTheme ? 'bg-gray-900' : 'bg-white'}`}>
-                                                                                {/* Prerequisites */}
-                                                                                {task.prerequisites && task.prerequisites.length > 0 && (
-                                                                                    <div className="mb-4">
-                                                                                        <h5 className={`font-semibold mb-2 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                                                            <i className="fas fa-list-check mr-2 text-blue-600"></i>
-                                                                                            Prerequisites
-                                                                                        </h5>
-                                                                                        <ul className="space-y-1">
-                                                                                            {task.prerequisites.map((prereq, pIdx) => (
-                                                                                                <li key={pIdx} className={`text-sm flex items-start ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>
-                                                                                                    <i className="fas fa-angle-right mr-2 mt-1 text-blue-500"></i>
-                                                                                                    <span>{prereq}</span>
-                                                                                                </li>
-                                                                                            ))}
-                                                                                        </ul>
-                                                                                    </div>
-                                                                                )}
-                                                                                
-                                                                                {/* Implementation Steps with Checkboxes */}
-                                                                                <div>
-                                                                                    <h5 className={`font-semibold mb-3 flex items-center ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                                                        <i className="fas fa-clipboard-list mr-2 text-indigo-600"></i>
-                                                                                        Implementation Steps
-                                                                                    </h5>
-                                                                                    <div className="space-y-3">
-                                                                                        {task.steps?.map((step, sIdx) => {
-                                                                                            const isCompleted = progress.completedSteps.includes(step.number);
-                                                                                            
-                                                                                            return (
-                                                                                            <div key={sIdx} className={`border-2 rounded-lg p-4 transition-all ${
-                                                                                                isCompleted ? (isDarkTheme ? 'border-green-700 bg-green-950' : 'border-green-300 bg-green-50') : (isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50')
-                                                                                            }`}>
-                                                                                                <div className="flex items-start gap-3">
-                                                                                                    {/* Checkbox */}
-                                                                                                    <input 
-                                                                                                        type="checkbox"
-                                                                                                        checked={isCompleted}
-                                                                                                        onChange={() => toggleStepCompletion(currentSessionId, idx, step.number)}
-                                                                                                        className="mt-1 w-5 h-5 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 cursor-pointer"
-                                                                                                    />
-                                                                                                    
-                                                                                                    <div className="flex-shrink-0 w-8 h-8 bg-indigo-600 text-white rounded-full flex items-center justify-center font-bold text-sm">
-                                                                                                        {isCompleted ? '✓' : step.number}
-                                                                                                    </div>
-                                                                                                    <div className="flex-1">
-                                                                                                        <p className={`text-sm font-medium ${
-                                                                                                            isCompleted ? (isDarkTheme ? 'text-gray-500 line-through' : 'text-gray-500 line-through') : (isDarkTheme ? 'text-gray-100' : 'text-gray-900')
-                                                                                                        }`}>{step.action}</p>
-                                                                                                    </div>
-                                                                                                </div>
-                                                                                                
-                                                                                                {/* SPL Query for this step */}
-                                                                                                {step.spl && (
-                                                                                                    <div className="mt-3 ml-16">
-                                                                                                        <div className="flex items-center justify-between mb-1">
-                                                                                                            <span className={`text-xs font-semibold ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>SPL Query:</span>
-                                                                                                            <button
-                                                                                                                onClick={() => copyToClipboard(step.spl, 'Step SPL')}
-                                                                                                                className="px-2 py-1 bg-gray-700 hover:bg-gray-800 text-white rounded text-xs"
-                                                                                                            >
-                                                                                                                <i className="fas fa-copy mr-1"></i>
-                                                                                                                Copy
-                                                                                                            </button>
-                                                                                                        </div>
-                                                                                                        <pre className="p-3 bg-gray-900 text-green-400 rounded text-xs overflow-x-auto">
-{step.spl}
-                                                                                                        </pre>
-                                                                                                    </div>
-                                                                                                )}
-                                                                                            </div>
-                                                                                        )})}
-                                                                                    </div>
-                                                                                </div>
-                                                                                
-                                                                                {/* Verification */}
-                                                                                {task.verification_spl && (
-                                                                                    <div className="mt-4">
-                                                                                        <div className={`p-4 border-l-4 rounded-r ${isDarkTheme ? 'bg-blue-950 border-blue-600' : 'bg-blue-50 border-blue-500'}`}>
-                                                                                            <div className="flex items-center justify-between mb-2">
-                                                                                                <h5 className={`font-semibold flex items-center ${isDarkTheme ? 'text-blue-200' : 'text-blue-900'}`}>
-                                                                                                    <i className="fas fa-check-circle mr-2"></i>
-                                                                                                    Verification
-                                                                                                </h5>
-                                                                                                <button
-                                                                                                    onClick={() => runVerification(currentSessionId, idx, task)}
-                                                                                                    disabled={verifyingTask === idx}
-                                                                                                    className={`px-4 py-2 rounded-lg font-medium text-sm transition-all ${
-                                                                                                        verifyingTask === idx
-                                                                                                            ? 'bg-gray-400 text-white cursor-not-allowed'
-                                                                                                            : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm hover:shadow'
-                                                                                                    }`}
-                                                                                                >
-                                                                                                    {verifyingTask === idx ? (
-                                                                                                        <>
-                                                                                                            <i className="fas fa-spinner fa-spin mr-2"></i>
-                                                                                                            Verifying...
-                                                                                                        </>
-                                                                                                    ) : (
-                                                                                                        <>
-                                                                                                            <i className="fas fa-play-circle mr-2"></i>
-                                                                                                            Run Verification
-                                                                                                        </>
-                                                                                                    )}
-                                                                                                </button>
-                                                                                            </div>
-                                                                                            
-                                                                                            <p className={`text-sm mb-2 ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>
-                                                                                                <strong>Expected Outcome:</strong> {task.expected_outcome}
-                                                                                            </p>
-                                                                                            
-                                                                                            <details className="mt-2">
-                                                                                                <summary className={`cursor-pointer text-xs font-semibold ${isDarkTheme ? 'text-blue-300 hover:text-blue-200' : 'text-blue-700 hover:text-blue-900'}`}>
-                                                                                                    <i className="fas fa-code mr-1"></i>
-                                                                                                    View Verification SPL
-                                                                                                </summary>
-                                                                                                <div className="mt-2 flex items-center justify-between mb-1">
-                                                                                                    <span className={`text-xs ${isDarkTheme ? 'text-blue-300' : 'text-blue-700'}`}></span>
-                                                                                                    <button
-                                                                                                        onClick={() => copyToClipboard(task.verification_spl, 'Verification SPL')}
-                                                                                                        className="px-2 py-1 bg-blue-700 hover:bg-blue-800 text-white rounded text-xs"
-                                                                                                    >
-                                                                                                        <i className="fas fa-copy mr-1"></i>
-                                                                                                        Copy
-                                                                                                    </button>
-                                                                                                </div>
-                                                                                                <pre className="p-3 bg-gray-900 text-green-400 rounded text-xs overflow-x-auto">
-{task.verification_spl}
-                                                                                                </pre>
-                                                                                            </details>
-                                                                                        </div>
-                                                                                        
-                                                                                        {/* Verification Results */}
-                                                                                        {(() => {
-                                                                                            const verResult = getVerificationResult(currentSessionId, idx);
-                                                                                            if (!verResult) return null;
-                                                                                            
-                                                                                            return (
-                                                                                                <div className={`mt-3 p-4 border-l-4 rounded-r fade-in ${
-                                                                                                    verResult.status === 'success' ? 'bg-green-50 border-green-500' :
-                                                                                                    verResult.status === 'partial' ? 'bg-yellow-50 border-yellow-500' :
-                                                                                                    verResult.status === 'failed' ? 'bg-red-50 border-red-500' :
-                                                                                                    'bg-gray-50 border-gray-500'
-                                                                                                }`}>
-                                                                                                    {/* Status Header */}
-                                                                                                    <div className="flex items-center justify-between mb-3">
-                                                                                                        <div className="flex items-center gap-2">
-                                                                                                            {verResult.status === 'success' && (
-                                                                                                                <span className="px-3 py-1 bg-green-600 text-white text-xs font-bold rounded-full">
-                                                                                                                    ✓ SUCCESS
-                                                                                                                </span>
-                                                                                                            )}
-                                                                                                            {verResult.status === 'partial' && (
-                                                                                                                <span className="px-3 py-1 bg-yellow-500 text-gray-900 text-xs font-bold rounded-full">
-                                                                                                                    ⚠ PARTIAL SUCCESS
-                                                                                                                </span>
-                                                                                                            )}
-                                                                                                            {verResult.status === 'failed' && (
-                                                                                                                <span className="px-3 py-1 bg-red-600 text-white text-xs font-bold rounded-full">
-                                                                                                                    ✗ FAILED
-                                                                                                                </span>
-                                                                                                            )}
-                                                                                                            {verResult.status === 'error' && (
-                                                                                                                <span className="px-3 py-1 bg-gray-600 text-white text-xs font-bold rounded-full">
-                                                                                                                    ⚠ ERROR
-                                                                                                                </span>
-                                                                                                            )}
-                                                                                                        </div>
-                                                                                                        <span className="text-xs text-gray-500">
-                                                                                                            {new Date(verResult.timestamp).toLocaleString()}
-                                                                                                        </span>
-                                                                                                    </div>
-                                                                                                    
-                                                                                                    {/* Message */}
-                                                                                                    <p className={`text-sm mb-3 ${
-                                                                                                            verResult.status === 'success' ? (isDarkTheme ? 'text-green-200' : 'text-green-900') :
-                                                                                                            verResult.status === 'partial' ? (isDarkTheme ? 'text-yellow-200' : 'text-yellow-900') :
-                                                                                                            verResult.status === 'failed' ? (isDarkTheme ? 'text-red-200' : 'text-red-900') :
-                                                                                                            (isDarkTheme ? 'text-gray-100' : 'text-gray-900')
-                                                                                                    }`}>
-                                                                                                        {verResult.message}
-                                                                                                    </p>
-                                                                                                    
-                                                                                                    {/* Metrics */}
-                                                                                                    {verResult.metrics && (
-                                                                                                        <div className="bg-white rounded-lg p-3 mb-3">
-                                                                                                            <h6 className="text-xs font-semibold text-gray-700 mb-2">Metrics:</h6>
-                                                                                                            <div className="grid grid-cols-2 gap-2 text-xs">
-                                                                                                                {verResult.metrics.current_value && (
-                                                                                                                    <div>
-                                                                                                                        <span className="text-gray-600">Current:</span>
-                                                                                                                        <span className="ml-2 font-medium">{verResult.metrics.current_value}</span>
-                                                                                                                    </div>
-                                                                                                                )}
-                                                                                                                {verResult.metrics.expected_value && (
-                                                                                                                    <div>
-                                                                                                                        <span className="text-gray-600">Expected:</span>
-                                                                                                                        <span className="ml-2 font-medium">{verResult.metrics.expected_value}</span>
-                                                                                                                    </div>
-                                                                                                                )}
-                                                                                                                {verResult.metrics.gap && (
-                                                                                                                    <div className="col-span-2">
-                                                                                                                        <span className="text-gray-600">Gap:</span>
-                                                                                                                        <span className="ml-2 font-medium text-orange-700">{verResult.metrics.gap}</span>
-                                                                                                                    </div>
-                                                                                                                )}
-                                                                                                            </div>
-                                                                                                        </div>
-                                                                                                    )}
-                                                                                                    
-                                                                                                    {/* Recommendations */}
-                                                                                                    {verResult.recommendations && verResult.recommendations.length > 0 && (
-                                                                                                        <div className="bg-white rounded-lg p-3 mb-3">
-                                                                                                            <h6 className="text-xs font-semibold text-gray-700 mb-2 flex items-center">
-                                                                                                                <i className="fas fa-lightbulb mr-1 text-yellow-600"></i>
-                                                                                                                Recommendations:
-                                                                                                            </h6>
-                                                                                                            <ul className="space-y-1">
-                                                                                                                {verResult.recommendations.map((rec, rIdx) => (
-                                                                                                                    <li key={rIdx} className="text-xs text-gray-700 flex items-start">
-                                                                                                                        <i className="fas fa-arrow-right mr-2 mt-0.5 text-blue-500"></i>
-                                                                                                                        <span>{rec}</span>
-                                                                                                                    </li>
-                                                                                                                ))}
-                                                                                                            </ul>
-                                                                                                        </div>
-                                                                                                    )}
-                                                                                                    
-                                                                                                    {/* Action Buttons for Failed/Partial */}
-                                                                                                    {(verResult.status === 'failed' || verResult.status === 'partial') && (
-                                                                                                        <div className="flex gap-2 mt-3">
-                                                                                                            <button
-                                                                                                                onClick={() => getRemediation(currentSessionId, idx, task, verResult)}
-                                                                                                                disabled={loadingRemediation === idx}
-                                                                                                                className="flex-1 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                                                                                                            >
-                                                                                                                {loadingRemediation === idx ? (
-                                                                                                                    <>
-                                                                                                                        <i className="fas fa-spinner fa-spin mr-1"></i>
-                                                                                                                        Analyzing...
-                                                                                                                    </>
-                                                                                                                ) : (
-                                                                                                                    <>
-                                                                                                                        <i className="fas fa-wrench mr-1"></i>
-                                                                                                                        Get Remediation Help
-                                                                                                                    </>
-                                                                                                                )}
-                                                                                                            </button>
-                                                                                                            <button
-                                                                                                                onClick={() => runVerification(currentSessionId, idx, task)}
-                                                                                                                disabled={verifyingTask === idx}
-                                                                                                                className="px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-xs font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                                                                                                            >
-                                                                                                                <i className="fas fa-redo mr-1"></i>
-                                                                                                                Re-verify
-                                                                                                            </button>
-                                                                                                            <button
-                                                                                                                onClick={() => {
-                                                                                                                    loadVerificationHistory(currentSessionId, idx);
-                                                                                                                    setShowHistory(showHistory === idx ? null : idx);
-                                                                                                                }}
-                                                                                                                className="px-3 py-2 bg-gray-600 hover:bg-gray-700 text-white text-xs font-medium rounded"
-                                                                                                            >
-                                                                                                                <i className="fas fa-history mr-1"></i>
-                                                                                                                History
-                                                                                                            </button>
-                                                                                                        </div>
-                                                                                                    )}
-                                                                                                    
-                                                                                                    {/* Success - Show Re-verify and History */}
-                                                                                                    {verResult.status === 'success' && (
-                                                                                                        <div className="flex gap-2 mt-3">
-                                                                                                            <button
-                                                                                                                onClick={() => {
-                                                                                                                    loadVerificationHistory(currentSessionId, idx);
-                                                                                                                    setShowHistory(showHistory === idx ? null : idx);
-                                                                                                                }}
-                                                                                                                className="px-3 py-2 bg-gray-600 hover:bg-gray-700 text-white text-xs font-medium rounded"
-                                                                                                            >
-                                                                                                                <i className="fas fa-history mr-1"></i>
-                                                                                                                View History
-                                                                                                            </button>
-                                                                                                        </div>
-                                                                                                    )}
-                                                                                                    
-                                                                                                    {/* Remediation Details */}
-                                                                                                    {(() => {
-                                                                                                        const remediation = remediationData[`${currentSessionId}_task${idx}`];
-                                                                                                        if (!remediation) return null;
-                                                                                                        
-                                                                                                        return (
-                                                                                                            <div className="mt-3 p-4 bg-gradient-to-r from-purple-50 to-indigo-50 border border-indigo-200 rounded-lg fade-in">
-                                                                                                                <h6 className="text-sm font-bold text-indigo-900 mb-3 flex items-center">
-                                                                                                                    <i className="fas fa-magic mr-2"></i>
-                                                                                                                    AI-Powered Remediation Guide
-                                                                                                                </h6>
-                                                                                                                
-                                                                                                                {/* Root Cause */}
-                                                                                                                <div className="bg-white rounded-lg p-3 mb-3">
-                                                                                                                    <h7 className="text-xs font-semibold text-gray-700 mb-1 flex items-center">
-                                                                                                                        <i className="fas fa-search mr-1 text-red-600"></i>
-                                                                                                                        Root Cause:
-                                                                                                                    </h7>
-                                                                                                                    <p className="text-xs text-gray-800">{remediation.root_cause}</p>
-                                                                                                                </div>
-                                                                                                                
-                                                                                                                {/* Remediation Steps */}
-                                                                                                                <div className="bg-white rounded-lg p-3 mb-3">
-                                                                                                                    <h7 className="text-xs font-semibold text-gray-700 mb-2 flex items-center">
-                                                                                                                        <i className="fas fa-list-ol mr-1 text-green-600"></i>
-                                                                                                                        Remediation Steps:
-                                                                                                                    </h7>
-                                                                                                                    <div className="space-y-3">
-                                                                                                                        {remediation.remediation_steps?.map((step, sIdx) => (
-                                                                                                                            <div key={sIdx} className="border-l-2 border-indigo-300 pl-3">
-                                                                                                                                <div className="flex items-start justify-between mb-1">
-                                                                                                                                    <span className="text-xs font-medium text-gray-900">
-                                                                                                                                        {step.number}. {step.action}
-                                                                                                                                    </span>
-                                                                                                                                    <span className={`px-2 py-0.5 text-xs rounded ${
-                                                                                                                                        step.risk === 'low' ? 'bg-green-100 text-green-800' :
-                                                                                                                                        step.risk === 'medium' ? 'bg-yellow-100 text-yellow-800' :
-                                                                                                                                        'bg-red-100 text-red-800'
-                                                                                                                                    }`}>
-                                                                                                                                        {step.risk?.toUpperCase()} RISK
-                                                                                                                                    </span>
-                                                                                                                                </div>
-                                                                                                                                {step.explanation && (
-                                                                                                                                    <p className="text-xs text-gray-600 mb-2">{step.explanation}</p>
-                                                                                                                                )}
-                                                                                                                                {step.spl && (
-                                                                                                                                    <pre className="bg-gray-900 text-green-400 p-2 rounded text-xs overflow-x-auto font-mono">
-{step.spl}
-                                                                                                                                    </pre>
-                                                                                                                                )}
-                                                                                                                            </div>
-                                                                                                                        ))}
-                                                                                                                    </div>
-                                                                                                                </div>
-                                                                                                                
-                                                                                                                {/* Metadata */}
-                                                                                                                <div className="grid grid-cols-2 gap-2 text-xs">
-                                                                                                                    <div className="bg-white rounded p-2">
-                                                                                                                        <span className="text-gray-600">Estimated Time:</span>
-                                                                                                                        <span className="ml-1 font-medium">{remediation.estimated_time}</span>
-                                                                                                                    </div>
-                                                                                                                    <div className="bg-white rounded p-2">
-                                                                                                                        <span className="text-gray-600">Success Probability:</span>
-                                                                                                                        <span className={`ml-1 font-medium ${
-                                                                                                                            remediation.success_probability === 'high' ? 'text-green-600' :
-                                                                                                                            remediation.success_probability === 'medium' ? 'text-yellow-600' :
-                                                                                                                            'text-red-600'
-                                                                                                                        }`}>
-                                                                                                                            {remediation.success_probability?.toUpperCase()}
-                                                                                                                        </span>
-                                                                                                                    </div>
-                                                                                                                </div>
-                                                                                                                
-                                                                                                                {/* Preventive Measures */}
-                                                                                                                {remediation.preventive_measures && remediation.preventive_measures.length > 0 && (
-                                                                                                                    <details className="mt-3 bg-white rounded-lg p-3">
-                                                                                                                        <summary className="text-xs font-semibold text-gray-700 cursor-pointer">
-                                                                                                                            <i className="fas fa-shield-alt mr-1 text-blue-600"></i>
-                                                                                                                            Preventive Measures
-                                                                                                                        </summary>
-                                                                                                                        <ul className="mt-2 space-y-1">
-                                                                                                                            {remediation.preventive_measures.map((measure, mIdx) => (
-                                                                                                                                <li key={mIdx} className="text-xs text-gray-700 flex items-start">
-                                                                                                                                    <i className="fas fa-check-circle mr-2 mt-0.5 text-green-500"></i>
-                                                                                                                                    <span>{measure}</span>
-                                                                                                                                </li>
-                                                                                                                            ))}
-                                                                                                                        </ul>
-                                                                                                                    </details>
-                                                                                                                )}
-                                                                                                            </div>
-                                                                                                        );
-                                                                                                    })()}
-                                                                                                    
-                                                                                                    {/* Verification History */}
-                                                                                                    {showHistory === idx && (() => {
-                                                                                                        const history = verificationHistory[`${currentSessionId}_task${idx}`];
-                                                                                                        if (!history) return <div className="mt-3 text-xs text-gray-500">Loading history...</div>;
-                                                                                                        
-                                                                                                        return (
-                                                                                                            <div className="mt-3 p-4 bg-gray-50 border border-gray-200 rounded-lg fade-in">
-                                                                                                                <h6 className="text-sm font-bold text-gray-900 mb-3 flex items-center justify-between">
-                                                                                                                    <span>
-                                                                                                                        <i className="fas fa-history mr-2"></i>
-                                                                                                                        Verification History
-                                                                                                                    </span>
-                                                                                                                    <button
-                                                                                                                        onClick={() => setShowHistory(null)}
-                                                                                                                        className="text-gray-500 hover:text-gray-700"
-                                                                                                                    >
-                                                                                                                        <i className="fas fa-times"></i>
-                                                                                                                    </button>
-                                                                                                                </h6>
-                                                                                                                
-                                                                                                                {/* Stats */}
-                                                                                                                <div className="grid grid-cols-4 gap-2 mb-3">
-                                                                                                                    <div className="bg-white rounded-lg p-2 text-center">
-                                                                                                                        <div className="text-lg font-bold text-blue-600">{history.total_attempts}</div>
-                                                                                                                        <div className="text-xs text-gray-600">Attempts</div>
-                                                                                                                    </div>
-                                                                                                                    <div className="bg-white rounded-lg p-2 text-center">
-                                                                                                                        <div className="text-lg font-bold text-green-600">{history.successful_attempts}</div>
-                                                                                                                        <div className="text-xs text-gray-600">Successful</div>
-                                                                                                                    </div>
-                                                                                                                    <div className="bg-white rounded-lg p-2 text-center">
-                                                                                                                        <div className="text-lg font-bold text-purple-600">{Math.round(history.success_rate * 100)}%</div>
-                                                                                                                        <div className="text-xs text-gray-600">Success Rate</div>
-                                                                                                                    </div>
-                                                                                                                    <div className="bg-white rounded-lg p-2 text-center">
-                                                                                                                        <div className={`text-lg font-bold ${
-                                                                                                                            history.improvement_trend === 'improving' ? 'text-green-600' :
-                                                                                                                            history.improvement_trend === 'stable' ? 'text-blue-600' :
-                                                                                                                            'text-red-600'
-                                                                                                                        }`}>
-                                                                                                                            {history.improvement_trend === 'improving' ? '↑' :
-                                                                                                                             history.improvement_trend === 'stable' ? '→' : '↓'}
-                                                                                                                        </div>
-                                                                                                                        <div className="text-xs text-gray-600">Trend</div>
-                                                                                                                    </div>
-                                                                                                                </div>
-                                                                                                                
-                                                                                                                {history.time_to_success && (
-                                                                                                                    <div className="bg-green-100 border border-green-300 rounded-lg p-2 mb-3 text-xs text-green-800">
-                                                                                                                        <i className="fas fa-clock mr-1"></i>
-                                                                                                                        Time to success: <span className="font-semibold">{history.time_to_success}</span>
-                                                                                                                    </div>
-                                                                                                                )}
-                                                                                                                
-                                                                                                                {/* Timeline */}
-                                                                                                                <div className="space-y-2 max-h-60 overflow-y-auto">
-                                                                                                                    {history.verifications?.map((ver, vIdx) => (
-                                                                                                                        <div key={vIdx} className="bg-white rounded-lg p-2 border-l-4 ${
-                                                                                                                            ver.status === 'success' ? 'border-green-500' :
-                                                                                                                            ver.status === 'partial' ? 'border-yellow-500' :
-                                                                                                                            'border-red-500'
-                                                                                                                        }">
-                                                                                                                            <div className="flex items-center justify-between mb-1">
-                                                                                                                                <span className={`text-xs font-semibold ${
-                                                                                                                                    ver.status === 'success' ? 'text-green-700' :
-                                                                                                                                    ver.status === 'partial' ? 'text-yellow-700' :
-                                                                                                                                    'text-red-700'
-                                                                                                                                }`}>
-                                                                                                                                    Attempt #{vIdx + 1} - {ver.status?.toUpperCase()}
-                                                                                                                                </span>
-                                                                                                                                <span className="text-xs text-gray-500">
-                                                                                                                                    {new Date(ver.timestamp).toLocaleString()}
-                                                                                                                                </span>
-                                                                                                                            </div>
-                                                                                                                            <p className="text-xs text-gray-700">{ver.message}</p>
-                                                                                                                        </div>
-                                                                                                                    ))}
-                                                                                                                </div>
-                                                                                                            </div>
-                                                                                                        );
-                                                                                                    })()}
-                                                                                                </div>
-                                                                                            );
-                                                                                        })()}
-                                                                                    </div>
-                                                                                )}
-                                                                                
-                                                                                {/* Rollback */}
-                                                                                {task.rollback && (
-                                                                                    <div className="mt-4 p-3 bg-yellow-50 border-l-4 border-yellow-500 rounded-r">
-                                                                                        <h5 className="font-semibold text-yellow-900 mb-1 flex items-center text-sm">
-                                                                                            <i className="fas fa-undo mr-2"></i>
-                                                                                            Rollback Instructions
-                                                                                        </h5>
-                                                                                        <p className="text-sm text-yellow-800">{task.rollback}</p>
-                                                                                    </div>
-                                                                                )}
-                                                                            </div>
-                                                                        </details>
-                                                                    </div>
-                                                                )})}
-                                                            </div>
-                                                        </div>
-                                                    ) : (
-                                                        <div className="text-center py-20">
-                                                            <div className="inline-block p-6 bg-gradient-to-br from-indigo-50 to-purple-50 rounded-2xl mb-6">
-                                                                <i className="fas fa-tools text-7xl text-indigo-400 mb-4"></i>
-                                                            </div>
-                                                            <h3 className="text-3xl font-bold text-gray-800 mb-3">
-                                                                Generating Tasks...
-                                                            </h3>
-                                                            <p className="text-lg text-gray-600 mb-6 max-w-2xl mx-auto">
-                                                                Admin tasks are being generated based on your environment analysis
-                                                            </p>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            )}
-                                        </div>
-                                    ) : (
-                                        <div className="text-center text-gray-500 py-12">
-                                            <i className="fas fa-exclamation-circle text-4xl mb-4"></i>
-                                            <p>No summary data available</p>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                    
-                    {/* Settings Modal */}
-                    {isSettingsOpen && config && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={closeSettings}>
-                            <div className={`settings-modal-shell rounded-xl shadow-2xl w-full max-w-2xl h-5/6 flex flex-col ${isDarkTheme ? 'bg-gray-800' : 'bg-white'}`} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" onKeyDown={(event) => handleDialogKeyDown(event, closeSettings)}>
-                                {/* Header */}
-                                <div className={`p-6 border-b flex justify-between items-center ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
-                                    <div className="flex items-center">
-                                        <i className="fas fa-cog text-2xl text-indigo-600 mr-3"></i>
-                                        <h2 id="settings-modal-title" className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Settings</h2>
-                                    </div>
-                                    <button type="button" onClick={closeSettings} className={`${isDarkTheme ? 'text-gray-400 hover:text-gray-200' : 'text-gray-500 hover:text-gray-700'}`} aria-label="Close settings">
-                                        <i className="fas fa-times text-xl"></i>
-                                    </button>
-                                </div>
-
-                                <div className={`px-6 py-4 border-b ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
-                                    <div className="flex items-center justify-between mb-3">
-                                        <h3 className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                            <i className="fas fa-adjust mr-2 text-indigo-600"></i>
-                                            Appearance Theme
-                                        </h3>
-                                        <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                            Active: {resolvedTheme}
-                                        </span>
-                                    </div>
-                                    <div className={`inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="group" aria-label="Theme preference">
-                                        <button
-                                            type="button"
-                                            onClick={() => setThemePreference('light')}
-                                            className={`px-3 py-2 text-xs font-medium ${themePreference === 'light' ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
-                                            aria-pressed={themePreference === 'light'}
-                                        >
-                                            Light
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={() => setThemePreference('dark')}
-                                            className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'dark' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
-                                            aria-pressed={themePreference === 'dark'}
-                                        >
-                                            Dark
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={() => setThemePreference('system')}
-                                            className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'system' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
-                                            aria-pressed={themePreference === 'system'}
-                                        >
-                                            System
-                                        </button>
-                                    </div>
-                                    <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                        System mode follows your OS appearance preference automatically.
-                                    </p>
-                                </div>
-                                
-                                {/* Scrollable Content */}
-                                <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                                    {/* MCP Configuration Vault */}
-                                    <div>
-                                        <div className={`rounded-lg p-6 border-2 ${isDarkTheme ? 'bg-gray-800 border-green-700' : 'bg-gradient-to-r from-green-50 to-emerald-50 border-green-200'}`}>
-                                            {/* Header */}
-                                            <div className="mb-4">
-                                                <h3 className="text-lg font-semibold text-gray-900 mb-2">
-                                                    <i className="fas fa-server mr-2 text-green-600"></i>
-                                                    MCP Server Configurations
-                                                </h3>
-                                                <p className="text-sm text-gray-600">Manage your Splunk MCP server connections</p>
-                                            </div>
-                                            
-                                            {/* Currently Loaded Indicator */}
-                                            {(loadedMCPConfigName || config?.active_mcp_config_name) && (
-                                                <div className="mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3">
-                                                    <div className="flex items-center justify-between">
-                                                        <div className="flex items-center gap-2">
-                                                            <i className="fas fa-check-circle text-emerald-600"></i>
-                                                            <div>
-                                                                <p className="text-sm font-semibold text-gray-900">Active Configuration:</p>
-                                                                <p className="text-base font-bold text-gray-800">{loadedMCPConfigName || config?.active_mcp_config_name}</p>
-                                                            </div>
-                                                        </div>
-                                                        <button
-                                                            onClick={() => {
-                                                                setLoadedMCPConfigName(null);
-                                                                setShowMCPConfigForm(false);
-                                                            }}
-                                                            className="text-emerald-700 hover:text-emerald-900 text-sm font-medium"
-                                                            title="Clear and close editor"
-                                                        >
-                                                            <i className="fas fa-times-circle mr-1"></i>Close
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            )}
-                                            
-                                            {/* Action Button - Create New Configuration */}
-                                            {!showMCPConfigForm && (
-                                                <div className="mb-4">
-                                                    <button
-                                                        onClick={() => {
-                                                            setShowMCPConfigForm(true);
-                                                            setLoadedMCPConfigName(null);
-                                                            setMCPTokenPlaceholder('Enter token');
-                                                        }}
-                                                        className="w-full px-4 py-3 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
-                                                    >
-                                                        <i className="fas fa-plus-circle mr-2"></i>Create New Configuration
-                                                    </button>
-                                                </div>
-                                            )}
-                                            
-                                            {/* Saved Configurations List */}
-                                            <div id="mcp-configs-list" className="space-y-2 max-h-96 overflow-y-auto">
-                                                <div className="text-sm text-gray-500 text-center py-4 italic">Loading configurations...</div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* MCP Configuration Form - Conditional */}
-                                    {showMCPConfigForm && (
-                                        <div>
-                                            <div className="flex items-center justify-between mb-3">
-                                                <h3 className="text-lg font-semibold text-gray-900">
-                                                    <i className="fas fa-server mr-2 text-green-600"></i>
-                                                    {loadedMCPConfigName ? 'Edit Configuration' : 'New Configuration'}
-                                                </h3>
-                                                <button
-                                                    onClick={() => {
-                                                        setShowMCPConfigForm(false);
-                                                        setLoadedMCPConfigName(null);
-                                                    }}
-                                                    className="px-3 py-1 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
-                                                >
-                                                    <i className="fas fa-times mr-1"></i>Cancel
-                                                </button>
-                                            </div>
-                                            <div className="space-y-3">
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-700 mb-1">MCP URL</label>
-                                                    <input 
-                                                        type="text" 
-                                                        defaultValue={config.mcp.url}
-                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                        id="mcp-url"
-                                                    />
-                                                </div>
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-700 mb-1">Token</label>
-                                                    <input 
-                                                        type="password" 
-                                                        placeholder={mcpTokenPlaceholder}
-                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                        id="mcp-token"
-                                                        onChange={() => setMCPTokenPlaceholder('Enter token')}
-                                                    />
-                                                </div>
-                                                <div className="flex items-center">
-                                                    <input 
-                                                        type="checkbox" 
-                                                        checked={config.mcp.verify_ssl}
-                                                        onChange={(e) => setConfig({...config, mcp: {...config.mcp, verify_ssl: e.target.checked}})}
-                                                        className="mr-2"
-                                                        id="mcp-verify-ssl"
-                                                    />
-                                                    <label htmlFor="mcp-verify-ssl" className="text-sm text-gray-700">Verify SSL Certificate</label>
-                                                </div>
-                                                
-                                                {/* Test & Save Buttons */}
-                                                <div className="pt-3 border-t border-gray-200 space-y-2">
-                                                    <button
-                                                        type="button"
-                                                        onClick={async (event) => {
-                                                            const urlEl = document.getElementById('mcp-url');
-                                                            const tokenEl = document.getElementById('mcp-token');
-                                                            const verifySslEl = document.getElementById('mcp-verify-ssl');
-                                                            
-                                                            const testUrl = urlEl?.value || config.mcp.url;
-                                                            const testToken = tokenEl?.value || config.mcp.token;
-                                                            const testVerifySsl = verifySslEl?.checked ?? config.mcp.verify_ssl;
-                                                            
-                                                            if (!testUrl) {
-                                                                alert('Please enter an MCP URL');
-                                                                return;
-                                                            }
-                                                            
-                                                            const button = event.currentTarget;
-                                                            const originalHTML = button.innerHTML;
-                                                            button.disabled = true;
-                                                            button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Testing...';
-                                                            
-                                                            try {
-                                                                const response = await fetch('/api/mcp-configs/test', {
-                                                                    method: 'POST',
-                                                                    headers: {'Content-Type': 'application/json'},
-                                                                    body: JSON.stringify({
-                                                                        url: testUrl,
-                                                                        token: testToken,
-                                                                        verify_ssl: testVerifySsl
-                                                                    })
-                                                                });
-                                                                
-                                                                const result = await response.json();
-                                                                
-                                                                if (result.status === 'success') {
-                                                                    alert('✅ ' + result.message);
-                                                                } else {
-                                                                    alert('⚠️ ' + result.message);
-                                                                }
-                                                            } catch (error) {
-                                                                alert('❌ Test failed: ' + error.message);
-                                                            } finally {
-                                                                button.disabled = false;
-                                                                button.innerHTML = originalHTML;
-                                                            }
-                                                        }}
-                                                        className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
-                                                    >
-                                                        <i className="fas fa-network-wired mr-2"></i>Test Connection
-                                                    </button>
-                                                    
-                                                    {/* Save Buttons */}
-                                                    {loadedMCPConfigName ? (
-                                                        <>
-                                                            <button
-                                                                onClick={() => {
-                                                                    setMCPConfigName('');
-                                                                    setIsMCPSaveModalOpen(true);
-                                                                }}
-                                                                className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
-                                                            >
-                                                                <i className="fas fa-plus-circle mr-2"></i>Save as New
-                                                            </button>
-                                                            <button
-                                                                onClick={() => {
-                                                                    setMCPConfigName(loadedMCPConfigName);
-                                                                    setIsMCPSaveModalOpen(true);
-                                                                }}
-                                                                className="w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
-                                                            >
-                                                                <i className="fas fa-sync-alt mr-2"></i>Update Active Configuration
-                                                            </button>
-                                                        </>
-                                                    ) : (
-                                                        <button
-                                                            onClick={() => {
-                                                                setMCPConfigName('');
-                                                                setIsMCPSaveModalOpen(true);
-                                                            }}
-                                                            className="w-full px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all"
-                                                        >
-                                                            <i className="fas fa-save mr-2"></i>Save as New Configuration
-                                                        </button>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-                                    
-                                    {/* LLM Credential Vault - Show First */}
-                                    <div>
-                                        <div className={`rounded-lg p-6 border-2 ${isDarkTheme ? 'bg-gray-800 border-purple-700' : 'bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200'}`}>
-                                            {/* Header */}
-                                            <div className="mb-4">
-                                                <h3 className="text-lg font-semibold text-gray-900 mb-2">
-                                                    <i className="fas fa-key mr-2 text-purple-600"></i>
-                                                    LLM Credentials
-                                                </h3>
-                                                <p className="text-sm text-gray-600">Manage your AI model connections</p>
-                                            </div>
-                                            
-                                            {/* Currently Loaded Indicator */}
-                                            {(loadedCredentialName || config?.active_credential_name) && (
-                                                <div className="mb-4 bg-amber-50 border-l-4 border-amber-500 rounded-r-lg p-3">
-                                                    <div className="flex items-center justify-between">
-                                                        <div className="flex items-center gap-2">
-                                                            <i className="fas fa-check-circle text-amber-600"></i>
-                                                            <div>
-                                                                <p className="text-sm font-semibold text-gray-900">Active Connection:</p>
-                                                                <p className="text-base font-bold text-gray-800">{loadedCredentialName || config?.active_credential_name}</p>
-                                                            </div>
-                                                        </div>
-                                                        <button
-                                                            onClick={() => {
-                                                                setLoadedCredentialName(null);
-                                                                setShowConfigForm(false);
-                                                            }}
-                                                            className="text-amber-600 hover:text-amber-800 text-sm font-medium"
-                                                            title="Clear and close editor"
-                                                        >
-                                                            <i className="fas fa-times-circle mr-1"></i>Close
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            )}
-                                            
-                                            {/* Action Button - Create New Connection */}
-                                            {!showConfigForm && (
-                                                <div className="mb-4">
-                                                    <button
-                                                        onClick={() => {
-                                                            setShowConfigForm(true);
-                                                            setLoadedCredentialName(null);
-                                                            setApiKeyPlaceholder('Enter API key');
-                                                        }}
-                                                        className="w-full px-4 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
-                                                    >
-                                                        <i className="fas fa-plus-circle mr-2"></i>Create New Connection
-                                                    </button>
-                                                </div>
-                                            )}
-                                            
-                                            {/* Saved Credentials List */}
-                                            <div id="credentials-list" className="space-y-2 max-h-96 overflow-y-auto">
-                                                <div className="text-sm text-gray-500 text-center py-4 italic">Loading credentials...</div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* LLM Configuration Form - Conditional */}
-                                    {showConfigForm && (
-                                        <div>
-                                            <div className="flex items-center justify-between mb-3">
-                                                <h3 className="text-lg font-semibold text-gray-900">
-                                                    <i className="fas fa-brain mr-2 text-purple-600"></i>
-                                                    {loadedCredentialName ? 'Edit Connection' : 'New Connection'}
-                                                </h3>
-                                                <button
-                                                    onClick={() => {
-                                                        setShowConfigForm(false);
-                                                        setLoadedCredentialName(null);
-                                                    }}
-                                                    className="px-3 py-1 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
-                                                >
-                                                    <i className="fas fa-times mr-1"></i>Cancel
-                                                </button>
-                                            </div>
-                                            <div className="space-y-3">
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-700 mb-1">Provider</label>
-                                                    <select 
-                                                        value={selectedProvider}
-                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                        id="llm-provider"
-                                                        onChange={(e) => {
-                                                            setSelectedProvider(e.target.value);
-                                                            handleSettingsChange();
-                                                        }}
-                                                    >
-                                                        <option value="openai">OpenAI</option>
-                                                        <option value="azure">Azure OpenAI</option>
-                                                        <option value="anthropic">Anthropic (Claude)</option>
-                                                        <option value="gemini">Google Gemini</option>
-                                                        <option value="custom">Custom Endpoint</option>
-                                                    </select>
-                                                </div>
-                                            {selectedProvider !== 'openai' && (
-                                                <div>
-                                                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                        Endpoint URL
-                                                        <span className="ml-2 text-xs text-gray-500">
-                                                            ({selectedProvider === 'custom' ? 'used exactly as configured' : 'base URL or full API path'})
-                                                        </span>
-                                                    </label>
-                                                    <input 
-                                                        type="text" 
-                                                        defaultValue={config.llm.endpoint_url || ''}
-                                                        placeholder={
-                                                            selectedProvider === 'azure' ? 'https://YOUR-RESOURCE.openai.azure.com' :
-                                                            selectedProvider === 'anthropic' ? 'https://api.anthropic.com (optional)' :
-                                                            selectedProvider === 'gemini' ? 'https://generativelanguage.googleapis.com (optional)' :
-                                                            'http://localhost:8000/v1/chat/completions'
-                                                        }
-                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                        id="llm-endpoint-url"
-                                                        onChange={handleSettingsChange}
-                                                    />
-                                                    {selectedProvider === 'custom' && (
-                                                        <p className="mt-1 text-xs text-gray-500">
-                                                            ✅ <strong>Full API Path (Recommended):</strong> <span className="font-mono">http://localhost:8000/v1/chat/completions</span><br/>
-                                                            ⚠️ <strong>Base URL (Slower):</strong> <span className="font-mono">http://localhost:8000</span> - requires auto-detection<br/>
-                                                            <span className="italic">URL is used exactly as entered. No automatic path manipulation.</span>
-                                                        </p>
-                                                    )}
-                                                </div>
-                                            )}
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    API Key
-                                                    {selectedProvider === 'custom' && (
-                                                        <span className="ml-2 text-xs text-gray-500">(Optional for local LLMs)</span>
-                                                    )}
-                                                </label>
-                                                <input 
-                                                    type="password" 
-                                                    placeholder={apiKeyPlaceholder}
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                    id="llm-api-key"
-                                                    onChange={handleApiKeyChange}
-                                                />
-                                            </div>
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Model
-                                                    <button
-                                                        onClick={async () => {
-                                                            setIsLoadingModels(true);
-                                                            try {
-                                                                const provider = document.getElementById('llm-provider').value;
-                                                                const apiKey = document.getElementById('llm-api-key').value;
-                                                                const endpointUrl = document.getElementById('llm-endpoint-url')?.value;
-                                                                
-                                                                const response = await fetch('/api/llm/list-models', {
-                                                                    method: 'POST',
-                                                                    headers: { 'Content-Type': 'application/json' },
-                                                                    body: JSON.stringify({
-                                                                        provider: provider,
-                                                                        api_key: apiKey,
-                                                                        endpoint_url: endpointUrl
-                                                                    })
-                                                                });
-                                                                
-                                                                if (response.ok) {
-                                                                    const data = await response.json();
-                                                                    setAvailableModels(data.models);
-                                                                    if (data.models.length > 0) {
-                                                                        setSelectedModel(data.models[0]);
-                                                                    }
-                                                                } else {
-                                                                    const error = await response.json();
-                                                                    alert('Failed to fetch models: ' + error.detail);
-                                                                }
-                                                            } catch (error) {
-                                                                alert('Error fetching models: ' + error.message);
-                                                            } finally {
-                                                                setIsLoadingModels(false);
-                                                            }
-                                                        }}
-                                                        className="ml-2 px-2 py-1 text-xs bg-purple-100 hover:bg-purple-200 text-purple-700 rounded disabled:opacity-50"
-                                                        disabled={isLoadingModels}
-                                                        type="button"
-                                                    >
-                                                        <i className={`fas ${isLoadingModels ? 'fa-spinner fa-spin' : 'fa-download'}`}></i> {isLoadingModels ? 'Fetching...' : 'Fetch Models'}
-                                                    </button>
-                                                </label>
-                                                {availableModels.length > 0 ? (
-                                                    <select
-                                                        value={selectedModel}
-                                                        onChange={(e) => {
-                                                            setSelectedModel(e.target.value);
-                                                            handleSettingsChange();
-                                                        }}
-                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                        id="llm-model"
-                                                    >
-                                                        {availableModels.map(model => (
-                                                            <option key={model} value={model}>{model}</option>
-                                                        ))}
-                                                    </select>
-                                                ) : (
-                                                    <input 
-                                                        type="text" 
-                                                        defaultValue={config.llm.model}
-                                                        placeholder={
-                                                            selectedProvider === 'openai' ? 'gpt-4o' :
-                                                            selectedProvider === 'azure' ? 'your-azure-deployment-name' :
-                                                            selectedProvider === 'anthropic' ? 'claude-3-5-sonnet-latest' :
-                                                            selectedProvider === 'gemini' ? 'gemini-1.5-pro' :
-                                                            'e.g., llama3.2:3b'
-                                                        }
-                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                        id="llm-model"
-                                                        onChange={handleSettingsChange}
-                                                    />
-                                                )}
-                                                {selectedProvider !== 'openai' && (
-                                                    <p className="mt-1 text-xs text-gray-500 italic">
-                                                        Tip: Click "Fetch Models" to query provider model/deployment inventory where supported
-                                                    </p>
-                                                )}
-                                            </div>
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Max Tokens
-                                                    <button 
-                                                        onClick={async () => {
-                                                            const btn = event.target;
-                                                            btn.disabled = true;
-                                                            btn.innerHTML = '<i className="fas fa-spinner fa-spin"></i> Testing...';
-                                                            try {
-                                                                const response = await fetch('/api/llm/assess-max-tokens', { method: 'POST' });
-                                                                const result = await response.json();
-                                                                document.getElementById('llm-max-tokens').value = result.recommended_max_tokens;
-                                                                btn.innerHTML = '<i className="fas fa-check"></i> Done';
-                                                                setTimeout(() => {
-                                                                    btn.disabled = false;
-                                                                    btn.innerHTML = '<i className="fas fa-magic"></i> Auto-Assess';
-                                                                }, 2000);
-                                                            } catch (error) {
-                                                                btn.innerHTML = '<i className="fas fa-times"></i> Failed';
-                                                                setTimeout(() => {
-                                                                    btn.disabled = false;
-                                                                    btn.innerHTML = '<i className="fas fa-magic"></i> Auto-Assess';
-                                                                }, 2000);
-                                                            }
-                                                        }}
-                                                        className="ml-2 px-2 py-1 text-xs bg-indigo-100 hover:bg-indigo-200 text-indigo-700 rounded"
-                                                    >
-                                                        <i className="fas fa-magic"></i> Auto-Assess
-                                                    </button>
-                                                </label>
-                                                <input 
-                                                    type="number" 
-                                                    defaultValue={config.llm.max_tokens}
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                    id="llm-max-tokens"
-                                                    onChange={handleSettingsChange}
-                                                />
-                                            </div>
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">Temperature</label>
-                                                <input 
-                                                    type="number" 
-                                                    step="0.1"
-                                                    defaultValue={config.llm.temperature}
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                                                    id="llm-temperature"
-                                                    onChange={handleSettingsChange}
-                                                />
-                                            </div>
-                                            
-                                            {/* Test Connection Button */}
-                                            <div className="pt-3 border-t border-gray-200">
-                                                <button
-                                                    onClick={async () => {
-                                                        const btn = event.target;
-                                                        const resultsDiv = document.getElementById('llm-test-results');
-                                                        
-                                                        btn.disabled = true;
-                                                        btn.innerHTML = '<i className="fas fa-spinner fa-spin mr-2"></i> Testing Connection...';
-                                                        resultsDiv.innerHTML = '<div className="text-blue-600"><i className="fas fa-spinner fa-spin mr-2"></i> Running tests...</div>';
-                                                        resultsDiv.style.display = 'block';
-                                                        
-                                                        try {
-                                                            // First save current settings
-                                                            const provider = document.getElementById('llm-provider').value;
-                                                            const endpointUrlInput = document.getElementById('llm-endpoint-url');
-                                                            
-                                                            await fetch('/api/config', {
-                                                                method: 'POST',
-                                                                headers: { 'Content-Type': 'application/json' },
-                                                                body: JSON.stringify({
-                                                                    llm: {
-                                                                        provider: provider,
-                                                                        api_key: document.getElementById('llm-api-key').value || undefined,
-                                                                        model: document.getElementById('llm-model').value,
-                                                                        endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
-                                                                        max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
-                                                                        temperature: parseFloat(document.getElementById('llm-temperature').value)
-                                                                    }
-                                                                })
-                                                            });
-                                                            
-                                                            // Then test the connection
-                                                            const response = await fetch('/api/llm/test-connection', {
-                                                                method: 'POST',
-                                                                headers: { 'Content-Type': 'application/json' },
-                                                                body: JSON.stringify({
-                                                                    llm: {
-                                                                        provider: provider,
-                                                                        api_key: document.getElementById('llm-api-key').value || undefined,
-                                                                        model: document.getElementById('llm-model').value,
-                                                                        endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
-                                                                        max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
-                                                                        temperature: parseFloat(document.getElementById('llm-temperature').value)
-                                                                    }
-                                                                })
-                                                            });
-                                                            const result = await response.json();
-                                                            
-                                                            let html = '<div className="space-y-2">';
-                                                            
-                                                            // Show URL cleaning notification if applicable
-                                                            if (result.url_cleaned && result.original_endpoint) {
-                                                                html += '<div className="bg-blue-100 border border-blue-300 rounded-lg p-3 mb-2">';
-                                                                html += '<div className="font-semibold text-blue-800"><i className="fas fa-info-circle mr-2"></i>Endpoint URL Cleaned</div>';
-                                                                html += '<div className="text-xs text-blue-700 mt-1">';
-                                                                html += 'Removed API path from endpoint URL for proper testing.<br>';
-                                                                html += '<span className="font-mono">From: ' + result.original_endpoint + '</span><br>';
-                                                                html += '<span className="font-mono">To: ' + result.endpoint + '</span><br>';
-                                                                html += '<span className="italic mt-1">Tip: Enter only the base URL (e.g., http://localhost:8000)</span>';
-                                                                html += '</div>';
-                                                                html += '</div>';
-                                                            }
-                                                            
-                                                            // Overall status
-                                                            if (result.status === 'success') {
-                                                                html += '<div className="bg-green-100 border border-green-300 rounded-lg p-3 mb-2">';
-                                                                html += '<div className="font-semibold text-green-800"><i className="fas fa-check-circle mr-2"></i>All Tests Passed!</div>';
-                                                                html += '<div className="text-sm text-green-700 mt-1">' + result.message + '</div>';
-                                                                html += '</div>';
-                                                                
-                                                                // Auto-apply recommended config
-                                                                if (result.recommended_config) {
-                                                                    document.getElementById('llm-max-tokens').value = result.recommended_config.max_tokens;
-                                                                }
-                                                            } else if (result.status === 'error') {
-                                                                html += '<div className="bg-red-100 border border-red-300 rounded-lg p-3 mb-2">';
-                                                                html += '<div className="font-semibold text-red-800"><i className="fas fa-times-circle mr-2"></i>Test Failed</div>';
-                                                                html += '<div className="text-sm text-red-700 mt-1">' + (result.message || result.error) + '</div>';
-                                                                html += '</div>';
-                                                            }
-                                                            
-                                                            // Individual test results
-                                                            html += '<div className="text-xs font-semibold text-gray-700 mb-1">Test Details:</div>';
-                                                            
-                                                            for (const [testName, testResult] of Object.entries(result.tests || {})) {
-                                                                const statusIcon = testResult.status === 'success' ? 'check' : 
-                                                                                 testResult.status === 'error' ? 'times' : 
-                                                                                 testResult.status === 'warning' ? 'exclamation-triangle' : 'info-circle';
-                                                                const statusColor = testResult.status === 'success' ? 'green' : 
-                                                                                  testResult.status === 'error' ? 'red' : 
-                                                                                  testResult.status === 'warning' ? 'yellow' : 'blue';
-                                                                
-                                                                html += `<div className="bg-${statusColor}-50 border border-${statusColor}-200 rounded p-2 mb-1">`;
-                                                                html += `<div className="text-xs font-medium text-${statusColor}-800">`;
-                                                                html += `<i className="fas fa-${statusIcon} mr-1"></i>${testName.charAt(0).toUpperCase() + testName.slice(1)}: ${testResult.message}`;
-                                                                html += '</div>';
-                                                                if (testResult.response_preview) {
-                                                                    html += `<div className="text-xs text-gray-600 mt-1 italic">"${testResult.response_preview}"</div>`;
-                                                                }
-                                                                html += '</div>';
-                                                            }
-                                                            
-                                                            html += '</div>';
-                                                            resultsDiv.innerHTML = html;
-                                                            
-                                                            btn.innerHTML = '<i className="fas fa-check mr-2"></i> Test Complete';
-                                                            setTimeout(() => {
-                                                                btn.disabled = false;
-                                                                btn.innerHTML = '<i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
-                                                            }, 3000);
-                                                            
-                                                        } catch (error) {
-                                                            resultsDiv.innerHTML = `<div className="bg-red-100 border border-red-300 rounded-lg p-3">
-                                                                <div className="font-semibold text-red-800"><i className="fas fa-times-circle mr-2"></i>Error</div>
-                                                                <div className="text-sm text-red-700 mt-1">${error.message}</div>
-                                                            </div>`;
-                                                            btn.innerHTML = '<i className="fas fa-times mr-2"></i> Test Failed';
-                                                            setTimeout(() => {
-                                                                btn.disabled = false;
-                                                                btn.innerHTML = '<i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
-                                                            }, 3000);
-                                                        }
-                                                    }}
-                                                    className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
-                                                >
-                                                    <i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure
-                                                </button>
-                                                <div id="llm-test-results" className="mt-3" style={{display: 'none'}}></div>
-                                                
-                                                {/* Save Buttons */}
-                                                <div className="mt-3 pt-3 border-t border-gray-200 space-y-2">
-                                                    {loadedCredentialName ? (
-                                                        <>
-                                                            <button
-                                                                onClick={() => {
-                                                                    setIsUpdateMode(false);
-                                                                    setCredentialName('');
-                                                                    setIsCredentialModalOpen(true);
-                                                                }}
-                                                                className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
-                                                            >
-                                                                <i className="fas fa-plus-circle mr-2"></i>Save as New
-                                                            </button>
-                                                            <button
-                                                                onClick={() => {
-                                                                    setIsUpdateMode(true);
-                                                                    setCredentialName(loadedCredentialName);
-                                                                    setIsCredentialModalOpen(true);
-                                                                }}
-                                                                className="w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
-                                                            >
-                                                                <i className="fas fa-sync-alt mr-2"></i>Update Active Connection
-                                                            </button>
-                                                        </>
-                                                    ) : (
-                                                        <button
-                                                            onClick={() => {
-                                                                setIsUpdateMode(false);
-                                                                setCredentialName('');
-                                                                setIsCredentialModalOpen(true);
-                                                            }}
-                                                            className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
-                                                        >
-                                                            <i className="fas fa-save mr-2"></i>Save Connection
-                                                        </button>
-                                                    )}
-                                                </div>
-                                            </div>
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                                
-                                {/* Footer */}
-                                <div className={`p-6 border-t ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
-                                    <div className="flex justify-between items-center">
-                                        <button
-                                            onClick={async () => {
-                                                try {
-                                                    const response = await fetch('/api/dependencies');
-                                                    const data = await response.json();
-                                                    
-                                                    const depsWindow = window.open('', 'dependencies', 'width=800,height=600,scrollbars=yes');
-                                                    if (depsWindow) {
-                                                        const doc = depsWindow.document;
-                                                        doc.open();
-                                                        doc.write('<html><head><title>Installed Dependencies</title>');
-                                                        doc.write('<style>body{font-family:system-ui;padding:20px;background:#f5f5f5}');
-                                                        doc.write('h1{color:#333;margin-bottom:20px}table{width:100%;border-collapse:collapse;background:white;box-shadow:0 2px 4px rgba(0,0,0,0.1)}');
-                                                        doc.write('th,td{padding:12px;text-align:left;border-bottom:1px solid #ddd}');
-                                                        doc.write('th{background:#4f46e5;color:white;font-weight:600}');
-                                                        doc.write('tr:hover{background:#f9fafb}.count{color:#666;margin-top:10px}</style></head>');
-                                                        doc.write('<body><h1>📦 Installed Python Packages</h1>');
-                                                        doc.write(`<p class="count"><strong>${data.total}</strong> packages installed</p>`);
-                                                        doc.write('<table><thead><tr><th>Package Name</th><th>Version</th></tr></thead><tbody>');
-                                                        data.packages.forEach(pkg => {
-                                                            doc.write(`<tr><td>${pkg.name}</td><td>${pkg.version}</td></tr>`);
-                                                        });
-                                                        doc.write('</tbody></table></body></html>');
-                                                        doc.close();
-                                                    } else {
-                                                        alert('Please allow popups to view dependencies');
-                                                    }
-                                                } catch (err) {
-                                                    alert('Failed to load dependencies: ' + err.message);
-                                                }
-                                            }}
-                                            className={`px-4 py-2 text-sm rounded-lg font-medium ${isDarkTheme ? 'bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'}`}
-                                        >
-                                            <i className="fas fa-list mr-2"></i>
-                                            View Dependencies
-                                        </button>
-                                        
-                                        {/* Always show Save Settings button */}
-                                        <button
-                                            onClick={async () => {
-                                                const providerEl = document.getElementById('llm-provider');
-                                                const endpointUrlInput = document.getElementById('llm-endpoint-url');
-                                                const modelInput = document.getElementById('llm-model');
-                                                const apiKeyEl = document.getElementById('llm-api-key');
-                                                const maxTokensEl = document.getElementById('llm-max-tokens');
-                                                const tempEl = document.getElementById('llm-temperature');
-                                                const mcpUrlEl = document.getElementById('mcp-url');
-                                                const mcpTokenEl = document.getElementById('mcp-token');
-                                                const mcpVerifyEl = document.getElementById('mcp-verify-ssl');
-                                                
-                                                const provider = providerEl ? providerEl.value : selectedProvider;
-                                                
-                                                // Only include token if it's actually changed (not empty)
-                                                const mcpToken = mcpTokenEl ? mcpTokenEl.value : '';
-                                                const mcpSettings = {
-                                                    url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
-                                                    verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
-                                                };
-                                                // Only include token if user entered a new one
-                                                if (mcpToken && mcpToken.trim()) {
-                                                    mcpSettings.token = mcpToken;
-                                                }
-                                                
-                                                const settings = {
-                                                    mcp: mcpSettings,
-                                                    llm: {
-                                                        provider: provider,
-                                                        api_key: (apiKeyEl ? apiKeyEl.value : config.llm.api_key) || undefined,
-                                                        model: (modelInput ? modelInput.value : selectedModel) || config.llm.model,
-                                                        endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
-                                                        max_tokens: maxTokensEl ? parseInt(maxTokensEl.value) : config.llm.max_tokens,
-                                                        temperature: tempEl ? parseFloat(tempEl.value) : config.llm.temperature
-                                                    },
-                                                    server: {
-                                                        ...config.server
-                                                    }
-                                                };
-                                                await saveSettings(settings);
-                                            }}
-                                            className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
-                                        >
-                                            <i className="fas fa-save mr-2"></i>
-                                            Save Settings
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                    
-                    {/* Credential Save Modal */}
-                    {isCredentialModalOpen && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                            <div className={`rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
-                                {/* Header */}
-                                <div className={`px-6 py-4 rounded-t-xl ${isUpdateMode ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white'}`}>
-                                    <div className="flex items-center justify-between">
-                                        <div className="flex items-center gap-3">
-                                            <i className={`text-2xl ${isUpdateMode ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
-                                            <h2 className="text-xl font-bold">{isUpdateMode ? 'Update' : 'Save'} LLM Credential</h2>
-                                        </div>
-                                        <button
-                                            onClick={() => {
-                                                setIsCredentialModalOpen(false);
-                                                setCredentialName('');
-                                                setIsUpdateMode(false);
-                                            }}
-                                            className={`transition-colors ${isUpdateMode ? 'text-gray-900 hover:text-gray-600' : 'text-white hover:text-gray-200'}`}
-                                        >
-                                            <i className="fas fa-times text-xl"></i>
-                                        </button>
-                                    </div>
-                                </div>
-                                
-                                {/* Content */}
-                                <div className="p-6">
-                                    {isUpdateMode ? (
-                                        <div className="bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4">
-                                            <div className="flex items-start">
-                                                <i className="fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5"></i>
-                                                <div>
-                                                    <p className="text-sm font-bold text-gray-900 mb-1">⚠️ Update Warning</p>
-                                                    <p className="text-sm text-gray-800">
-                                                        You are about to overwrite the existing credential "<strong className="text-gray-900">{credentialName}</strong>". 
-                                                        This will replace all settings with your current configuration. This action cannot be undone.
-                                                    </p>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ) : (
-                                        <p className={`text-sm mb-4 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            Save your current LLM settings as a named credential for quick access later.
-                                        </p>
-                                    )}
-                                    
-                                    <div className="mb-6">
-                                        <label className={`block text-sm font-medium mb-2 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
-                                            Credential Name <span className="text-red-500">*</span>
-                                        </label>
-                                        <input
-                                            type="text"
-                                            value={credentialName}
-                                            onChange={(e) => setCredentialName(e.target.value)}
-                                            placeholder="e.g., My OpenAI GPT-4, Local Llama Server"
-                                            className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
-                                            disabled={isUpdateMode}
-                                            autoFocus={!isUpdateMode}
-                                        />
-                                        {isUpdateMode && (
-                                            <p className={`text-xs mt-1 italic ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>Credential name cannot be changed when updating</p>
-                                        )}
-                                    </div>
-                                    
-                                    {/* Preview */}
-                                    <div className={`rounded-lg p-4 mb-6 border ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                        <h4 className={`text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>Current Settings Preview</h4>
-                                        <div className={`space-y-1 text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            <div><span className="font-medium">Provider:</span> {selectedProvider}</div>
-                                            <div><span className="font-medium">Model:</span> {document.getElementById('llm-model')?.value || 'N/A'}</div>
-                                            <div><span className="font-medium">Max Tokens:</span> {document.getElementById('llm-max-tokens')?.value || 'N/A'}</div>
-                                            <div><span className="font-medium">Temperature:</span> {document.getElementById('llm-temperature')?.value || 'N/A'}</div>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* Actions */}
-                                    <div className="flex gap-3">
-                                        <button
-                                            onClick={() => {
-                                                setIsCredentialModalOpen(false);
-                                                setCredentialName('');
-                                                setIsUpdateMode(false);
-                                            }}
-                                            className={`flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}
-                                        >
-                                            Cancel
-                                        </button>
-                                        <button
-                                            onClick={async () => {
-                                                if (!credentialName.trim()) {
-                                                    alert('Please enter a credential name');
-                                                    return;
-                                                }
-                                                
-                                                // Additional confirmation for updates
-                                                if (isUpdateMode) {
-                                                    const confirmed = confirm(`⚠️ Confirm Update\n\nAre you sure you want to overwrite "${credentialName}"?\n\nThis will replace:\n• Provider & Model\n• API Key\n• Endpoint URL\n• Max Tokens & Temperature\n\nThis action cannot be undone.`);
-                                                    if (!confirmed) return;
-                                                }
-                                                
-                                                try {
-                                                    const provider = document.getElementById('llm-provider').value;
-                                                    const endpointUrlInput = document.getElementById('llm-endpoint-url');
-                                                    
-                                                    const response = await fetch('/api/credentials', {
-                                                        method: 'POST',
-                                                        headers: { 'Content-Type': 'application/json' },
-                                                        body: JSON.stringify({
-                                                            name: credentialName.trim(),
-                                                            provider: provider,
-                                                            api_key: document.getElementById('llm-api-key').value,
-                                                            model: document.getElementById('llm-model').value,
-                                                            endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : null,
-                                                            max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
-                                                            temperature: parseFloat(document.getElementById('llm-temperature').value)
-                                                        })
-                                                    });
-                                                    
-                                                    if (response.ok) {
-                                                        // Close modal
-                                                        setIsCredentialModalOpen(false);
-                                                        setCredentialName('');
-                                                        const wasUpdate = isUpdateMode;
-                                                        setIsUpdateMode(false);
-                                                        
-                                                        // Refresh credential list
-                                                        await loadCredentials();
-                                                        
-                                                        // Show success message
-                                                        const successDiv = document.createElement('div');
-                                                        successDiv.className = `fixed top-6 right-6 ${wasUpdate ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600' : 'bg-green-600 text-white'} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
-                                                        successDiv.innerHTML = `
-                                                            <div class="flex items-center gap-3">
-                                                                <i class="fas ${wasUpdate ? 'fa-sync-alt' : 'fa-check-circle'} text-2xl"></i>
-                                                                <div>
-                                                                    <p class="font-bold text-base">Credential ${wasUpdate ? 'Updated' : 'Saved'}!</p>
-                                                                    <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${credentialName}</p>
-                                                                </div>
-                                                            </div>
-                                                        `;
-                                                        document.body.appendChild(successDiv);
-                                                        setTimeout(() => {
-                                                            successDiv.style.animation = 'none';
-                                                            successDiv.style.opacity = '0';
-                                                            successDiv.style.transition = 'opacity 0.3s';
-                                                            setTimeout(() => successDiv.remove(), 300);
-                                                        }, 2500);
-                                                    } else {
-                                                        const error = await response.json();
-                                                        alert('Failed to save credential: ' + (error.detail || 'Unknown error'));
-                                                    }
-                                                } catch (error) {
-                                                    alert('Error saving credential: ' + error.message);
-                                                }
-                                            }}
-                                            disabled={!credentialName.trim()}
-                                            className={`flex-1 px-4 py-2 ${isUpdateMode ? 'bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600' : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white'} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`}
-                                        >
-                                            <i className={`mr-2 ${isUpdateMode ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
-                                            {isUpdateMode ? 'Update Credential' : 'Save Credential'}
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                    
-                    {/* MCP Configuration Save Modal */}
-                    {isMCPSaveModalOpen && (
-                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                            <div className={`rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
-                                {/* Header */}
-                                <div className={`px-6 py-4 rounded-t-xl ${loadedMCPConfigName ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 text-white'}`}>
-                                    <div className="flex items-center justify-between">
-                                        <div className="flex items-center gap-3">
-                                            <i className={`text-2xl ${loadedMCPConfigName ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
-                                            <h2 className="text-xl font-bold">{loadedMCPConfigName ? 'Update' : 'Save'} MCP Configuration</h2>
-                                        </div>
-                                        <button
-                                            onClick={() => {
-                                                setIsMCPSaveModalOpen(false);
-                                                setMCPConfigName('');
-                                                setMCPConfigDescription('');
-                                            }}
-                                            className={`transition-colors ${loadedMCPConfigName ? 'text-gray-900 hover:text-gray-600' : 'text-white hover:text-gray-200'}`}
-                                        >
-                                            <i className="fas fa-times text-xl"></i>
-                                        </button>
-                                    </div>
-                                </div>
-                                
-                                {/* Content */}
-                                <div className="p-6">
-                                    {loadedMCPConfigName ? (
-                                        <div className="bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4">
-                                            <div className="flex items-start">
-                                                <i className="fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5"></i>
-                                                <div>
-                                                    <p className="text-sm font-bold text-gray-900 mb-1">⚠️ Update Warning</p>
-                                                    <p className="text-sm text-gray-800">
-                                                        You are about to overwrite the existing configuration "<strong className="text-gray-900">{mcpConfigName}</strong>". 
-                                                        This will replace all settings with your current configuration. This action cannot be undone.
-                                                    </p>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ) : (
-                                        <p className={`text-sm mb-4 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            Save your current MCP server settings as a named configuration for quick access later.
-                                        </p>
-                                    )}
-                                    
-                                    <div className="mb-4">
-                                        <label className={`block text-sm font-medium mb-2 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
-                                            Configuration Name <span className="text-red-500">*</span>
-                                        </label>
-                                        <input
-                                            type="text"
-                                            value={mcpConfigName}
-                                            onChange={(e) => setMCPConfigName(e.target.value)}
-                                            placeholder="e.g., Production Splunk, Dev Environment"
-                                            className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
-                                            disabled={loadedMCPConfigName}
-                                            autoFocus={!loadedMCPConfigName}
-                                        />
-                                        {loadedMCPConfigName && (
-                                            <p className={`text-xs mt-1 italic ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>Configuration name cannot be changed when updating</p>
-                                        )}
-                                    </div>
-                                    
-                                    <div className="mb-6">
-                                        <label className={`block text-sm font-medium mb-2 ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>
-                                            Description (Optional)
-                                        </label>
-                                        <input
-                                            type="text"
-                                            value={mcpConfigDescription}
-                                            onChange={(e) => setMCPConfigDescription(e.target.value)}
-                                            placeholder="e.g., Main production Splunk server"
-                                            className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
-                                        />
-                                    </div>
-                                    
-                                    {/* Preview */}
-                                    <div className={`rounded-lg p-4 mb-6 border ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                        <h4 className={`text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>Current Settings Preview</h4>
-                                        <div className={`space-y-1 text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            <div><span className="font-medium">URL:</span> {config?.mcp?.url || 'N/A'}</div>
-                                            <div><span className="font-medium">Token:</span> {config?.mcp?.token ? '***' : 'Not set'}</div>
-                                            <div><span className="font-medium">Verify SSL:</span> {config?.mcp?.verify_ssl ? 'Yes' : 'No'}</div>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* Actions */}
-                                    <div className="flex gap-3">
-                                        <button
-                                            onClick={() => {
-                                                setIsMCPSaveModalOpen(false);
-                                                setMCPConfigName('');
-                                                setMCPConfigDescription('');
-                                            }}
-                                            className={`flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}
-                                        >
-                                            Cancel
-                                        </button>
-                                        <button
-                                            onClick={async () => {
-                                                if (!mcpConfigName.trim()) {
-                                                    alert('Please enter a configuration name');
-                                                    return;
-                                                }
-                                                
-                                                // Additional confirmation for updates
-                                                if (loadedMCPConfigName) {
-                                                    const confirmed = confirm(`⚠️ Confirm Update\n\nAre you sure you want to overwrite "${mcpConfigName}"?\n\nThis will replace:\n• MCP URL\n• Token\n• SSL Settings\n• Description\n\nThis action cannot be undone.`);
-                                                    if (!confirmed) return;
-                                                }
-                                                
-                                                try {
-                                                    const response = await fetch('/api/mcp-configs', {
-                                                        method: 'POST',
-                                                        headers: { 'Content-Type': 'application/json' },
-                                                        body: JSON.stringify({
-                                                            name: mcpConfigName.trim(),
-                                                            url: document.getElementById('mcp-url').value,
-                                                            token: document.getElementById('mcp-token').value || config.mcp.token,
-                                                            verify_ssl: document.getElementById('mcp-verify-ssl').checked,
-                                                            description: mcpConfigDescription.trim() || null
-                                                        })
-                                                    });
-                                                    
-                                                    if (response.ok) {
-                                                        // Close modal
-                                                        setIsMCPSaveModalOpen(false);
-                                                        const savedName = mcpConfigName.trim();
-                                                        const wasUpdate = loadedMCPConfigName;
-                                                        setMCPConfigName('');
-                                                        setMCPConfigDescription('');
-                                                        
-                                                        // Refresh MCP configs list
-                                                        await loadMCPConfigs();
-                                                        
-                                                        // Show success message
-                                                        const successDiv = document.createElement('div');
-                                                        successDiv.className = `fixed top-6 right-6 ${wasUpdate ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600' : 'bg-green-600 text-white'} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
-                                                        successDiv.innerHTML = `
-                                                            <div class="flex items-center gap-3">
-                                                                <i class="fas ${wasUpdate ? 'fa-sync-alt' : 'fa-check-circle'} text-2xl"></i>
-                                                                <div>
-                                                                    <p class="font-bold text-base">Configuration ${wasUpdate ? 'Updated' : 'Saved'}!</p>
-                                                                    <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${savedName}</p>
-                                                                </div>
-                                                            </div>
-                                                        `;
-                                                        document.body.appendChild(successDiv);
-                                                        setTimeout(() => {
-                                                            successDiv.style.animation = 'none';
-                                                            successDiv.style.opacity = '0';
-                                                            successDiv.style.transition = 'opacity 0.3s';
-                                                            setTimeout(() => successDiv.remove(), 300);
-                                                        }, 2500);
-                                                    } else {
-                                                        const error = await response.json();
-                                                        alert('Failed to save configuration: ' + (error.detail || 'Unknown error'));
-                                                    }
-                                                } catch (error) {
-                                                    alert('Error saving configuration: ' + error.message);
-                                                }
-                                            }}
-                                            disabled={!mcpConfigName.trim()}
-                                            className={`flex-1 px-4 py-2 ${loadedMCPConfigName ? 'bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white'} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`}
-                                        >
-                                            <i className={`mr-2 ${loadedMCPConfigName ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
-                                            {loadedMCPConfigName ? 'Update Configuration' : 'Save Configuration'}
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                </div>
-            );
-        }
-        
-        // Global error handler to catch unhandled errors
-        window.addEventListener('error', (event) => {
-            console.error('Global error caught:', event.error);
-            // Prevent white screen by not letting the error propagate
-            event.preventDefault();
-        });
-        
-        window.addEventListener('unhandledrejection', (event) => {
-            console.error('Unhandled promise rejection:', event.reason);
-            // Prevent white screen
-            event.preventDefault();
-        });
-        
-        ReactDOM.render(
-            <ErrorBoundary>
-                <App />
-            </ErrorBoundary>,
-            document.getElementById('root')
-        );
-    </script>
-</body>
-</html>
-    """
 
 
 if __name__ == "__main__":

@@ -252,6 +252,22 @@ function Install-Dependencies {
     New-Manifest $pythonVersion $pipVersion
 }
 
+function Test-FrontendBundleSync {
+    param([string]$PythonExecutable)
+
+    $syncCheckScript = Join-Path $INSTALL_DIR "tools\check_frontend_sync.py"
+    if (-not (Test-Path $syncCheckScript)) {
+        return
+    }
+
+    & $PythonExecutable $syncCheckScript --quiet
+    if ($LASTEXITCODE -ne 0) {
+        Write-ColorMsg $ColorYellow "⚠ Frontend static assets are out of sync with src\web_app.py."
+        Write-ColorMsg $ColorYellow "  The app can still start, but the shipped static frontend may be stale."
+        Write-ColorMsg $ColorBlue "  Run: npm run build:frontend"
+    }
+}
+
 # Start service
 function Start-DT4SMSService {
     # Check if already running
@@ -272,6 +288,8 @@ function Start-DT4SMSService {
         Write-ColorMsg $ColorYellow "Run .\install.ps1 first to install dependencies."
         exit 1
     }
+
+    Test-FrontendBundleSync -PythonExecutable $venvPython
 
     # Ensure log file exists
     if (-not (Test-Path $LOG_FILE)) {

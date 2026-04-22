@@ -3,7 +3,6 @@ SPL Query Generator - Creates contextual Splunk queries based on discovered data
 """
 
 from typing import Dict, List, Any
-import json
 
 
 class SPLGenerator:

@@ -5,9 +5,8 @@ This module analyzes executive summaries, detailed findings, and classification 
 to generate highly targeted SPL queries that address specific issues discovered.
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 import re
-import json
 
 
 class ReportAnalyzer:
