@@ -45,13 +45,9 @@ The goal is to move from ad hoc chat findings to a repeatable review package tha
 - `FINDINGS_REGISTER.md` for the working issue ledger
 - `REMEDIATION_ISSUE_TEMPLATE.md` for implementation-ready follow-up tickets
 - `PUBLIC_APP_READINESS_FINDINGS_REPORT.md` for the current consolidated report
-- `docs/exec_ctrl/PUBLIC_APP_READINESS_EXEC_CTRL.md` for the governing control record
-- `docs/exec_ctrl/PUBLIC_APP_READINESS_AUDIT_LOG.md` for audit checkpoints and evidence
-- `docs/exec_ctrl/PUBLIC_APP_READINESS_DECISION_LOG.md` for scope and severity decisions
 
 ## Current Execution Status
 
-- the public-readiness effort is now governed under `exec-ctrl`
 - the audited semantics, control-integrity, contrast, and public-language issues have been remediated and revalidated against `http://localhost:8003`
 - contrast review explicitly covered buttons, cards, badges, disclosures, expandable surfaces, and modal/tab shells during the live audit
 - the current release gate recommendation is ready for controlled preview and public-facing use without an open medium-severity delivery-model finding in the runtime shell

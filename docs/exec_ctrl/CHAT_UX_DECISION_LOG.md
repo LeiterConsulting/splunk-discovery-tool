@@ -1,8 +1,0 @@
-# Chat UX Refinement Decision Log
-
-| ID | Date | Decision | Rationale | Consequence |
-| --- | --- | --- | --- | --- |
-| D-001 | 2026-04-20 | Govern the chat UX refinement under a dedicated `chat-ux` `exec-ctrl` initiative | The requested work spans backend follow-on logic, persisted chat context, frontend behavior, and validation evidence | The slice is tracked through its own control, audit, and decision records rather than reopening the completed optional-capabilities initiative |
-| D-002 | 2026-04-20 | Drive Suggested Next Actions from the latest tool summary before focus-based fallbacks | The code already computes `query_shape`, `top_dimensions`, `time_bounds`, `findings`, and `next_pivots`, but the old routing did not use them strongly enough | Follow-on actions now vary by immediate output shape and only fall back to broader focus prompts when the latest output lacks strong anchors |
-| D-003 | 2026-04-20 | Preserve capability evidence but collapse it by default | Capability evidence is valuable, but keeping it expanded by default makes the chat card noisy and pushes the operator away from the answer body | The evidence stays available through the existing disclosure control while default message density is reduced |
-| D-004 | 2026-04-20 | Centralize chat reopen behavior in the `isChatOpen` effect | Chat can be opened from multiple UI entry points, so scroll positioning must not depend on any one call site | Opening chat now consistently focuses the input and scrolls the modal to the latest message regardless of which control opened it |

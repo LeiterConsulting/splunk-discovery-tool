@@ -6658,7 +6658,7 @@ ${query.spl}`,
         onChange: handleSettingsChange,
         disabled: isOpenAIImageModelSelected
       }
-    ), isOpenAIImageModelSelected && /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-xs text-amber-700" }, "gpt-image-2 uses the OpenAI images API. max_tokens is ignored for summary infographic generation, and chat or exec-ctrl still require a text-capable model.")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "Temperature"), /* @__PURE__ */ React.createElement(
+    ), isOpenAIImageModelSelected && /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-xs text-amber-700" }, "gpt-image-2 uses the OpenAI images API. max_tokens is ignored for summary infographic generation, and text-generation features still require a text-capable model.")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "Temperature"), /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "number",

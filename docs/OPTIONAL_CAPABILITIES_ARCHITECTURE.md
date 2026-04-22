@@ -1,14 +1,5 @@
 # Optional Capabilities Architecture
 
-This initiative is governed by `exec-ctrl`.
-
-Control artifacts:
-
-- `docs/EXEC_CTRL.md`
-- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_EXEC_CTRL.md`
-- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_AUDIT_LOG.md`
-- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_DECISION_LOG.md`
-
 ## Intent
 
 This document explores an optional capabilities model for DT4SMS that adds:

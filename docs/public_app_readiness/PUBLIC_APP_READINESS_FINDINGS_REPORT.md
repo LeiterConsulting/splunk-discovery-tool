@@ -97,6 +97,6 @@ Frontend delivery drift was addressed as a deliberate hardening workstream rathe
 
 ## Conclusion
 
-The audited public-app shell no longer has active blocker, high-severity, or medium-severity interaction-level UX/accessibility defects in its primary audited surfaces. The app is materially stronger than it was at the start of this exec-ctrl slice.
+The audited public-app shell no longer has active blocker, high-severity, or medium-severity interaction-level UX/accessibility defects in its primary audited surfaces. The app is materially stronger than it was at the start of this audit effort.
 
 What remains open is now narrower than it was before: a future cleanup may remove the legacy inline fallback, but the architectural delivery risk itself is no longer open for the public runtime path.

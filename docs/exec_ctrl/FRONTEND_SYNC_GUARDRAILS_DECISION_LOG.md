@@ -1,7 +1,0 @@
-# Frontend Sync Guardrails Decision Log
-
-| ID | Date | Decision | Rationale | Consequence |
-| --- | --- | --- | --- | --- |
-| D-001 | 2026-04-20 | Govern frontend bundle drift detection under a dedicated follow-up initiative | Frontend delivery hardening fixed the runtime path, but it did not yet guarantee that later edits would keep `src/static/` aligned with `src/web_app.py` | The repo now tracks drift detection as a separate bounded guardrail slice rather than reopening the delivery migration itself |
-| D-002 | 2026-04-20 | Use a generated build manifest instead of rebuilding inside the Python test suite | The repo already has a Python-first validation path, and forcing the unittest suite to invoke Node would make local enforcement slower and more fragile | Python validation now compares current source and artifact hashes against a recorded manifest without rebuilding the bundle during the check |
-| D-003 | 2026-04-20 | Enforce drift detection through the existing unittest gate and installer warnings before adding CI work | There is no current GitHub Actions pipeline in the repo, but `unittest discover -v` and the installers are already normal execution paths | The guardrail works today in the repo’s real workflows, while CI automation remains optional future improvement |

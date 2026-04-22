@@ -1,7 +1,0 @@
-# Chat UX Refinement Audit Log
-
-| Date | Checkpoint | Evidence Reviewed | Verdict | Gaps | Next Action |
-| --- | --- | --- | --- | --- | --- |
-| 2026-04-20 | Baseline audit | `docs/EXEC_CTRL.md`, `src/web_app.py` follow-on generation helpers, `src/web_app.py` chat modal JSX and open-state effects | `pass-with-gaps` | Suggested next actions were relying too heavily on coarse focus fallbacks, Capability Evidence rendered open by default, and chat reopen did not land at the bottom of persisted history | Create a dedicated `chat-ux` control pack and implement the three requested changes together |
-| 2026-04-20 | Build and regression audit | `src/web_app.py`, `tests/test_chat_and_llm_helpers.py`, `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -m unittest tests.test_chat_and_llm_helpers -v` | `pass` | No open automated-test gaps remained in the targeted helper surface after the new follow-on regressions were added | Restart the app and complete live browser verification for the two UI-only behaviors |
-| 2026-04-20 | Completion audit | `./install.ps1 -Restart`, live browser DOM checks for `Capability Evidence` and chat scroll position, `docs/exec_ctrl/CHAT_UX_EXEC_CTRL.md`, `docs/exec_ctrl/CHAT_UX_DECISION_LOG.md` | `pass` | No must-pass gaps remain | Mark the initiative complete and use the control pack as the baseline if chat UX is reopened later |

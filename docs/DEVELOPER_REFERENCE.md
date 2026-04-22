@@ -173,24 +173,3 @@ Every button should communicate purpose:
 For the proposed optional RAG and installable enhancement-pack model, see:
 
 - `docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md`
-
-## 12) Execution Control
-
-The optional capabilities initiative is governed by the engineering control process in:
-
-- `docs/EXEC_CTRL.md`
-- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_EXEC_CTRL.md`
-- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_AUDIT_LOG.md`
-- `docs/exec_ctrl/OPTIONAL_CAPABILITIES_DECISION_LOG.md`
-- `docs/exec_ctrl/RAG_KNOWLEDGE_ASSET_PLANE_EXEC_CTRL.md`
-- `docs/exec_ctrl/RAG_KNOWLEDGE_ASSET_PLANE_AUDIT_LOG.md`
-- `docs/exec_ctrl/RAG_KNOWLEDGE_ASSET_PLANE_DECISION_LOG.md`
-- `docs/exec_ctrl/FRONTEND_DELIVERY_HARDENING_EXEC_CTRL.md`
-- `docs/exec_ctrl/FRONTEND_DELIVERY_HARDENING_AUDIT_LOG.md`
-- `docs/exec_ctrl/FRONTEND_DELIVERY_HARDENING_DECISION_LOG.md`
-- `docs/exec_ctrl/FRONTEND_SYNC_GUARDRAILS_EXEC_CTRL.md`
-- `docs/exec_ctrl/FRONTEND_SYNC_GUARDRAILS_AUDIT_LOG.md`
-- `docs/exec_ctrl/FRONTEND_SYNC_GUARDRAILS_DECISION_LOG.md`
-- `docs/exec_ctrl/REPO_VALIDATION_AUTOMATION_EXEC_CTRL.md`
-- `docs/exec_ctrl/REPO_VALIDATION_AUTOMATION_AUDIT_LOG.md`
-- `docs/exec_ctrl/REPO_VALIDATION_AUTOMATION_DECISION_LOG.md`

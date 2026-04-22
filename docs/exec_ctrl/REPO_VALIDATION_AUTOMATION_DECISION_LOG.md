@@ -1,7 +1,0 @@
-# Repo Validation Automation Decision Log
-
-| ID | Date | Decision | Rationale | Consequence |
-| --- | --- | --- | --- | --- |
-| D-001 | 2026-04-20 | Govern repo validation automation as its own follow-up initiative | Frontend sync guardrails closed the local enforcement gap, but the repo still relied on developer discipline because nothing ran automatically on push or pull request | The repo now tracks hosted validation automation as a bounded `exec-ctrl` slice instead of reopening earlier frontend-delivery work |
-| D-002 | 2026-04-20 | Reuse the existing documented local gate sequence in CI | The repo already had a clear validation path for frontend build, sync, lint, compile, and unittest checks, so introducing a separate CI-only harness would create drift and duplicate maintenance | GitHub Actions now mirrors the same commands developers are expected to run locally |
-| D-003 | 2026-04-20 | Run repo validation on both Ubuntu and Windows runners | The repo has already encountered Windows-sensitive path and line-ending issues in the frontend delivery path, so Linux-only validation would leave a known gap open | Automated validation now exercises the same gate sequence across both hosted environments while leaving macOS as an explicit future follow-up |

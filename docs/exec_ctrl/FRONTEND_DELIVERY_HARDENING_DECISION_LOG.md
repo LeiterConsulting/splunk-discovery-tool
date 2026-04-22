@@ -1,8 +1,0 @@
-# Frontend Delivery Hardening Decision Log
-
-| ID | Date | Decision | Rationale | Consequence |
-| --- | --- | --- | --- | --- |
-| D-001 | 2026-04-20 | Govern `PAR-F009` under a dedicated frontend-delivery hardening initiative | The remaining risk was architectural and cross-cutting rather than another UX-polish item | The follow-up is tracked with its own control record, audit log, and decision log |
-| D-002 | 2026-04-20 | Use Node only as a build-time dependency and keep runtime startup free of Node requirements | DT4SMS is already installed and started through Python-first installers, and adding a Node runtime dependency would widen deployment scope | The repo now includes build tooling and checked-in runtime assets, but normal startup still works through the existing Python installer flow |
-| D-003 | 2026-04-20 | Keep the legacy inline frontend template as the build source and safe fallback for this slice | Rewriting the UI source layout would add churn and migration risk beyond what was needed to close the runtime delivery issue | FastAPI prefers `src/static/index.html`, but developers can still fall back to `get_frontend_html()` if generated assets are temporarily missing |
-| D-004 | 2026-04-20 | Pin the local frontend vendor versions to the verified runtime-compatible set | The previous issue was partly about uncontrolled delivery drift, so the hardening slice should narrow rather than widen version movement | The build pipeline now vendors pinned React, ReactDOM, Tailwind `2.2.19`, Font Awesome `6.0.0`, and a fixed esbuild version |
