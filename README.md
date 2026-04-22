@@ -85,8 +85,12 @@ After startup, open the URL printed in the console (typically **http://localhost
 install.ps1 / install.sh       Installer + service control
 src/main.py                    Runtime entrypoint
 src/web_app.py                 FastAPI API + embedded React UI
+src/static/                    Shipped local frontend bundle
 src/discovery/v2_pipeline.py   V2 discovery pipeline + artifact packaging
 src/config_manager.py          Encrypted config manager
+tools/build_frontend.mjs       Rebuild shipped frontend assets from the inline source
+tools/check_frontend_sync.py   Validate frontend bundle sync before release
+.github/workflows/repo-validation.yml  GitHub Actions validation workflow for repo quality gates
 output/                        Discovery and summary artifacts
 ```
 
@@ -159,9 +163,26 @@ $env:PIP_INDEX_URL = "https://pypi.org/simple"
 .\install.ps1
 ```
 
+### Frontend changes are not showing up or startup warns about stale assets
+
+- The shipped UI is served from checked-in files under `src/static/`.
+- After editing the legacy inline frontend source in `src/web_app.py`, rebuild and verify the shipped bundle:
+
+```bash
+npm run build:frontend
+python tools/check_frontend_sync.py
+```
+
+- To run the deterministic browser regression for visualization previews, install the Chromium test browser once and run:
+
+```bash
+npx playwright install chromium
+npm run test:browser
+```
+
 ## 🤝 Contributing
 
-Contributions are welcome via pull requests.
+Contributions are welcome via pull requests. Repo validation is also mirrored in `.github/workflows/repo-validation.yml`, which runs the documented frontend build, sync, browser regression, lint, compile, and unittest gates on GitHub-hosted runners.
 
 ## 📄 License
 

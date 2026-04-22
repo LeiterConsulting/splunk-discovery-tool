@@ -259,3 +259,4 @@ Current and recent initiative control records include:
 - `docs/exec_ctrl/OPTIONAL_CAPABILITIES_EXEC_CTRL.md`
 - `docs/exec_ctrl/CHAT_UX_EXEC_CTRL.md`
 - `docs/exec_ctrl/PUBLIC_APP_READINESS_EXEC_CTRL.md`
+- `docs/exec_ctrl/REPO_VALIDATION_AUTOMATION_EXEC_CTRL.md`

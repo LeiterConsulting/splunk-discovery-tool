@@ -51,6 +51,7 @@ output/
 *.swo
 *~
 .DS_Store
+node_modules/
 
 # Logs
 *.log
@@ -79,6 +80,7 @@ PERFORMANCE_OPTIMIZATION.md
 PHASE1_TESTING_REPORT.md
 docs/THEME_SWITCH_PLAN.md
 docs/internal/
+docs/exec_ctrl
 
 # Environment
 .env

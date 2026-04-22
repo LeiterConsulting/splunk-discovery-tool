@@ -1,0 +1,6 @@
+# Frontend Sync Guardrails Audit Log
+
+| Date | Checkpoint | Evidence Reviewed | Verdict | Gaps | Next Action |
+| --- | --- | --- | --- | --- | --- |
+| 2026-04-20 | Baseline audit | `docs/exec_ctrl/FRONTEND_DELIVERY_HARDENING_EXEC_CTRL.md`, `src/web_app.py`, `src/static/`, `package.json` | `pass-with-gaps` | The repo could ship a good local frontend bundle, but nothing in the Python validation path failed when `src/web_app.py` and `src/static/` drifted apart | Add a deterministic build manifest and a Python-readable sync check wired into existing quality gates |
+| 2026-04-20 | Guardrail implementation audit | `tools/build_frontend.mjs`, `src/frontend_delivery.py`, `tools/check_frontend_sync.py`, `tests/test_frontend_delivery.py`, `install.ps1`, `install.sh`, `npm run build:frontend`, `python tools/check_frontend_sync.py`, `python -m unittest discover -v`, and forced-manifest-mismatch validation through `./install.ps1 -Restart` followed by rebuild restore | `pass` | The remaining enforcement gap is future CI automation, but local and release-path guardrails are now in place and the installer warning path has direct evidence | Close the initiative and treat CI expansion only as optional future follow-up |

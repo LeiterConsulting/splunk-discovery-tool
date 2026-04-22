@@ -1,0 +1,6 @@
+# Frontend Delivery Hardening Audit Log
+
+| Date | Checkpoint | Evidence Reviewed | Verdict | Gaps | Next Action |
+| --- | --- | --- | --- | --- | --- |
+| 2026-04-20 | Baseline audit | `docs/public_app_readiness/FINDINGS_REGISTER.md`, `docs/exec_ctrl/PUBLIC_APP_READINESS_EXEC_CTRL.md`, `src/web_app.py` | `pass-with-gaps` | The runtime shell still loaded React, ReactDOM, Tailwind, Font Awesome, and Babel from CDNs, and the app still depended on an inline `text/babel` script | Create a dedicated hardening initiative and replace the runtime delivery model with local static assets |
+| 2026-04-20 | Build and runtime validation audit | `package.json`, `tools/render_frontend_template.py`, `tools/build_frontend.mjs`, `src/static/index.html`, `src/static/app.js`, `src/static/vendor/`, `src/web_app.py`, `npm run build:frontend`, and live reload at `http://localhost:8003` | `pass` | The legacy inline frontend template remains as a build source and fallback, but the shipped runtime path no longer uses CDN assets or browser-side Babel | Close the initiative, keep the frontend build step in the release path, and leave inline-template removal as optional future cleanup |

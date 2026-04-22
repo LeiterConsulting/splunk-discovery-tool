@@ -54,5 +54,6 @@ The goal is to move from ad hoc chat findings to a repeatable review package tha
 - the public-readiness effort is now governed under `exec-ctrl`
 - the audited semantics, control-integrity, contrast, and public-language issues have been remediated and revalidated against `http://localhost:8003`
 - contrast review explicitly covered buttons, cards, badges, disclosures, expandable surfaces, and modal/tab shells during the live audit
-- the current release gate recommendation is ready for controlled preview and public-facing use with one documented architectural follow-up
-- the remaining follow-up backlog is now limited to frontend delivery hardening around CDN-delivered assets and in-browser Babel
+- the current release gate recommendation is ready for controlled preview and public-facing use without an open medium-severity delivery-model finding in the runtime shell
+- the repo now also has lightweight drift-detection gates through `ruff.toml`, strict compile validation for the embedded frontend string, and a local static-frontend build step through `npm run build:frontend`
+- frontend delivery hardening is now implemented through checked-in local static assets served from `src/static/`, with the legacy inline frontend retained only as a build source and fallback

@@ -1,0 +1,6 @@
+# Repo Validation Automation Audit Log
+
+| Date | Checkpoint | Evidence Reviewed | Verdict | Gaps | Next Action |
+| --- | --- | --- | --- | --- | --- |
+| 2026-04-20 | Baseline audit | `README.md`, `docs/DEVELOPER_REFERENCE.md`, `package.json`, `requirements.txt`, `requirements-dev.txt`, `.github/` | `pass-with-gaps` | The repo had documented local validation commands and frontend drift guardrails, but no workflow automation existed under `.github/workflows/` | Add a GitHub Actions workflow that mirrors the documented local gates and update the repo guidance accordingly |
+| 2026-04-20 | Completion audit | `.github/workflows/repo-validation.yml`, `README.md`, `docs/DEVELOPER_REFERENCE.md`, `docs/EXEC_CTRL.md`, `npm run build:frontend`, `python tools/check_frontend_sync.py`, `python -m ruff check src tests`, `python -W error::SyntaxWarning -m compileall -q src tests`, `python -m unittest discover -v` | `pass-with-gaps` | The workflow was added and local gate parity was validated, but the first hosted GitHub Actions run cannot be observed from this local workspace without a remote push or manual dispatch in the repository | After the next push or manual dispatch, record the first hosted run outcome and decide whether branch protection should require the new check |

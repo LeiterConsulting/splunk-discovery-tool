@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### 🧩 V2 Workspace & Summarization UX Hardening
 
 #### Added
+- **Repo Validation Automation**
+  - GitHub Actions workflow at `.github/workflows/repo-validation.yml`
+  - Push, pull request, and manual validation for frontend build, frontend sync, Ruff, strict compile, and unittest gates
+  - Ubuntu and Windows runner coverage to catch OS-sensitive path and line-ending regressions earlier
+
+- **Frontend Bundle Sync Guardrails**
+  - Build manifest generation for shipped frontend assets in `src/static/build-manifest.json`
+  - Python sync checker at `tools/check_frontend_sync.py` for source-to-bundle drift detection
+  - Unittest coverage that fails when `src/web_app.py` and `src/static/` fall out of sync
+  - Installer start warnings when stale frontend assets are detected
+
+#### Added
 - **V2 Workspace Surfaces (UI + API integration)**
   - Unified static top bar with Mission / Intelligence / Artifacts workflow tabs
   - Intelligence workspace bindings to `/api/discovery/dashboard`, `/api/discovery/compare`, `/api/discovery/runbook`, and `/api/v2/intelligence`

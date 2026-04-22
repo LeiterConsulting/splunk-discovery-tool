@@ -116,6 +116,12 @@ Every button should communicate purpose:
 - `GET /api/v2/artifacts` → V2 artifact catalog
 - `GET /api/capabilities` → Capability registry with persisted state
 - `GET /api/capabilities/health` → Capability health snapshot
+- `GET /api/capabilities/rag/assets` → Managed RAG knowledge-asset catalog
+- `GET /api/capabilities/rag/assets/{asset_id}` → Managed knowledge-asset detail with stored sections and chunk-browser output
+- `POST /api/capabilities/rag/assets/import/text` → Import pasted text as a managed knowledge asset
+- `POST /api/capabilities/rag/assets/import/file` → Import a supported text-based file as a managed knowledge asset
+- `POST /api/capabilities/rag/assets/{asset_id}/delete` → Delete a managed knowledge asset
+- `POST /api/capabilities/rag/context/build` → Build an operator-facing context preview from indexed managed knowledge assets, including traceable chunk references for matched assets
 - `POST /api/capabilities/{name}/install` → Install or prepare a capability
 - `POST /api/capabilities/{name}/enable` → Enable an installed capability
 - `POST /api/capabilities/{name}/disable` → Disable a capability
@@ -128,10 +134,33 @@ Every button should communicate purpose:
 ### Capability notes
 
 - `rag_chromadb` persists an `index_summary` alongside the local Chroma storage and surfaces that summary through `GET /api/capabilities`
+- `rag_chromadb` now also supports managed knowledge assets stored under a capability-controlled asset directory, with catalog/list/delete behavior exposed through dedicated RAG endpoints
+- managed knowledge assets now persist deterministic focus terms, key points, and usage guidance so preview results can explain why an asset matched and how it should be used
+- managed knowledge assets refresh stored derived sections on load, and preview/search requests auto-reindex before retrieval if managed-asset timestamps are newer than the last Chroma index build
+- `GET /api/capabilities/rag/assets/{asset_id}` returns a single managed asset plus stored-section detail and a chunk-browser payload generated from the same sectioning logic used by the indexer
+- `/api/capabilities/rag/context/build` returns raw matched chunks plus an operator brief, recommended uses, basic coverage-gap signals, and stable matched-chunk identifiers that map back to asset-detail chunk-browser sections
+- managed knowledge assets currently support pasted text plus `.md`, `.txt`, `.json`, `.log`, `.csv`, `.pdf`, and `.docx` uploads; richer document ingestion is intentionally deferred beyond staged PDF and DOCX extraction
 - Chroma indexing uses a deterministic local hash-based embedding function so optional retrieval works without downloading an external embedding model
 - `splunk_deeplink_tools` derives a Splunk Web base URL from `config.mcp.url` by default, supports a `web_base_url` override in capability config, and currently ships search deeplinks first
 
-## 9) Build-Your-Own Checklist
+## 9) Quality Gates
+
+- lightweight repo linting now lives in `ruff.toml` with developer install support in `requirements-dev.txt`
+- current lint baseline is intentionally narrow and correctness-focused: unused imports, undefined names, invalid local scope references, and syntax-level failures
+- the public frontend now ships from checked-in local static assets under `src/static/`; rebuild them with `npm run build:frontend` whenever the legacy inline frontend source in `src/web_app.py` changes
+- `src/static/build-manifest.json` now records the expected source and artifact hashes for the shipped frontend bundle so drift can be detected without rebuilding during Python validation
+- `.github/workflows/repo-validation.yml` now mirrors the documented local validation gates on GitHub-hosted Ubuntu and Windows runners for `push`, `pull_request`, and manual dispatch
+- recommended validation commands for hardening work are:
+   - `npm run build:frontend`
+   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe tools/check_frontend_sync.py`
+   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -m ruff check src tests`
+   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -W error::SyntaxWarning -m compileall -q src tests`
+   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -m unittest discover -v`
+- because the frontend is embedded inside a Python string in `src/web_app.py`, CSS selectors and JavaScript regex literals must keep Python-safe escaping or strict compile validation will fail
+- `tools/render_frontend_template.py` renders the legacy inline template, and `tools/build_frontend.mjs` transpiles its JSX plus vendors pinned local assets so runtime delivery no longer depends on CDN-hosted React, Tailwind, Font Awesome, or in-browser Babel
+- `tools/check_frontend_sync.py` and `tests/test_frontend_delivery.py` now enforce that the shipped static bundle still matches the legacy inline frontend source before release
+
+## 10) Build-Your-Own Checklist
 
 - Replace discovery recommendation logic with domain controls
 - Add custom deterministic intents for your data model
@@ -139,13 +168,13 @@ Every button should communicate purpose:
 - Add org-specific KPI cards over capability_graph and finding_ledger
 - Keep settings contract stable for operator familiarity
 
-## 10) Optional Capabilities
+## 11) Optional Capabilities
 
 For the proposed optional RAG and installable enhancement-pack model, see:
 
 - `docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md`
 
-## 11) Execution Control
+## 12) Execution Control
 
 The optional capabilities initiative is governed by the engineering control process in:
 
@@ -153,3 +182,15 @@ The optional capabilities initiative is governed by the engineering control proc
 - `docs/exec_ctrl/OPTIONAL_CAPABILITIES_EXEC_CTRL.md`
 - `docs/exec_ctrl/OPTIONAL_CAPABILITIES_AUDIT_LOG.md`
 - `docs/exec_ctrl/OPTIONAL_CAPABILITIES_DECISION_LOG.md`
+- `docs/exec_ctrl/RAG_KNOWLEDGE_ASSET_PLANE_EXEC_CTRL.md`
+- `docs/exec_ctrl/RAG_KNOWLEDGE_ASSET_PLANE_AUDIT_LOG.md`
+- `docs/exec_ctrl/RAG_KNOWLEDGE_ASSET_PLANE_DECISION_LOG.md`
+- `docs/exec_ctrl/FRONTEND_DELIVERY_HARDENING_EXEC_CTRL.md`
+- `docs/exec_ctrl/FRONTEND_DELIVERY_HARDENING_AUDIT_LOG.md`
+- `docs/exec_ctrl/FRONTEND_DELIVERY_HARDENING_DECISION_LOG.md`
+- `docs/exec_ctrl/FRONTEND_SYNC_GUARDRAILS_EXEC_CTRL.md`
+- `docs/exec_ctrl/FRONTEND_SYNC_GUARDRAILS_AUDIT_LOG.md`
+- `docs/exec_ctrl/FRONTEND_SYNC_GUARDRAILS_DECISION_LOG.md`
+- `docs/exec_ctrl/REPO_VALIDATION_AUTOMATION_EXEC_CTRL.md`
+- `docs/exec_ctrl/REPO_VALIDATION_AUTOMATION_AUDIT_LOG.md`
+- `docs/exec_ctrl/REPO_VALIDATION_AUTOMATION_DECISION_LOG.md`

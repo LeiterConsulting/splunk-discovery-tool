@@ -63,11 +63,11 @@ Validated evidence:
 - the capability workspace now refreshes health on load, so updated wording appears without requiring a manual `Test`
 - `POST /api/capabilities/exports/build` returned `Report package generated.` and created `dt4sms_report_package_20260419_101515_admin_admin_discovery_package.zip`
 
-## Remaining Medium Follow-Up
+## Architectural Follow-Up Closure
 
-### PAR-F009: Frontend delivery choices still increase drift risk
+### PAR-F009: Frontend delivery hardening is now complete
 
-The UI still depends on CDN-delivered React, Tailwind `2.2.19`, Font Awesome, and in-browser Babel. The compatibility layer reduced the immediate user-facing risk, but the delivery model still makes styling regressions easier to ship.
+The UI now serves checked-in local static assets by default instead of relying on CDN-delivered React, Tailwind `2.2.19`, Font Awesome, and in-browser Babel. A build-time pipeline renders the legacy inline template, transpiles the JSX into `src/static/app.js`, and vendors pinned local runtime assets under `src/static/vendor/`, while the FastAPI app serves `src/static/index.html` at runtime.
 
 ## Cross-Cutting Patterns
 
@@ -82,21 +82,21 @@ The highest-severity fixes were effective because they targeted shared implement
 
 ### Remaining structural pattern
 
-The remaining open item is not an isolated bug either. Frontend delivery drift cuts across the entire public shell, so it should be handled as a deliberate hardening workstream rather than ad hoc polish.
+Frontend delivery drift was addressed as a deliberate hardening workstream rather than ad hoc polish. The runtime shell is now decoupled from live CDN asset resolution and from browser-side JSX compilation.
 
 ## Recommended Next Steps
 
-1. Decide whether to precompile the frontend or formally lock the supported CDN asset/version set so the compatibility shim does not become the only release guardrail.
-2. Add a lightweight release check that flags unexpected frontend asset/version drift before public releases.
+1. Keep `npm run build:frontend` in the release path whenever the legacy inline frontend source changes.
+2. Keep the lightweight release checks in the hardening path: `ruff check`, strict `compileall` with `SyntaxWarning` treated as error, and the full unittest suite.
 3. Keep the KPI/card and capability-language checks in future UI regression sweeps so this closeout state is preserved.
 
 ## Remaining Validation Gaps
 
 - exhaustive keyboard-flow testing outside the audited primary surfaces is still limited
-- the frontend delivery model remains a documented architectural follow-up rather than a closed remediation item
+- the legacy inline frontend template still exists as a build source and safe fallback, so a later cleanup slice could remove that duplication if the repo benefits from it
 
 ## Conclusion
 
 The audited public-app shell no longer has active blocker, high-severity, or medium-severity interaction-level UX/accessibility defects in its primary audited surfaces. The app is materially stronger than it was at the start of this exec-ctrl slice.
 
-What remains open is narrower and architectural rather than interaction-level: frontend delivery hardening. That follow-up is important enough to keep tracked, but it no longer prevents closing this public-readiness initiative or describing the current UI as ready for controlled public-facing use.
+What remains open is now narrower than it was before: a future cleanup may remove the legacy inline fallback, but the architectural delivery risk itself is no longer open for the public runtime path.

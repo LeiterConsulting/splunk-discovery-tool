@@ -205,11 +205,14 @@ What is complete now:
 - live modal checks verified chat, chat settings, settings, connection details, and summary shells as dialogs, with summary tab semantics present after async load
 - the capability workspace now uses operator-facing labels such as `Capability Management`, `Local Artifact Search`, `Indexed Artifact Search`, and `Report package generation is ready.`, with capability health refreshed on load so stale persisted copy does not leak into the UI
 - report package naming is now consistent across mission actions, capability status, API responses, and newly generated package files
+- lightweight repo guardrails now exist for latent-quality regressions: `ruff.toml`, `requirements-dev.txt`, strict `compileall` with `SyntaxWarning` as error, and full-suite unittest validation
+- the post-close hardening pass removed multiple stale imports and fixed a real `datetime` local-scope bug in `src/web_app.py` without reopening any closed UX findings
+- the runtime frontend shell now serves checked-in local static assets from `src/static/`, with `npm run build:frontend` generating `src/static/app.js` plus pinned local vendor assets instead of shipping CDN-hosted React, Tailwind, Font Awesome, and in-browser Babel
 - findings packaging artifacts now reflect the remediation outcome and the single deferred architectural follow-up
 
 Post-initiative follow-up:
 
-- the frontend delivery model still relies on CDN assets plus in-browser Babel and remains a medium-severity production-hardening risk tracked as `PAR-F009`
+- the previously deferred frontend delivery risk `PAR-F009` is now closed through a dedicated hardening slice, though the legacy inline frontend template remains available as a build source and safe fallback if local static assets are missing
 
 ## Validation Evidence
 
@@ -221,4 +224,8 @@ Post-initiative follow-up:
 - live chat validation showing explicit `aria-label` values on icon-only actions plus the send button and chat input
 - live capability-workspace validation showing `Capability Management`, `Local Artifact Search`, `Indexed Artifact Search`, `Create report packages for reports and presentations.`, `Report package generation is ready.`, and a human-readable latest-package label
 - API validation at `POST /api/capabilities/exports/build` returned `Report package generated.` and produced `dt4sms_report_package_20260419_101515_admin_admin_discovery_package.zip`
-- source inspection showing the compatibility layer in `src/web_app.py` now supplies the missing light-theme utility families while the frontend still depends on Tailwind CSS `2.2.19` plus in-browser Babel
+- source inspection showing the compatibility layer in `src/web_app.py` now supplies the missing light-theme utility families while the runtime shell serves `src/static/index.html` and local `/static/...` assets instead of CDN dependencies and in-browser Babel
+- `npm run build:frontend`
+- `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -m ruff check src tests`
+- `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -W error::SyntaxWarning -m compileall -q src tests`
+- `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -m unittest discover -v`
