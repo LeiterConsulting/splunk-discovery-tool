@@ -1,0 +1,15 @@
+target-version = "py313"
+src = ["src", "tests"]
+exclude = [
+    ".venv",
+    "output",
+]
+
+[lint]
+select = [
+    "E9",
+    "F401",
+    "F821",
+    "F822",
+    "F823",
+]
