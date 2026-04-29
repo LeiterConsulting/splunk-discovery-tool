@@ -29,3 +29,24 @@ class FrontendDeliveryTests(unittest.TestCase):
             frontend_delivery.compute_artifact_fingerprint(),
             "Generated frontend artifacts drifted from the recorded build manifest.",
         )
+
+    def test_summary_verification_state_wiring_is_declared(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const [showHistory, setShowHistory] = useState(null);", template_source)
+        self.assertIn("setShowHistory(showHistory === taskIndex ? null : taskIndex);", template_source)
+        self.assertIn("{showHistory === taskIndex && (() => {", template_source)
+
+    def test_summary_action_handlers_are_declared(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const launchChatInvestigation = async (prompt, options = {}) => {", template_source)
+        self.assertIn("const buildRiskInvestigationPrompt = (risk) => [", template_source)
+        self.assertIn("const buildUnknownEntityValidationChatPrompt = (item) => {", template_source)
+        self.assertIn("const focusRiskControlPath = (risk) => {", template_source)
+        self.assertIn("const focusQueriesForRisk = (risk) => {", template_source)
+        self.assertIn("const focusQueriesForTask = (task) => {", template_source)
+        self.assertIn("onClick={() => focusRiskControlPath(risk)}", template_source)
+        self.assertIn("onClick={() => focusQueriesForRisk(risk)}", template_source)
+        self.assertIn("onClick={() => focusQueriesForTask(task)}", template_source)
+        self.assertIn("buildUnknownEntityValidationChatPrompt(item)", template_source)

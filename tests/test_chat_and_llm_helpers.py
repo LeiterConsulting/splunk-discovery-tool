@@ -13,7 +13,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
-from llm.factory import filter_openai_generation_models, get_openai_model_capabilities, is_openai_image_generation_model
+from llm.factory import CustomLLMClient, filter_openai_generation_models, get_openai_model_capabilities, is_openai_image_generation_model
 from capabilities.models import CapabilityActionResult, CapabilityConfig
 from discovery.context_manager import DiscoveryContextManager
 import web_app
@@ -124,6 +124,233 @@ class OpenAIModelHelperTests(unittest.TestCase):
                 "summary_infographic_debug_probe_20260422_140526.png"
             )
         )
+
+
+class CustomLLMClientCompatibilityTests(unittest.TestCase):
+    class _StubMetrics:
+        def to_dict(self):
+            return {}
+
+    class _StubHealthMonitor:
+        def should_attempt_request(self):
+            return True
+
+        def record_request(self, success, response_time, is_timeout):
+            return None
+
+        def get_metrics(self):
+            return CustomLLMClientCompatibilityTests._StubMetrics()
+
+    class _StubTimeoutManager:
+        def calculate_timeout(self, estimated_tokens):
+            return 30
+
+    class _StubPayloadAdapter:
+        def adapt_request(self, messages, max_tokens):
+            return messages, max_tokens
+
+    class _StubResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    class _StubSession:
+        def __init__(self, response):
+            self.response = response
+            self.calls = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.calls.append({
+                "url": url,
+                "headers": headers,
+                "json": json,
+                "timeout": timeout,
+            })
+            return self.response
+
+    class _SequenceStubSession:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.calls.append({
+                "url": url,
+                "headers": headers,
+                "json": json,
+                "timeout": timeout,
+            })
+            index = min(len(self.calls) - 1, len(self.responses) - 1)
+            return self.responses[index]
+
+    def _build_client(self, endpoint_url, response_payload):
+        client = CustomLLMClient(endpoint_url, model="llama3", provider="custom")
+        client.health_monitor = self._StubHealthMonitor()
+        client.timeout_manager = self._StubTimeoutManager()
+        client.payload_adapter = self._StubPayloadAdapter()
+        client.session = self._StubSession(self._StubResponse(response_payload))
+        client.use_session = True
+        return client
+
+    def test_ollama_base_url_includes_native_api_candidates(self):
+        client = CustomLLMClient("http://localhost:11434", model="llama3", provider="custom")
+
+        candidates = client._build_candidate_urls()
+
+        self.assertEqual(candidates[0], "http://localhost:11434/v1/chat/completions")
+        self.assertEqual(candidates[1], "http://localhost:11434/chat/completions")
+        self.assertIn("http://localhost:11434/api/chat", candidates)
+        self.assertIn("http://localhost:11434/api/generate", candidates)
+
+    def test_generate_response_sync_extracts_ollama_chat_content(self):
+        client = self._build_client(
+            "http://localhost:11434/api/chat",
+            {"message": {"content": "Ollama says hello."}},
+        )
+
+        response = client.generate_response_sync(
+            [{"role": "user", "content": "Say hello."}],
+            max_tokens=128,
+            temperature=0.2,
+        )
+
+        self.assertEqual(response, "Ollama says hello.")
+        self.assertEqual(client.session.calls[0]["url"], "http://localhost:11434/api/chat")
+        self.assertEqual(client.session.calls[0]["json"]["messages"][0]["content"], "Say hello.")
+        self.assertNotIn("prompt", client.session.calls[0]["json"])
+
+    def test_generate_response_sync_normalizes_ollama_native_tool_calls(self):
+        client = self._build_client(
+            "http://localhost:11434/api/chat",
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "tool:splunk_run_query",
+                                "arguments": {
+                                    "tool": "splunk_run_query",
+                                    "args": {
+                                        "query": "search index=_internal | head 5",
+                                        "earliest_time": "-24h",
+                                        "latest_time": "now",
+                                    },
+                                },
+                            }
+                        }
+                    ],
+                }
+            },
+        )
+
+        response = client.generate_response_sync(
+            [{"role": "user", "content": "Inspect _internal."}],
+            max_tokens=128,
+            temperature=0.2,
+        )
+
+        self.assertTrue(response.startswith("<TOOL_CALL>"))
+        self.assertTrue(response.endswith("</TOOL_CALL>"))
+        payload = json.loads(response[len("<TOOL_CALL>"):-len("</TOOL_CALL>")])
+        self.assertEqual(payload["tool"], "splunk_run_query")
+        self.assertEqual(payload["args"]["query"], "search index=_internal | head 5")
+        self.assertEqual(payload["args"]["earliest_time"], "-24h")
+        self.assertEqual(payload["args"]["latest_time"], "now")
+
+    def test_generate_response_sync_normalizes_openai_style_tool_calls(self):
+        client = self._build_client(
+            "http://localhost:11434/v1/chat/completions",
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "tool.splunk_run_query",
+                                        "arguments": json.dumps(
+                                            {
+                                                "tool": "splunk_run_query",
+                                                "args": {
+                                                    "query": "search index=_audit | head 3",
+                                                    "earliest_time": "-24h",
+                                                    "latest_time": "now",
+                                                },
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+        response = client.generate_response_sync(
+            [{"role": "user", "content": "Inspect _audit."}],
+            max_tokens=128,
+            temperature=0.2,
+        )
+
+        self.assertTrue(response.startswith("<TOOL_CALL>"))
+        self.assertTrue(response.endswith("</TOOL_CALL>"))
+        payload = json.loads(response[len("<TOOL_CALL>"):-len("</TOOL_CALL>")])
+        self.assertEqual(payload["tool"], "splunk_run_query")
+        self.assertEqual(payload["args"]["query"], "search index=_audit | head 3")
+        self.assertEqual(payload["args"]["earliest_time"], "-24h")
+        self.assertEqual(payload["args"]["latest_time"], "now")
+
+    def test_generate_response_sync_falls_back_after_recoverable_ollama_parse_error(self):
+        client = CustomLLMClient("http://localhost:11434", model="llama3", provider="custom")
+        client.health_monitor = self._StubHealthMonitor()
+        client.timeout_manager = self._StubTimeoutManager()
+        client.payload_adapter = self._StubPayloadAdapter()
+        client.session = self._SequenceStubSession([
+            self._StubResponse(
+                {"error": {"message": "error parsing tool call: raw='{"}},
+                status_code=500,
+            ),
+            self._StubResponse({"error": "not found"}, status_code=404),
+            self._StubResponse({"error": "not found"}, status_code=404),
+            self._StubResponse({"response": "Recovered via generate fallback."}),
+        ])
+        client.use_session = True
+
+        response = client.generate_response_sync(
+            [{"role": "user", "content": "Inspect platform health."}],
+            max_tokens=128,
+            temperature=0.2,
+        )
+
+        self.assertEqual(response, "Recovered via generate fallback.")
+        self.assertEqual(client.session.calls[0]["url"], "http://localhost:11434/v1/chat/completions")
+        self.assertEqual(client.session.calls[3]["url"], "http://localhost:11434/api/generate")
+        self.assertEqual(client.endpoint_url, "http://localhost:11434/api/generate")
+
+    def test_generate_response_sync_builds_ollama_generate_payload(self):
+        client = self._build_client(
+            "http://localhost:11434/api/generate",
+            {"response": "Generated from Ollama."},
+        )
+
+        response = client.generate_response_sync(
+            [{"role": "user", "content": "Summarize this."}],
+            max_tokens=128,
+            temperature=0.2,
+        )
+
+        self.assertEqual(response, "Generated from Ollama.")
+        self.assertEqual(client.session.calls[0]["url"], "http://localhost:11434/api/generate")
+        self.assertEqual(client.session.calls[0]["json"]["prompt"], "Summarize this.")
+        self.assertNotIn("messages", client.session.calls[0]["json"])
 
 
 class LLMSettingsTests(unittest.TestCase):
@@ -337,6 +564,60 @@ class ChatSettingsTests(unittest.TestCase):
 
 
 class ChatHelperTests(unittest.TestCase):
+    def test_finalize_user_facing_response_text_uses_fallback_after_sanitization(self):
+        self.assertEqual(
+            web_app.finalize_user_facing_response_text(
+                "<CONTEXT_REQUEST>inventory</CONTEXT_REQUEST>",
+                web_app.DEFAULT_DIRECT_CHAT_RESPONSE,
+            ),
+            web_app.DEFAULT_DIRECT_CHAT_RESPONSE,
+        )
+
+    def test_sanitize_llm_response_text_strips_reasoning_markup(self):
+        self.assertEqual(
+            web_app.sanitize_llm_response_text(
+                "<think>internal reasoning</think>Visible answer<thinking>more hidden reasoning</thinking>"
+            ),
+            "Visible answer",
+        )
+
+    def test_build_chat_runtime_profile_detects_ollama_runtime(self):
+        stub_config = type(
+            "Config",
+            (),
+            {
+                "llm": type(
+                    "LLMSettingsStub",
+                    (),
+                    {
+                        "provider": "custom",
+                        "endpoint_url": "http://localhost:11434",
+                        "model": "gpt-oss:20b",
+                    },
+                )(),
+            },
+        )()
+        stub_client = type("LLMClientStub", (), {"provider_type": "ollama"})()
+        original_chat_settings = dict(web_app.chat_session_settings)
+
+        try:
+            web_app.chat_session_settings["max_tokens"] = 16000
+            web_app.chat_session_settings["context_history"] = 6
+
+            profile = web_app.build_chat_runtime_profile(stub_config, stub_client)
+        finally:
+            web_app.chat_session_settings.clear()
+            web_app.chat_session_settings.update(original_chat_settings)
+
+        self.assertEqual(profile["provider"], "ollama")
+        self.assertEqual(profile["context_history_limit"], 4)
+        self.assertEqual(profile["initial_max_tokens"], 1200)
+        self.assertEqual(profile["followup_max_tokens"], 1400)
+        self.assertEqual(profile["final_max_tokens"], 1800)
+        self.assertEqual(profile["retry_max_tokens"], 1200)
+        self.assertAlmostEqual(profile["temperature_multiplier"], 0.9)
+        self.assertIn("Do not emit <think>", profile["reasoning_guard"])
+
     def test_extract_primary_spl_query_prefers_last_non_empty_query(self):
         tool_calls = [
             {
@@ -444,6 +725,79 @@ class ChatHelperTests(unittest.TestCase):
         self.assertIn('user="admin"', recovered["params"]["arguments"]["query"])
         self.assertEqual(recovered["params"]["arguments"]["earliest_time"], "-24h")
         self.assertEqual(recovered["params"]["arguments"]["latest_time"], "now")
+
+    def test_execute_mcp_tool_call_remaps_unknown_query_tool_to_splunk_query(self):
+        captured = {}
+
+        async def stub_discover_mcp_tools(_config, force_refresh=False):
+            return {"splunk_run_query"}
+
+        class StubResponse:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = '{"result":{"structuredContent":{"results":[{"count":"1"}]}}}'
+
+            def json(self):
+                return {"result": {"structuredContent": {"results": [{"count": "1"}]}}}
+
+        class StubAsyncClient:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                captured["url"] = url
+                captured["json"] = json
+                captured["headers"] = headers
+                return StubResponse()
+
+        stub_config = type(
+            "Config",
+            (),
+            {
+                "mcp": type(
+                    "MCPSettingsStub",
+                    (),
+                    {
+                        "url": "https://splunk:8089/services/mcp",
+                        "token": "test-token",
+                        "verify_ssl": False,
+                    },
+                )(),
+                "security": type("SecuritySettingsStub", (), {"ca_bundle_path": None})(),
+            },
+        )()
+
+        tool_call = {
+            "method": "tools/call",
+            "params": {
+                "name": "container.exec",
+                "arguments": {
+                    "query": "search index=_internal | head 5",
+                    "earliest_time": "-24h",
+                    "latest_time": "now",
+                },
+            },
+        }
+
+        with patch.object(web_app, "discover_mcp_tools", new=stub_discover_mcp_tools), patch.object(
+            web_app.httpx,
+            "AsyncClient",
+            StubAsyncClient,
+        ):
+            result = asyncio.run(web_app.execute_mcp_tool_call(tool_call, stub_config))
+
+        self.assertIn("result", result)
+        self.assertEqual(captured["json"]["params"]["name"], "splunk_run_query")
+        self.assertEqual(
+            captured["json"]["params"]["arguments"]["query"],
+            "search index=_internal | head 5",
+        )
 
     def test_detect_report_intent_handles_strategic_questions_only(self):
         report_knowledge = {
@@ -782,6 +1136,118 @@ class ChatHelperTests(unittest.TestCase):
         self.assertEqual(result["capability_usage"][0]["used_in"], "llm_prompt")
         self.assertEqual(result["capability_usage"][0]["chunks"][0]["source"], "output/v2_operator_runbook_20260417_144141.md")
 
+    def test_chat_with_splunk_logic_falls_back_when_sanitized_direct_answer_is_empty(self):
+        original_get_or_create_llm_client = web_app.get_or_create_llm_client
+        original_get_context_manager = web_app.get_context_manager
+        original_load_latest_report_knowledge = web_app.load_latest_report_knowledge
+        original_get_memory_store_path = web_app._get_memory_store_path
+        original_cache = dict(web_app.chat_agent_memory)
+        original_chat_settings = dict(web_app.chat_session_settings)
+
+        class StubLLMClient:
+            async def generate_response(self, messages, max_tokens, temperature):
+                return "<CONTEXT_REQUEST>inventory</CONTEXT_REQUEST>"
+
+        class StubContextManager:
+            def get_specific_context(self, _context_type):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            web_app.chat_agent_memory.clear()
+            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app.get_or_create_llm_client = lambda config: StubLLMClient()
+            web_app.get_context_manager = lambda: StubContextManager()
+            web_app.load_latest_report_knowledge = lambda *_: None
+            web_app.chat_session_settings["enable_splunk_augmentation"] = False
+
+            try:
+                result = asyncio.run(
+                    web_app.chat_with_splunk_logic(
+                        {
+                            "message": "Summarize the current state.",
+                            "history": [],
+                            "chat_session_id": "empty_direct_answer_fallback_test",
+                        }
+                    )
+                )
+            finally:
+                web_app.get_or_create_llm_client = original_get_or_create_llm_client
+                web_app.get_context_manager = original_get_context_manager
+                web_app.load_latest_report_knowledge = original_load_latest_report_knowledge
+                web_app._get_memory_store_path = original_get_memory_store_path
+                web_app.chat_session_settings.clear()
+                web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_agent_memory.clear()
+                web_app.chat_agent_memory.update(original_cache)
+
+        self.assertEqual(result.get("response"), web_app.DEFAULT_DIRECT_CHAT_RESPONSE)
+        self.assertEqual(result.get("chat_memory", {}).get("last_assistant_response"), web_app.DEFAULT_DIRECT_CHAT_RESPONSE)
+        self.assertEqual(result.get("conversation_history", [])[-1].get("content"), web_app.DEFAULT_DIRECT_CHAT_RESPONSE)
+
+    def test_chat_stream_returns_fallback_when_sanitized_direct_answer_is_empty(self):
+        original_get_or_create_llm_client = web_app.get_or_create_llm_client
+        original_get_context_manager = web_app.get_context_manager
+        original_load_latest_report_knowledge = web_app.load_latest_report_knowledge
+        original_get_memory_store_path = web_app._get_memory_store_path
+        original_cache = dict(web_app.chat_agent_memory)
+        original_chat_settings = dict(web_app.chat_session_settings)
+
+        class StubLLMClient:
+            async def generate_response(self, messages, max_tokens, temperature):
+                return "<CONTEXT_REQUEST>inventory</CONTEXT_REQUEST>"
+
+        class StubContextManager:
+            def get_specific_context(self, _context_type):
+                return None
+
+        async def collect_stream_body():
+            response = await web_app.chat_with_splunk_stream(
+                {
+                    "message": "Summarize the current state.",
+                    "history": [],
+                    "chat_session_id": "empty_direct_answer_stream_fallback_test",
+                }
+            )
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+            return "".join(chunks)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            web_app.chat_agent_memory.clear()
+            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app.get_or_create_llm_client = lambda config: StubLLMClient()
+            web_app.get_context_manager = lambda: StubContextManager()
+            web_app.load_latest_report_knowledge = lambda *_: None
+            web_app.chat_session_settings["enable_splunk_augmentation"] = False
+
+            try:
+                sse_body = asyncio.run(collect_stream_body())
+            finally:
+                web_app.get_or_create_llm_client = original_get_or_create_llm_client
+                web_app.get_context_manager = original_get_context_manager
+                web_app.load_latest_report_knowledge = original_load_latest_report_knowledge
+                web_app._get_memory_store_path = original_get_memory_store_path
+                web_app.chat_session_settings.clear()
+                web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_agent_memory.clear()
+                web_app.chat_agent_memory.update(original_cache)
+
+        payloads = [
+            json.loads(line[6:])
+            for line in sse_body.splitlines()
+            if line.startswith("data: ")
+        ]
+        final_payload = next(payload for payload in payloads if payload.get("type") == "response")
+
+        self.assertEqual(final_payload["data"].get("response"), web_app.DEFAULT_DIRECT_CHAT_RESPONSE)
+        self.assertEqual(
+            final_payload["data"].get("chat_memory", {}).get("last_assistant_response"),
+            web_app.DEFAULT_DIRECT_CHAT_RESPONSE,
+        )
+
     def test_chat_with_splunk_logic_allows_unrelated_general_requests(self):
         original_get_or_create_llm_client = web_app.get_or_create_llm_client
         original_load_latest_report_knowledge = web_app.load_latest_report_knowledge
@@ -1026,6 +1492,98 @@ class ChatHelperTests(unittest.TestCase):
         system_messages = [msg.get("content", "") for msg in captured.get("messages", []) if msg.get("role") == "system"]
         self.assertTrue(any("Remembered indexes: esp32" in content for content in system_messages))
         self.assertTrue(any("Current request to interpret in-session: what's my freezer temp right now" in content for content in system_messages))
+
+    def test_chat_with_splunk_logic_uses_ollama_runtime_profile(self):
+        original_get_or_create_llm_client = web_app.get_or_create_llm_client
+        original_load_latest_report_knowledge = web_app.load_latest_report_knowledge
+        original_discover_mcp_tools = web_app.discover_mcp_tools
+        original_get_memory_store_path = web_app._get_memory_store_path
+        original_cache = dict(web_app.chat_agent_memory)
+        original_chat_settings = dict(web_app.chat_session_settings)
+        original_config_get = web_app.config_manager.get
+        captured = {}
+
+        class CapturingStubLLMClient:
+            provider_type = "ollama"
+
+            async def generate_response(self, messages, max_tokens, temperature):
+                captured["messages"] = messages
+                captured["max_tokens"] = max_tokens
+                captured["temperature"] = temperature
+                return "Ollama runtime profile applied."
+
+        async def stub_discover_mcp_tools(_config):
+            return {"splunk_run_query"}
+
+        stub_config = type(
+            "Config",
+            (),
+            {
+                "llm": type(
+                    "LLMSettingsStub",
+                    (),
+                    {
+                        "provider": "custom",
+                        "endpoint_url": "http://localhost:11434",
+                        "model": "gpt-oss:20b",
+                        "api_key": "",
+                        "temperature": 0.7,
+                    },
+                )(),
+            },
+        )()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            web_app.chat_agent_memory.clear()
+            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app.get_or_create_llm_client = lambda config: CapturingStubLLMClient()
+            web_app.config_manager.get = lambda: stub_config
+            web_app.load_latest_report_knowledge = lambda *_: None
+            web_app.discover_mcp_tools = stub_discover_mcp_tools
+            web_app.chat_session_settings["enable_splunk_augmentation"] = False
+            web_app.chat_session_settings["enable_rag_context"] = False
+            web_app.chat_session_settings["context_history"] = 6
+            web_app.chat_session_settings["max_tokens"] = 16000
+
+            try:
+                result = asyncio.run(
+                    web_app.chat_with_splunk_logic(
+                        {
+                            "message": "Summarize the current platform state.",
+                            "history": [
+                                {"role": "system", "content": "stale system prompt"},
+                                {"role": "user", "content": "Turn 1"},
+                                {"role": "assistant", "content": "Turn 2"},
+                                {"role": "user", "content": "Turn 3"},
+                                {"role": "assistant", "content": "Turn 4"},
+                                {"role": "user", "content": "Turn 5"},
+                                {"role": "assistant", "content": "Turn 6"},
+                            ],
+                            "chat_session_id": "ollama_runtime_profile_test",
+                        }
+                    )
+                )
+            finally:
+                web_app.get_or_create_llm_client = original_get_or_create_llm_client
+                web_app.config_manager.get = original_config_get
+                web_app.load_latest_report_knowledge = original_load_latest_report_knowledge
+                web_app.discover_mcp_tools = original_discover_mcp_tools
+                web_app._get_memory_store_path = original_get_memory_store_path
+                web_app.chat_session_settings.clear()
+                web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_agent_memory.clear()
+                web_app.chat_agent_memory.update(original_cache)
+
+        self.assertEqual(result.get("response"), "Ollama runtime profile applied.")
+        self.assertEqual(captured.get("max_tokens"), 1200)
+        self.assertAlmostEqual(captured.get("temperature"), 0.63)
+        self.assertEqual(
+            [msg.get("content") for msg in captured.get("messages", []) if msg.get("role") in {"user", "assistant"}],
+            ["Turn 3", "Turn 4", "Turn 5", "Turn 6", "Summarize the current platform state."],
+        )
+        system_messages = [msg.get("content", "") for msg in captured.get("messages", []) if msg.get("role") == "system"]
+        self.assertTrue(any("Do not emit <think>" in content for content in system_messages))
 
     def test_chat_with_splunk_logic_report_intent_returns_normalized_history_and_rag_usage(self):
         original_get_rag_context = web_app.capability_manager.get_rag_context

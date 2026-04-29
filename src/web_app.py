@@ -100,6 +100,78 @@ def build_default_chat_settings() -> Dict[str, Any]:
     }
 
 
+def detect_chat_runtime_provider(config: Any, llm_client: Any = None) -> str:
+    """Resolve the effective provider used by the active chat runtime."""
+    configured_provider = normalize_provider_name(getattr(getattr(config, "llm", None), "provider", ""))
+    if configured_provider and configured_provider not in {"custom", "custom endpoint"}:
+        return configured_provider
+
+    runtime_provider = normalize_provider_name(str(getattr(llm_client, "provider_type", "") or ""))
+    if runtime_provider and runtime_provider != "custom":
+        return runtime_provider
+
+    endpoint_url = str(getattr(getattr(config, "llm", None), "endpoint_url", "") or "").lower()
+    if "ollama" in endpoint_url or ":11434" in endpoint_url:
+        return "ollama"
+
+    return configured_provider or runtime_provider or "generic"
+
+
+def build_chat_runtime_profile(config: Any, llm_client: Any = None) -> Dict[str, Any]:
+    """Return provider-aware chat behavior defaults for the active runtime."""
+    try:
+        session_max_tokens = int(chat_session_settings.get("max_tokens", 16000) or 16000)
+    except (TypeError, ValueError):
+        session_max_tokens = 16000
+    try:
+        context_history_limit = int(chat_session_settings.get("context_history", 6) or 6)
+    except (TypeError, ValueError):
+        context_history_limit = 6
+
+    effective_provider = detect_chat_runtime_provider(config, llm_client)
+    model_name = str(getattr(getattr(config, "llm", None), "model", "") or "").strip().lower()
+
+    profile = {
+        "provider": effective_provider,
+        "model": model_name,
+        "use_compact_prompt": effective_provider in {"custom", "generic", "ollama", "vllm", "local-vllm"},
+        "short_circuit_greetings": effective_provider in {"custom", "generic", "ollama", "vllm", "local-vllm"},
+        "context_history_limit": max(1, context_history_limit),
+        "initial_max_tokens": max(400, min(2000, int(session_max_tokens * 0.15))),
+        "followup_max_tokens": max(500, min(2500, int(session_max_tokens * 0.18))),
+        "final_max_tokens": max(600, min(3000, int(session_max_tokens * 0.25))),
+        "retry_max_tokens": max(400, min(2000, int(session_max_tokens * 0.15))),
+        "temperature_multiplier": 1.0,
+        "reasoning_guard": "",
+    }
+
+    if effective_provider == "ollama":
+        profile.update({
+            "use_compact_prompt": True,
+            "short_circuit_greetings": True,
+            "context_history_limit": min(profile["context_history_limit"], 4),
+            "initial_max_tokens": max(384, min(1200, int(session_max_tokens * 0.10))),
+            "followup_max_tokens": max(512, min(1400, int(session_max_tokens * 0.12))),
+            "final_max_tokens": max(640, min(1800, int(session_max_tokens * 0.16))),
+            "retry_max_tokens": max(384, min(1200, int(session_max_tokens * 0.10))),
+            "temperature_multiplier": 0.9,
+            "reasoning_guard": (
+                "8) Do not emit <think>, </think>, <thinking>, or chain-of-thought markup. "
+                "Return either a direct answer or a single <TOOL_CALL> block plus one short sentence."
+            ),
+        })
+
+    if effective_provider in {"vllm", "local-vllm"}:
+        profile.update({
+            "use_compact_prompt": True,
+            "short_circuit_greetings": True,
+            "context_history_limit": min(profile["context_history_limit"], 5),
+            "temperature_multiplier": 0.95,
+        })
+
+    return profile
+
+
 chat_settings_explicit_overrides = {
     "enable_rag_context": False,
 }
@@ -1911,12 +1983,26 @@ def sanitize_llm_response_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
 
-    cleaned = re.sub(r'<CONTEXT_REQUEST>.*?</CONTEXT_REQUEST>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<thinking>.*?</thinking>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<CONTEXT_REQUEST>.*?</CONTEXT_REQUEST>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<TOOL_CALL>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = cleaned.replace('</TOOL_CALL>', '')
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
+
+
+DEFAULT_DIRECT_CHAT_RESPONSE = "I couldn't generate a complete answer for that request. Please try again."
+DEFAULT_TOOL_INVESTIGATION_RESPONSE = "Investigation complete. See findings above."
+
+
+def finalize_user_facing_response_text(text: Any, fallback: str) -> str:
+    """Return sanitized assistant text, or a sanitized fallback if nothing user-visible remains."""
+    cleaned = sanitize_llm_response_text(str(text or ""))
+    if cleaned:
+        return cleaned
+    return sanitize_llm_response_text(str(fallback or ""))
 
 
 def extract_tool_call_from_text(response_text: str) -> Optional[Dict[str, Any]]:
@@ -9241,7 +9327,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         )
 
         query_tool_name = resolve_tool_name("splunk_run_query", available_mcp_tools)
-        provider_name = str(getattr(config.llm, "provider", "")).strip().lower()
+        provider_name = normalize_provider_name(getattr(config.llm, "provider", ""))
         is_custom_provider = provider_name in {"custom", "custom endpoint"}
 
         # Deterministic path for "latest entry in <index>" requests to avoid LLM misclassification
@@ -10108,6 +10194,15 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
         print(f"🔵 [CHAT] Getting LLM client...")
         llm_client = get_or_create_llm_client(config)
         print(f"🔵 [CHAT] LLM client initialized, provider: {config.llm.provider}")
+        chat_runtime_profile = build_chat_runtime_profile(config, llm_client)
+        runtime_temperature = max(0.0, config.llm.temperature * chat_runtime_profile["temperature_multiplier"])
+        print(
+            f"🔵 [CHAT] Runtime profile: provider={chat_runtime_profile['provider']} "
+            f"model={chat_runtime_profile['model'] or getattr(config.llm, 'model', '')} "
+            f"compact={chat_runtime_profile['use_compact_prompt']} "
+            f"context_limit={chat_runtime_profile['context_history_limit']} "
+            f"initial_max_tokens={chat_runtime_profile['initial_max_tokens']}"
+        )
         
         # Use simplified prompt for custom endpoints (local LLMs have smaller context windows)
         if is_custom_provider:
@@ -10301,7 +10396,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         
         # Prepare messages
         # Use the compact prompt only for custom/local providers; OpenAI-class providers keep the richer agent prompt above.
-        if is_custom_provider:
+        if chat_runtime_profile["use_compact_prompt"]:
             system_prompt = build_compact_chat_prompt(
                 query_tool_name=query_tool_name,
                 discovery_context=discovery_context,
@@ -10310,8 +10405,10 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 available_tools_text=available_tools_text,
                 discovery_age_warning=discovery_age_warning
             )
+            if chat_runtime_profile["reasoning_guard"]:
+                system_prompt = f"{system_prompt}\n{chat_runtime_profile['reasoning_guard']}"
 
-        context_limit = chat_session_settings["context_history"]
+        context_limit = chat_runtime_profile["context_history_limit"]
         continuity_context = build_llm_continuity_context(
             user_message=user_message,
             history=history,
@@ -10325,7 +10422,7 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         query_lower = user_message.lower().strip()
         is_greeting = any(phrase in query_lower for phrase in ['hi', 'hello', 'hey', 'how are you', 'thanks', 'thank you', 'bye', 'goodbye'])
         
-        if is_custom_provider and is_greeting and not has_session_context:
+        if chat_runtime_profile["short_circuit_greetings"] and is_greeting and not has_session_context:
             # Bare minimum for greetings - just the user message
             messages = [{"role": "user", "content": user_message}]
         else:
@@ -10358,14 +10455,14 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         # Get LLM response - use session max_tokens setting (with 15% limit for initial chat)
         status_timeline: List[Dict[str, Any]] = []
         await push_status(status_timeline, "🧠 Building investigation plan", 0)
-        chat_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
+        chat_max_tokens = chat_runtime_profile["initial_max_tokens"]
         print(f"🔵 [CHAT] Calling LLM with {len(messages)} messages, max_tokens={chat_max_tokens}")
         print(f"🔵 [CHAT] Client type: {type(llm_client)}, has generate_response: {hasattr(llm_client, 'generate_response')}")
         print(f"🔵 [CHAT] About to await generate_response...")
         response = await llm_client.generate_response(
             messages=messages,
             max_tokens=chat_max_tokens,
-            temperature=config.llm.temperature
+            temperature=runtime_temperature
         )
         print(f"🔵 [CHAT] Got response: {len(response)} chars")
         
@@ -10893,11 +10990,11 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
                 if status_callback:
                     await status_callback(action, iteration, elapsed)
                 
-                followup_max_tokens = min(2500, int(chat_session_settings["max_tokens"] * 0.18))
+                followup_max_tokens = chat_runtime_profile["followup_max_tokens"]
                 next_response = await llm_client.generate_response(
                     messages=conversation_history,
                     max_tokens=followup_max_tokens,
-                    temperature=config.llm.temperature * 0.9  # Slightly lower temp for more focused decisions
+                    temperature=max(0.0, runtime_temperature * 0.9)  # Slightly lower temp for more focused decisions
                 )
                 
                 next_tool_call = extract_recoverable_tool_call(
@@ -10969,11 +11066,11 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
                             
                             conversation_history.append({"role": "system", "content": final_prompt})
                             
-                            final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                            final_max_tokens = chat_runtime_profile["final_max_tokens"]
                             final_response = await llm_client.generate_response(
                                 messages=conversation_history,
                                 max_tokens=final_max_tokens,
-                                temperature=config.llm.temperature
+                                temperature=runtime_temperature
                             )
                             final_answer = final_response
                             print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
@@ -11044,11 +11141,11 @@ Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-be
 
                                     conversation_history.append({"role": "system", "content": final_prompt})
 
-                                    final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                    final_max_tokens = chat_runtime_profile["final_max_tokens"]
                                     final_response = await llm_client.generate_response(
                                         messages=conversation_history,
                                         max_tokens=final_max_tokens,
-                                        temperature=config.llm.temperature
+                                        temperature=runtime_temperature
                                     )
                                     final_answer = final_response
                                     print(f"✅ [Iteration {iteration}] Final user answer with SPL explanation generated ({len(final_response)} chars)")
@@ -11101,11 +11198,11 @@ Do not explain what you will do - DO IT with a tool call."""
                             if status_callback:
                                 await status_callback(action, iteration, elapsed)
                             
-                            retry_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
+                            retry_max_tokens = chat_runtime_profile["retry_max_tokens"]
                             retry_response = await llm_client.generate_response(
                                 messages=conversation_history,
                                 max_tokens=retry_max_tokens,
-                                temperature=config.llm.temperature * 0.7  # Lower temp for stricter format
+                                temperature=max(0.0, runtime_temperature * 0.7)  # Lower temp for stricter format
                             )
                             
                             retry_tool_call = extract_recoverable_tool_call(
@@ -11199,11 +11296,11 @@ Based on your previous response, provide your next query NOW using the proper fo
                             
                             conversation_history.append({"role": "system", "content": format_enforcement})
                             
-                            retry_max_tokens = min(2000, int(chat_session_settings["max_tokens"] * 0.15))
+                            retry_max_tokens = chat_runtime_profile["retry_max_tokens"]
                             retry_response = await llm_client.generate_response(
                                 messages=conversation_history,
                                 max_tokens=retry_max_tokens,
-                                temperature=config.llm.temperature * 0.7
+                                temperature=max(0.0, runtime_temperature * 0.7)
                             )
                             
                             retry_tool_call = extract_recoverable_tool_call(
@@ -11262,11 +11359,11 @@ Based on your previous response, provide your next query NOW using the proper fo
                                     
                                     conversation_history.append({"role": "system", "content": final_prompt})
                                     
-                                    final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                    final_max_tokens = chat_runtime_profile["final_max_tokens"]
                                     final_response = await llm_client.generate_response(
                                         messages=conversation_history,
                                         max_tokens=final_max_tokens,
-                                        temperature=config.llm.temperature
+                                        temperature=runtime_temperature
                                     )
                                     final_answer = final_response
                                     print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
@@ -11304,11 +11401,11 @@ Based on your previous response, provide your next query NOW using the proper fo
 
                                             conversation_history.append({"role": "system", "content": final_prompt})
 
-                                            final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                            final_max_tokens = chat_runtime_profile["final_max_tokens"]
                                             final_response = await llm_client.generate_response(
                                                 messages=conversation_history,
                                                 max_tokens=final_max_tokens,
-                                                temperature=config.llm.temperature
+                                                temperature=runtime_temperature
                                             )
                                             final_answer = final_response
                                             print(f"✅ [Iteration {iteration}] Final user answer with SPL explanation generated ({len(final_response)} chars)")
@@ -11349,11 +11446,11 @@ Based on your previous response, provide your next query NOW using the proper fo
 
                                         conversation_history.append({"role": "system", "content": final_prompt})
 
-                                        final_max_tokens = min(3000, int(chat_session_settings["max_tokens"] * 0.25))
+                                        final_max_tokens = chat_runtime_profile["final_max_tokens"]
                                         final_response = await llm_client.generate_response(
                                             messages=conversation_history,
                                             max_tokens=final_max_tokens,
-                                            temperature=config.llm.temperature
+                                            temperature=runtime_temperature
                                         )
                                         final_answer = final_response
                                         print(f"✅ [Iteration {iteration}] Final no-data answer with SPL explanation generated ({len(final_response)} chars)")
@@ -11374,22 +11471,26 @@ Based on your previous response, provide your next query NOW using the proper fo
             
             # Return comprehensive response with status timeline
             # Include conversation_history so follow-up queries maintain context
+            user_facing_final_answer = finalize_user_facing_response_text(
+                final_answer,
+                DEFAULT_TOOL_INVESTIGATION_RESPONSE,
+            )
             updated_memory = update_chat_memory(
                 chat_session_id,
                 user_message,
                 all_tool_calls,
-                assistant_response=final_answer or "Investigation complete. See findings above.",
+                assistant_response=user_facing_final_answer,
                 record_user_turn=False,
             )
             follow_on_actions = build_follow_on_actions(
                 user_message,
                 updated_memory,
                 all_tool_calls,
-                assistant_response=final_answer or "Investigation complete. See findings above.",
+                assistant_response=user_facing_final_answer,
             )
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(all_tool_calls, capability_usage)
             return {
-                "response": sanitize_llm_response_text(final_answer or "Investigation complete. See findings above."),
+                "response": user_facing_final_answer,
                 "initial_response": user_message,
                 "tool_calls": all_tool_calls,
                 "spl_query": extract_primary_spl_query(all_tool_calls),
@@ -11418,19 +11519,23 @@ Based on your previous response, provide your next query NOW using the proper fo
         
         # No tool call, return clean response with any SPL found
         await push_status(status_timeline, "✅ Returning direct answer", 0)
+        direct_response = finalize_user_facing_response_text(
+            clean_response,
+            DEFAULT_DIRECT_CHAT_RESPONSE,
+        )
         updated_memory = update_chat_memory(
             chat_session_id,
             user_message,
-            assistant_response=clean_response,
+            assistant_response=direct_response,
             record_user_turn=False,
         )
         follow_on_actions = build_follow_on_actions(
             user_message,
             updated_memory,
-            assistant_response=clean_response,
+            assistant_response=direct_response,
         )
         return {
-            "response": sanitize_llm_response_text(clean_response),
+            "response": direct_response,
             "spl_in_text": spl_in_text,
             "status_timeline": status_timeline,
             "iterations": 0,
@@ -11438,7 +11543,7 @@ Based on your previous response, provide your next query NOW using the proper fo
             "discovery_age_warning": discovery_age_warning,
             "chat_session_id": chat_session_id,
             "chat_memory": updated_memory,
-            "conversation_history": _build_follow_up_conversation_history(history, user_message, clean_response),
+            "conversation_history": _build_follow_up_conversation_history(history, user_message, direct_response),
             "capability_usage": capability_usage,
             "has_follow_on": len(follow_on_actions) > 0,
             "follow_on_actions": follow_on_actions
@@ -11498,6 +11603,33 @@ async def execute_mcp_tool_call(tool_call, config):
         requested_args = tool_call.get('params', {}).get('arguments', {})
         available_tools = await discover_mcp_tools(config)
         resolved_tool_name = resolve_tool_name(requested_tool_name, available_tools)
+        default_query_tool_name = resolve_tool_name("splunk_run_query", available_tools)
+
+        if resolved_tool_name not in available_tools:
+            if (
+                isinstance(requested_args, dict)
+                and isinstance(requested_args.get("query"), str)
+                and requested_args.get("query", "").strip()
+                and default_query_tool_name in available_tools
+            ):
+                debug_log(
+                    f"Remapping unavailable tool '{requested_tool_name}' to '{default_query_tool_name}' because it carries a Splunk query",
+                    "warning",
+                )
+                resolved_tool_name = default_query_tool_name
+            else:
+                available_preview = ", ".join(sorted(available_tools)) if available_tools else "none"
+                debug_log(
+                    f"Rejected unavailable MCP tool '{requested_tool_name}'. Available tools: {available_preview}",
+                    "warning",
+                )
+                return {
+                    "error": f"Requested tool '{requested_tool_name}' is not available",
+                    "detail": f"Available tools: {available_preview}",
+                    "status_code": 400,
+                    "fatal": False,
+                }
+
         resolved_args = normalize_tool_arguments(resolved_tool_name, requested_args)
 
         resolved_tool_call = {

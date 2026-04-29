@@ -990,9 +990,14 @@ class CustomLLMClient:
                 base,
             ])
         else:
+            if self.provider_type == "ollama":
+                candidates.extend([
+                    f"{base}/v1/chat/completions",
+                    f"{base}/chat/completions",
+                    f"{base}/api/chat",
+                    f"{base}/api/generate",
+                ])
             candidates.extend([
-                f"{base}/v1/chat/completions",
-                f"{base}/chat/completions",
                 f"{base}/v1/completions",
                 f"{base}/completions",
                 base,
@@ -1005,6 +1010,35 @@ class CustomLLMClient:
                 seen.add(url)
                 deduped.append(url)
         return deduped
+
+    def _infer_endpoint_format(self, candidate_url: str) -> str:
+        """Infer request/response format from the resolved endpoint URL."""
+        url = (candidate_url or "").rstrip('/').lower()
+
+        if url.endswith('/api/chat'):
+            return "Ollama Chat"
+        if url.endswith('/api/generate'):
+            return "Ollama Generate"
+        if url.endswith('/v1/chat/completions') or url.endswith('/chat/completions'):
+            return "OpenAI v1"
+        if url.endswith('/v1/completions') or url.endswith('/completions'):
+            if self.provider_type in ["vllm", "local-vllm"]:
+                return "vLLM Completions"
+            return "Generic Completions"
+
+        if self.provider_type == "ollama":
+            return "Ollama Chat"
+        return "Generic Chat"
+
+    def _is_recoverable_ollama_candidate_error(self, status_code: int, response_text: str) -> bool:
+        """Return True when Ollama returned an endpoint-specific parse failure worth retrying elsewhere."""
+        if self.provider_type != "ollama":
+            return False
+        if status_code < 500:
+            return False
+
+        response_preview = str(response_text or "").lower()
+        return "error parsing tool call" in response_preview or "unexpected end of json input" in response_preview
     
     def generate_response_sync(self, messages: list, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """SYNCHRONOUS response generation with health monitoring (v1.1.0)."""
@@ -1052,13 +1086,7 @@ class CustomLLMClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         
-        payload = {
-            "model": self.model,
-            "messages": adapted_messages,
-            "max_tokens": adapted_max_tokens,
-            "temperature": temperature,
-            "stream": False
-        }
+        prompt_text = self._messages_to_prompt(adapted_messages)
         
         logger.info(f"[CustomLLM-SYNC] 📊 Messages: {len(messages)} → {len(adapted_messages)}")
         logger.info(f"[CustomLLM-SYNC] � Max Tokens: {max_tokens} → {adapted_max_tokens}")
@@ -1072,11 +1100,21 @@ class CustomLLMClient:
             request_time = 0.0
             response = None
             last_error = None
+            resolved_endpoint_format = None
             
             for candidate_url in candidate_urls:
                 request_start = time.time()
+                endpoint_format = self._infer_endpoint_format(candidate_url)
+                payload = self._build_payload(
+                    endpoint_format,
+                    adapted_messages,
+                    prompt_text,
+                    adapted_max_tokens,
+                    temperature,
+                )
                 logger.info(f"[CustomLLM-SYNC] ⏱️  {time.time()-start_time:.3f}s - Sending HTTP POST to {candidate_url}...")
                 logger.info(f"[CustomLLM-SYNC] 🔧 Using {'PERSISTENT session' if self.use_session else 'FRESH connection'}")
+                logger.info(f"[CustomLLM-SYNC] 🧭 Endpoint format: {endpoint_format}")
 
                 try:
                     if self.use_session and self.session:
@@ -1100,8 +1138,17 @@ class CustomLLMClient:
                         logger.warning(f"[CustomLLM-SYNC] Endpoint not found: {candidate_url}")
                         last_error = Exception(f"HTTP 404 at {candidate_url}")
                         continue
+                    if self._is_recoverable_ollama_candidate_error(candidate_response.status_code, candidate_response.text):
+                        logger.warning(
+                            f"[CustomLLM-SYNC] Recoverable Ollama endpoint error at {candidate_url}; trying next candidate"
+                        )
+                        last_error = Exception(
+                            f"HTTP {candidate_response.status_code} recoverable Ollama error at {candidate_url}: {candidate_response.text[:200]}"
+                        )
+                        continue
 
                     response = candidate_response
+                    resolved_endpoint_format = endpoint_format
                     if candidate_url != self.endpoint_url:
                         logger.info(f"[CustomLLM-SYNC] ✅ Resolved custom LLM endpoint to {candidate_url}")
                         self.endpoint_url = candidate_url
@@ -1125,7 +1172,7 @@ class CustomLLMClient:
                 parse_time = time.time() - parse_start
                 logger.info(f"[CustomLLM-SYNC] ⏱️  JSON parsed in {parse_time:.3f}s")
                 
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                content = self._extract_response_content(data, resolved_endpoint_format or "OpenAI v1")
                 total_time = time.time() - start_time
                 
                 # Record success in health monitor
@@ -1242,14 +1289,75 @@ class CustomLLMClient:
                 "temperature": temperature,
                 "stream": False
             }
+
+    def _normalize_native_tool_call(self, tool_call: dict) -> Optional[dict]:
+        """Convert native tool call payloads into the tagged chat-agent format."""
+        if not isinstance(tool_call, dict):
+            return None
+
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        raw_name = str(function.get("name") or tool_call.get("name") or "").strip()
+        if raw_name.startswith("tool:"):
+            raw_name = raw_name.split(":", 1)[1].strip()
+        elif raw_name.startswith("tool."):
+            raw_name = raw_name.split(".", 1)[1].strip()
+
+        raw_arguments = function.get("arguments", tool_call.get("arguments"))
+        if isinstance(raw_arguments, str):
+            try:
+                raw_arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                raw_arguments = {"query": raw_arguments}
+
+        if isinstance(raw_arguments, dict) and raw_arguments.get("tool") and isinstance(raw_arguments.get("args"), dict):
+            return {
+                "tool": str(raw_arguments.get("tool") or raw_name).strip(),
+                "args": raw_arguments.get("args", {}),
+            }
+
+        if not raw_name:
+            return None
+
+        return {
+            "tool": raw_name,
+            "args": raw_arguments if isinstance(raw_arguments, dict) else {},
+        }
+
+    def _render_native_tool_calls(self, tool_calls: Any) -> str:
+        """Render native tool calls as tagged text for the existing chat agent parser."""
+        if not isinstance(tool_calls, list):
+            return ""
+
+        rendered_calls = []
+        for tool_call in tool_calls:
+            normalized = self._normalize_native_tool_call(tool_call)
+            if not normalized:
+                continue
+            rendered_calls.append(f"<TOOL_CALL>{json.dumps(normalized, ensure_ascii=False)}</TOOL_CALL>")
+
+        return "\n".join(rendered_calls)
     
     def _extract_response_content(self, response_data: dict, endpoint_format: str) -> str:
         """Extract response content based on endpoint format."""
         try:
             if endpoint_format in ["OpenAI v1", "OpenAI", "LM Studio"]:
-                return response_data["choices"][0]["message"]["content"]
+                message = response_data["choices"][0]["message"]
+                content = message.get("content") or response_data.get("response", "")
+                native_tool_calls = self._render_native_tool_calls(message.get("tool_calls"))
+                if native_tool_calls and content:
+                    return f"{native_tool_calls}\n\n{content}".strip()
+                if native_tool_calls:
+                    return native_tool_calls
+                return content
             elif endpoint_format == "Ollama Chat":
-                return response_data["message"]["content"]
+                message = response_data.get("message", {}) if isinstance(response_data, dict) else {}
+                content = message.get("content") or response_data.get("response", "")
+                native_tool_calls = self._render_native_tool_calls(message.get("tool_calls"))
+                if native_tool_calls and content:
+                    return f"{native_tool_calls}\n\n{content}".strip()
+                if native_tool_calls:
+                    return native_tool_calls
+                return content
             elif endpoint_format == "Ollama Generate":
                 return response_data.get("response", "")
             elif endpoint_format == "vLLM Completions":
