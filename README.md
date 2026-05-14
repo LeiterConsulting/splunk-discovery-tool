@@ -72,6 +72,26 @@ After startup, open the URL printed in the console (typically **http://localhost
 - **Intelligence**: View V2 blueprint KPIs, coverage gaps, capability graph, trends
 - **Artifacts**: Browse and open V2 outputs and generated summaries
 
+## 📸 SPL Library Workflow
+
+The SPL Library keeps reusable SPL in the managed context workspace so operators can save good queries from chat, inspect stored context, and reuse saved SPL without leaving the tool.
+
+### Save a Query From Chat
+
+![Save a chat-generated SPL query to the SPL Library](docs/screenshots/spl-library-save-from-chat.png)
+
+### Browse the SPL Library
+
+![SPL Library listing in the Context workspace](docs/screenshots/spl-library-listing.png)
+
+### Inspect Stored Asset Detail
+
+![SPL Library asset detail view with stored sections and chunk browser](docs/screenshots/spl-library-detail.png)
+
+### Reuse Library Context in Chat
+
+![Chat response showing SPL Library context and reusable SPL evidence](docs/screenshots/spl-library-chat-context.png)
+
 ## 🔐 Security
 
 - Credentials encrypted at rest (`config.encrypted`, `.config.key`)

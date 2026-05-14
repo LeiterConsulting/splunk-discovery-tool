@@ -3379,11 +3379,14 @@
                 );
             };
 
-            const saveSplQueryToLibrary = async (splQuery, options = {}) => {
-                const payload = buildSplLibraryPayload(splQuery, options);
-                if (!payload) {
+            const importKnowledgeAssetToLibrary = async (payload, options = {}) => {
+                if (!payload || typeof payload !== 'object') {
                     return null;
                 }
+
+                const fallbackSuccessMessage = String(options.successMessage || 'Knowledge asset saved to the context library.').trim();
+                const fallbackErrorMessage = String(options.errorMessage || 'Knowledge asset import failed.').trim();
+                const logLabel = String(options.logLabel || 'knowledge asset import').trim() || 'knowledge asset import';
 
                 setCapabilityActionState(prev => ({
                     ...prev,
@@ -3398,25 +3401,26 @@
                     });
                     const result = await response.json();
                     if (!response.ok) {
-                        throw new Error(result?.detail || result?.message || 'Failed to save SPL query to the library.');
+                        throw new Error(result?.detail || result?.message || fallbackErrorMessage);
                     }
 
-                    const savedAssetId = result?.details?.asset?.asset_id || null;
+                    const savedAsset = result?.details?.asset || null;
+                    const savedAssetId = savedAsset?.asset_id || null;
 
                     setCapabilityNotice({
                         type: 'success',
-                        message: result?.message || 'SPL query saved to the context library.'
+                        message: result?.message || fallbackSuccessMessage,
                     });
                     await loadCapabilities();
                     if (savedAssetId && ragAssetWorkspace.detailAssetId === savedAssetId) {
                         await loadRagAssetDetail(savedAssetId, { force: true });
                     }
-                    return result?.details?.asset || null;
+                    return savedAsset;
                 } catch (error) {
-                    console.error('Failed to save SPL query to library:', error);
+                    console.error(`Failed during ${logLabel}:`, error);
                     setCapabilityNotice({
                         type: 'error',
-                        message: error.message || 'Failed to save SPL query to the library.'
+                        message: error?.message || fallbackErrorMessage,
                     });
                     return null;
                 } finally {
@@ -3427,6 +3431,19 @@
                     });
                     setTimeout(() => setCapabilityNotice(null), 3500);
                 }
+            };
+
+            const saveSplQueryToLibrary = async (splQuery, options = {}) => {
+                const payload = buildSplLibraryPayload(splQuery, options);
+                if (!payload) {
+                    return null;
+                }
+
+                return importKnowledgeAssetToLibrary(payload, {
+                    successMessage: 'SPL query saved to the context library.',
+                    errorMessage: 'Failed to save SPL query to the library.',
+                    logLabel: 'save SPL query to library',
+                });
             };
 
             const useSplQueryInChat = (splQuery, options = {}) => {
@@ -7418,6 +7435,232 @@
                 setActiveTab('queries');
             };
 
+            const getSummaryContextActionClasses = (tone) => {
+                switch (String(tone || '').toLowerCase()) {
+                    case 'cyan':
+                        return 'bg-cyan-700 hover:bg-cyan-800 text-white';
+                    case 'indigo':
+                        return 'bg-indigo-600 hover:bg-indigo-700 text-white';
+                    case 'red':
+                        return 'bg-red-600 hover:bg-red-700 text-white';
+                    case 'amber':
+                        return 'bg-amber-600 hover:bg-amber-700 text-white';
+                    case 'emerald':
+                        return 'bg-emerald-600 hover:bg-emerald-700 text-white';
+                    default:
+                        return 'bg-slate-700 hover:bg-slate-800 text-white';
+                }
+            };
+
+            const saveSummaryContextAssetToLibrary = async (action) => {
+                const assetImport = action?.assetImport && typeof action.assetImport === 'object'
+                    ? action.assetImport
+                    : null;
+                if (!assetImport) {
+                    return null;
+                }
+
+                return importKnowledgeAssetToLibrary(assetImport, {
+                    successMessage: action?.successMessage || 'Context asset saved to the context library.',
+                    errorMessage: action?.errorMessage || 'Failed to save context asset to the library.',
+                    logLabel: 'save summary context asset to library',
+                });
+            };
+
+            const applySummaryContextQueryFocus = (queryFocus) => {
+                if (!queryFocus || typeof queryFocus !== 'object') {
+                    return;
+                }
+
+                setQueryFocus({
+                    title: queryFocus.title || 'Focused Query Set',
+                    category: queryFocus.category || 'General',
+                    categories: Array.isArray(queryFocus.categories) ? queryFocus.categories : [],
+                    findingReference: queryFocus.findingReference || '',
+                    environmentEvidence: Array.isArray(queryFocus.environmentEvidence) ? queryFocus.environmentEvidence : [],
+                    sourceLabel: queryFocus.sourceLabel || 'Focused From Context Explorer',
+                    description: queryFocus.description || '',
+                    generatedQueries: Array.isArray(queryFocus.generatedQueries) ? queryFocus.generatedQueries : [],
+                });
+                setQueryFilter('all');
+                setActiveTab('queries');
+            };
+
+            const applySummaryContextTaskFocus = (taskFocus) => {
+                const nextTaskFilter = typeof taskFocus?.taskFilter === 'string' && taskFocus.taskFilter.trim()
+                    ? taskFocus.taskFilter.trim()
+                    : 'all';
+
+                if (taskFocus?.riskData && typeof taskFocus.riskData === 'object') {
+                    setRiskFocus({
+                        title: taskFocus.title || taskFocus.riskData?.risk || 'Operational risk',
+                        domain: taskFocus.domain || taskFocus.riskData?.domain || 'general',
+                        taskFilter: nextTaskFilter,
+                        riskData: taskFocus.riskData,
+                    });
+                } else {
+                    clearRiskFocus();
+                }
+
+                setQueryFilter('all');
+                setQueryFocus(null);
+                setTaskFilter(nextTaskFilter);
+                setActiveTab('tasks');
+            };
+
+            const executeSummaryContextAction = async (action) => {
+                if (!action || typeof action !== 'object') {
+                    return;
+                }
+
+                switch (action.kind) {
+                    case 'launch_chat': {
+                        const prompt = typeof action.prompt === 'string' ? action.prompt.trim() : '';
+                        if (!prompt) {
+                            return;
+                        }
+                        await launchChatInvestigation(prompt, {
+                            ...(action.launchOptions && typeof action.launchOptions === 'object' ? action.launchOptions : {}),
+                        });
+                        return;
+                    }
+                    case 'focus_queries':
+                        applySummaryContextQueryFocus(action.queryFocus);
+                        return;
+                    case 'focus_tasks':
+                        applySummaryContextTaskFocus(action.taskFocus);
+                        return;
+                    case 'save_context_asset':
+                        await saveSummaryContextAssetToLibrary(action);
+                        return;
+                    default:
+                        console.warn('Unsupported summary context action:', action);
+                }
+            };
+
+            const renderSummaryContextActionButtons = (actions, options = {}) => {
+                const safeActions = Array.isArray(actions)
+                    ? actions.filter((action) => action && typeof action === 'object' && action.kind)
+                    : [];
+                if (safeActions.length === 0) {
+                    return null;
+                }
+
+                return (
+                    <div
+                        className={options.containerClassName || 'mt-3 flex flex-wrap gap-2'}
+                        data-testid={options.testId || 'summary-context-action-group'}
+                    >
+                        {safeActions.map((action, idx) => (
+                            <button
+                                key={`${action.kind || 'action'}-${action.label || idx}-${idx}`}
+                                type="button"
+                                onClick={() => executeSummaryContextAction(action)}
+                                data-testid={action.kind === 'save_context_asset' ? 'summary-context-save-action' : 'summary-context-action-button'}
+                                className={`inline-flex items-center rounded px-3 py-1.5 text-xs font-medium transition-colors ${getSummaryContextActionClasses(action.tone)} ${options.buttonClassName || ''}`.trim()}
+                            >
+                                {action.icon && <i className={`fas ${action.icon} mr-1.5`}></i>}
+                                <span>{action.label || 'Action'}</span>
+                            </button>
+                        ))}
+                    </div>
+                );
+            };
+
+            const normalizeSummaryContextPatternEntry = (pattern) => {
+                if (!pattern) {
+                    return [];
+                }
+
+                if (Array.isArray(pattern)) {
+                    return pattern.flatMap((item) => normalizeSummaryContextPatternEntry(item));
+                }
+
+                if (typeof pattern === 'string') {
+                    const trimmedPattern = pattern.trim();
+                    if (!trimmedPattern) {
+                        return [];
+                    }
+
+                    try {
+                        return normalizeSummaryContextPatternEntry(JSON.parse(trimmedPattern));
+                    } catch (error) {
+                        return [{
+                            title: trimmedPattern,
+                            description: '',
+                            signal: '',
+                        }];
+                    }
+                }
+
+                if (typeof pattern !== 'object') {
+                    return [];
+                }
+
+                const embeddedPatternPayload = [
+                    pattern.title,
+                    pattern.name,
+                    pattern.pattern,
+                    pattern.description,
+                    pattern.summary,
+                    pattern.insight,
+                ].find((value) => typeof value === 'string' && value.trim().startsWith('{') && value.includes('"patterns"'));
+                if (embeddedPatternPayload) {
+                    try {
+                        return normalizeSummaryContextPatternEntry(JSON.parse(embeddedPatternPayload));
+                    } catch (error) {
+                    }
+                }
+
+                if (Array.isArray(pattern.patterns)) {
+                    return pattern.patterns.flatMap((item) => normalizeSummaryContextPatternEntry(item));
+                }
+
+                const title = String(pattern.title || pattern.name || pattern.pattern || pattern.category || pattern.signal || '').trim();
+                const description = String(pattern.description || pattern.summary || pattern.insight || '').trim();
+                let signal = '';
+
+                if (Array.isArray(pattern.evidence)) {
+                    signal = pattern.evidence
+                        .map((item) => String(item || '').trim())
+                        .filter(Boolean)
+                        .slice(0, 2)
+                        .join(', ');
+                } else if (typeof pattern.evidence === 'string') {
+                    signal = pattern.evidence.trim();
+                } else if (typeof pattern.signal === 'string') {
+                    signal = pattern.signal.trim();
+                }
+
+                if (!title && !description && !signal) {
+                    return [];
+                }
+
+                return [{
+                    title: title || description || 'Pattern',
+                    description: title && description === title ? '' : description,
+                    signal,
+                }];
+            };
+
+            const normalizeSummaryContextPatterns = (rawPatterns) => {
+                if (!Array.isArray(rawPatterns)) {
+                    return [];
+                }
+
+                const seenPatterns = new Set();
+                return rawPatterns
+                    .flatMap((pattern) => normalizeSummaryContextPatternEntry(pattern))
+                    .filter((pattern) => {
+                        const key = `${pattern.title || ''}::${pattern.description || ''}::${pattern.signal || ''}`.trim().toLowerCase();
+                        if (!key || seenPatterns.has(key)) {
+                            return false;
+                        }
+                        seenPatterns.add(key);
+                        return true;
+                    });
+            };
+
             const clearQueryFocus = () => {
                 setQueryFocus(null);
                 setQueryFilter('all');
@@ -7451,7 +7694,11 @@
             const contextLanes = contextExplorer?.lanes && typeof contextExplorer.lanes === 'object'
                 ? contextExplorer.lanes
                 : {};
-            const contextPatterns = Array.isArray(contextExplorer?.patterns) ? contextExplorer.patterns : [];
+            const contextPatterns = normalizeSummaryContextPatterns(contextExplorer?.patterns);
+            const visibleContextPatterns = contextPatterns.slice(0, 4);
+            const leadContextPattern = visibleContextPatterns[0] || null;
+            const supportingContextPatterns = visibleContextPatterns.slice(1);
+            const hiddenContextPatternCount = Math.max(0, contextPatterns.length - visibleContextPatterns.length);
             const contextIndexAnchors = Array.isArray(contextAnchors?.indexes) ? contextAnchors.indexes : [];
             const contextSourcetypeAnchors = Array.isArray(contextAnchors?.sourcetypes) ? contextAnchors.sourcetypes : [];
             const contextHostAnchors = Array.isArray(contextAnchors?.hosts) ? contextAnchors.hosts : [];
@@ -10533,7 +10780,6 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                 <details
                                                                     className="mt-3"
                                                                     data-testid="chat-capability-evidence"
-                                                                    open={msg.capability_usage.some((usage) => Array.isArray(usage?.reusable_queries) && usage.reusable_queries.length > 0)}
                                                                 >
                                                                     <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-emerald-300 hover:text-emerald-100' : 'text-emerald-700 hover:text-emerald-900'}`}>
                                                                         <i className="fas fa-puzzle-piece mr-2"></i>
@@ -11725,23 +11971,83 @@ Reason: ${item.reason || 'not classified in current model'}`,
                                                                 <div className="p-6 space-y-6">
                                                                     {contextPatterns.length > 0 && (
                                                                         <div className={`rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-cyan-50 border-cyan-200'}`}>
-                                                                            <div className="flex items-center gap-2 mb-3">
-                                                                                <i className="fas fa-radar text-cyan-600"></i>
-                                                                                <h4 className={`text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Observed Patterns</h4>
+                                                                            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                                                                                <div className="max-w-3xl">
+                                                                                    <div className="flex items-center gap-2">
+                                                                                        <i className="fas fa-radar text-cyan-600"></i>
+                                                                                        <h4 className={`text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Observed Patterns</h4>
+                                                                                    </div>
+                                                                                    <p className={`mt-2 text-sm leading-6 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>
+                                                                                        Scan the main takeaway first, then review the supporting patterns without digging through a dense card wall.
+                                                                                    </p>
+                                                                                </div>
+                                                                                <div className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${isDarkTheme ? 'bg-cyan-950 border border-cyan-800 text-cyan-100' : 'bg-white border border-cyan-200 text-cyan-800'}`}>
+                                                                                    {contextPatterns.length} surfaced
+                                                                                </div>
                                                                             </div>
-                                                                            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                                                                                {contextPatterns.slice(0, 6).map((pattern, idx) => (
-                                                                                    <div key={`context-pattern-${idx}`} className={`rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                                                                                        <div className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{pattern.title || `Pattern ${idx + 1}`}</div>
-                                                                                        {pattern.description && (
-                                                                                            <p className={`mt-2 text-xs leading-5 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>{pattern.description}</p>
-                                                                                        )}
-                                                                                        {pattern.signal && (
-                                                                                            <div className={`mt-2 text-[11px] uppercase tracking-wide ${isDarkTheme ? 'text-cyan-300' : 'text-cyan-700'}`}>{pattern.signal}</div>
+
+                                                                            {leadContextPattern && (
+                                                                                <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.15fr),minmax(0,0.85fr)]">
+                                                                                    <div className={`rounded-2xl border p-5 ${isDarkTheme ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                                                                                        <div className={`text-[11px] font-semibold uppercase tracking-[0.24em] ${isDarkTheme ? 'text-cyan-300' : 'text-cyan-700'}`}>
+                                                                                            Lead pattern
+                                                                                        </div>
+                                                                                        <div className={`mt-3 text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
+                                                                                            {leadContextPattern.title || 'Pattern 1'}
+                                                                                        </div>
+                                                                                        <p className={`mt-3 text-sm leading-6 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>
+                                                                                            {leadContextPattern.description || 'Discovery surfaced this pattern without additional narrative detail.'}
+                                                                                        </p>
+                                                                                        {leadContextPattern.signal && (
+                                                                                            <div className={`mt-4 rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-cyan-950/40 border-cyan-900 text-cyan-100' : 'bg-cyan-50 border-cyan-200 text-cyan-900'}`}>
+                                                                                                <div className={`text-[11px] font-semibold uppercase tracking-[0.22em] ${isDarkTheme ? 'text-cyan-300' : 'text-cyan-700'}`}>
+                                                                                                    Signal
+                                                                                                </div>
+                                                                                                <div className="mt-1 text-sm leading-6 break-words">{leadContextPattern.signal}</div>
+                                                                                            </div>
                                                                                         )}
                                                                                     </div>
-                                                                                ))}
-                                                                            </div>
+
+                                                                                    <div className="space-y-3">
+                                                                                        {supportingContextPatterns.length > 0 ? (
+                                                                                            supportingContextPatterns.map((pattern, idx) => (
+                                                                                                <div key={`context-pattern-${idx + 1}`} className={`rounded-xl border px-4 py-4 ${isDarkTheme ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                                                                                                    <div className="flex items-start gap-3">
+                                                                                                        <span className={`mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? 'bg-gray-950 text-cyan-200 border border-gray-700' : 'bg-cyan-100 text-cyan-800 border border-cyan-200'}`}>
+                                                                                                            {idx + 2}
+                                                                                                        </span>
+                                                                                                        <div className="min-w-0">
+                                                                                                            <div className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
+                                                                                                                {pattern.title || `Pattern ${idx + 2}`}
+                                                                                                            </div>
+                                                                                                            {pattern.description && (
+                                                                                                                <p className={`mt-1 text-xs leading-5 ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>
+                                                                                                                    {pattern.description}
+                                                                                                                </p>
+                                                                                                            )}
+                                                                                                            {pattern.signal && (
+                                                                                                                <div className={`mt-2 text-xs leading-5 ${isDarkTheme ? 'text-cyan-200' : 'text-cyan-800'}`}>
+                                                                                                                    <span className="font-semibold">Signal:</span> {pattern.signal}
+                                                                                                                </div>
+                                                                                                            )}
+                                                                                                        </div>
+                                                                                                    </div>
+                                                                                                </div>
+                                                                                            ))
+                                                                                        ) : (
+                                                                                            <div className={`rounded-xl border px-4 py-4 text-sm ${isDarkTheme ? 'bg-slate-900 border-slate-800 text-gray-300' : 'bg-white border-slate-200 text-gray-700'}`}>
+                                                                                                No additional supporting patterns were extracted for this session.
+                                                                                            </div>
+                                                                                        )}
+                                                                                    </div>
+                                                                                </div>
+                                                                            )}
+
+                                                                            {hiddenContextPatternCount > 0 && (
+                                                                                <div className={`mt-4 text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-600'}`}>
+                                                                                    Showing the top {visibleContextPatterns.length} patterns first to keep the review focused.
+                                                                                </div>
+                                                                            )}
                                                                         </div>
                                                                     )}
 
@@ -11792,28 +12098,7 @@ Reason: ${item.reason || 'not classified in current model'}`,
                                                                                                 </div>
                                                                                                 <div className={`text-[11px] uppercase tracking-wide ${section.accent}`}>{section.key}</div>
                                                                                             </div>
-                                                                                            <div className="mt-3 flex flex-wrap gap-2">
-                                                                                                <button
-                                                                                                    type="button"
-                                                                                                    onClick={() => launchChatInvestigation(
-                                                                                                        buildContextExplorerChatPrompt(section.key, item),
-                                                                                                        {
-                                                                                                            freshContext: true,
-                                                                                                            investigationMode: 'context_explorer',
-                                                                                                        }
-                                                                                                    )}
-                                                                                                    className="px-3 py-1.5 bg-cyan-700 hover:bg-cyan-800 text-white text-xs font-medium rounded transition-colors"
-                                                                                                >
-                                                                                                    Explore in Chat
-                                                                                                </button>
-                                                                                                <button
-                                                                                                    type="button"
-                                                                                                    onClick={() => focusQueriesForContextExplorer(section.key, item)}
-                                                                                                    className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded"
-                                                                                                >
-                                                                                                    Open Queries
-                                                                                                </button>
-                                                                                            </div>
+                                                                                            {renderSummaryContextActionButtons(item.actions)}
                                                                                         </div>
                                                                                     ))}
                                                                                 </div>
@@ -11839,28 +12124,7 @@ Reason: ${item.reason || 'not classified in current model'}`,
                                                                                             </div>
                                                                                             <div className={`text-[11px] uppercase tracking-wide ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-700'}`}>{item.type || 'entity'}</div>
                                                                                         </div>
-                                                                                        <div className="mt-3 flex flex-wrap gap-2">
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => launchChatInvestigation(
-                                                                                                    buildUnknownEntityValidationChatPrompt(item),
-                                                                                                    {
-                                                                                                        freshContext: true,
-                                                                                                        investigationMode: 'unknown_entity_context_builder',
-                                                                                                    }
-                                                                                                )}
-                                                                                                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Build Context
-                                                                                            </button>
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => focusQueriesForContextExplorer(item?.type === 'sourcetype' ? 'sourcetype' : 'index', item)}
-                                                                                                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-800 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Open Queries
-                                                                                            </button>
-                                                                                        </div>
+                                                                                        {renderSummaryContextActionButtons(item.actions)}
                                                                                     </div>
                                                                                 ))}
                                                                             </div>
@@ -11876,32 +12140,7 @@ Reason: ${item.reason || 'not classified in current model'}`,
                                                                                     <div key={`context-risk-${idx}`} className={`rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-slate-900 border-slate-800' : 'bg-red-50 border-red-200'}`}>
                                                                                         <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{(risk.severity || 'medium').toString().toUpperCase()} • {risk.domain || 'general'}</div>
                                                                                         <div className={`mt-1 text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>{risk.risk || 'Operational risk'}</div>
-                                                                                        <div className="mt-3 flex flex-wrap gap-2">
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => focusRiskControlPath(risk)}
-                                                                                                className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Open Control Path
-                                                                                            </button>
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => launchChatInvestigation(
-                                                                                                    `Help me build context around this risk and decide what evidence to collect next.
-
-Risk: ${risk.risk || ''}
-Impact: ${risk.impact || ''}
-Mitigation: ${risk.mitigation || ''}`,
-                                                                                                    {
-                                                                                                        freshContext: true,
-                                                                                                        investigationMode: 'context_explorer',
-                                                                                                    }
-                                                                                                )}
-                                                                                                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-800 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Investigate in Chat
-                                                                                            </button>
-                                                                                        </div>
+                                                                                        {renderSummaryContextActionButtons(risk.actions)}
                                                                                     </div>
                                                                                 ))}
                                                                                 {contextCoverageGapItems.slice(0, 2).map((gap, idx) => (
@@ -11911,32 +12150,7 @@ Mitigation: ${risk.mitigation || ''}`,
                                                                                         {gap.why_it_matters && (
                                                                                             <div className={`mt-1 text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-600'}`}>{gap.why_it_matters}</div>
                                                                                         )}
-                                                                                        <div className="mt-3 flex flex-wrap gap-2">
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => setActiveTab('tasks')}
-                                                                                                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Open Task Queue
-                                                                                            </button>
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => launchChatInvestigation(
-                                                                                                    `Help me build context around this coverage gap and decide what control work should follow.
-
-Gap: ${gap.gap || ''}
-Why it matters: ${gap.why_it_matters || ''}
-Suggested next step: ${gap.recommended_next_step || ''}`,
-                                                                                                    {
-                                                                                                        freshContext: true,
-                                                                                                        investigationMode: 'context_explorer',
-                                                                                                    }
-                                                                                                )}
-                                                                                                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-800 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Explore in Chat
-                                                                                            </button>
-                                                                                        </div>
+                                                                                        {renderSummaryContextActionButtons(gap.actions)}
                                                                                     </div>
                                                                                 ))}
                                                                             </div>
@@ -11959,29 +12173,7 @@ Suggested next step: ${gap.recommended_next_step || ''}`,
                                                                                             </div>
                                                                                             <div className={`text-[11px] uppercase tracking-wide ${isDarkTheme ? 'text-emerald-300' : 'text-emerald-700'}`}>{task.priority || 'MEDIUM'}</div>
                                                                                         </div>
-                                                                                        <div className="mt-3 flex flex-wrap gap-2">
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => setActiveTab('tasks')}
-                                                                                                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Open Task Queue
-                                                                                            </button>
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                onClick={() => {
-                                                                                                    const matchingTask = (summaryData?.admin_tasks || []).find((candidate) => candidate?.title === task?.title);
-                                                                                                    if (matchingTask) {
-                                                                                                        focusQueriesForTask(matchingTask);
-                                                                                                    } else {
-                                                                                                        setActiveTab('queries');
-                                                                                                    }
-                                                                                                }}
-                                                                                                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-800 text-white text-xs rounded"
-                                                                                            >
-                                                                                                Open Related Queries
-                                                                                            </button>
-                                                                                        </div>
+                                                                                        {renderSummaryContextActionButtons(task.actions)}
                                                                                     </div>
                                                                                 ))}
                                                                             </div>

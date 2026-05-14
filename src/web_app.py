@@ -3683,6 +3683,686 @@ def _safe_int(value: Any) -> int:
     return 0
 
 
+def _normalize_context_anchor_type(anchor_type: Any) -> str:
+    normalized = str(anchor_type or "").strip().lower()
+    if normalized in {"sourcetype", "host"}:
+        return normalized
+    return "index"
+
+
+def _format_context_volume_label(value: Any) -> str:
+    cleaned = str(value or "unknown").replace("_", " ").strip()
+    if not cleaned:
+        cleaned = "unknown"
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _dedupe_context_tags(*tag_groups: Any, limit: int = 12) -> List[str]:
+    tags: List[str] = []
+    seen = set()
+    for group in tag_groups:
+        if isinstance(group, list):
+            raw_items = group
+        else:
+            raw_items = [group]
+        for item in raw_items:
+            cleaned = re.sub(r"\s+", " ", str(item or "").strip())
+            if not cleaned:
+                continue
+            normalized = cleaned.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            tags.append(cleaned)
+            if len(tags) >= limit:
+                return tags
+    return tags
+
+
+def _build_context_query_focus_payload(
+    title: str,
+    category: str,
+    categories: List[str],
+    finding_reference: str,
+    environment_evidence: List[str],
+    source_label: str,
+    description: str,
+    generated_queries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "title": title,
+        "category": category,
+        "categories": categories,
+        "findingReference": finding_reference,
+        "environmentEvidence": environment_evidence,
+        "sourceLabel": source_label,
+        "description": description,
+        "generatedQueries": generated_queries,
+    }
+
+
+def _build_context_task_focus_payload(title: str, task_filter: str, risk_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "title": title,
+        "taskFilter": str(task_filter or "all"),
+    }
+    if isinstance(risk_data, dict) and risk_data:
+        payload["domain"] = str(risk_data.get("domain") or "general")
+        payload["riskData"] = risk_data
+    return payload
+
+
+def _build_context_asset_import_payload(
+    *,
+    title: str,
+    asset_type: str,
+    description: str,
+    tags: List[str],
+    session_id: Optional[str],
+    content_sections: List[Tuple[str, str]],
+    attributes: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    content_lines = [
+        "Saved discovery-summary context for reuse in the managed context library and follow-on chat workflows.",
+    ]
+    if session_id:
+        content_lines.append(f"Session: {session_id}")
+
+    for heading, body in content_sections:
+        normalized_heading = str(heading or "").strip()
+        normalized_body = str(body or "").strip()
+        if not normalized_heading or not normalized_body:
+            continue
+        content_lines.extend(["", f"## {normalized_heading}", normalized_body])
+
+    return {
+        "title": str(title or "Discovery Context").strip() or "Discovery Context",
+        "content": "\n".join(content_lines),
+        "asset_type": str(asset_type or "reference_document").strip() or "reference_document",
+        "source_label": "Discovery Summary Context Explorer",
+        "description": str(description or "Saved discovery summary context for follow-on chat and library reuse.").strip(),
+        "tags": _dedupe_context_tags(tags, ["summary-context", "context-explorer"]),
+        "attributes": dict(attributes or {}),
+    }
+
+
+def _build_context_explorer_queries(anchor_type: str, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    resolved_anchor_type = _normalize_context_anchor_type(anchor_type)
+    anchor_name = str(item.get("name") or "").strip()
+    if not anchor_name:
+        return []
+
+    search_anchor = f"{resolved_anchor_type}={anchor_name}"
+    evidence = [f"{resolved_anchor_type}:{anchor_name}"]
+    priority = "🔴 HIGH" if resolved_anchor_type == "index" else "🟠 MEDIUM"
+    breakdown_fields = "sourcetype host" if resolved_anchor_type == "index" else "index host" if resolved_anchor_type == "sourcetype" else "index sourcetype"
+    trend_field = "sourcetype" if resolved_anchor_type == "index" else "index" if resolved_anchor_type == "sourcetype" else "sourcetype"
+
+    return [
+        {
+            "title": f"🔎 {anchor_name} Context Snapshot",
+            "description": f"Profile {search_anchor} so an operator can quickly see where it shows up and how much signal it carries.",
+            "use_case": "Data Quality",
+            "category": "Data Quality",
+            "spl": f"{search_anchor} earliest=-24h | stats count by {breakdown_fields} | sort - count | head 20",
+            "finding_reference": f"Context explorer anchor for {search_anchor}",
+            "execution_time": "< 30s",
+            "business_value": "Shows the immediate shape and spread of this anchor before you decide on monitoring or ownership.",
+            "priority": priority,
+            "difficulty": "Beginner",
+            "environment_evidence": evidence,
+            "query_source": "context_engine",
+        },
+        {
+            "title": f"📈 {anchor_name} Activity Trend",
+            "description": f"Trend {search_anchor} over time to identify whether it is stable, bursty, or drifting.",
+            "use_case": "Performance Monitoring",
+            "category": "Infrastructure & Performance",
+            "spl": f"{search_anchor} earliest=-7d | timechart span=1h count by {trend_field} limit=10 useother=true",
+            "finding_reference": f"Trend exploration for {search_anchor}",
+            "execution_time": "< 45s",
+            "business_value": "Helps determine whether this anchor deserves coverage or more targeted alerting.",
+            "priority": priority,
+            "difficulty": "Intermediate",
+            "environment_evidence": evidence,
+            "query_source": "context_engine",
+        },
+        {
+            "title": f"🧪 {anchor_name} Sample Events",
+            "description": f"Pull a small sample from {search_anchor} so the operator can inspect representative events directly.",
+            "use_case": "Data Exploration",
+            "category": "Data Quality",
+            "spl": f"{search_anchor} earliest=-24h | head 20 | table _time index sourcetype host source",
+            "finding_reference": f"Sample event triage for {search_anchor}",
+            "execution_time": "< 15s",
+            "business_value": "Speeds up fast human classification before creating tasks or controls.",
+            "priority": priority,
+            "difficulty": "Beginner",
+            "environment_evidence": evidence,
+            "query_source": "context_engine",
+        },
+    ]
+
+
+def _build_context_explorer_chat_prompt(anchor_type: str, item: Dict[str, Any]) -> str:
+    resolved_anchor_type = _normalize_context_anchor_type(anchor_type)
+    anchor_name = str(item.get("name") or "").strip()
+    generated_queries = _build_context_explorer_queries(resolved_anchor_type, item)
+    if not anchor_name or not generated_queries:
+        return ""
+
+    search_anchor = f"{resolved_anchor_type}={anchor_name}"
+    starter_queries = "\n".join([f"{idx + 1}. {query['spl']}" for idx, query in enumerate(generated_queries)])
+    volume_signal = (
+        f"{_safe_int(item.get('events')).__format__(',')} observed events in discovery."
+        if item.get("events") is not None
+        else "Use the first query to determine current volume and spread."
+    )
+    size_mb = item.get("size_mb")
+    size_signal = ""
+    try:
+        if size_mb not in (None, ""):
+            size_signal = f"Approximate indexed size: {float(size_mb):.1f} MB."
+    except Exception:
+        size_signal = ""
+
+    return "\n".join([
+        f"Build operational context for {search_anchor} within this discovery session.",
+        "",
+        f"Use the exact entity anchor {search_anchor}. Do not substitute another {resolved_anchor_type} name.",
+        f"Anchor type: {resolved_anchor_type}",
+        f"Name: {anchor_name}",
+        volume_signal,
+        size_signal,
+        "",
+        "Start by executing one or more of these exact SPL queries before broadening the investigation:",
+        starter_queries,
+        "",
+        "Return:",
+        "1. What this anchor most likely represents in the environment",
+        "2. Which related indexes, sourcetypes, or hosts stand out",
+        "3. What monitoring, ownership, or validation should happen next",
+    ]).strip()
+
+
+def _build_unknown_entity_validation_queries(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entity_type = "sourcetype" if str(item.get("type") or "").lower() == "sourcetype" else "index"
+    entity_name = str(item.get("name") or "").strip()
+    if not entity_name:
+        return []
+
+    search_anchor = f"index={entity_name}" if entity_type == "index" else f"index=* sourcetype={entity_name}"
+    breakout_fields = "sourcetype host" if entity_type == "index" else "index host"
+    trend_field = "sourcetype" if entity_type == "index" else "index"
+    entity_label = f"index={entity_name}" if entity_type == "index" else f"sourcetype={entity_name}"
+    priority = "🔴 HIGH" if bool((item.get("context") or {}).get("has_significant_data")) else "🟠 MEDIUM"
+    finding_reference = str(item.get("question") or f"Classify and validate {entity_name} before it becomes an unmanaged blind spot.").strip()
+    business_value = (
+        f"Shows whether {entity_name} is an active data set, what sources feed it, and which hosts are contributing telemetry."
+        if entity_type == "index"
+        else f"Shows where sourcetype {entity_name} is present and whether it represents a meaningful operational or security signal."
+    )
+
+    return [
+        {
+            "title": f"🧭 {entity_name} Footprint by {'Sourcetype and Host' if entity_type == 'index' else 'Index and Host'}",
+            "description": f"Establish the basic coverage and volume profile for {entity_label} before deciding how it should be classified.",
+            "use_case": "Data Quality",
+            "category": "Data Quality",
+            "spl": f"{search_anchor} earliest=-24h | stats count by {breakout_fields} | sort - count",
+            "finding_reference": finding_reference,
+            "execution_time": "< 30s",
+            "business_value": business_value,
+            "priority": priority,
+            "difficulty": "Beginner",
+            "environment_evidence": [entity_label],
+            "query_source": "context_engine",
+        },
+        {
+            "title": f"📈 {entity_name} Activity Trend",
+            "description": f"Trend {entity_label} over time so you can tell whether it is steady, bursty, or mostly dormant.",
+            "use_case": "Data Quality",
+            "category": "Data Quality",
+            "spl": f"{search_anchor} earliest=-7d | timechart span=1h count by {trend_field} limit=10 useother=true",
+            "finding_reference": finding_reference,
+            "execution_time": "< 30s",
+            "business_value": "Shows whether the entity is stable enough to warrant monitoring coverage or onboarding work.",
+            "priority": priority,
+            "difficulty": "Intermediate",
+            "environment_evidence": [entity_label],
+            "query_source": "context_engine",
+        },
+        {
+            "title": f"🔎 {entity_name} Sample Event Triage",
+            "description": f"Pull a small sample so an operator can quickly inspect what this entity actually contains.",
+            "use_case": "Data Quality",
+            "category": "Data Quality",
+            "spl": f"{search_anchor} earliest=-24h | head 20 | table _time index sourcetype host source",
+            "finding_reference": finding_reference,
+            "execution_time": "< 15s",
+            "business_value": "Provides fast human inspection of representative events before creating dashboards or detections.",
+            "priority": priority,
+            "difficulty": "Beginner",
+            "environment_evidence": [entity_label],
+            "query_source": "context_engine",
+        },
+    ]
+
+
+def _build_unknown_entity_validation_chat_prompt(item: Dict[str, Any]) -> str:
+    entity_type = "sourcetype" if str(item.get("type") or "").lower() == "sourcetype" else "index"
+    entity_name = str(item.get("name") or "").strip()
+    generated_queries = _build_unknown_entity_validation_queries(item)
+    if not entity_name or not generated_queries:
+        return ""
+
+    entity_label = f"index={entity_name}" if entity_type == "index" else f"sourcetype={entity_name}"
+    suggestions = item.get("suggestions") if isinstance(item.get("suggestions"), list) else []
+    likely_categories = ", ".join([str(suggestion.get("label") or "").strip() for suggestion in suggestions[:3] if isinstance(suggestion, dict) and str(suggestion.get("label") or "").strip()]) or "unknown"
+    starter_queries = "\n".join([f"{idx + 1}. {query['spl']}" for idx, query in enumerate(generated_queries)])
+    question = str(item.get("question") or "Classify this entity and determine what it contains.").strip()
+    context = item.get("context") if isinstance(item.get("context"), dict) else {}
+    volume_signal = _format_context_volume_label(context.get("volume_category"))
+    significance_note = "This entity already appears to have significant data." if bool(context.get("has_significant_data")) else "This entity may still be low-signal or poorly understood."
+
+    return "\n".join([
+        f"Build context for this unclear Splunk {entity_type} and decide whether it is expected, important, and worth monitoring coverage.",
+        "",
+        f"Use the exact entity anchor {entity_label}. Do not substitute another {entity_type} name.",
+        f"Name: {entity_name}",
+        f"Question: {question}",
+        f"Likely categories: {likely_categories}",
+        f"Volume signal: {volume_signal}",
+        significance_note,
+        "",
+        "Start by executing one or more of these exact SPL queries, then improve or branch from them only if the results justify it:",
+        starter_queries,
+        "",
+        "Return:",
+        "1. What this entity most likely contains",
+        "2. Whether it looks expected or risky",
+        "3. What monitoring, ownership, or validation should happen next",
+    ]).strip()
+
+
+def _get_risk_task_filter_key(risk: Dict[str, Any]) -> str:
+    risk_text = " ".join([
+        str(risk.get("domain") or ""),
+        str(risk.get("risk") or ""),
+        str(risk.get("impact") or ""),
+        str(risk.get("mitigation") or ""),
+    ]).lower()
+
+    if any(token in risk_text for token in ("security", "authentication", "privilege")):
+        return "category:Security"
+    if any(token in risk_text for token in ("data quality", "freshness", "clock skew", "timestamp")):
+        return "category:Data Quality"
+    if any(token in risk_text for token in ("ingestion", "collector", "pipeline", "configuration")):
+        return "category:Configuration"
+    if any(token in risk_text for token in ("performance", "platform", "health", "availability", "latency", "throughput", "infrastructure", "application")):
+        return "category:Performance"
+    domain = str(risk.get("domain") or "").strip()
+    if domain:
+        return f"category:{domain}"
+    return "open"
+
+
+def _get_task_query_categories(task: Dict[str, Any]) -> List[str]:
+    category = str(task.get("category") or "").strip()
+    if category in {"Security", "Compliance"}:
+        return ["Security & Compliance"]
+    if category == "Performance":
+        return ["Infrastructure & Performance", "Capacity Planning"]
+    if category == "Data Quality":
+        return ["Data Quality", "Data Exploration"]
+    if category == "Configuration":
+        return ["Infrastructure & Performance", "Data Quality"]
+    return []
+
+
+def _build_context_launch_action(label: str, prompt: str, tone: str = "slate", investigation_mode: str = "context_explorer") -> Dict[str, Any]:
+    return {
+        "kind": "launch_chat",
+        "label": label,
+        "icon": "fa-comments",
+        "tone": tone,
+        "prompt": prompt,
+        "launchOptions": {
+            "freshContext": True,
+            "investigationMode": investigation_mode,
+        },
+    }
+
+
+def _build_context_query_action(label: str, query_focus: Dict[str, Any], tone: str = "indigo") -> Dict[str, Any]:
+    return {
+        "kind": "focus_queries",
+        "label": label,
+        "icon": "fa-code",
+        "tone": tone,
+        "queryFocus": query_focus,
+    }
+
+
+def _build_context_task_action(label: str, task_focus: Dict[str, Any], tone: str = "emerald") -> Dict[str, Any]:
+    return {
+        "kind": "focus_tasks",
+        "label": label,
+        "icon": "fa-list-check",
+        "tone": tone,
+        "taskFocus": task_focus,
+    }
+
+
+def _build_context_save_action(label: str, asset_import: Dict[str, Any], tone: str = "slate") -> Dict[str, Any]:
+    asset_title = str(asset_import.get("title") or "context asset").strip()
+    return {
+        "kind": "save_context_asset",
+        "label": label,
+        "icon": "fa-book-open",
+        "tone": tone,
+        "assetImport": asset_import,
+        "successMessage": f"Saved {asset_title} to the context library.",
+        "errorMessage": f"Failed to save {asset_title} to the context library.",
+    }
+
+
+def _build_context_anchor_actions(anchor_type: str, item: Dict[str, Any], session_id: Optional[str], readiness_score: int) -> List[Dict[str, Any]]:
+    resolved_anchor_type = _normalize_context_anchor_type(anchor_type)
+    anchor_name = str(item.get("name") or "").strip()
+    if not anchor_name:
+        return []
+
+    search_anchor = f"{resolved_anchor_type}={anchor_name}"
+    generated_queries = _build_context_explorer_queries(resolved_anchor_type, item)
+    chat_prompt = _build_context_explorer_chat_prompt(resolved_anchor_type, item)
+    focus_payload = _build_context_query_focus_payload(
+        title=f"{anchor_name} Context Explorer",
+        category="Data Quality",
+        categories=["Data Quality", "Infrastructure & Performance"],
+        finding_reference=f"Context explorer for {search_anchor}",
+        environment_evidence=[f"{resolved_anchor_type}:{anchor_name}"],
+        source_label="Focused From Context Explorer",
+        description=f"Showing discovery-aligned context queries for {search_anchor} so you can classify, validate, and route follow-up work without leaving exec-control.",
+        generated_queries=generated_queries,
+    )
+    events = _safe_int(item.get("events"))
+    size_mb = item.get("size_mb")
+    signal_lines = [
+        f"Anchor type: {resolved_anchor_type}",
+        f"Name: {anchor_name}",
+        f"Observed events: {events:,}" if events else "Observed events: unknown",
+        f"Session readiness score: {readiness_score}" if readiness_score else "Session readiness score: unknown",
+    ]
+    try:
+        if size_mb not in (None, ""):
+            signal_lines.append(f"Approximate indexed size: {float(size_mb):.1f} MB")
+    except Exception:
+        pass
+    if str(item.get("max_time") or "").strip():
+        signal_lines.append(f"Latest observed time: {str(item.get('max_time') or '').strip()}")
+    query_blocks = []
+    for query in generated_queries:
+        query_blocks.extend([f"### {query.get('title')}", f"```spl\n{query.get('spl')}\n```"])
+    asset_import = _build_context_asset_import_payload(
+        title=f"Discovery Context: {search_anchor}",
+        asset_type="monitored_system_context" if resolved_anchor_type == "host" else "reference_document",
+        description=f"Saved summary context for {search_anchor} with discovery-aligned investigation prompts and starter SPL.",
+        tags=[resolved_anchor_type, anchor_name, search_anchor, "discovery-summary"],
+        session_id=session_id,
+        content_sections=[
+            ("Signal", "\n".join(signal_lines)),
+            ("Investigation Prompt", chat_prompt),
+            ("Suggested Queries", "\n\n".join(query_blocks)),
+        ],
+        attributes={
+            "origin_kind": "summary_context_anchor",
+            "origin_label": "Summary Context Explorer",
+            "session_id": session_id or "",
+            "anchor_type": resolved_anchor_type,
+            "anchor_name": anchor_name,
+        },
+    )
+    return [
+        _build_context_launch_action("Explore in Chat", chat_prompt, tone="cyan"),
+        _build_context_query_action("Open Queries", focus_payload, tone="indigo"),
+        _build_context_save_action("Save to Context Library", asset_import, tone="slate"),
+    ]
+
+
+def _build_unknown_entity_actions(item: Dict[str, Any], session_id: Optional[str], readiness_score: int) -> List[Dict[str, Any]]:
+    entity_type = "sourcetype" if str(item.get("type") or "").lower() == "sourcetype" else "index"
+    entity_name = str(item.get("name") or "").strip()
+    if not entity_name:
+        return []
+
+    generated_queries = _build_unknown_entity_validation_queries(item)
+    chat_prompt = _build_unknown_entity_validation_chat_prompt(item)
+    entity_label = f"index={entity_name}" if entity_type == "index" else f"sourcetype={entity_name}"
+    focus_payload = _build_context_query_focus_payload(
+        title=f"{entity_name} Context Builder",
+        category="Data Quality",
+        categories=["Data Quality"],
+        finding_reference=str(item.get("question") or f"Build context for {entity_label}").strip(),
+        environment_evidence=[entity_label],
+        source_label="Focused From Context Explorer",
+        description=f"Showing discovery-aligned validation queries for {entity_label} so you can classify it before it becomes an unmanaged blind spot.",
+        generated_queries=generated_queries,
+    )
+    suggestions = item.get("suggestions") if isinstance(item.get("suggestions"), list) else []
+    suggestion_labels = [str(suggestion.get("label") or "").strip() for suggestion in suggestions[:4] if isinstance(suggestion, dict) and str(suggestion.get("label") or "").strip()]
+    context = item.get("context") if isinstance(item.get("context"), dict) else {}
+    asset_import = _build_context_asset_import_payload(
+        title=f"Discovery Context: {entity_label}",
+        asset_type="reference_document",
+        description=f"Saved summary context for {entity_label} with validation prompts and starter SPL.",
+        tags=[entity_type, entity_name, entity_label, "unknown-entity", "discovery-summary"],
+        session_id=session_id,
+        content_sections=[
+            ("Signal", "\n".join([
+                f"Entity type: {entity_type}",
+                f"Name: {entity_name}",
+                f"Question: {str(item.get('question') or 'Needs classification.').strip()}",
+                f"Volume signal: {_format_context_volume_label(context.get('volume_category'))}",
+                "Significant data observed: yes" if bool(context.get("has_significant_data")) else "Significant data observed: no",
+                f"Session readiness score: {readiness_score}" if readiness_score else "Session readiness score: unknown",
+                f"Likely categories: {', '.join(suggestion_labels)}" if suggestion_labels else "Likely categories: unknown",
+            ])),
+            ("Investigation Prompt", chat_prompt),
+            ("Suggested Queries", "\n\n".join([f"### {query.get('title')}\n```spl\n{query.get('spl')}\n```" for query in generated_queries])),
+        ],
+        attributes={
+            "origin_kind": "summary_context_unknown_entity",
+            "origin_label": "Summary Context Explorer",
+            "session_id": session_id or "",
+            "anchor_type": entity_type,
+            "anchor_name": entity_name,
+        },
+    )
+    return [
+        _build_context_launch_action("Build Context in Chat", chat_prompt, tone="indigo", investigation_mode="unknown_entity_context_builder"),
+        _build_context_query_action("Open Queries", focus_payload, tone="slate"),
+        _build_context_save_action("Save to Context Library", asset_import, tone="slate"),
+    ]
+
+
+def _build_risk_actions(risk: Dict[str, Any], session_id: Optional[str], readiness_score: int) -> List[Dict[str, Any]]:
+    risk_title = str(risk.get("risk") or "Operational risk").strip() or "Operational risk"
+    chat_prompt = "\n".join([
+        "Help me build context around this risk and decide what evidence to collect next.",
+        "",
+        f"Risk: {risk_title}",
+        f"Impact: {str(risk.get('impact') or '').strip()}",
+        f"Mitigation: {str(risk.get('mitigation') or '').strip()}",
+    ]).strip()
+    asset_import = _build_context_asset_import_payload(
+        title=f"Discovery Risk Context: {risk_title}",
+        asset_type="runbook_context",
+        description=f"Saved summary context for the risk '{risk_title}' with recommended follow-up evidence collection.",
+        tags=[str(risk.get("domain") or "general").strip() or "general", "risk", "discovery-summary"],
+        session_id=session_id,
+        content_sections=[
+            ("Risk", "\n".join([
+                f"Severity: {str(risk.get('severity') or 'medium').strip()}",
+                f"Domain: {str(risk.get('domain') or 'general').strip()}",
+                f"Risk: {risk_title}",
+                f"Impact: {str(risk.get('impact') or '').strip()}",
+                f"Mitigation: {str(risk.get('mitigation') or '').strip()}",
+                f"Session readiness score: {readiness_score}" if readiness_score else "Session readiness score: unknown",
+            ])),
+            ("Investigation Prompt", chat_prompt),
+        ],
+        attributes={
+            "origin_kind": "summary_context_risk",
+            "origin_label": "Summary Context Explorer",
+            "session_id": session_id or "",
+            "risk_domain": str(risk.get("domain") or "").strip(),
+            "risk_title": risk_title,
+        },
+    )
+    return [
+        _build_context_task_action(
+            "Open Control Path",
+            _build_context_task_focus_payload(risk_title, _get_risk_task_filter_key(risk), risk_data=risk),
+            tone="red",
+        ),
+        _build_context_launch_action("Investigate in Chat", chat_prompt, tone="slate"),
+        _build_context_save_action("Save to Context Library", asset_import, tone="slate"),
+    ]
+
+
+def _build_coverage_gap_actions(gap: Dict[str, Any], session_id: Optional[str], readiness_score: int) -> List[Dict[str, Any]]:
+    gap_title = str(gap.get("gap") or "Coverage gap").strip() or "Coverage gap"
+    chat_prompt = "\n".join([
+        "Help me build context around this coverage gap and decide what control work should follow.",
+        "",
+        f"Gap: {gap_title}",
+        f"Why it matters: {str(gap.get('why_it_matters') or '').strip()}",
+        f"Suggested next step: {str(gap.get('recommended_next_step') or gap.get('recommended_action') or '').strip()}",
+    ]).strip()
+    gap_domain = str(gap.get("domain") or "").strip()
+    task_filter = f"category:{gap_domain}" if gap_domain else "open"
+    asset_import = _build_context_asset_import_payload(
+        title=f"Discovery Coverage Gap: {gap_title}",
+        asset_type="runbook_context",
+        description=f"Saved summary context for the coverage gap '{gap_title}' with recommended control follow-up.",
+        tags=[gap_domain or "coverage", "coverage-gap", "discovery-summary"],
+        session_id=session_id,
+        content_sections=[
+            ("Coverage Gap", "\n".join([
+                f"Priority: {str(gap.get('priority') or 'unspecified').strip()}",
+                f"Domain: {gap_domain or 'general'}",
+                f"Gap: {gap_title}",
+                f"Why it matters: {str(gap.get('why_it_matters') or '').strip()}",
+                f"Recommended next step: {str(gap.get('recommended_next_step') or gap.get('recommended_action') or '').strip()}",
+                f"Session readiness score: {readiness_score}" if readiness_score else "Session readiness score: unknown",
+            ])),
+            ("Investigation Prompt", chat_prompt),
+        ],
+        attributes={
+            "origin_kind": "summary_context_coverage_gap",
+            "origin_label": "Summary Context Explorer",
+            "session_id": session_id or "",
+            "gap_domain": gap_domain,
+            "gap_title": gap_title,
+        },
+    )
+    return [
+        _build_context_task_action("Open Task Queue", _build_context_task_focus_payload(gap_title, task_filter), tone="amber"),
+        _build_context_launch_action("Explore in Chat", chat_prompt, tone="slate"),
+        _build_context_save_action("Save to Context Library", asset_import, tone="slate"),
+    ]
+
+
+def _build_priority_task_actions(task: Dict[str, Any], session_id: Optional[str], readiness_score: int) -> List[Dict[str, Any]]:
+    task_title = str(task.get("title") or "Untitled task").strip() or "Untitled task"
+    task_category = str(task.get("category") or "General").strip() or "General"
+    query_focus = _build_context_query_focus_payload(
+        title=task_title,
+        category=task_category,
+        categories=_get_task_query_categories(task),
+        finding_reference=str(task.get("finding_reference") or "").strip(),
+        environment_evidence=list(task.get("environment_evidence") or []) if isinstance(task.get("environment_evidence"), list) else [],
+        source_label="Focused From Task Queue",
+        description=f"Showing validation queries aligned to the {task_category} workstream using matching finding and telemetry evidence.",
+        generated_queries=[],
+    )
+    asset_import = _build_context_asset_import_payload(
+        title=f"Discovery Task Context: {task_title}",
+        asset_type="runbook_context",
+        description=f"Saved summary context for the priority task '{task_title}'.",
+        tags=[task_category, str(task.get("priority") or "MEDIUM").strip() or "MEDIUM", "priority-task", "discovery-summary"],
+        session_id=session_id,
+        content_sections=[
+            ("Task", "\n".join([
+                f"Priority: {str(task.get('priority') or 'MEDIUM').strip()}",
+                f"Category: {task_category}",
+                f"Title: {task_title}",
+                f"Finding reference: {str(task.get('finding_reference') or '').strip()}",
+                f"Session readiness score: {readiness_score}" if readiness_score else "Session readiness score: unknown",
+            ])),
+        ],
+        attributes={
+            "origin_kind": "summary_context_priority_task",
+            "origin_label": "Summary Context Explorer",
+            "session_id": session_id or "",
+            "task_category": task_category,
+            "task_title": task_title,
+        },
+    )
+    return [
+        _build_context_task_action("Open Task Queue", _build_context_task_focus_payload(task_title, "all"), tone="emerald"),
+        _build_context_query_action("Open Related Queries", query_focus, tone="slate"),
+        _build_context_save_action("Save to Context Library", asset_import, tone="slate"),
+    ]
+
+
+def _context_explorer_has_formal_actions(context_explorer: Any) -> bool:
+    if not isinstance(context_explorer, dict):
+        return False
+    anchors = context_explorer.get("anchors") if isinstance(context_explorer.get("anchors"), dict) else {}
+    lanes = context_explorer.get("lanes") if isinstance(context_explorer.get("lanes"), dict) else {}
+    collections = [
+        anchors.get("indexes"),
+        anchors.get("sourcetypes"),
+        anchors.get("hosts"),
+        lanes.get("unknown_entities"),
+        lanes.get("coverage_gaps"),
+        lanes.get("risks"),
+        lanes.get("priority_tasks"),
+    ]
+    for collection in collections:
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if isinstance(item, dict) and isinstance(item.get("actions"), list) and item.get("actions"):
+                return True
+    return False
+
+
+def _context_explorer_has_structured_patterns(context_explorer: Any) -> bool:
+    if not isinstance(context_explorer, dict):
+        return False
+
+    patterns = context_explorer.get("patterns")
+    if not isinstance(patterns, list):
+        return True
+
+    for pattern in patterns:
+        if not isinstance(pattern, dict):
+            return False
+
+        title = str(pattern.get("title") or "").strip()
+        description = str(pattern.get("description") or "").strip()
+        signal = str(pattern.get("signal") or "").strip()
+        if title.lstrip().startswith("{") and '"patterns"' in title:
+            return False
+        if not (title or description or signal):
+            return False
+
+    return True
+
+
 def compute_discovery_readiness_score(
     overview: Any,
     recommendations: List[Dict[str, Any]],
@@ -3714,6 +4394,7 @@ def build_context_explorer_payload(
     coverage_gaps: Optional[List[Dict[str, Any]]] = None,
     risk_register: Optional[List[Dict[str, Any]]] = None,
     readiness_score: Optional[int] = None,
+    session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a session-scoped context explorer payload from discovery artifacts."""
     if not isinstance(discovery_data, dict):
@@ -3793,50 +4474,29 @@ def build_context_explorer_payload(
     hosts.sort(key=lambda item: item.get("events", 0), reverse=True)
 
     normalized_patterns: List[Dict[str, str]] = []
-    raw_patterns = overview.get("notable_patterns", []) if isinstance(overview.get("notable_patterns", []), list) else []
     seen_pattern_titles = set()
-    for raw_pattern in raw_patterns:
-        payload = raw_pattern
-        if isinstance(raw_pattern, str):
-            try:
-                payload = json.loads(raw_pattern)
-            except Exception:
-                payload = {"patterns": [{"title": raw_pattern}]}
+    for pattern in _parse_v2_notable_patterns(overview.get("notable_patterns", [])):
+        title = str(pattern.get("title") or pattern.get("name") or pattern.get("pattern") or pattern.get("category") or pattern.get("signal") or "").strip()
+        description = str(pattern.get("description") or pattern.get("summary") or pattern.get("insight") or "").strip()
+        evidence = pattern.get("evidence")
+        signal = ""
+        if isinstance(evidence, list):
+            signal = ", ".join([str(item).strip() for item in evidence[:2] if str(item).strip()])
+        elif isinstance(evidence, str):
+            signal = evidence.strip()
 
-        if isinstance(payload, dict) and isinstance(payload.get("patterns"), list):
-            pattern_items = payload.get("patterns", [])
-        else:
-            pattern_items = [payload]
+        if not title:
+            continue
 
-        for pattern in pattern_items:
-            title = ""
-            description = ""
-            signal = ""
-            if isinstance(pattern, dict):
-                title = str(pattern.get("title") or pattern.get("name") or pattern.get("pattern") or pattern.get("signal") or "").strip()
-                description = str(pattern.get("description") or pattern.get("summary") or pattern.get("insight") or "").strip()
-                evidence = pattern.get("evidence")
-                if isinstance(evidence, list):
-                    signal = ", ".join([str(item).strip() for item in evidence[:2] if str(item).strip()])
-                elif isinstance(evidence, str):
-                    signal = evidence.strip()
-            elif isinstance(pattern, str):
-                title = pattern.strip()
-
-            if not title:
-                continue
-
-            lowered_title = title.lower()
-            if lowered_title in seen_pattern_titles:
-                continue
-            seen_pattern_titles.add(lowered_title)
-            normalized_patterns.append({
-                "title": title,
-                "description": description,
-                "signal": signal,
-            })
-            if len(normalized_patterns) >= 6:
-                break
+        lowered_title = title.lower()
+        if lowered_title in seen_pattern_titles:
+            continue
+        seen_pattern_titles.add(lowered_title)
+        normalized_patterns.append({
+            "title": title,
+            "description": description,
+            "signal": signal,
+        })
         if len(normalized_patterns) >= 6:
             break
 
@@ -3844,10 +4504,11 @@ def build_context_explorer_payload(
     safe_gaps = [item for item in (coverage_gaps or discovery_data.get("coverage_gaps", []) or []) if isinstance(item, dict)]
     safe_risks = [item for item in (risk_register or discovery_data.get("risk_register", []) or []) if isinstance(item, dict)]
     safe_tasks = [item for item in (admin_tasks or []) if isinstance(item, dict)]
+    resolved_readiness_score = _safe_int(readiness_score if readiness_score is not None else discovery_data.get("readiness_score"))
 
     return {
         "overview": {
-            "readiness_score": _safe_int(readiness_score if readiness_score is not None else discovery_data.get("readiness_score")),
+            "readiness_score": resolved_readiness_score,
             "total_indexes": _safe_int(overview.get("total_indexes", len(indexes))),
             "total_sourcetypes": _safe_int(overview.get("total_sourcetypes", len(sourcetypes))),
             "total_hosts": _safe_int(overview.get("total_hosts", len(hosts))),
@@ -3855,21 +4516,58 @@ def build_context_explorer_payload(
             "license_state": str(overview.get("license_state", "unknown") or "unknown"),
         },
         "anchors": {
-            "indexes": indexes[:8],
-            "sourcetypes": sourcetypes[:8],
-            "hosts": hosts[:8],
+            "indexes": [
+                {
+                    **item,
+                    "actions": _build_context_anchor_actions("index", item, session_id, resolved_readiness_score),
+                }
+                for item in indexes[:8]
+            ],
+            "sourcetypes": [
+                {
+                    **item,
+                    "actions": _build_context_anchor_actions("sourcetype", item, session_id, resolved_readiness_score),
+                }
+                for item in sourcetypes[:8]
+            ],
+            "hosts": [
+                {
+                    **item,
+                    "actions": _build_context_anchor_actions("host", item, session_id, resolved_readiness_score),
+                }
+                for item in hosts[:8]
+            ],
         },
         "patterns": normalized_patterns[:6],
         "lanes": {
-            "unknown_entities": safe_unknowns[:6],
-            "coverage_gaps": safe_gaps[:6],
-            "risks": safe_risks[:6],
+            "unknown_entities": [
+                {
+                    **item,
+                    "actions": _build_unknown_entity_actions(item, session_id, resolved_readiness_score),
+                }
+                for item in safe_unknowns[:6]
+            ],
+            "coverage_gaps": [
+                {
+                    **item,
+                    "actions": _build_coverage_gap_actions(item, session_id, resolved_readiness_score),
+                }
+                for item in safe_gaps[:6]
+            ],
+            "risks": [
+                {
+                    **item,
+                    "actions": _build_risk_actions(item, session_id, resolved_readiness_score),
+                }
+                for item in safe_risks[:6]
+            ],
             "priority_tasks": [
                 {
                     "title": str(task.get("title") or "Untitled task"),
                     "priority": str(task.get("priority") or "MEDIUM"),
                     "category": str(task.get("category") or "General"),
                     "finding_reference": str(task.get("finding_reference") or ""),
+                    "actions": _build_priority_task_actions(task, session_id, resolved_readiness_score),
                 }
                 for task in safe_tasks[:6]
             ],
@@ -7165,7 +7863,14 @@ async def summarize_session(request: Dict[str, Any]):
                 for key in ["schema_version", "trend_signals", "risk_register", "recursive_investigations"]
             )
             if has_v2_panels:
-                if "context_explorer" not in existing_summary and json_file.exists():
+                if (
+                    (
+                        "context_explorer" not in existing_summary
+                        or not _context_explorer_has_formal_actions(existing_summary.get("context_explorer"))
+                        or not _context_explorer_has_structured_patterns(existing_summary.get("context_explorer"))
+                    )
+                    and json_file.exists()
+                ):
                     try:
                         with open(json_file, 'r', encoding='utf-8') as cached_discovery_file:
                             cached_discovery_data = json.load(cached_discovery_file)
@@ -7176,6 +7881,7 @@ async def summarize_session(request: Dict[str, Any]):
                             coverage_gaps=existing_summary.get("coverage_gaps"),
                             risk_register=existing_summary.get("risk_register"),
                             readiness_score=existing_summary.get("readiness_score"),
+                            session_id=safe_timestamp,
                         )
                         with open(summary_file, 'w', encoding='utf-8') as summary_out:
                             json.dump(existing_summary, summary_out, indent=2)
@@ -8259,6 +8965,7 @@ Return ONLY the JSON array, no other text."""
         coverage_gaps=coverage_gaps,
         risk_register=risk_register,
         readiness_score=readiness_score,
+        session_id=timestamp,
     )
     
     # Prepare response
@@ -8886,20 +9593,87 @@ def _extract_markdown_section_items(markdown_text: str, heading: str, max_items:
     return items[:max(1, max_items)]
 
 
+def _decode_jsonish_string(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    try:
+        return json.loads(f'"{text}"')
+    except Exception:
+        return (
+            text
+            .replace('\\n', ' ')
+            .replace('\\r', ' ')
+            .replace('\\t', ' ')
+            .replace('\\"', '"')
+            .strip()
+        )
+
+
+def _extract_v2_notable_patterns_from_text(raw_text: str) -> List[Dict[str, Any]]:
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return []
+
+    extracted: List[Dict[str, Any]] = []
+    segments = re.split(r'(?="category"\s*:)', raw_text)
+    for segment in segments:
+        category_match = re.search(r'"category"\s*:\s*"((?:\\.|[^"\\])*)"', segment)
+        insight_match = re.search(r'"insight"\s*:\s*"((?:\\.|[^"\\])*)"', segment, re.DOTALL)
+        if not category_match and not insight_match:
+            continue
+
+        evidence_items: List[str] = []
+        evidence_match = re.search(r'"evidence"\s*:\s*\[(.*?)\]', segment, re.DOTALL)
+        if evidence_match:
+            for item in re.findall(r'"((?:\\.|[^"\\])*)"', evidence_match.group(1)):
+                decoded_item = _decode_jsonish_string(item)
+                if decoded_item:
+                    evidence_items.append(decoded_item)
+                if len(evidence_items) >= 6:
+                    break
+
+        extracted.append({
+            "category": _decode_jsonish_string(category_match.group(1)) if category_match else "",
+            "insight": _decode_jsonish_string(insight_match.group(1)) if insight_match else "",
+            "evidence": evidence_items,
+        })
+
+    return extracted
+
+
 def _parse_v2_notable_patterns(raw_patterns: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw_patterns, list):
         return []
 
+    parsed_patterns: List[Dict[str, Any]] = []
     for item in raw_patterns:
         payload = item
         if isinstance(item, str):
             try:
                 payload = json.loads(item)
             except Exception:
+                parsed_patterns.extend(_extract_v2_notable_patterns_from_text(item))
                 continue
         if isinstance(payload, dict) and isinstance(payload.get('patterns'), list):
-            return [pattern for pattern in payload.get('patterns', []) if isinstance(pattern, dict)]
-    return []
+            parsed_patterns.extend([pattern for pattern in payload.get('patterns', []) if isinstance(pattern, dict)])
+        elif isinstance(payload, dict):
+            parsed_patterns.append(payload)
+
+    deduped_patterns: List[Dict[str, Any]] = []
+    seen = set()
+    for pattern in parsed_patterns:
+        title = str(pattern.get('title') or pattern.get('name') or pattern.get('pattern') or pattern.get('category') or '').strip().lower()
+        description = str(pattern.get('description') or pattern.get('summary') or pattern.get('insight') or '').strip().lower()
+        signal = str(pattern.get('signal') or '').strip().lower()
+        if not (title or description or signal):
+            continue
+        key = f"{title}::{description}::{signal}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_patterns.append(pattern)
+    return deduped_patterns
 
 
 def _dedupe_ranked_entities(items: List[Dict[str, Any]], limit: int = 6) -> List[Dict[str, Any]]:

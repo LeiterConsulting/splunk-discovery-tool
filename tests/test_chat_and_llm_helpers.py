@@ -125,6 +125,145 @@ class OpenAIModelHelperTests(unittest.TestCase):
             )
         )
 
+    def test_build_context_explorer_payload_includes_formalized_actions(self):
+        discovery_data = {
+            "overview": {
+                "total_indexes": 1,
+                "total_sourcetypes": 1,
+                "total_hosts": 1,
+                "data_volume_24h": "14.2 GB",
+                "license_state": "healthy",
+                "notable_patterns": [
+                    {
+                        "patterns": [
+                            {
+                                "title": "Authentication activity concentration",
+                                "description": "Security events are concentrated into one index.",
+                                "signal": "index coverage",
+                            }
+                        ]
+                    }
+                ],
+            },
+            "finding_ledger": [
+                {
+                    "title": "Index inventory",
+                    "data": {
+                        "title": "main",
+                        "totalEventCount": 1240,
+                        "currentDBSizeMB": 84.2,
+                        "datatype": "event",
+                        "maxTime": "2026-05-01T12:30:00Z",
+                    },
+                },
+                {
+                    "title": "Sourcetype inventory",
+                    "data": {
+                        "type": "sourcetypes",
+                        "title": "WinEventLog:Security",
+                        "totalCount": 880,
+                    },
+                },
+                {
+                    "title": "Analyzing host: splunk-sh-1",
+                    "data": {
+                        "title": "splunk-sh-1",
+                        "eventCount": 610,
+                    },
+                }
+            ],
+        }
+        unknown_questions = [
+            {
+                "type": "index",
+                "name": "mystery_index",
+                "question": "What kind of data lands in this index?",
+                "context": {
+                    "volume_category": "high",
+                    "has_significant_data": True,
+                },
+                "suggestions": [
+                    {"label": "Security"},
+                    {"label": "Authentication"},
+                ],
+            }
+        ]
+        coverage_gaps = [
+            {
+                "priority": "HIGH",
+                "domain": "Security",
+                "gap": "Authentication dashboards are missing",
+                "why_it_matters": "Operators cannot validate authentication trends quickly.",
+                "recommended_next_step": "Build an authentication validation dashboard.",
+            }
+        ]
+        risk_register = [
+            {
+                "severity": "high",
+                "domain": "Security",
+                "risk": "Authentication gaps",
+                "impact": "Reduced visibility into privileged activity.",
+                "mitigation": "Create validation dashboards and review saved searches.",
+            }
+        ]
+        admin_tasks = [
+            {
+                "title": "Create authentication validation dashboard",
+                "priority": "HIGH",
+                "category": "Security",
+                "finding_reference": "Authentication gaps",
+                "environment_evidence": ["index=main", "sourcetype=WinEventLog:Security"],
+            }
+        ]
+
+        payload = web_app.build_context_explorer_payload(
+            discovery_data,
+            unknown_questions=unknown_questions,
+            admin_tasks=admin_tasks,
+            coverage_gaps=coverage_gaps,
+            risk_register=risk_register,
+            readiness_score=87,
+            session_id="20260501_123456",
+        )
+
+        index_actions = payload["anchors"]["indexes"][0]["actions"]
+        self.assertEqual([action["kind"] for action in index_actions], ["launch_chat", "focus_queries", "save_context_asset"])
+        self.assertEqual(index_actions[0]["launchOptions"]["investigationMode"], "context_explorer")
+        self.assertEqual(index_actions[1]["queryFocus"]["generatedQueries"][0]["query_source"], "context_engine")
+        self.assertEqual(index_actions[2]["assetImport"]["source_label"], "Discovery Summary Context Explorer")
+        self.assertIn("Session: 20260501_123456", index_actions[2]["assetImport"]["content"])
+
+        unknown_actions = payload["lanes"]["unknown_entities"][0]["actions"]
+        self.assertEqual(unknown_actions[0]["launchOptions"]["investigationMode"], "unknown_entity_context_builder")
+        self.assertEqual(unknown_actions[1]["queryFocus"]["title"], "mystery_index Context Builder")
+        self.assertEqual(unknown_actions[2]["assetImport"]["asset_type"], "reference_document")
+
+        risk_actions = payload["lanes"]["risks"][0]["actions"]
+        self.assertEqual(risk_actions[0]["taskFocus"]["taskFilter"], "category:Security")
+        self.assertEqual(risk_actions[2]["assetImport"]["asset_type"], "runbook_context")
+
+        task_actions = payload["lanes"]["priority_tasks"][0]["actions"]
+        self.assertEqual(task_actions[0]["kind"], "focus_tasks")
+        self.assertEqual(task_actions[1]["queryFocus"]["categories"], ["Security & Compliance"])
+        self.assertEqual(task_actions[2]["kind"], "save_context_asset")
+
+    def test_build_context_explorer_payload_recovers_truncated_notable_pattern_blob(self):
+        discovery_data = {
+            "overview": {
+                "notable_patterns": [
+                    '{"patterns": [{"category": "Data volume and distribution", "insight": "Large indexes dominate the environment.", "evidence": ["netops: 88M", "_internal: 84M"]}, {"category": "Temporal patterns", "insight": "Most active sources are near-real-time.", "evidence": ["recent data"]}'
+                ],
+            },
+            "finding_ledger": [],
+        }
+
+        payload = web_app.build_context_explorer_payload(discovery_data)
+
+        self.assertGreaterEqual(len(payload["patterns"]), 2)
+        self.assertEqual(payload["patterns"][0]["title"], "Data volume and distribution")
+        self.assertIn("Large indexes dominate the environment.", payload["patterns"][0]["description"])
+        self.assertEqual(payload["patterns"][0]["signal"], "netops: 88M, _internal: 84M")
+
 
 class CustomLLMClientCompatibilityTests(unittest.TestCase):
     class _StubMetrics:

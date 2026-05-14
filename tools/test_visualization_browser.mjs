@@ -634,10 +634,15 @@ async function runWorkspaceSmoke(baseUrl) {
         await firstLibraryCard.getByRole('button', { name: 'Use in Chat' }).click();
         await assertChatPromptContains(page, libraryQuery);
         await page.getByRole('button', { name: 'Send chat message' }).click();
+        const capabilityEvidence = page.getByTestId('chat-capability-evidence');
+        await capabilityEvidence.waitFor({ state: 'visible' });
+        const evidenceAutoExpanded = await capabilityEvidence.evaluate((element) => element.hasAttribute('open'));
+        assert(evidenceAutoExpanded === false, 'Expected capability evidence to stay collapsed by default even when reusable SPL candidates are present.');
+        await capabilityEvidence.locator('summary').click();
+        const evidenceExpandedAfterClick = await capabilityEvidence.evaluate((element) => element.hasAttribute('open'));
+        assert(evidenceExpandedAfterClick === true, 'Expected capability evidence to expand after the user opens it.');
         const reusableQueryCard = page.getByTestId('chat-capability-reusable-query-card').first();
         await reusableQueryCard.waitFor({ state: 'visible' });
-        const evidenceAutoExpanded = await page.getByTestId('chat-capability-evidence').evaluate((element) => element.hasAttribute('open'));
-        assert(evidenceAutoExpanded === true, 'Expected capability evidence to auto-expand when reusable SPL candidates are present.');
         const chatReuseBadgeText = ((await reusableQueryCard.getByTestId('chat-capability-reusable-query-reuse-tier').textContent()) || '').trim();
         assert(chatReuseBadgeText.includes('Reuse: Known Good'), `Expected reusable-query reuse badge, but received: ${chatReuseBadgeText}`);
         const chatFitBadgeText = ((await reusableQueryCard.getByTestId('chat-capability-reusable-query-fit-status').textContent()) || '').trim();
