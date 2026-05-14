@@ -359,6 +359,7 @@ class CapabilityManager:
                 source_label=payload.get("source_label") or "",
                 description=payload.get("description") or "",
                 tags=payload.get("tags") or [],
+                attributes=payload.get("attributes") or {},
                 auto_reindex=auto_reindex,
             )
         except Exception as exc:
@@ -374,11 +375,17 @@ class CapabilityManager:
         if auto_reindex and config.installed:
             self._sync_health_state(definition, config)
 
-        message = "Knowledge asset imported."
+        import_action = str(details.get("asset_import_action") or "created").strip().lower()
+        is_refresh = import_action == "updated"
+        message = "Knowledge asset refreshed." if is_refresh else "Knowledge asset imported."
         if details.get("auto_reindexed"):
-            message = "Knowledge asset imported and indexed."
+            message = "Knowledge asset refreshed and indexed." if is_refresh else "Knowledge asset imported and indexed."
         elif not config.enabled:
-            message = "Knowledge asset imported. Enable indexed retrieval to use it in context previews and chat."
+            message = (
+                "Knowledge asset refreshed. Enable indexed retrieval to use it in context previews and chat."
+                if is_refresh
+                else "Knowledge asset imported. Enable indexed retrieval to use it in context previews and chat."
+            )
 
         return CapabilityActionResult(
             ok=True,
@@ -415,6 +422,7 @@ class CapabilityManager:
                 source_label=payload.get("source_label") or "",
                 description=payload.get("description") or "",
                 tags=payload.get("tags") or [],
+                attributes=payload.get("attributes") or {},
                 auto_reindex=auto_reindex,
             )
         except Exception as exc:
@@ -430,11 +438,17 @@ class CapabilityManager:
         if auto_reindex and config.installed:
             self._sync_health_state(definition, config)
 
-        message = "Knowledge asset uploaded."
+        import_action = str(details.get("asset_import_action") or "created").strip().lower()
+        is_refresh = import_action == "updated"
+        message = "Knowledge asset refreshed." if is_refresh else "Knowledge asset uploaded."
         if details.get("auto_reindexed"):
-            message = "Knowledge asset uploaded and indexed."
+            message = "Knowledge asset refreshed and indexed." if is_refresh else "Knowledge asset uploaded and indexed."
         elif not config.enabled:
-            message = "Knowledge asset uploaded. Enable indexed retrieval to use it in context previews and chat."
+            message = (
+                "Knowledge asset refreshed. Enable indexed retrieval to use it in context previews and chat."
+                if is_refresh
+                else "Knowledge asset uploaded. Enable indexed retrieval to use it in context previews and chat."
+            )
 
         return CapabilityActionResult(
             ok=True,
@@ -595,6 +609,53 @@ class CapabilityManager:
             capability=definition.name,
             action="build-context",
             message=details.get("message") or "RAG context preview generated.",
+            state=self.get_capability_state(definition.name),
+            details=details,
+        )
+
+    def record_rag_spl_query_feedback(
+        self,
+        name: str,
+        query: str,
+        status: str,
+        feedback: Optional[Dict[str, Any]] = None,
+    ) -> CapabilityActionResult:
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "record-feedback", "Unknown capability.")
+
+        config = self._get_or_create_config(definition)
+        provider = self._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "record_spl_query_feedback"):
+            return self._result(definition.name, "record-feedback", False, "Capability does not expose SPL query feedback updates.")
+
+        try:
+            details = provider.record_spl_query_feedback(query=query, status=status, feedback=feedback or {})
+        except Exception as exc:
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="record-feedback",
+                message="SPL query feedback update failed.",
+                state=self.get_capability_state(definition.name),
+                details={"error": str(exc)},
+            )
+
+        if not details.get("found"):
+            return CapabilityActionResult(
+                ok=False,
+                capability=definition.name,
+                action="record-feedback",
+                message="No matching SPL library asset was found for feedback.",
+                state=self.get_capability_state(definition.name),
+                details=details,
+            )
+
+        return CapabilityActionResult(
+            ok=True,
+            capability=definition.name,
+            action="record-feedback",
+            message="SPL query feedback recorded.",
             state=self.get_capability_state(definition.name),
             details=details,
         )

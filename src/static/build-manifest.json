@@ -1,12 +1,12 @@
 {
-  "built_at_utc": "2026-05-14T15:24:44.949Z",
+  "built_at_utc": "2026-05-14T18:24:16.920Z",
   "source": {
-    "legacy_html_sha256": "d24fb3f802c2f707ee1928843ad68b1c850117e440857842a8d40a2a0941bd08",
-    "app_source_sha256": "6670d8ae81c76fe87777c30317ac7f6c15ef87536a54dd68a9c0d617417e364d"
+    "legacy_html_sha256": "d9bf94df68ce90fb073ce30a08fe51e58ac7cfa7fa7b3e2ef7ca075130bdc054",
+    "app_source_sha256": "f7b1687a1ca9ef93891bd82a2c96f304edd4cad87b61add7d4c188f07383ca01"
   },
   "artifacts": {
     "index_html_sha256": "128e17d24b5c3704a05ab24694e78198ffb04f2bf8025d6aac6bf867d5f1be16",
-    "app_js_sha256": "66f914a21e73a643bf17fdbe6a10dac54ba4c9ee33554d01396bc84cef00bc42"
+    "app_js_sha256": "6c77347d0efc268d65b2ea1816824b94c5874cb08d423a086d778b256cc78e1f"
   },
   "runtime": {
     "script_refs": [

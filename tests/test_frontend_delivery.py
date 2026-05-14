@@ -81,6 +81,53 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("actions.push(...extractAssistantListedFollowOnActions(cleanedResponse, seenPrompts, ignoredPrefixes));", template_source)
         self.assertIn("for (const pattern of inlineListPatterns) {", template_source)
 
+    def test_spl_library_wiring_is_declared(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const SPL_LIBRARY_ASSET_TYPE = 'spl_query_library';", template_source)
+        self.assertIn("const saveSplQueryToLibrary = async (splQuery, options = {}) => {", template_source)
+        self.assertIn("const savedAssetId = result?.details?.asset?.asset_id || null;", template_source)
+        self.assertIn("const useSplQueryInChat = (splQuery, options = {}) => {", template_source)
+        self.assertIn("const renderSplQueryActionButtons = (splQuery, options = {}) => {", template_source)
+        self.assertIn("const getKnowledgeAssetSplIntelligence = (attributes) => {", template_source)
+        self.assertIn("const renderSplQueryIntelligence = (attributes, options = {}) => {", template_source)
+        self.assertIn("asset_type: SPL_LIBRARY_ASSET_TYPE,", template_source)
+        self.assertIn("const reportSplQueries = Array.isArray(reportContent?.spl_queries) ? reportContent.spl_queries : [];", template_source)
+        self.assertIn("{ key: 'spl_library', label: `SPL Library (${ragSplLibraryAssetCount})` },", template_source)
+        self.assertIn("renderSplQueryActionButtons(msg.spl_query, {", template_source)
+        self.assertIn("renderSplQueryActionButtons(task.verification_spl, {", template_source)
+        self.assertIn("reusable_queries: Array.isArray(usage?.reusable_queries)", template_source)
+        self.assertIn("const renderCapabilityReusableQueryCards = (usage) => {", template_source)
+        self.assertIn("data-testid=\"chat-capability-reusable-query-card\"", template_source)
+        self.assertIn("data-testid=\"chat-capability-evidence\"", template_source)
+        self.assertIn("open={msg.capability_usage.some((usage) => Array.isArray(usage?.reusable_queries) && usage.reusable_queries.length > 0)}", template_source)
+        self.assertIn("const isSplLibraryOnlyView = ragLibraryFilter === 'spl_library' && Boolean(savedSplQuery);", template_source)
+        self.assertIn("data-testid=\"report-viewer-spl-blocks\"", template_source)
+        self.assertIn("data-testid=\"context-library-spl-query-card\"", template_source)
+        self.assertIn("data-testid=\"context-library-spl-only-query\"", template_source)
+        self.assertIn("testIdPrefix: isSplLibraryOnlyView ? 'context-library-spl' : '',", template_source)
+        self.assertIn("buildTestId('fit-status')", template_source)
+        self.assertIn("buildTestId('validation-status')", template_source)
+        self.assertIn("buildTestId('reuse-tier')", template_source)
+        self.assertIn("buildTestId('feedback-counts')", template_source)
+        self.assertIn("data-testid=\"context-library-detail-spl-query\"", template_source)
+        self.assertIn("renderSplQueryIntelligence(detailAttributes, { testIdPrefix: 'context-library-detail-spl' })", template_source)
+        self.assertIn("data-testid=\"discovery-report-year-toggle\"", template_source)
+        self.assertIn("data-testid=\"discovery-report-session-toggle\"", template_source)
+        self.assertIn("data-testid=\"discovery-report-row\"", template_source)
+
+    def test_context_workspace_entrypoint_is_declared(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const openRagCapabilitiesWorkspace = (options = {}) => {", template_source)
+        self.assertIn("if (options.libraryFilter) {", template_source)
+        self.assertIn("setRagLibraryFilter(options.libraryFilter);", template_source)
+        self.assertIn("id=\"workspace-tab-context\"", template_source)
+        self.assertIn("data-testid=\"workspace-tab-context\"", template_source)
+        self.assertIn("aria-selected={isCapabilitiesRagView}", template_source)
+        self.assertIn("onClick={() => openRagCapabilitiesWorkspace({ libraryFilter: 'spl_library' })}", template_source)
+        self.assertIn("Refresh Context", template_source)
+
     def test_workspace_shell_expands_full_width_when_no_sidebar_is_present(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 

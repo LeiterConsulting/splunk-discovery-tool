@@ -344,6 +344,139 @@ class CapabilityFrameworkTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
 
+    def test_rag_chromadb_spl_library_asset_persists_structured_attributes(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+                (output_dir / "discovery_sessions.json").write_text(
+                    json.dumps([
+                        {
+                            "timestamp": "20260514_120000",
+                            "created_at": "2026-05-14T12:00:00",
+                            "overview": {"splunk_version": "10.0.1"},
+                            "mcp_capabilities": {"tools": ["splunk_run_query"]},
+                            "report_paths": ["v2_intelligence_blueprint_20260514_120000.json"],
+                            "readiness_score": 92,
+                        }
+                    ]),
+                    encoding="utf-8",
+                )
+                (output_dir / "v2_intelligence_blueprint_20260514_120000.json").write_text(
+                    json.dumps(
+                        {
+                            "generated_at": "2026-05-14T12:00:00",
+                            "readiness_score": 92,
+                            "overview": {"splunk_version": "10.0.1"},
+                            "finding_ledger": [
+                                {"title": "Analyzing index: _internal", "data": {"title": "_internal", "totalEventCount": "12"}},
+                                {"title": "Analyzing sourcetype: splunkd", "data": {"sourcetype": "splunkd"}},
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                import_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Saved SPL Library Query",
+                        "asset_type": "spl_query_library",
+                        "source_label": "Chat assistant",
+                        "description": "Saved reusable SPL for later chat and Splunk execution.",
+                        "tags": ["spl", "library", "chat"],
+                        "content": "Saved SPL query for reuse. Query summary: search index=_internal | stats count by sourcetype.",
+                        "attributes": {
+                            "spl_query": "search index=_internal | stats count by sourcetype",
+                            "app": "search",
+                            "earliest": "-24h",
+                            "latest": "now",
+                            "origin_kind": "chat_assistant",
+                        },
+                    },
+                )
+
+                self.assertTrue(import_result.ok)
+                self.assertEqual(import_result.details["asset"]["asset_type"], "spl_query_library")
+                self.assertEqual(
+                    import_result.details["asset"]["attributes"]["spl_query"],
+                    "search index=_internal | stats count by sourcetype",
+                )
+                self.assertEqual(import_result.details["asset"]["attributes"]["origin_kind"], "chat_assistant")
+                self.assertEqual(
+                    import_result.details["asset"]["attributes"]["spl_intelligence"]["indexes"],
+                    ["_internal"],
+                )
+                self.assertEqual(
+                    import_result.details["asset"]["attributes"]["spl_intelligence"]["query_intent"],
+                    "inventory_aggregation",
+                )
+                self.assertEqual(
+                    import_result.details["asset"]["attributes"]["spl_intelligence"]["environment_fit"]["status"],
+                    "strong",
+                )
+                self.assertTrue(
+                    import_result.details["asset"]["attributes"]["spl_intelligence"]["environment_fit"]["score"] >= 80
+                )
+                self.assertEqual(
+                    import_result.details["asset"]["attributes"]["spl_intelligence"]["validation"]["status"],
+                    "unvalidated",
+                )
+                self.assertEqual(
+                    import_result.details["asset"]["attributes"]["spl_intelligence"]["reuse"]["tier"],
+                    "preferred",
+                )
+
+                list_result = manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(list_result.ok)
+                self.assertEqual(list_result.details["asset_count"], 1)
+                self.assertEqual(list_result.details["asset_type_counts"]["spl_query_library"], 1)
+                self.assertEqual(
+                    list_result.details["assets"][0]["attributes"]["spl_query"],
+                    "search index=_internal | stats count by sourcetype",
+                )
+
+                detail_result = manager.get_rag_asset_detail(
+                    "rag_chromadb",
+                    import_result.details["asset"]["asset_id"],
+                )
+                self.assertTrue(detail_result.ok)
+                self.assertEqual(
+                    detail_result.details["asset"]["attributes"]["app"],
+                    "search",
+                )
+                self.assertEqual(
+                    detail_result.details["asset"]["attributes"]["spl_intelligence"]["environment_fit"]["splunk_version"],
+                    "10.0.1",
+                )
+
+                reloaded_manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                reloaded_assets = reloaded_manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(reloaded_assets.ok)
+                self.assertEqual(
+                    reloaded_assets.details["assets"][0]["attributes"]["spl_query"],
+                    "search index=_internal | stats count by sourcetype",
+                )
+                self.assertEqual(
+                    reloaded_assets.details["assets"][0]["attributes"]["spl_intelligence"]["environment_fit"]["status"],
+                    "strong",
+                )
+            finally:
+                os.chdir(original_cwd)
+
     def test_rag_chromadb_managed_asset_library_check_out_and_check_in_flow(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             temp_path = Path(temp_dir)
@@ -432,6 +565,101 @@ class CapabilityFrameworkTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
 
+    def test_rag_chromadb_spl_library_duplicate_save_refreshes_existing_asset(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                initial_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Saved SPL Library Query",
+                        "asset_type": "spl_query_library",
+                        "source_label": "Chat assistant",
+                        "description": "Original reusable SPL entry.",
+                        "tags": ["spl", "library", "chat"],
+                        "content": "Saved SPL query for reuse.\n\n## Query\nsearch index=_internal | stats count by sourcetype",
+                        "attributes": {
+                            "spl_query": "search index=_internal | stats count by sourcetype",
+                            "app": "search",
+                            "earliest": "-24h",
+                            "latest": "now",
+                            "origin_kind": "chat_assistant",
+                        },
+                    },
+                )
+
+                self.assertTrue(initial_result.ok)
+                self.assertEqual(initial_result.details["asset_import_action"], "created")
+                initial_asset = initial_result.details["asset"]
+
+                refreshed_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Top Sourcetypes SPL",
+                        "asset_type": "spl_query_library",
+                        "source_label": "Report viewer",
+                        "description": "Refreshed metadata for the same reusable SPL entry.",
+                        "tags": ["spl", "library", "report"],
+                        "content": "Saved SPL query for reuse.\n\n## Query\nsearch   index=_internal   |   stats count by sourcetype\n\n## Context\nDetected in report output.",
+                        "attributes": {
+                            "spl_query": "search   index=_internal   |   stats count by sourcetype",
+                            "app": "search",
+                            "earliest": "-7d",
+                            "latest": "now",
+                            "origin_kind": "report_viewer",
+                            "origin_label": "summary_report.md",
+                        },
+                    },
+                )
+
+                self.assertTrue(refreshed_result.ok)
+                self.assertEqual(refreshed_result.message, "Knowledge asset refreshed. Enable indexed retrieval to use it in context previews and chat.")
+                self.assertEqual(refreshed_result.details["asset_import_action"], "updated")
+                refreshed_asset = refreshed_result.details["asset"]
+                self.assertEqual(refreshed_asset["asset_id"], initial_asset["asset_id"])
+                self.assertEqual(refreshed_asset["content_path"], initial_asset["content_path"])
+                self.assertEqual(refreshed_asset["created_at"], initial_asset["created_at"])
+                self.assertGreaterEqual(refreshed_asset["updated_at"], initial_asset["updated_at"])
+                self.assertEqual(refreshed_asset["title"], "Top Sourcetypes SPL")
+                self.assertEqual(refreshed_asset["source_label"], "Report viewer")
+                self.assertEqual(refreshed_asset["attributes"]["earliest"], "-7d")
+                self.assertEqual(refreshed_asset["attributes"]["origin_kind"], "report_viewer")
+
+                list_result = manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(list_result.ok)
+                self.assertEqual(list_result.details["asset_count"], 1)
+                self.assertEqual(list_result.details["asset_type_counts"]["spl_query_library"], 1)
+                self.assertEqual(list_result.details["assets"][0]["title"], "Top Sourcetypes SPL")
+
+                detail_result = manager.get_rag_asset_detail("rag_chromadb", refreshed_asset["asset_id"])
+                self.assertTrue(detail_result.ok)
+                self.assertIn("Detected in report output.", detail_result.details["context_body"])
+                self.assertEqual(detail_result.details["asset"]["attributes"]["origin_label"], "summary_report.md")
+
+                reloaded_manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                reloaded_assets = reloaded_manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(reloaded_assets.ok)
+                self.assertEqual(reloaded_assets.details["asset_count"], 1)
+                self.assertEqual(reloaded_assets.details["assets"][0]["asset_id"], initial_asset["asset_id"])
+                self.assertEqual(reloaded_assets.details["assets"][0]["attributes"]["earliest"], "-7d")
+            finally:
+                os.chdir(original_cwd)
+
     def test_rag_chromadb_asset_detail_exposes_stored_sections_and_chunk_browser(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             temp_path = Path(temp_dir)
@@ -479,6 +707,299 @@ class CapabilityFrameworkTests(unittest.TestCase):
                     detail_result.details["chunk_sections"][0]["metadata"]["asset_type"],
                     "connected_system_context",
                 )
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_spl_library_feedback_updates_validation_state(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+                (output_dir / "discovery_sessions.json").write_text(
+                    json.dumps([
+                        {
+                            "timestamp": "20260514_120000",
+                            "created_at": "2026-05-14T12:00:00",
+                            "overview": {"splunk_version": "10.0.1"},
+                            "mcp_capabilities": {"tools": ["splunk_run_query"]},
+                            "report_paths": ["v2_intelligence_blueprint_20260514_120000.json"],
+                            "readiness_score": 92,
+                        }
+                    ]),
+                    encoding="utf-8",
+                )
+                (output_dir / "v2_intelligence_blueprint_20260514_120000.json").write_text(
+                    json.dumps(
+                        {
+                            "generated_at": "2026-05-14T12:00:00",
+                            "readiness_score": 92,
+                            "overview": {"splunk_version": "10.0.1"},
+                            "finding_ledger": [
+                                {"title": "Analyzing index: _internal", "data": {"title": "_internal", "totalEventCount": "12"}},
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                import_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Saved SPL Library Query",
+                        "asset_type": "spl_query_library",
+                        "source_label": "Chat assistant",
+                        "description": "Saved reusable SPL for later chat and Splunk execution.",
+                        "tags": ["spl", "library", "chat"],
+                        "content": "Saved SPL query for reuse.",
+                        "attributes": {
+                            "spl_query": "search index=_internal | stats count by sourcetype",
+                            "app": "search",
+                            "earliest": "-24h",
+                            "latest": "now",
+                            "origin_kind": "chat_assistant",
+                        },
+                    },
+                )
+
+                self.assertTrue(import_result.ok)
+
+                success_feedback = manager.record_rag_spl_query_feedback(
+                    "rag_chromadb",
+                    "search index=_internal | stats count by sourcetype",
+                    "success",
+                    {
+                        "row_count": 4,
+                        "earliest_time": "-24h",
+                        "latest_time": "now",
+                    },
+                )
+                self.assertTrue(success_feedback.ok)
+                self.assertEqual(
+                    success_feedback.details["asset"]["attributes"]["spl_intelligence"]["validation"]["status"],
+                    "known_good",
+                )
+                self.assertEqual(
+                    success_feedback.details["asset"]["attributes"]["spl_intelligence"]["validation"]["success_count"],
+                    1,
+                )
+                self.assertEqual(
+                    success_feedback.details["asset"]["attributes"]["spl_intelligence"]["reuse"]["tier"],
+                    "known_good",
+                )
+
+                failure_feedback = manager.record_rag_spl_query_feedback(
+                    "rag_chromadb",
+                    "search index=_internal | stats count by sourcetype",
+                    "failure",
+                    {
+                        "error": "Search failed due to permissions.",
+                        "earliest_time": "-24h",
+                        "latest_time": "now",
+                    },
+                )
+                self.assertTrue(failure_feedback.ok)
+                self.assertEqual(
+                    failure_feedback.details["asset"]["attributes"]["spl_intelligence"]["validation"]["status"],
+                    "mixed",
+                )
+                self.assertEqual(
+                    failure_feedback.details["asset"]["attributes"]["spl_intelligence"]["validation"]["failure_count"],
+                    1,
+                )
+                self.assertEqual(
+                    failure_feedback.details["asset"]["attributes"]["spl_intelligence"]["validation"]["last_error"],
+                    "Search failed due to permissions.",
+                )
+
+                reloaded_manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                reloaded_assets = reloaded_manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(reloaded_assets.ok)
+                self.assertEqual(
+                    reloaded_assets.details["assets"][0]["attributes"]["spl_intelligence"]["validation"]["execution_count"],
+                    2,
+                )
+                self.assertEqual(
+                    reloaded_assets.details["assets"][0]["attributes"]["spl_intelligence"]["validation"]["status"],
+                    "mixed",
+                )
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_search_surfaces_known_good_reusable_spl_queries(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+                (output_dir / "discovery_sessions.json").write_text(
+                    json.dumps([
+                        {
+                            "timestamp": "20260514_120000",
+                            "created_at": "2026-05-14T12:00:00",
+                            "overview": {"splunk_version": "10.0.1"},
+                            "mcp_capabilities": {"tools": ["splunk_run_query"]},
+                            "report_paths": ["v2_intelligence_blueprint_20260514_120000.json"],
+                            "readiness_score": 92,
+                        }
+                    ]),
+                    encoding="utf-8",
+                )
+                (output_dir / "v2_intelligence_blueprint_20260514_120000.json").write_text(
+                    json.dumps(
+                        {
+                            "generated_at": "2026-05-14T12:00:00",
+                            "readiness_score": 92,
+                            "overview": {"splunk_version": "10.0.1"},
+                            "finding_ledger": [
+                                {"title": "Analyzing index: _internal", "data": {"title": "_internal", "totalEventCount": "12"}},
+                                {"title": "Analyzing index: netops", "data": {"title": "netops", "totalEventCount": "12"}},
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Internal Sourcetype Counts",
+                        "asset_type": "spl_query_library",
+                        "source_label": "Chat assistant",
+                        "description": "Check top sourcetypes in internal logs.",
+                        "tags": ["spl", "internal"],
+                        "content": "Reusable SPL for internal telemetry analysis.",
+                        "attributes": {
+                            "spl_query": "search index=_internal | stats count by sourcetype",
+                            "app": "search",
+                            "earliest": "-24h",
+                            "latest": "now",
+                        },
+                    },
+                )
+                manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "Netops Host Counts",
+                        "asset_type": "spl_query_library",
+                        "source_label": "Chat assistant",
+                        "description": "Check top hosts in network operations data.",
+                        "tags": ["spl", "netops"],
+                        "content": "Reusable SPL for network operations telemetry.",
+                        "attributes": {
+                            "spl_query": "search index=netops | stats count by host",
+                            "app": "search",
+                            "earliest": "-24h",
+                            "latest": "now",
+                        },
+                    },
+                )
+                manager.record_rag_spl_query_feedback(
+                    "rag_chromadb",
+                    "search index=_internal | stats count by sourcetype",
+                    "success",
+                    {"row_count": 3, "earliest_time": "-24h", "latest_time": "now"},
+                )
+
+                definition = manager.registry.get_definition("rag_chromadb")
+                config = manager.config_manager.get_capability("rag_chromadb")
+                indexer = ArtifactSourceIndexer(config=config, definition=definition)
+                indexer.reindex()
+                search_result = indexer.search("Help me reuse a query to inspect internal sourcetype counts.", max_chunks=3)
+
+                self.assertTrue(search_result["reusable_spl_queries"])
+                self.assertEqual(
+                    search_result["reusable_spl_queries"][0]["query"],
+                    "search index=_internal | stats count by sourcetype",
+                )
+                self.assertTrue(search_result["reusable_spl_queries"][0]["known_good"])
+                self.assertIn("REUSABLE SPL QUERY CANDIDATES", search_result["context_text"])
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_chromadb_search_migrates_legacy_saved_spl_library_assets(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {
+                        "source_dir": str(output_dir),
+                        "storage_dir": str(output_dir / "rag" / "chromadb"),
+                    },
+                )
+
+                import_result = manager.import_rag_text_asset(
+                    "rag_chromadb",
+                    {
+                        "title": "SPL Library: | tstats count where index=* by index | sort - count | head 25",
+                        "asset_type": "reference_document",
+                        "source_label": "Chat assistant response",
+                        "description": "Saved reusable SPL query for direct Splunk launch and chat reuse.",
+                        "tags": ["spl", "spl-library", "chat-assistant"],
+                        "content": (
+                            "Saved SPL query for reuse in Splunk Web and follow-on chat workflows.\n"
+                            "Query summary: | tstats count where index=* by index | sort - count | head 25\n"
+                            "Saved from: Chat assistant response."
+                        ),
+                        "attributes": {},
+                    },
+                )
+                self.assertTrue(import_result.ok)
+                self.assertEqual(import_result.details["asset"]["asset_type"], "reference_document")
+
+                definition = manager.registry.get_definition("rag_chromadb")
+                config = manager.config_manager.get_capability("rag_chromadb")
+                indexer = ArtifactSourceIndexer(config=config, definition=definition)
+                indexer.reindex()
+
+                migrated_assets = manager.list_rag_assets("rag_chromadb")
+                self.assertTrue(migrated_assets.ok)
+                self.assertEqual(migrated_assets.details["asset_type_counts"]["spl_query_library"], 1)
+                self.assertEqual(
+                    migrated_assets.details["assets"][0]["attributes"]["spl_query"],
+                    "| tstats count where index=* by index | sort - count | head 25",
+                )
+
+                search_result = indexer.search("top indexes by event count", max_chunks=3)
+
+                self.assertTrue(search_result["reusable_spl_queries"])
+                self.assertEqual(
+                    search_result["reusable_spl_queries"][0]["query"],
+                    "| tstats count where index=* by index | sort - count | head 25",
+                )
+                self.assertIn("REUSABLE SPL QUERY CANDIDATES", search_result["context_text"])
             finally:
                 os.chdir(original_cwd)
 

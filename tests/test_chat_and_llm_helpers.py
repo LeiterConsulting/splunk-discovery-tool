@@ -639,6 +639,45 @@ class ChatHelperTests(unittest.TestCase):
             "search index=_internal | head 5",
         )
 
+    def test_extract_spl_queries_from_text_returns_fenced_and_inline_queries(self):
+        response_text = """
+Here are two searches to keep handy.
+
+```spl
+search index=main sourcetype=syslog | stats count by host
+```
+
+Verification SPL: | tstats count where index=_internal by sourcetype
+"""
+
+        queries = web_app.extract_spl_queries_from_text(response_text)
+
+        self.assertEqual(queries[0], "search index=main sourcetype=syslog | stats count by host")
+        self.assertIn("| tstats count where index=_internal by sourcetype", queries)
+
+    def test_extract_spl_queries_from_payload_walks_nested_report_shapes(self):
+        payload = {
+            "summary": "No query here.",
+            "tasks": [
+                {
+                    "action": "Validate ingestion",
+                    "verification_spl": "search index=_internal | stats count by component",
+                },
+                {
+                    "steps": [
+                        {
+                            "spl": "| tstats count where index=main by host",
+                        }
+                    ]
+                },
+            ],
+        }
+
+        queries = web_app.extract_spl_queries_from_payload(payload)
+
+        self.assertIn("search index=_internal | stats count by component", queries)
+        self.assertIn("| tstats count where index=main by host", queries)
+
     def test_build_follow_on_actions_returns_clickable_prompts(self):
         memory = {
             "entities": {
@@ -798,6 +837,85 @@ class ChatHelperTests(unittest.TestCase):
             captured["json"]["params"]["arguments"]["query"],
             "search index=_internal | head 5",
         )
+
+    def test_maybe_record_rag_spl_query_feedback_records_success(self):
+        captured = {}
+
+        def stub_record(name, query, status, feedback):
+            captured["name"] = name
+            captured["query"] = query
+            captured["status"] = status
+            captured["feedback"] = feedback
+            return CapabilityActionResult(True, name, "record-feedback", "ok")
+
+        with patch.object(web_app.capability_manager, "record_rag_spl_query_feedback", side_effect=stub_record):
+            web_app.maybe_record_rag_spl_query_feedback(
+                "splunk_run_query",
+                {
+                    "query": "search index=_internal | head 5",
+                    "earliest_time": "-24h",
+                    "latest_time": "now",
+                },
+                mcp_response={
+                    "result": {
+                        "structuredContent": {
+                            "results": [
+                                {"count": "1"},
+                                {"count": "2"},
+                            ]
+                        }
+                    }
+                },
+            )
+
+        self.assertEqual(captured["name"], "rag_chromadb")
+        self.assertEqual(captured["query"], "search index=_internal | head 5")
+        self.assertEqual(captured["status"], "success")
+        self.assertEqual(captured["feedback"]["row_count"], 2)
+        self.assertEqual(captured["feedback"]["earliest_time"], "-24h")
+        self.assertEqual(captured["feedback"]["latest_time"], "now")
+
+    def test_build_capability_usage_from_rag_result_includes_reusable_queries(self):
+        capability_usage = web_app.build_capability_usage_from_rag_result(
+            {
+                "capability": "rag_chromadb",
+                "context_text": "context",
+                "chunks": [
+                    {
+                        "source": "output/example.md",
+                        "score": 88,
+                        "snippet": "Matched queue guidance.",
+                        "metadata": {"source_type": "knowledge_asset"},
+                    }
+                ],
+                "reusable_spl_queries": [
+                    {
+                        "title": "Internal Sourcetype Counts",
+                        "query": "search index=_internal | stats count by sourcetype",
+                        "reuse_tier": "known_good",
+                        "known_good": True,
+                        "why_reuse": "Prefer adapting this known-good query before generating a new one.",
+                        "environment_fit_status": "strong",
+                        "validation_status": "known_good",
+                        "success_count": 3,
+                        "failure_count": 1,
+                        "app": "search",
+                        "earliest": "-24h",
+                        "latest": "now",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(len(capability_usage), 1)
+        self.assertEqual(capability_usage[0]["reusable_queries"][0]["reuse_tier"], "known_good")
+        self.assertTrue(capability_usage[0]["reusable_queries"][0]["known_good"])
+        self.assertEqual(capability_usage[0]["reusable_queries"][0]["environment_fit_status"], "strong")
+        self.assertEqual(capability_usage[0]["reusable_queries"][0]["validation_status"], "known_good")
+        self.assertEqual(capability_usage[0]["reusable_queries"][0]["success_count"], 3)
+        self.assertEqual(capability_usage[0]["reusable_queries"][0]["failure_count"], 1)
+        self.assertEqual(capability_usage[0]["reusable_queries"][0]["app"], "search")
+        self.assertIn("reusable SPL candidate", capability_usage[0]["contribution"])
 
     def test_detect_report_intent_handles_strategic_questions_only(self):
         report_knowledge = {
@@ -1135,6 +1253,196 @@ class ChatHelperTests(unittest.TestCase):
         self.assertEqual(result["capability_usage"][0]["name"], "rag_local")
         self.assertEqual(result["capability_usage"][0]["used_in"], "llm_prompt")
         self.assertEqual(result["capability_usage"][0]["chunks"][0]["source"], "output/v2_operator_runbook_20260417_144141.md")
+
+    def test_chat_with_splunk_logic_cites_adapted_reusable_query_in_direct_response(self):
+        original_get_or_create_llm_client = web_app.get_or_create_llm_client
+        original_get_rag_context = web_app.capability_manager.get_rag_context
+        original_list_rag_assets = web_app.capability_manager.list_rag_assets
+        original_load_latest_report_knowledge = web_app.load_latest_report_knowledge
+        original_get_memory_store_path = web_app._get_memory_store_path
+        original_extract_recoverable_tool_call = web_app.extract_recoverable_tool_call
+        original_cache = dict(web_app.chat_agent_memory)
+        original_chat_settings = dict(web_app.chat_session_settings)
+
+        class StubLLMClient:
+            async def generate_response(self, messages, max_tokens, temperature):
+                return (
+                    "Use this adapted query to inspect internal sourcetype counts:\n\n"
+                    "```spl\n"
+                    "search index=_internal | stats count by sourcetype | head 20\n"
+                    "```"
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            web_app.chat_agent_memory.clear()
+            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app.get_or_create_llm_client = lambda config: StubLLMClient()
+            web_app.load_latest_report_knowledge = lambda *_: None
+            web_app.extract_recoverable_tool_call = lambda *args, **kwargs: None
+            web_app.capability_manager.list_rag_assets = lambda name="rag_chromadb": type(
+                "StubAssetListResult",
+                (),
+                {
+                    "ok": True,
+                    "details": {
+                        "assets": [
+                            {
+                                "title": "Internal Sourcetype Counts",
+                                "description": "Prefer adapting this baseline query before generating a new one.",
+                                "attributes": {
+                                    "spl_query": "search index=_internal | stats count by sourcetype",
+                                    "spl_intelligence": {
+                                        "environment_fit": {"status": "strong", "score": 88},
+                                        "validation": {"status": "known_good", "success_count": 3, "failure_count": 1},
+                                        "reuse": {"tier": "known_good", "known_good": True, "guidance": "Prefer adapting this baseline query before generating a new one."},
+                                    },
+                                },
+                            }
+                        ]
+                    },
+                },
+            )()
+            web_app.capability_manager.get_rag_context = lambda user_message, max_chunks=3: {
+                "capability": "rag_local",
+                "provider": "lightweight",
+                "context_text": "Recovered known-good SPL guidance for internal sourcetype analysis.",
+                "chunks": [
+                    {
+                        "source": "output/v2_operator_runbook_20260417_144141.md",
+                        "score": 5,
+                        "snippet": "Known-good internal sourcetype rollup query is available for reuse.",
+                    }
+                ],
+                "reusable_spl_queries": [
+                    {
+                        "title": "Internal Sourcetype Counts",
+                        "query": "search index=_internal | stats count by sourcetype",
+                        "reuse_tier": "known_good",
+                        "known_good": True,
+                        "why_reuse": "Prefer adapting this baseline query before generating a new one.",
+                        "environment_fit_status": "strong",
+                        "validation_status": "known_good",
+                        "success_count": 3,
+                        "failure_count": 1,
+                    }
+                ],
+            }
+            web_app.chat_session_settings["enable_rag_context"] = True
+            web_app.chat_session_settings["enable_splunk_augmentation"] = False
+
+            try:
+                result = asyncio.run(
+                    web_app.chat_with_splunk_logic(
+                        {
+                            "message": "Give me a reusable SPL to inspect internal sourcetype counts.",
+                            "history": [],
+                            "chat_session_id": "reusable_query_citation_test",
+                        }
+                    )
+                )
+            finally:
+                web_app.get_or_create_llm_client = original_get_or_create_llm_client
+                web_app.capability_manager.get_rag_context = original_get_rag_context
+                web_app.capability_manager.list_rag_assets = original_list_rag_assets
+                web_app.load_latest_report_knowledge = original_load_latest_report_knowledge
+                web_app._get_memory_store_path = original_get_memory_store_path
+                web_app.extract_recoverable_tool_call = original_extract_recoverable_tool_call
+                web_app.chat_session_settings.clear()
+                web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_agent_memory.clear()
+                web_app.chat_agent_memory.update(original_cache)
+
+        self.assertIn('Reusable SPL reference: adapted from "Internal Sourcetype Counts"', result.get("response", ""))
+        self.assertIn("Use this adapted query to inspect internal sourcetype counts", result.get("response", ""))
+        self.assertIn("known good", result.get("response", "").lower())
+        self.assertEqual(result.get("iterations"), 0)
+
+    def test_chat_with_splunk_logic_cites_saved_query_in_deterministic_basic_route(self):
+        original_execute_mcp_tool_call = web_app.execute_mcp_tool_call
+        original_get_or_create_llm_client = web_app.get_or_create_llm_client
+        original_list_rag_assets = web_app.capability_manager.list_rag_assets
+        original_load_latest_report_knowledge = web_app.load_latest_report_knowledge
+        original_get_memory_store_path = web_app._get_memory_store_path
+        original_cache = dict(web_app.chat_agent_memory)
+        original_chat_settings = dict(web_app.chat_session_settings)
+
+        class StubAssetListResult:
+            ok = True
+            details = {
+                "assets": [
+                    {
+                        "title": "Top Index Counts",
+                        "description": "Saved reusable SPL query for direct Splunk launch and chat reuse.",
+                        "attributes": {
+                            "spl_query": "| tstats count where index=* by index | sort - count | head 25",
+                            "spl_intelligence": {
+                                "environment_fit": {"status": "unknown", "score": 50},
+                                "validation": {"status": "unvalidated", "success_count": 0, "failure_count": 0},
+                                "reuse": {"tier": "candidate", "score": 50, "guidance": "Reasonable starting point, but validate the fit before relying on it."},
+                            },
+                        },
+                    }
+                ]
+            }
+
+        class StubLLMClient:
+            async def generate_response(self, messages, max_tokens, temperature):
+                raise AssertionError("Deterministic basic route should not call the LLM")
+
+        async def stub_execute_mcp_tool_call(tool_call, config):
+            query = tool_call.get("params", {}).get("arguments", {}).get("query")
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "result": {
+                    "content": [],
+                    "structuredContent": {
+                        "results": [
+                            {"index": "main", "count": "10"},
+                            {"index": "netops", "count": "5"},
+                        ],
+                        "truncated": False,
+                        "total_rows": 2,
+                    },
+                },
+                "_debug_query": query,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            web_app.chat_agent_memory.clear()
+            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app.get_or_create_llm_client = lambda config: StubLLMClient()
+            web_app.execute_mcp_tool_call = stub_execute_mcp_tool_call
+            web_app.capability_manager.list_rag_assets = lambda name="rag_chromadb": StubAssetListResult()
+            web_app.load_latest_report_knowledge = lambda *_: None
+            web_app.chat_session_settings["enable_splunk_augmentation"] = True
+
+            try:
+                result = asyncio.run(
+                    web_app.chat_with_splunk_logic(
+                        {
+                            "message": "Give me a reusable SPL for top indexes by event count.",
+                            "history": [],
+                            "chat_session_id": "deterministic_reusable_citation_test",
+                        }
+                    )
+                )
+            finally:
+                web_app.execute_mcp_tool_call = original_execute_mcp_tool_call
+                web_app.get_or_create_llm_client = original_get_or_create_llm_client
+                web_app.capability_manager.list_rag_assets = original_list_rag_assets
+                web_app.load_latest_report_knowledge = original_load_latest_report_knowledge
+                web_app._get_memory_store_path = original_get_memory_store_path
+                web_app.chat_session_settings.clear()
+                web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_agent_memory.clear()
+                web_app.chat_agent_memory.update(original_cache)
+
+        self.assertIn('Reusable SPL reference: "Top Index Counts"', result.get("response", ""))
+        self.assertIn("Top indexes by event count", result.get("response", ""))
+        self.assertEqual(result.get("iterations"), 1)
 
     def test_chat_with_splunk_logic_falls_back_when_sanitized_direct_answer_is_empty(self):
         original_get_or_create_llm_client = web_app.get_or_create_llm_client

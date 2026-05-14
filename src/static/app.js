@@ -283,6 +283,20 @@
           category: typeof (usage == null ? void 0 : usage.category) === "string" ? usage.category : void 0,
           used_in: typeof (usage == null ? void 0 : usage.used_in) === "string" ? usage.used_in : void 0,
           contribution: typeof (usage == null ? void 0 : usage.contribution) === "string" ? usage.contribution : "",
+          reusable_queries: Array.isArray(usage == null ? void 0 : usage.reusable_queries) ? usage.reusable_queries.slice(0, 2).map((candidate, candidateIdx) => ({
+            title: typeof (candidate == null ? void 0 : candidate.title) === "string" ? candidate.title : `Reusable query ${candidateIdx + 1}`,
+            query: typeof (candidate == null ? void 0 : candidate.query) === "string" ? candidate.query : "",
+            reuse_tier: typeof (candidate == null ? void 0 : candidate.reuse_tier) === "string" ? candidate.reuse_tier : void 0,
+            known_good: Boolean(candidate == null ? void 0 : candidate.known_good),
+            why_reuse: typeof (candidate == null ? void 0 : candidate.why_reuse) === "string" ? candidate.why_reuse : "",
+            environment_fit_status: typeof (candidate == null ? void 0 : candidate.environment_fit_status) === "string" ? candidate.environment_fit_status : void 0,
+            validation_status: typeof (candidate == null ? void 0 : candidate.validation_status) === "string" ? candidate.validation_status : void 0,
+            success_count: Number.isFinite(Number(candidate == null ? void 0 : candidate.success_count)) ? Number(candidate.success_count) : 0,
+            failure_count: Number.isFinite(Number(candidate == null ? void 0 : candidate.failure_count)) ? Number(candidate.failure_count) : 0,
+            app: typeof (candidate == null ? void 0 : candidate.app) === "string" ? candidate.app : void 0,
+            earliest: typeof (candidate == null ? void 0 : candidate.earliest) === "string" ? candidate.earliest : void 0,
+            latest: typeof (candidate == null ? void 0 : candidate.latest) === "string" ? candidate.latest : void 0
+          })).filter((candidate) => candidate.query) : [],
           chunks: Array.isArray(usage == null ? void 0 : usage.chunks) ? usage.chunks.slice(0, 3).map((chunk, chunkIdx) => ({
             source: typeof (chunk == null ? void 0 : chunk.source) === "string" ? chunk.source : `artifact_${chunkIdx + 1}`,
             score: typeof (chunk == null ? void 0 : chunk.score) === "number" ? chunk.score : void 0,
@@ -540,17 +554,13 @@
             },
             /* @__PURE__ */ React.createElement("i", { className: "fas fa-times" })
           )),
-          /* @__PURE__ */ React.createElement("div", { className: "px-4 pb-4" }, /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-2 gap-2 text-xs" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${detailCardChipClass}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-wide opacity-75" }, xAxisLabel), /* @__PURE__ */ React.createElement("div", { className: "mt-1 font-semibold break-words" }, selectedPoint.fullLabel || selectedPoint.label)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${detailCardChipClass}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-wide opacity-75" }, yAxisLabel), /* @__PURE__ */ React.createElement("div", { className: "mt-1 font-semibold" }, formatVisualizationNumber(selectedPoint.value)))), /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border px-3 py-3 text-xs ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-[0.16em] opacity-75" }, "Preview Context"), /* @__PURE__ */ React.createElement("div", { className: "mt-2" }, (spec == null ? void 0 : spec.title) || "Visualization Preview"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, (spec == null ? void 0 : spec.summary_text) || "Generated from chartable query results.")), sourceQueryPreview ? /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border px-3 py-3 text-xs ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-[0.16em] opacity-75" }, "Source SPL"), /* @__PURE__ */ React.createElement("pre", { className: "mt-2 max-h-24 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px]" }, sourceQueryPreview)) : /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border px-3 py-3 text-xs ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-400" : "bg-gray-50 border-gray-200 text-gray-500"}` }, "No source SPL query was attached to this visualization preview."), /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap items-center justify-end gap-2" }, hasSplunkAction ? /* @__PURE__ */ React.createElement(
-            "button",
-            {
-              type: "button",
-              "data-testid": `${chartTestId}-open-splunk`,
-              onClick: () => onOpenSplunk(sourceQueryPreview),
-              className: `px-3 py-2 rounded-lg text-xs font-semibold ${chartType === "line" ? "bg-sky-600 hover:bg-sky-700 text-white" : "bg-cyan-600 hover:bg-cyan-700 text-white"}`
-            },
-            /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt mr-2" }),
-            "Open Source Search in Splunk"
-          ) : sourceQueryPreview ? /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Splunk deeplink launch is unavailable until the deeplink tool is ready.") : null, /* @__PURE__ */ React.createElement(
+          /* @__PURE__ */ React.createElement("div", { className: "px-4 pb-4" }, /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-2 gap-2 text-xs" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${detailCardChipClass}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-wide opacity-75" }, xAxisLabel), /* @__PURE__ */ React.createElement("div", { className: "mt-1 font-semibold break-words" }, selectedPoint.fullLabel || selectedPoint.label)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${detailCardChipClass}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-wide opacity-75" }, yAxisLabel), /* @__PURE__ */ React.createElement("div", { className: "mt-1 font-semibold" }, formatVisualizationNumber(selectedPoint.value)))), /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border px-3 py-3 text-xs ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-[0.16em] opacity-75" }, "Preview Context"), /* @__PURE__ */ React.createElement("div", { className: "mt-2" }, (spec == null ? void 0 : spec.title) || "Visualization Preview"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, (spec == null ? void 0 : spec.summary_text) || "Generated from chartable query results.")), sourceQueryPreview ? /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border px-3 py-3 text-xs ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, /* @__PURE__ */ React.createElement("div", { className: "uppercase tracking-[0.16em] opacity-75" }, "Source SPL"), /* @__PURE__ */ React.createElement("pre", { className: "mt-2 max-h-24 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px]" }, sourceQueryPreview)) : /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border px-3 py-3 text-xs ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-400" : "bg-gray-50 border-gray-200 text-gray-500"}` }, "No source SPL query was attached to this visualization preview."), /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" }, sourceQueryPreview ? renderSplQueryActionButtons(sourceQueryPreview, {
+            originKind: "visualization_preview",
+            originLabel: (spec == null ? void 0 : spec.title) || "Visualization Preview",
+            sourceLabel: (spec == null ? void 0 : spec.title) || "Visualization Preview",
+            contextExcerpt: (spec == null ? void 0 : spec.summary_text) || (spec == null ? void 0 : spec.title) || "",
+            className: "sm:justify-start"
+          }) : /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "SPL actions appear when a source query is attached."), /* @__PURE__ */ React.createElement(
             "button",
             {
               type: "button",
@@ -945,6 +955,7 @@
     const [availableModels, setAvailableModels] = useState([]);
     const [isLoadingModels, setIsLoadingModels] = useState(false);
     const [selectedModel, setSelectedModel] = useState("");
+    const SPL_LIBRARY_ASSET_TYPE = "spl_query_library";
     const defaultRagAssetDraft = {
       title: "",
       asset_type: "reference_document",
@@ -1095,11 +1106,15 @@
     const ragDisplayedAssets = Array.isArray(ragAssetWorkspace.assets) ? ragAssetWorkspace.assets : [];
     const ragDisplayedAssetCount = (_i = (_h = (_g = ragAssetWorkspace.summary) == null ? void 0 : _g.asset_count) != null ? _h : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_count) != null ? _i : 0;
     const ragDisplayedAssetDir = ((_j = ragAssetWorkspace.summary) == null ? void 0 : _j.asset_dir) || (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_dir) || "output/rag/assets";
+    const ragSplLibraryAssetCount = ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.asset_type) || "").toLowerCase() === SPL_LIBRARY_ASSET_TYPE).length;
     const ragLibraryStatusCounts = ((_k = ragAssetWorkspace.summary) == null ? void 0 : _k.library_status_counts) && typeof ragAssetWorkspace.summary.library_status_counts === "object" ? ragAssetWorkspace.summary.library_status_counts : (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.library_status_counts) && typeof ragKnowledgeAssetSummary.library_status_counts === "object" ? ragKnowledgeAssetSummary.library_status_counts : { checked_in: 0, checked_out: 0 };
     const ragCheckedInAssetCount = (_n = (_m = (_l = ragAssetWorkspace.summary) == null ? void 0 : _l.checked_in_asset_count) != null ? _m : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.checked_in_asset_count) != null ? _n : ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.library_status) || "checked_in").toLowerCase() !== "checked_out").length;
     const ragCheckedOutAssetCount = (_q = (_p = (_o = ragAssetWorkspace.summary) == null ? void 0 : _o.checked_out_asset_count) != null ? _p : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.checked_out_asset_count) != null ? _q : ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.library_status) || "").toLowerCase() === "checked_out").length;
     const ragLibraryAssets = ragDisplayedAssets.filter((asset) => {
       const libraryStatus = String((asset == null ? void 0 : asset.library_status) || "checked_in").toLowerCase();
+      if (ragLibraryFilter === "spl_library") {
+        return String((asset == null ? void 0 : asset.asset_type) || "").toLowerCase() === SPL_LIBRARY_ASSET_TYPE;
+      }
       if (ragLibraryFilter === "checked_in") {
         return libraryStatus !== "checked_out";
       }
@@ -1928,6 +1943,8 @@
     };
     const formatKnowledgeAssetTypeLabel = (assetType) => {
       switch (String(assetType || "").toLowerCase()) {
+        case "spl_query_library":
+          return "SPL Library Query";
         case "splunk_documentation":
           return "Splunk Documentation";
         case "monitored_system_context":
@@ -2134,16 +2151,24 @@
       }
       return `search ${query}`;
     };
-    const buildSplunkSearchUrl = (splQuery) => {
+    const getDefaultSplunkDeeplinkPayload = (overrides = {}) => {
+      const capabilityConfig = (deeplinkCapability == null ? void 0 : deeplinkCapability.config) || {};
+      return {
+        app: String(overrides.app || (deeplinkCapability == null ? void 0 : deeplinkCapability.default_app) || capabilityConfig.default_app || "search").trim().replace(/^\/+|\/+$/g, "") || "search",
+        earliest: String(overrides.earliest || capabilityConfig.default_earliest || "-24h").trim() || "-24h",
+        latest: String(overrides.latest || capabilityConfig.default_latest || "now").trim() || "now"
+      };
+    };
+    const buildSplunkSearchUrl = (splQuery, overrides = {}) => {
       if (!canUseSplunkDeeplinks) {
         return "";
       }
       const normalizedQuery = normalizeSplunkSearchQuery(splQuery);
       const baseUrl = String((deeplinkCapability == null ? void 0 : deeplinkCapability.resolved_web_base_url) || "").trim().replace(/\/+$/, "");
-      const capabilityConfig = (deeplinkCapability == null ? void 0 : deeplinkCapability.config) || {};
-      const appName = String((deeplinkCapability == null ? void 0 : deeplinkCapability.default_app) || capabilityConfig.default_app || "search").trim().replace(/^\/+|\/+$/g, "") || "search";
-      const earliest = String(capabilityConfig.default_earliest || "-24h").trim() || "-24h";
-      const latest = String(capabilityConfig.default_latest || "now").trim() || "now";
+      const deeplinkDefaults = getDefaultSplunkDeeplinkPayload(overrides);
+      const appName = deeplinkDefaults.app;
+      const earliest = deeplinkDefaults.earliest;
+      const latest = deeplinkDefaults.latest;
       if (!normalizedQuery || !baseUrl) {
         return "";
       }
@@ -2154,11 +2179,15 @@
       });
       return `${baseUrl}/en-US/app/${encodeURIComponent(appName)}/search?${params.toString()}`;
     };
-    const openSplunkSearchFromChat = async (splQuery) => {
+    const openSplunkSearch = async (splQuery, overrides = {}) => {
       if (!splQuery || !canUseSplunkDeeplinks) {
         return;
       }
-      const directUrl = buildSplunkSearchUrl(splQuery);
+      const deeplinkPayload = {
+        query: splQuery,
+        ...getDefaultSplunkDeeplinkPayload(overrides)
+      };
+      const directUrl = buildSplunkSearchUrl(deeplinkPayload.query, deeplinkPayload);
       if (directUrl) {
         const launchedWindow = window.open(directUrl, "_blank", "noopener,noreferrer");
         if (!launchedWindow) {
@@ -2166,14 +2195,8 @@
         }
         return;
       }
-      const capabilityConfig = (deeplinkCapability == null ? void 0 : deeplinkCapability.config) || {};
       await buildCapabilityDeeplink(
-        {
-          query: splQuery,
-          earliest: capabilityConfig.default_earliest || "-24h",
-          latest: capabilityConfig.default_latest || "now",
-          app: capabilityConfig.default_app || "search"
-        },
+        deeplinkPayload,
         {
           name: "splunk_deeplink_tools",
           openAfterBuild: true,
@@ -2181,6 +2204,305 @@
           storeResult: false
         }
       );
+    };
+    const openSplunkSearchFromChat = async (splQuery) => {
+      await openSplunkSearch(splQuery);
+    };
+    const buildSplLibraryTitle = (splQuery, options = {}) => {
+      const explicitTitle = String(options.title || "").trim();
+      if (explicitTitle) {
+        return explicitTitle;
+      }
+      const singleLineQuery = normalizeSplunkSearchQuery(splQuery).replace(/\s+/g, " ").trim();
+      const preview = singleLineQuery.length > 72 ? `${singleLineQuery.slice(0, 72).trim()}...` : singleLineQuery;
+      return preview ? `SPL Library: ${preview}` : "SPL Library Query";
+    };
+    const buildSplLibraryTags = (options = {}) => {
+      const rawTags = [
+        "spl",
+        "spl-library",
+        String(options.originKind || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+        ...Array.isArray(options.tags) ? options.tags : []
+      ];
+      const tags = [];
+      const seen = /* @__PURE__ */ new Set();
+      rawTags.forEach((rawTag) => {
+        const cleanedTag = String(rawTag || "").trim();
+        if (!cleanedTag) {
+          return;
+        }
+        const normalizedTag = cleanedTag.toLowerCase();
+        if (seen.has(normalizedTag)) {
+          return;
+        }
+        seen.add(normalizedTag);
+        tags.push(cleanedTag);
+      });
+      return tags.slice(0, 12);
+    };
+    const buildSplLibraryPayload = (splQuery, options = {}) => {
+      const trimmedQuery = String(splQuery || "").trim();
+      if (!trimmedQuery) {
+        return null;
+      }
+      const sourceLabel = String(options.sourceLabel || options.originLabel || "").trim();
+      const originKind = String(options.originKind || "interface_spl_query").trim() || "interface_spl_query";
+      const contextExcerpt = String(options.contextExcerpt || "").trim();
+      const deeplinkDefaults = getDefaultSplunkDeeplinkPayload(options.deeplinkOptions || {});
+      const singleLineQuery = normalizeSplunkSearchQuery(trimmedQuery).replace(/\s+/g, " ").trim();
+      const contentLines = [
+        "Saved SPL query for reuse in Splunk Web and follow-on chat workflows.",
+        `Query summary: ${singleLineQuery}`
+      ];
+      if (sourceLabel) {
+        contentLines.push(`Saved from: ${sourceLabel}.`);
+      }
+      contentLines.push("", "## Query", trimmedQuery);
+      if (contextExcerpt) {
+        contentLines.push("", "## Context", contextExcerpt.slice(0, 900));
+      }
+      return {
+        title: buildSplLibraryTitle(trimmedQuery, options),
+        content: contentLines.join("\n"),
+        asset_type: SPL_LIBRARY_ASSET_TYPE,
+        source_label: sourceLabel || "Interface SPL Query",
+        description: String(options.description || "Saved reusable SPL query for direct Splunk launch and chat reuse.").trim(),
+        tags: buildSplLibraryTags(options),
+        attributes: {
+          spl_query: trimmedQuery,
+          app: deeplinkDefaults.app,
+          earliest: deeplinkDefaults.earliest,
+          latest: deeplinkDefaults.latest,
+          origin_kind: originKind,
+          origin_label: sourceLabel
+        }
+      };
+    };
+    const getKnowledgeAssetAttributes = (asset) => {
+      return (asset == null ? void 0 : asset.attributes) && typeof asset.attributes === "object" ? asset.attributes : {};
+    };
+    const getKnowledgeAssetSplIntelligence = (attributes) => {
+      return (attributes == null ? void 0 : attributes.spl_intelligence) && typeof attributes.spl_intelligence === "object" ? attributes.spl_intelligence : {};
+    };
+    const formatSplIntelligenceLabel = (value, fallback = "Unknown") => {
+      const normalized = String(value || "").trim().toLowerCase();
+      if (!normalized) {
+        return fallback;
+      }
+      if (normalized === "known_good") {
+        return "Known Good";
+      }
+      return formatTokenLabel(normalized) || fallback;
+    };
+    const getSplEnvironmentFitClasses = (status) => {
+      switch (String(status || "").toLowerCase()) {
+        case "strong":
+          return isDarkTheme ? "bg-emerald-950 border-emerald-800 text-emerald-100" : "bg-emerald-50 border-emerald-200 text-emerald-800";
+        case "partial":
+          return isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800";
+        case "weak":
+        case "mismatch":
+          return isDarkTheme ? "bg-rose-950 border-rose-800 text-rose-100" : "bg-rose-50 border-rose-200 text-rose-800";
+        default:
+          return isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700";
+      }
+    };
+    const getSplValidationClasses = (status) => {
+      switch (String(status || "").toLowerCase()) {
+        case "known_good":
+          return isDarkTheme ? "bg-emerald-950 border-emerald-800 text-emerald-100" : "bg-emerald-50 border-emerald-200 text-emerald-800";
+        case "mixed":
+          return isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800";
+        case "failing":
+          return isDarkTheme ? "bg-rose-950 border-rose-800 text-rose-100" : "bg-rose-50 border-rose-200 text-rose-800";
+        case "unvalidated":
+        default:
+          return isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700";
+      }
+    };
+    const getSplReuseTierClasses = (tier, knownGood = false) => {
+      if (knownGood || String(tier || "").toLowerCase() === "known_good") {
+        return isDarkTheme ? "bg-emerald-950 border-emerald-800 text-emerald-100" : "bg-emerald-50 border-emerald-200 text-emerald-800";
+      }
+      switch (String(tier || "").toLowerCase()) {
+        case "high":
+        case "preferred":
+          return isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800";
+        case "medium":
+        case "candidate":
+          return isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700";
+        case "low":
+          return isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800";
+        default:
+          return isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700";
+      }
+    };
+    const renderSplQueryIntelligence = (attributes, options = {}) => {
+      const splIntelligence = getKnowledgeAssetSplIntelligence(attributes);
+      const environmentFit = splIntelligence.environment_fit && typeof splIntelligence.environment_fit === "object" ? splIntelligence.environment_fit : {};
+      const validation = splIntelligence.validation && typeof splIntelligence.validation === "object" ? splIntelligence.validation : {};
+      const reuse = splIntelligence.reuse && typeof splIntelligence.reuse === "object" ? splIntelligence.reuse : {};
+      const fitStatus = String(environmentFit.status || "").trim().toLowerCase();
+      const fitReason = String(environmentFit.reason || "").trim();
+      const validationStatus = String(validation.status || "").trim().toLowerCase();
+      const reuseTier = String(reuse.tier || "").trim().toLowerCase();
+      const reuseGuidance = String(reuse.guidance || "").trim();
+      const successCount = Number(validation.success_count || 0);
+      const failureCount = Number(validation.failure_count || 0);
+      const executionCount = Number(validation.execution_count || 0);
+      const knownGood = Boolean(reuse.known_good) || validationStatus === "known_good";
+      const testIdPrefix = typeof options.testIdPrefix === "string" ? options.testIdPrefix.trim() : "";
+      const buildTestId = (suffix) => testIdPrefix ? `${testIdPrefix}-${suffix}` : void 0;
+      const hasIntelligence = fitStatus || validationStatus || reuseTier || executionCount > 0 || successCount > 0 || failureCount > 0 || fitReason || reuseGuidance;
+      if (!hasIntelligence) {
+        return null;
+      }
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": buildTestId("intelligence-panel"), className: "mt-3 space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-[11px]" }, fitStatus && /* @__PURE__ */ React.createElement("span", { "data-testid": buildTestId("fit-status"), className: `rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}` }, "Environment Fit: ", formatSplIntelligenceLabel(fitStatus, "Unknown")), validationStatus && /* @__PURE__ */ React.createElement("span", { "data-testid": buildTestId("validation-status"), className: `rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}` }, "Validation: ", formatSplIntelligenceLabel(validationStatus, "Unknown")), (reuseTier || knownGood) && /* @__PURE__ */ React.createElement("span", { "data-testid": buildTestId("reuse-tier"), className: `rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}` }, "Reuse: ", knownGood ? "Known Good" : formatSplIntelligenceLabel(reuseTier, "Candidate")), (executionCount > 0 || successCount > 0 || failureCount > 0) && /* @__PURE__ */ React.createElement("span", { "data-testid": buildTestId("feedback-counts"), className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-white border-gray-300 text-gray-700"}` }, "Observed Runs: ", successCount, " success / ", failureCount, " failure")), (fitReason || reuseGuidance) && /* @__PURE__ */ React.createElement("div", { "data-testid": buildTestId("intelligence-notes"), className: `text-xs ${subtextClass}` }, [fitReason, reuseGuidance].filter(Boolean).join(" ")));
+    };
+    const saveSplQueryToLibrary = async (splQuery, options = {}) => {
+      var _a2, _b2, _c2;
+      const payload = buildSplLibraryPayload(splQuery, options);
+      if (!payload) {
+        return null;
+      }
+      setCapabilityActionState((prev) => ({
+        ...prev,
+        rag_chromadb: "import-asset"
+      }));
+      try {
+        const response = await fetch("/api/capabilities/rag/assets/import/text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.message) || "Failed to save SPL query to the library.");
+        }
+        const savedAssetId = ((_b2 = (_a2 = result == null ? void 0 : result.details) == null ? void 0 : _a2.asset) == null ? void 0 : _b2.asset_id) || null;
+        setCapabilityNotice({
+          type: "success",
+          message: (result == null ? void 0 : result.message) || "SPL query saved to the context library."
+        });
+        await loadCapabilities();
+        if (savedAssetId && ragAssetWorkspace.detailAssetId === savedAssetId) {
+          await loadRagAssetDetail(savedAssetId, { force: true });
+        }
+        return ((_c2 = result == null ? void 0 : result.details) == null ? void 0 : _c2.asset) || null;
+      } catch (error) {
+        console.error("Failed to save SPL query to library:", error);
+        setCapabilityNotice({
+          type: "error",
+          message: error.message || "Failed to save SPL query to the library."
+        });
+        return null;
+      } finally {
+        setCapabilityActionState((prev) => {
+          const next = { ...prev };
+          delete next.rag_chromadb;
+          return next;
+        });
+        setTimeout(() => setCapabilityNotice(null), 3500);
+      }
+    };
+    const useSplQueryInChat = (splQuery, options = {}) => {
+      const trimmedQuery = String(splQuery || "").trim();
+      if (!trimmedQuery) {
+        return;
+      }
+      const contextLabel = String(options.originLabel || options.sourceLabel || "saved SPL query").trim() || "saved SPL query";
+      const prompt = String(options.chatPrompt || "").trim() || [
+        `Help me work with this ${contextLabel}:`,
+        "",
+        "```spl",
+        trimmedQuery,
+        "```",
+        "",
+        "Explain it, refine it, or run it if appropriate."
+      ].join("\n");
+      openChatSurface();
+      setChatInput(prompt);
+      setTimeout(() => {
+        var _a2;
+        return (_a2 = chatInputRef.current) == null ? void 0 : _a2.focus();
+      }, 0);
+    };
+    const renderSplQueryActionButtons2 = (splQuery, options = {}) => {
+      const trimmedQuery = String(splQuery || "").trim();
+      if (!trimmedQuery) {
+        return null;
+      }
+      const deeplinkOptions = options.deeplinkOptions || {};
+      return /* @__PURE__ */ React.createElement("div", { className: `flex flex-wrap items-center gap-2 ${options.className || ""}` }, canUseSplunkDeeplinks && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => openSplunkSearch(trimmedQuery, deeplinkOptions),
+          className: "px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors",
+          title: "Open this search in Splunk Web"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt mr-1" }),
+        "Open in Splunk"
+      ), options.allowSave !== false && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => saveSplQueryToLibrary(trimmedQuery, options),
+          disabled: isRagBusy,
+          className: `px-2 py-1 text-xs rounded transition-colors ${!isRagBusy ? "text-emerald-100 bg-emerald-700 hover:bg-emerald-800" : isDarkTheme ? "bg-gray-800 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`,
+          title: "Save this query to the managed SPL library"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-bookmark mr-1" }),
+        ragActionInProgress === "import-asset" ? "Saving..." : "Save to Library"
+      ), options.allowUseInChat !== false && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => useSplQueryInChat(trimmedQuery, options),
+          className: "px-2 py-1 text-xs text-violet-100 hover:text-white bg-violet-700 hover:bg-violet-800 rounded transition-colors",
+          title: "Bring this query into the chat workspace"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-comments mr-1" }),
+        "Use in Chat"
+      ), options.allowCopy !== false && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => copyToClipboard(trimmedQuery),
+          className: "px-2 py-1 text-xs text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors",
+          title: "Copy this query to the clipboard"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy mr-1" }),
+        "Copy"
+      ));
+    };
+    const renderCapabilityReusableQueryCards = (usage) => {
+      const reusableQueries = Array.isArray(usage == null ? void 0 : usage.reusable_queries) ? usage.reusable_queries.filter((candidate) => typeof (candidate == null ? void 0 : candidate.query) === "string" && candidate.query.trim()).slice(0, 3) : [];
+      if (reusableQueries.length === 0) {
+        return null;
+      }
+      return /* @__PURE__ */ React.createElement("div", { className: "space-y-2 mt-3", "data-testid": "chat-capability-reusable-query-list" }, /* @__PURE__ */ React.createElement("div", { className: `text-[11px] font-semibold uppercase tracking-[0.18em] ${mutedTextClass}` }, "Reusable SPL Candidates"), reusableQueries.map((candidate, candidateIdx) => {
+        const query = String(candidate.query || "").trim();
+        const reuseTier = String(candidate.reuse_tier || "").trim().toLowerCase();
+        const fitStatus = String(candidate.environment_fit_status || "").trim().toLowerCase();
+        const validationStatus = String(candidate.validation_status || "").trim().toLowerCase();
+        const successCount = Number(candidate.success_count || 0);
+        const failureCount = Number(candidate.failure_count || 0);
+        const knownGood = Boolean(candidate.known_good) || validationStatus === "known_good";
+        return /* @__PURE__ */ React.createElement("div", { key: `${(usage == null ? void 0 : usage.name) || "capability"}-candidate-${candidateIdx}`, "data-testid": "chat-capability-reusable-query-card", className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, candidate.title || "Saved SPL Query"), candidate.why_reuse && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, candidate.why_reuse)), renderSplQueryActionButtons2(query, {
+          allowSave: false,
+          originKind: "chat_capability_reuse",
+          originLabel: candidate.title || (usage == null ? void 0 : usage.title) || "Reusable SPL candidate",
+          sourceLabel: (usage == null ? void 0 : usage.title) || (usage == null ? void 0 : usage.name) || "Capability Evidence",
+          contextExcerpt: candidate.why_reuse || (usage == null ? void 0 : usage.contribution) || "",
+          deeplinkOptions: {
+            app: candidate.app,
+            earliest: candidate.earliest,
+            latest: candidate.latest
+          },
+          className: "sm:justify-end"
+        })), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2 text-[11px]" }, (reuseTier || knownGood) && /* @__PURE__ */ React.createElement("span", { "data-testid": "chat-capability-reusable-query-reuse-tier", className: `rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}` }, "Reuse: ", knownGood ? "Known Good" : formatSplIntelligenceLabel(reuseTier, "Candidate")), fitStatus && /* @__PURE__ */ React.createElement("span", { "data-testid": "chat-capability-reusable-query-fit-status", className: `rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}` }, "Environment Fit: ", formatSplIntelligenceLabel(fitStatus, "Unknown")), validationStatus && /* @__PURE__ */ React.createElement("span", { "data-testid": "chat-capability-reusable-query-validation-status", className: `rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}` }, "Validation: ", formatSplIntelligenceLabel(validationStatus, "Unknown")), (successCount > 0 || failureCount > 0) && /* @__PURE__ */ React.createElement("span", { "data-testid": "chat-capability-reusable-query-feedback-counts", className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700"}` }, "Observed Runs: ", successCount, " success / ", failureCount, " failure")), /* @__PURE__ */ React.createElement("pre", { "data-testid": "chat-capability-reusable-query", className: `mt-2 max-h-32 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-gray-50 border-gray-200 text-gray-900"}` }, query));
+      }));
     };
     const extractAssistantSplQuery = (result) => {
       var _a2;
@@ -2647,10 +2969,16 @@
       }
     };
     const openCapabilitiesOverview = () => {
+      setWorkspaceTab("capabilities");
       setCapabilitiesView("overview");
+      loadCapabilities();
     };
-    const openRagCapabilitiesWorkspace = () => {
+    const openRagCapabilitiesWorkspace = (options = {}) => {
+      setWorkspaceTab("capabilities");
       setCapabilitiesView("rag");
+      if (options.libraryFilter) {
+        setRagLibraryFilter(options.libraryFilter);
+      }
       loadCapabilities();
     };
     const openCapabilityDetail = (name) => {
@@ -2782,7 +3110,7 @@
     const renderRagWorkspaceView = () => {
       var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2;
       if (!ragCapability) {
-        return /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold ${headingClass}` }, "RAG Workspace"), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${subtextClass}` }, "The dedicated retrieval workspace is unavailable because the `rag_chromadb` capability was not returned by the capabilities API."));
+        return /* @__PURE__ */ React.createElement("div", { "data-testid": "context-library-detail-panel", className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold ${headingClass}` }, "RAG Workspace"), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${subtextClass}` }, "The dedicated retrieval workspace is unavailable because the `rag_chromadb` capability was not returned by the capabilities API."));
       }
       return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-4xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${getCapabilityStatusClasses(ragStatusLabel)}` }, formatCapabilityStatusLabel(ragStatusLabel)), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-gray-100 text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(ragCapability.category || "retrieval")), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-sky-950 text-sky-100 border border-sky-800" : "bg-sky-50 text-sky-800 border border-sky-200"}` }, "Dedicated Workspace")), /* @__PURE__ */ React.createElement("h3", { className: `text-xl font-semibold ${headingClass}` }, ragCapability.title || "Indexed Artifact Search"), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${subtextClass}` }, ragCapability.description || "Indexed artifact search plus managed knowledge assets for context-rich retrieval.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 min-w-[240px] ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium ${headingClass}` }, "Health"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-sm ${subtextClass}` }, ragCapability.health_message || "Capability has not been tested yet."), ragCapability.last_tested_at && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-[11px] ${mutedTextClass}` }, "Last checked: ", new Date(ragCapability.last_tested_at).toLocaleString()), ragCapability.version && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-[11px] ${mutedTextClass}` }, "Version: ", ragCapability.version))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 xl:grid-cols-4 gap-3 mt-5" }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-indigo-900 border border-indigo-700" : "bg-indigo-50"} rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-indigo-200" : "text-indigo-700"} text-xs uppercase tracking-wide` }, "Documents Indexed"), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-indigo-100" : "text-indigo-900"} text-2xl font-semibold` }, ragIndexedDocumentCount)), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-blue-900 border border-blue-700" : "bg-blue-50"} rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-blue-200" : "text-blue-700"} text-xs uppercase tracking-wide` }, "Source Files"), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-blue-100" : "text-blue-900"} text-2xl font-semibold` }, (ragIndexSummary == null ? void 0 : ragIndexSummary.source_file_count) || 0)), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-emerald-900 border border-emerald-700" : "bg-emerald-50"} rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-emerald-200" : "text-emerald-700"} text-xs uppercase tracking-wide` }, "Managed Assets"), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-emerald-100" : "text-emerald-900"} text-2xl font-semibold` }, ragDisplayedAssetCount)), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-violet-900 border border-violet-700" : "bg-violet-50"} rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-violet-200" : "text-violet-700"} text-xs uppercase tracking-wide` }, "Preview Ready"), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "text-violet-100" : "text-violet-900"} text-sm font-semibold mt-2` }, canUseRagContextPreview ? "Indexed retrieval ready" : "Install, enable, and reindex first"))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Index Status"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, "Last indexed: ", (ragIndexSummary == null ? void 0 : ragIndexSummary.last_indexed_at) ? new Date(ragIndexSummary.last_indexed_at).toLocaleString() : "Not indexed yet."), Array.isArray(ragIndexSummary == null ? void 0 : ragIndexSummary.sample_sources) && ragIndexSummary.sample_sources.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-[11px] ${mutedTextClass}` }, "Sample sources: ", ragIndexSummary.sample_sources.join(", "))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Knowledge Asset Plane"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, "Managed asset directory: ", ragDisplayedAssetDir), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, "Checked in: ", ragCheckedInAssetCount, ". Checked out: ", ragCheckedOutAssetCount, "."), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, canUseRagContextPreview ? "Checked-in assets are ready for indexed context previews." : "Asset import works now; preview and chat retrieval unlock once indexed retrieval is ready."))), (Array.isArray(ragCapability.dependency_packages) && ragCapability.dependency_packages.length > 0 || ragIndexSourceTypes.length > 0 || ragKnowledgeAssetTypeCounts.length > 0) && /* @__PURE__ */ React.createElement("div", { className: "space-y-3 mt-4" }, Array.isArray(ragCapability.dependency_packages) && ragCapability.dependency_packages.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Dependencies"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-[11px]" }, ragCapability.dependency_packages.map((pkg) => /* @__PURE__ */ React.createElement("span", { key: pkg, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, pkg)))), ragIndexSourceTypes.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Indexed Source Mix"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-[11px]" }, ragIndexSourceTypes.map(([sourceType, count]) => /* @__PURE__ */ React.createElement("span", { key: sourceType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, formatCapabilitySourceTypeLabel(sourceType), ": ", count)))), ragKnowledgeAssetTypeCounts.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Managed Asset Mix"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-[11px]" }, ragKnowledgeAssetTypeCounts.map(([assetType, count]) => /* @__PURE__ */ React.createElement("span", { key: assetType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, formatKnowledgeAssetTypeLabel(assetType), ": ", count))))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-5" }, /* @__PURE__ */ React.createElement(
         "button",
@@ -2852,6 +3180,7 @@
           onChange: (event2) => updateRagAssetDraft("asset_type", event2.target.value),
           className: `rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`
         },
+        /* @__PURE__ */ React.createElement("option", { value: SPL_LIBRARY_ASSET_TYPE }, "SPL Library Query"),
         /* @__PURE__ */ React.createElement("option", { value: "reference_document" }, "Reference Document"),
         /* @__PURE__ */ React.createElement("option", { value: "splunk_documentation" }, "Splunk Documentation"),
         /* @__PURE__ */ React.createElement("option", { value: "monitored_system_context" }, "Monitored System Context"),
@@ -2994,7 +3323,26 @@
           className: `px-3 py-1.5 rounded text-sm font-medium ${isDarkTheme ? "bg-gray-700 hover:bg-gray-600 text-white" : "bg-gray-100 hover:bg-gray-200 text-gray-800 border border-gray-300"}`
         },
         "Close Detail"
-      )), ragAssetWorkspace.detailStatus === "loading" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${subtextClass}` }, "Loading managed knowledge asset detail.") : ragAssetWorkspace.detailStatus === "error" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, ragAssetWorkspace.detailError || "Knowledge asset detail could not be loaded.") : ((_f2 = ragAssetWorkspace.assetDetail) == null ? void 0 : _f2.asset) ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, ragAssetWorkspace.assetDetail.asset.title || "Knowledge Asset"), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, formatKnowledgeAssetTypeLabel(ragAssetWorkspace.assetDetail.asset.asset_type))), ragAssetWorkspace.assetDetail.asset.source_label && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, "Source: ", ragAssetWorkspace.assetDetail.asset.source_label)), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Stored as: ", ragAssetWorkspace.assetDetail.stored_path || ragAssetWorkspace.assetDetail.asset.content_path || "managed asset")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-[11px]" }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Stored sections: ", Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) ? ragAssetWorkspace.assetDetail.stored_sections.length : 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Chunk sections: ", ragAssetWorkspace.assetDetail.chunk_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Context characters: ", ragAssetWorkspace.assetDetail.context_character_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Imported: ", ragAssetWorkspace.assetDetail.asset.created_at ? new Date(ragAssetWorkspace.assetDetail.asset.created_at).toLocaleString() : "Unknown"))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 2xl:grid-cols-2 gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Stored Sections"), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) && ragAssetWorkspace.assetDetail.stored_sections.length > 0 ? ragAssetWorkspace.assetDetail.stored_sections.map((section, sectionIndex) => /* @__PURE__ */ React.createElement("details", { key: `${section.title || "section"}-${sectionIndex}`, open: section.title !== "Context", className: `rounded border px-3 py-2 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-medium ${headingClass}` }, section.title || `Section ${sectionIndex + 1}`, " (", section.character_count || 0, " chars)"), Array.isArray(section.items) && section.items.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: `mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}` }, section.items.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${section.title || "section"}-${itemIndex}` }, item))) : /* @__PURE__ */ React.createElement("pre", { className: `mt-2 text-xs whitespace-pre-wrap font-mono ${subtextClass}` }, section.content || "No section content available."))) : /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, "No stored sections were available for this asset."))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Chunk Browser"), /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-2 ${subtextClass}` }, "These are the current chunk splits generated from the asset file by the indexing logic."), activeDetailPreviewTrace.matchedChunkIds.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-2 mb-2 ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, "Current preview matched ", activeDetailPreviewTrace.matchedChunkIds.length, " chunk-browser section(s) for this asset. Highlighted below."), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.chunk_sections) && ragAssetWorkspace.assetDetail.chunk_sections.length > 0 ? ragAssetWorkspace.assetDetail.chunk_sections.map((section, sectionIndex) => {
+      )), ragAssetWorkspace.detailStatus === "loading" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${subtextClass}` }, "Loading managed knowledge asset detail.") : ragAssetWorkspace.detailStatus === "error" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, ragAssetWorkspace.detailError || "Knowledge asset detail could not be loaded.") : ((_f2 = ragAssetWorkspace.assetDetail) == null ? void 0 : _f2.asset) ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, ragAssetWorkspace.assetDetail.asset.title || "Knowledge Asset"), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, formatKnowledgeAssetTypeLabel(ragAssetWorkspace.assetDetail.asset.asset_type))), ragAssetWorkspace.assetDetail.asset.source_label && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, "Source: ", ragAssetWorkspace.assetDetail.asset.source_label)), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Stored as: ", ragAssetWorkspace.assetDetail.stored_path || ragAssetWorkspace.assetDetail.asset.content_path || "managed asset")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-[11px]" }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Stored sections: ", Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) ? ragAssetWorkspace.assetDetail.stored_sections.length : 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Chunk sections: ", ragAssetWorkspace.assetDetail.chunk_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Context characters: ", ragAssetWorkspace.assetDetail.context_character_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Imported: ", ragAssetWorkspace.assetDetail.asset.created_at ? new Date(ragAssetWorkspace.assetDetail.asset.created_at).toLocaleString() : "Unknown"))), (() => {
+        const detailAttributes = getKnowledgeAssetAttributes(ragAssetWorkspace.assetDetail.asset);
+        const detailSplQuery = String(detailAttributes.spl_query || "").trim();
+        if (!detailSplQuery) {
+          return null;
+        }
+        return /* @__PURE__ */ React.createElement("div", { "data-testid": "context-library-detail-spl-query", className: `rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, "Saved SPL Query"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, "Run this query in Splunk Web, reuse it in chat, or keep it parked in the context library.")), renderSplQueryActionButtons2(detailSplQuery, {
+          allowSave: false,
+          originKind: "spl_library_asset",
+          originLabel: ragAssetWorkspace.assetDetail.asset.title || "Saved SPL Library Query",
+          sourceLabel: ragAssetWorkspace.assetDetail.asset.source_label || ragAssetWorkspace.assetDetail.asset.title || "SPL Library Query",
+          contextExcerpt: ragAssetWorkspace.assetDetail.asset.summary || ragAssetWorkspace.assetDetail.asset.preview || "",
+          deeplinkOptions: {
+            app: detailAttributes.app,
+            earliest: detailAttributes.earliest,
+            latest: detailAttributes.latest
+          },
+          className: "sm:justify-end"
+        })), /* @__PURE__ */ React.createElement("pre", { className: `mt-3 max-h-40 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-gray-50 border-gray-200 text-gray-900"}` }, detailSplQuery), renderSplQueryIntelligence(detailAttributes, { testIdPrefix: "context-library-detail-spl" }));
+      })(), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 2xl:grid-cols-2 gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Stored Sections"), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) && ragAssetWorkspace.assetDetail.stored_sections.length > 0 ? ragAssetWorkspace.assetDetail.stored_sections.map((section, sectionIndex) => /* @__PURE__ */ React.createElement("details", { key: `${section.title || "section"}-${sectionIndex}`, open: section.title !== "Context", className: `rounded border px-3 py-2 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-medium ${headingClass}` }, section.title || `Section ${sectionIndex + 1}`, " (", section.character_count || 0, " chars)"), Array.isArray(section.items) && section.items.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: `mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}` }, section.items.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${section.title || "section"}-${itemIndex}` }, item))) : /* @__PURE__ */ React.createElement("pre", { className: `mt-2 text-xs whitespace-pre-wrap font-mono ${subtextClass}` }, section.content || "No section content available."))) : /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, "No stored sections were available for this asset."))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Chunk Browser"), /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-2 ${subtextClass}` }, "These are the current chunk splits generated from the asset file by the indexing logic."), activeDetailPreviewTrace.matchedChunkIds.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-2 mb-2 ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, "Current preview matched ", activeDetailPreviewTrace.matchedChunkIds.length, " chunk-browser section(s) for this asset. Highlighted below."), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.chunk_sections) && ragAssetWorkspace.assetDetail.chunk_sections.length > 0 ? ragAssetWorkspace.assetDetail.chunk_sections.map((section, sectionIndex) => {
         const isPreviewMatched = activeDetailPreviewTrace.matchedChunkIds.includes(section.document_id);
         return /* @__PURE__ */ React.createElement("details", { key: section.document_id || `${section.section || "chunk"}-${sectionIndex}`, open: isPreviewMatched || sectionIndex === 0, className: `rounded border px-3 py-2 ${isPreviewMatched ? isDarkTheme ? "border-sky-700 bg-sky-950/40" : "border-sky-300 bg-sky-50" : isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-medium ${headingClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", null, section.section || `Chunk ${sectionIndex + 1}`, " (", section.character_count || 0, " chars)"), isPreviewMatched && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-900 border-sky-700 text-sky-100" : "bg-sky-100 border-sky-300 text-sky-800"}` }, "Matched in Preview"))), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 text-xs whitespace-pre-wrap font-mono ${subtextClass}` }, section.content || "No chunk content available."));
       }) : /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, "No chunk-browser sections were produced for this asset."))))) : null), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("details", { className: `rounded-lg border ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}` }, "Inspect Configuration"), /* @__PURE__ */ React.createElement("div", { className: "px-3 py-3" }, /* @__PURE__ */ React.createElement(
@@ -3016,6 +3364,7 @@
         ragActionInProgress === "config" ? "Saving..." : "Save Config"
       ))))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass} mt-6` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3 mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, "Knowledge Asset Library"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, "Imports land here checked in by default. Check assets out to keep them stored but remove them from active RAG circulation until you check them back in.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-3 gap-2 min-w-[280px] text-[11px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Total"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-semibold ${headingClass}` }, ragDisplayedAssetCount)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Checked In"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-semibold ${headingClass}` }, ragCheckedInAssetCount)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Checked Out"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-semibold ${headingClass}` }, ragCheckedOutAssetCount)))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, [
         { key: "all", label: `All (${ragDisplayedAssetCount})` },
+        { key: "spl_library", label: `SPL Library (${ragSplLibraryAssetCount})` },
         { key: "checked_in", label: `Checked In (${(_g2 = ragLibraryStatusCounts == null ? void 0 : ragLibraryStatusCounts.checked_in) != null ? _g2 : ragCheckedInAssetCount})` },
         { key: "checked_out", label: `Checked Out (${(_h2 = ragLibraryStatusCounts == null ? void 0 : ragLibraryStatusCounts.checked_out) != null ? _h2 : ragCheckedOutAssetCount})` }
       ].map((filterOption) => {
@@ -3024,21 +3373,42 @@
           "button",
           {
             key: filterOption.key,
+            "data-testid": `context-library-filter-${filterOption.key}`,
             type: "button",
             onClick: () => setRagLibraryFilter(filterOption.key),
             className: `px-3 py-1.5 rounded text-xs font-medium border ${isActive ? isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800" : isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200 hover:bg-gray-800" : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50"}`
           },
           filterOption.label
         );
-      })), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, ragLibraryAssetCount, " item(s) shown")), ragAssetWorkspace.status === "loading" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${subtextClass}` }, "Loading managed knowledge assets.") : ragAssetWorkspace.status === "error" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, ragAssetWorkspace.error || "Failed to load managed knowledge assets.") : ragLibraryAssets.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, ragLibraryFilter === "checked_in" ? "No checked-in knowledge assets are currently in active library circulation." : ragLibraryFilter === "checked_out" ? "No knowledge assets are currently checked out of circulation." : "No managed knowledge assets have been imported yet.") : /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-[42rem] overflow-y-auto pr-1" }, ragLibraryAssets.map((asset) => {
-        var _a3, _b3;
+      })), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, ragLibraryAssetCount, " item(s) shown")), ragAssetWorkspace.status === "loading" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${subtextClass}` }, "Loading managed knowledge assets.") : ragAssetWorkspace.status === "error" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, ragAssetWorkspace.error || "Failed to load managed knowledge assets.") : ragLibraryAssets.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, ragLibraryFilter === "spl_library" ? "No SPL library queries have been saved into the context workspace yet." : ragLibraryFilter === "checked_in" ? "No checked-in knowledge assets are currently in active library circulation." : ragLibraryFilter === "checked_out" ? "No knowledge assets are currently checked out of circulation." : "No managed knowledge assets have been imported yet.") : /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-[42rem] overflow-y-auto pr-1" }, ragLibraryAssets.map((asset) => {
+        var _a3, _b3, _c3, _d3;
         const assetLibraryStatus = String(asset.library_status || "checked_in").toLowerCase();
         const isAssetCheckedOut = assetLibraryStatus === "checked_out";
         const libraryActionKey = isAssetCheckedOut ? "check-in-asset" : "check-out-asset";
-        return /* @__PURE__ */ React.createElement("div", { key: asset.asset_id || asset.content_path || asset.title, className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, asset.title || "Knowledge Asset"), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, formatKnowledgeAssetTypeLabel(asset.asset_type)), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700"}` }, formatKnowledgeAssetImportMethodLabel(asset.import_method)), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${getKnowledgeAssetLibraryStatusClasses(assetLibraryStatus)}` }, formatKnowledgeAssetLibraryStatusLabel(assetLibraryStatus))), asset.source_label && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, "Source: ", asset.source_label)), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
+        const assetAttributes = getKnowledgeAssetAttributes(asset);
+        const savedSplQuery = String(assetAttributes.spl_query || "").trim();
+        const isSplLibraryOnlyView = ragLibraryFilter === "spl_library" && Boolean(savedSplQuery);
+        const splIntelligenceSummary = renderSplQueryIntelligence(assetAttributes, {
+          testIdPrefix: isSplLibraryOnlyView ? "context-library-spl" : ""
+        });
+        const splQueryActionOptions = {
+          allowSave: false,
+          originKind: "spl_library_asset",
+          originLabel: asset.title || "Saved SPL Library Query",
+          sourceLabel: asset.source_label || asset.title || "SPL Library Query",
+          contextExcerpt: asset.summary || asset.preview || "",
+          deeplinkOptions: {
+            app: assetAttributes.app,
+            earliest: assetAttributes.earliest,
+            latest: assetAttributes.latest
+          },
+          className: "sm:justify-end"
+        };
+        return /* @__PURE__ */ React.createElement("div", { key: asset.asset_id || asset.content_path || asset.title, "data-testid": savedSplQuery ? "context-library-spl-asset-card" : "context-library-asset-card", className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, isSplLibraryOnlyView ? /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { "data-testid": "context-library-spl-query-card", className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-950 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: `text-[11px] font-semibold uppercase tracking-wide ${mutedTextClass}` }, "Saved SPL Query"), renderSplQueryActionButtons2(savedSplQuery, splQueryActionOptions)), /* @__PURE__ */ React.createElement("pre", { "data-testid": "context-library-spl-only-query", className: `mt-2 max-h-[26rem] overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-100" : "bg-white border-gray-300 text-gray-900"}` }, savedSplQuery), splIntelligenceSummary), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
           "button",
           {
             type: "button",
+            "data-testid": "context-library-view-spl-details",
             onClick: () => loadRagAssetDetail(asset.asset_id),
             disabled: ragAssetWorkspace.detailStatus === "loading" || !asset.asset_id,
             className: `px-3 py-1.5 rounded text-sm font-medium ${ragAssetWorkspace.detailStatus !== "loading" && asset.asset_id ? "bg-slate-700 hover:bg-slate-800 text-white" : isDarkTheme ? "bg-gray-800 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
@@ -3062,7 +3432,35 @@
             className: `px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy ? "bg-rose-600 hover:bg-rose-700 text-white" : isDarkTheme ? "bg-gray-800 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
           },
           ragActionInProgress === "delete-asset" ? "Removing..." : "Remove"
-        ))), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, asset.summary || asset.preview || "No summary available."), isAssetCheckedOut && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800"}` }, "Checked out of active circulation. Retrieval previews and chat RAG will ignore this asset until it is checked back in."), asset.description && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Purpose: ", asset.description), Array.isArray(asset.tags) && asset.tags.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-2 text-[11px]" }, asset.tags.map((tag) => /* @__PURE__ */ React.createElement("span", { key: `${asset.asset_id || asset.title}-${tag}`, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700"}` }, tag))), Array.isArray(asset.focus_terms) && asset.focus_terms.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-2 text-[11px]" }, asset.focus_terms.slice(0, 8).map((term) => /* @__PURE__ */ React.createElement("span", { key: `${asset.asset_id || asset.title}-focus-${term}`, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, term))), Array.isArray(asset.key_points) && asset.key_points.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: `mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}` }, asset.key_points.slice(0, 2).map((point, pointIndex) => /* @__PURE__ */ React.createElement("li", { key: `${asset.asset_id || asset.title}-point-${pointIndex}` }, point))), Array.isArray(asset.usage_guidance) && asset.usage_guidance.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Best used for: ", asset.usage_guidance[0]), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 mt-3 text-[11px]" }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Words: ", asset.word_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Characters: ", asset.text_char_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Imported: ", asset.created_at ? new Date(asset.created_at).toLocaleString() : "Unknown"), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Last checked in: ", asset.last_checked_in_at ? new Date(asset.last_checked_in_at).toLocaleString() : "Not recorded")), asset.checked_out_at ? /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-[11px] ${mutedTextClass}` }, "Checked out: ", new Date(asset.checked_out_at).toLocaleString()) : /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-[11px] ${mutedTextClass}` }, "Available for preview and chat retrieval while checked in."), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-[11px] ${mutedTextClass}` }, "Stored as: ", asset.content_path || "managed asset"));
+        )), isAssetCheckedOut && /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800"}` }, "Checked out of active circulation. Retrieval previews and chat RAG will ignore this asset until it is checked back in.")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, asset.title || "Knowledge Asset"), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, formatKnowledgeAssetTypeLabel(asset.asset_type)), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700"}` }, formatKnowledgeAssetImportMethodLabel(asset.import_method)), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${getKnowledgeAssetLibraryStatusClasses(assetLibraryStatus)}` }, formatKnowledgeAssetLibraryStatusLabel(assetLibraryStatus))), asset.source_label && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, "Source: ", asset.source_label)), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            "data-testid": savedSplQuery ? "context-library-view-spl-details" : void 0,
+            onClick: () => loadRagAssetDetail(asset.asset_id),
+            disabled: ragAssetWorkspace.detailStatus === "loading" || !asset.asset_id,
+            className: `px-3 py-1.5 rounded text-sm font-medium ${ragAssetWorkspace.detailStatus !== "loading" && asset.asset_id ? "bg-slate-700 hover:bg-slate-800 text-white" : isDarkTheme ? "bg-gray-800 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
+          },
+          ragAssetWorkspace.detailStatus === "loading" && ragAssetWorkspace.detailAssetId === asset.asset_id ? "Loading Detail..." : ((_d3 = (_c3 = ragAssetWorkspace.assetDetail) == null ? void 0 : _c3.asset) == null ? void 0 : _d3.asset_id) === asset.asset_id ? "Hide Details" : "View Details"
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => setRagKnowledgeAssetLibraryStatus(asset.asset_id, asset.title, isAssetCheckedOut ? "checked_in" : "checked_out"),
+            disabled: isRagBusy || !asset.asset_id,
+            className: `px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy && asset.asset_id ? isAssetCheckedOut ? "bg-emerald-600 hover:bg-emerald-700 text-white" : "bg-amber-600 hover:bg-amber-700 text-white" : isDarkTheme ? "bg-gray-800 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
+          },
+          ragActionInProgress === libraryActionKey ? isAssetCheckedOut ? "Checking In..." : "Checking Out..." : isAssetCheckedOut ? "Check In" : "Check Out"
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => deleteRagKnowledgeAsset(asset.asset_id, asset.title),
+            disabled: isRagBusy,
+            className: `px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy ? "bg-rose-600 hover:bg-rose-700 text-white" : isDarkTheme ? "bg-gray-800 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
+          },
+          ragActionInProgress === "delete-asset" ? "Removing..." : "Remove"
+        ))), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, asset.summary || asset.preview || "No summary available."), savedSplQuery && /* @__PURE__ */ React.createElement("div", { "data-testid": "context-library-spl-query-card", className: `mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-950 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: `text-[11px] font-semibold uppercase tracking-wide ${mutedTextClass}` }, "Saved SPL Query"), renderSplQueryActionButtons2(savedSplQuery, splQueryActionOptions)), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 max-h-32 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-100" : "bg-white border-gray-300 text-gray-900"}` }, savedSplQuery), splIntelligenceSummary), isAssetCheckedOut && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800"}` }, "Checked out of active circulation. Retrieval previews and chat RAG will ignore this asset until it is checked back in."), asset.description && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Purpose: ", asset.description), Array.isArray(asset.tags) && asset.tags.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-2 text-[11px]" }, asset.tags.map((tag) => /* @__PURE__ */ React.createElement("span", { key: `${asset.asset_id || asset.title}-${tag}`, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 border-gray-600 text-gray-200" : "bg-gray-100 border-gray-300 text-gray-700"}` }, tag))), Array.isArray(asset.focus_terms) && asset.focus_terms.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-2 text-[11px]" }, asset.focus_terms.slice(0, 8).map((term) => /* @__PURE__ */ React.createElement("span", { key: `${asset.asset_id || asset.title}-focus-${term}`, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, term))), Array.isArray(asset.key_points) && asset.key_points.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: `mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}` }, asset.key_points.slice(0, 2).map((point, pointIndex) => /* @__PURE__ */ React.createElement("li", { key: `${asset.asset_id || asset.title}-point-${pointIndex}` }, point))), Array.isArray(asset.usage_guidance) && asset.usage_guidance.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Best used for: ", asset.usage_guidance[0]), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 mt-3 text-[11px]" }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Words: ", asset.word_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Characters: ", asset.text_char_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Imported: ", asset.created_at ? new Date(asset.created_at).toLocaleString() : "Unknown"), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Last checked in: ", asset.last_checked_in_at ? new Date(asset.last_checked_in_at).toLocaleString() : "Not recorded")), asset.checked_out_at ? /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-[11px] ${mutedTextClass}` }, "Checked out: ", new Date(asset.checked_out_at).toLocaleString()) : /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-[11px] ${mutedTextClass}` }, "Available for preview and chat retrieval while checked in."), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-[11px] ${mutedTextClass}` }, "Stored as: ", asset.content_path || "managed asset")));
       }))));
     };
     const loadConnectionInfo = async () => {
@@ -5023,6 +5421,8 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       const selectedReportType = String((selectedWorkspaceReportRecord == null ? void 0 : selectedWorkspaceReportRecord.type) || (reportContent == null ? void 0 : reportContent.type) || "file").toUpperCase();
       const selectedReportSize = (_b2 = (_a2 = selectedWorkspaceReportRecord == null ? void 0 : selectedWorkspaceReportRecord.size_bytes) != null ? _a2 : selectedWorkspaceReportRecord == null ? void 0 : selectedWorkspaceReportRecord.size) != null ? _b2 : null;
       const selectedReportModifiedAt = (selectedWorkspaceReportRecord == null ? void 0 : selectedWorkspaceReportRecord.modified_at) || (selectedWorkspaceReportRecord == null ? void 0 : selectedWorkspaceReportRecord.modified) || null;
+      const reportSplQueries = Array.isArray(reportContent == null ? void 0 : reportContent.spl_queries) ? reportContent.spl_queries : [];
+      const reportContextExcerpt = (reportContent == null ? void 0 : reportContent.type) === "text" ? String((reportContent == null ? void 0 : reportContent.content) || "").slice(0, 900) : "";
       return /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-[11px] uppercase tracking-[0.18em] ${mutedTextClass}` }, viewerLabel), /* @__PURE__ */ React.createElement("h3", { className: `mt-2 text-lg font-medium break-all ${headingClass}` }, selectedReport), /* @__PURE__ */ React.createElement("div", { className: `mt-2 flex flex-wrap items-center gap-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 border ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, selectedReportType), selectedReportSize != null && /* @__PURE__ */ React.createElement("span", null, (selectedReportSize / 1024).toFixed(1), " KB"), selectedReportModifiedAt && /* @__PURE__ */ React.createElement("span", null, new Date(selectedReportModifiedAt).toLocaleString()))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, reportContent.type === "image" && /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -5047,6 +5447,13 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: "p-6 overflow-y-auto scroll-container",
           style: { height: `${reportViewerHeight}px` }
         },
+        reportSplQueries.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mb-6 space-y-3", "data-testid": "report-viewer-spl-blocks" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-4 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, "Detected SPL Blocks"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, "Save report-visible SPL into the context library, open it in Splunk Web, or bring it into chat.")), reportSplQueries.map((splQuery, splIndex) => /* @__PURE__ */ React.createElement("div", { key: `${selectedReport || "report"}-spl-${splIndex}`, "data-testid": "report-viewer-spl-card", className: `rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, "SPL Block ", splIndex + 1), renderSplQueryActionButtons2(splQuery, {
+          originKind: "report_viewer",
+          originLabel: selectedReport || "Report Viewer",
+          sourceLabel: selectedReport || "Report Viewer",
+          contextExcerpt: reportContextExcerpt,
+          className: "sm:justify-end"
+        })), /* @__PURE__ */ React.createElement("pre", { className: `mt-3 max-h-40 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-gray-50 border-gray-200 text-gray-900"}` }, splQuery)))),
         reportContent.type === "image" ? /* @__PURE__ */ React.createElement("div", { className: "h-full flex flex-col gap-4" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-[0.18em] ${mutedTextClass}` }, isInfographicArtifact(selectedReport) ? "Summary infographic preview" : "Image preview"), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-[320px] rounded-2xl border p-4 ${isDarkTheme ? "bg-gray-950 border-gray-700" : "bg-slate-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement(
           "img",
           {
@@ -5080,6 +5487,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         "button",
         {
           type: "button",
+          "data-testid": "discovery-report-year-toggle",
           className: `w-full p-3 border-b text-left font-semibold ${isDarkTheme ? "bg-indigo-900 border-gray-700 hover:bg-indigo-800" : "bg-gradient-to-r from-indigo-100 to-purple-100 border-gray-200"}`,
           onClick: () => toggleYear(yearKey),
           "aria-expanded": !!expandedYears[yearKey]
@@ -5089,6 +5497,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         "button",
         {
           type: "button",
+          "data-testid": "discovery-report-month-toggle",
           className: `w-full p-3 border-b text-left ${isDarkTheme ? "bg-blue-900 border-gray-700 hover:bg-blue-800" : "bg-gradient-to-r from-blue-50 to-indigo-50 border-gray-200"}`,
           onClick: () => toggleMonth(monthKey),
           style: { paddingLeft: yearData.visible ? "1.5rem" : "0.75rem" },
@@ -5099,6 +5508,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         "button",
         {
           type: "button",
+          "data-testid": "discovery-report-day-toggle",
           className: `w-full p-3 border-b text-left ${dayData.isToday ? isDarkTheme ? "bg-green-900" : "bg-green-50" : isDarkTheme ? "bg-gray-800" : "bg-gray-50"} ${isDarkTheme ? "hover:bg-gray-700 border-gray-700" : "hover:bg-gray-100 border-gray-200"}`,
           onClick: () => toggleDay(dayKey),
           style: { paddingLeft: monthData.visible ? yearData.visible ? "3rem" : "1.5rem" : yearData.visible ? "1.5rem" : "0.75rem" },
@@ -5110,6 +5520,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         return /* @__PURE__ */ React.createElement("div", { key: session.timestamp }, /* @__PURE__ */ React.createElement(
           "div",
           {
+            "data-testid": "discovery-report-session-toggle",
             className: `p-4 border-b cursor-pointer transition-colors overflow-hidden ${isDarkTheme ? "bg-gray-800 hover:bg-gray-700 border-gray-700" : "bg-white hover:bg-gray-50 border-gray-200"}`,
             onClick: () => toggleSession(session.timestamp),
             onKeyDown: (event2) => handleKeyActivate(event2, () => toggleSession(session.timestamp)),
@@ -5135,6 +5546,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "div",
           {
             key: report.name,
+            "data-testid": "discovery-report-row",
             className: `p-4 cursor-pointer ${isDarkTheme ? "hover:bg-gray-700" : "hover:bg-gray-50"} ${selectedReport === report.name ? isDarkTheme ? "bg-indigo-900 border-r-4 border-indigo-400" : "bg-indigo-50 border-r-4 border-indigo-500" : ""}`,
             onClick: () => loadReport(report.name),
             onKeyDown: (event2) => handleKeyActivate(event2, () => loadReport(report.name)),
@@ -5180,6 +5592,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       {
         type: "button",
         id: "workspace-tab-discovery",
+        "data-testid": "workspace-tab-discovery",
         role: "tab",
         "aria-selected": isArtifactsTab,
         tabIndex: isArtifactsTab ? 0 : -1,
@@ -5195,15 +5608,27 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       "button",
       {
         type: "button",
-        id: "workspace-tab-capabilities",
+        id: "workspace-tab-context",
+        "data-testid": "workspace-tab-context",
         role: "tab",
-        "aria-selected": isCapabilitiesTab,
-        tabIndex: isCapabilitiesTab ? 0 : -1,
-        onClick: () => {
-          setWorkspaceTab("capabilities");
-          refreshCapabilitiesWorkspace();
-        },
-        className: `px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesTab ? "bg-white text-indigo-900 font-semibold" : "bg-transparent text-indigo-200 hover:bg-indigo-700"}`,
+        "aria-selected": isCapabilitiesRagView,
+        tabIndex: isCapabilitiesRagView ? 0 : -1,
+        onClick: () => openRagCapabilitiesWorkspace({ libraryFilter: "spl_library" }),
+        className: `px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesRagView ? "bg-white text-indigo-900 font-semibold" : "bg-transparent text-indigo-200 hover:bg-indigo-700"}`,
+        title: "Context tab: managed SPL library and indexed retrieval workspace"
+      },
+      "Context"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        id: "workspace-tab-capabilities",
+        "data-testid": "workspace-tab-capabilities",
+        role: "tab",
+        "aria-selected": isCapabilitiesOverview,
+        tabIndex: isCapabilitiesOverview ? 0 : -1,
+        onClick: openCapabilitiesOverview,
+        className: `px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesOverview ? "bg-white text-indigo-900 font-semibold" : "bg-transparent text-indigo-200 hover:bg-indigo-700"}`,
         title: "Capabilities tab: optional capability packs, health, and control surface"
       },
       "Capabilities"
@@ -5265,7 +5690,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-folder-open mr-1" }),
       "Refresh Discovery"
-    ), isCapabilitiesTab && /* @__PURE__ */ React.createElement(
+    ), isCapabilitiesOverview && /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: refreshCapabilitiesWorkspace,
@@ -5274,6 +5699,15 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-1" }),
       "Refresh Capabilities"
+    ), isCapabilitiesRagView && /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => openRagCapabilitiesWorkspace({ libraryFilter: ragLibraryFilter }),
+        className: "px-2.5 sm:px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-700 text-white",
+        title: "Refresh the context workspace and managed SPL library"
+      },
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-book-open mr-1" }),
+      "Refresh Context"
     ), /* @__PURE__ */ React.createElement(
       "button",
       {
@@ -5672,7 +6106,26 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: `px-3 py-1.5 rounded text-sm font-medium ${isDarkTheme ? "bg-gray-800 hover:bg-gray-700 text-gray-100" : "bg-white hover:bg-gray-100 text-gray-800 border border-gray-300"}`
         },
         "Close Detail"
-      )), ragAssetWorkspace.detailStatus === "loading" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${subtextClass}` }, "Loading managed knowledge asset detail.") : ragAssetWorkspace.detailStatus === "error" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, ragAssetWorkspace.detailError || "Knowledge asset detail could not be loaded.") : ((_k2 = ragAssetWorkspace.assetDetail) == null ? void 0 : _k2.asset) ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, ragAssetWorkspace.assetDetail.asset.title || "Knowledge Asset"), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, formatKnowledgeAssetTypeLabel(ragAssetWorkspace.assetDetail.asset.asset_type))), ragAssetWorkspace.assetDetail.asset.source_label && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, "Source: ", ragAssetWorkspace.assetDetail.asset.source_label)), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Stored as: ", ragAssetWorkspace.assetDetail.stored_path || ragAssetWorkspace.assetDetail.asset.content_path || "managed asset")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-[11px]" }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Stored sections: ", Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) ? ragAssetWorkspace.assetDetail.stored_sections.length : 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Chunk sections: ", ragAssetWorkspace.assetDetail.chunk_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Context characters: ", ragAssetWorkspace.assetDetail.context_character_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Imported: ", ragAssetWorkspace.assetDetail.asset.created_at ? new Date(ragAssetWorkspace.assetDetail.asset.created_at).toLocaleString() : "Unknown"))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 lg:grid-cols-2 gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Stored Sections"), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) && ragAssetWorkspace.assetDetail.stored_sections.length > 0 ? ragAssetWorkspace.assetDetail.stored_sections.map((section, sectionIndex) => /* @__PURE__ */ React.createElement("details", { key: `${section.title || "section"}-${sectionIndex}`, open: section.title !== "Context", className: `rounded border px-3 py-2 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-medium ${headingClass}` }, section.title || `Section ${sectionIndex + 1}`, " (", section.character_count || 0, " chars)"), Array.isArray(section.items) && section.items.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: `mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}` }, section.items.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${section.title || "section"}-${itemIndex}` }, item))) : /* @__PURE__ */ React.createElement("pre", { className: `mt-2 text-xs whitespace-pre-wrap font-mono ${subtextClass}` }, section.content || "No section content available."))) : /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, "No stored sections were available for this asset."))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Chunk Browser"), /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-2 ${subtextClass}` }, "These are the current chunk splits generated from the asset file by the indexing logic."), activeDetailPreviewTrace.matchedChunkIds.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-2 mb-2 ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, "Current preview matched ", activeDetailPreviewTrace.matchedChunkIds.length, " chunk-browser section(s) for this asset. Highlighted below."), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.chunk_sections) && ragAssetWorkspace.assetDetail.chunk_sections.length > 0 ? ragAssetWorkspace.assetDetail.chunk_sections.map((section, sectionIndex) => {
+      )), ragAssetWorkspace.detailStatus === "loading" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${subtextClass}` }, "Loading managed knowledge asset detail.") : ragAssetWorkspace.detailStatus === "error" ? /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, ragAssetWorkspace.detailError || "Knowledge asset detail could not be loaded.") : ((_k2 = ragAssetWorkspace.assetDetail) == null ? void 0 : _k2.asset) ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, ragAssetWorkspace.assetDetail.asset.title || "Knowledge Asset"), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, formatKnowledgeAssetTypeLabel(ragAssetWorkspace.assetDetail.asset.asset_type))), ragAssetWorkspace.assetDetail.asset.source_label && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, "Source: ", ragAssetWorkspace.assetDetail.asset.source_label)), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Stored as: ", ragAssetWorkspace.assetDetail.stored_path || ragAssetWorkspace.assetDetail.asset.content_path || "managed asset")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-[11px]" }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Stored sections: ", Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) ? ragAssetWorkspace.assetDetail.stored_sections.length : 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Chunk sections: ", ragAssetWorkspace.assetDetail.chunk_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Context characters: ", ragAssetWorkspace.assetDetail.context_character_count || 0), /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Imported: ", ragAssetWorkspace.assetDetail.asset.created_at ? new Date(ragAssetWorkspace.assetDetail.asset.created_at).toLocaleString() : "Unknown"))), (() => {
+        const detailAttributes = getKnowledgeAssetAttributes(ragAssetWorkspace.assetDetail.asset);
+        const detailSplQuery = String(detailAttributes.spl_query || "").trim();
+        if (!detailSplQuery) {
+          return null;
+        }
+        return /* @__PURE__ */ React.createElement("div", { "data-testid": "context-library-detail-spl-query", className: `rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, "Saved SPL Query"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, "Run this query in Splunk Web, reuse it in chat, or keep it parked in the context library.")), renderSplQueryActionButtons2(detailSplQuery, {
+          allowSave: false,
+          originKind: "spl_library_asset",
+          originLabel: ragAssetWorkspace.assetDetail.asset.title || "Saved SPL Library Query",
+          sourceLabel: ragAssetWorkspace.assetDetail.asset.source_label || ragAssetWorkspace.assetDetail.asset.title || "SPL Library Query",
+          contextExcerpt: ragAssetWorkspace.assetDetail.asset.summary || ragAssetWorkspace.assetDetail.asset.preview || "",
+          deeplinkOptions: {
+            app: detailAttributes.app,
+            earliest: detailAttributes.earliest,
+            latest: detailAttributes.latest
+          },
+          className: "sm:justify-end"
+        })), /* @__PURE__ */ React.createElement("pre", { className: `mt-3 max-h-40 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-gray-50 border-gray-200 text-gray-900"}` }, detailSplQuery), renderSplQueryIntelligence(detailAttributes, { testIdPrefix: "context-library-detail-spl" }));
+      })(), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 lg:grid-cols-2 gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Stored Sections"), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.stored_sections) && ragAssetWorkspace.assetDetail.stored_sections.length > 0 ? ragAssetWorkspace.assetDetail.stored_sections.map((section, sectionIndex) => /* @__PURE__ */ React.createElement("details", { key: `${section.title || "section"}-${sectionIndex}`, open: section.title !== "Context", className: `rounded border px-3 py-2 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-medium ${headingClass}` }, section.title || `Section ${sectionIndex + 1}`, " (", section.character_count || 0, " chars)"), Array.isArray(section.items) && section.items.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: `mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}` }, section.items.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${section.title || "section"}-${itemIndex}` }, item))) : /* @__PURE__ */ React.createElement("pre", { className: `mt-2 text-xs whitespace-pre-wrap font-mono ${subtextClass}` }, section.content || "No section content available."))) : /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, "No stored sections were available for this asset."))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Chunk Browser"), /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-2 ${subtextClass}` }, "These are the current chunk splits generated from the asset file by the indexing logic."), activeDetailPreviewTrace.matchedChunkIds.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-2 mb-2 ${isDarkTheme ? "bg-sky-950 border-sky-800 text-sky-100" : "bg-sky-50 border-sky-200 text-sky-800"}` }, "Current preview matched ", activeDetailPreviewTrace.matchedChunkIds.length, " chunk-browser section(s) for this asset. Highlighted below."), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-96 overflow-y-auto pr-1" }, Array.isArray(ragAssetWorkspace.assetDetail.chunk_sections) && ragAssetWorkspace.assetDetail.chunk_sections.length > 0 ? ragAssetWorkspace.assetDetail.chunk_sections.map((section, sectionIndex) => {
         const isPreviewMatched = activeDetailPreviewTrace.matchedChunkIds.includes(section.document_id);
         return /* @__PURE__ */ React.createElement("details", { key: section.document_id || `${section.section || "chunk"}-${sectionIndex}`, open: isPreviewMatched || sectionIndex === 0, className: `rounded border px-3 py-2 ${isPreviewMatched ? isDarkTheme ? "border-sky-700 bg-sky-950/40" : "border-sky-300 bg-sky-50" : isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-medium ${headingClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", null, section.section || `Chunk ${sectionIndex + 1}`, " (", section.character_count || 0, " chars)"), isPreviewMatched && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? "bg-sky-900 border-sky-700 text-sky-100" : "bg-sky-100 border-sky-300 text-sky-800"}` }, "Matched in Preview"))), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 text-xs whitespace-pre-wrap font-mono ${subtextClass}` }, section.content || "No chunk content available."));
       }) : /* @__PURE__ */ React.createElement("div", { className: `text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}` }, "No chunk-browser sections were produced for this asset."))))) : null)), capability.name === "splunk_deeplink_tools" && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium mb-2 ${headingClass}` }, "Build Search Deeplink"), /* @__PURE__ */ React.createElement(
@@ -5925,65 +6378,32 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-label": isChatTab ? "Close full-screen chat workspace" : "Close chat"
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl" })
-      ))), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4", style: fullscreenChatConversationStyle }, chatMessages.length === 0 && /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-4xl mb-4" }), /* @__PURE__ */ React.createElement("p", { className: "text-lg" }, "Start a conversation with your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "Ask questions about your data, indexes, searches, or get help with SPL queries")), chatMessages.map((msg) => /* @__PURE__ */ React.createElement("div", { key: msg.id, className: `flex min-w-0 ${msg.type === "user" ? "justify-end" : "justify-start"}` }, /* @__PURE__ */ React.createElement("div", { className: `max-w-3xl min-w-0 p-4 rounded-lg ${msg.type === "user" ? "bg-indigo-600 text-white" : msg.type === "error" ? isDarkTheme ? "bg-red-900 text-red-100 border border-red-700" : "bg-red-50 text-red-800 border border-red-200" : msg.type === "warning" ? isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-900 border border-amber-200" : isDarkTheme ? "bg-gray-700 text-gray-100 border border-gray-600" : "bg-gray-100 text-gray-800"}`, style: getChatBubbleStyle(msg.type) }, msg.type === "user" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("i", { className: "fas fa-user ml-3 mt-1" })), msg.type === "assistant" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot mr-3 mt-1 text-green-600" }), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), msg.spl_query && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium text-indigo-600 hover:text-indigo-800 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }), "SPL Query Executed"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 p-4 bg-gray-900 text-green-300 rounded-lg font-mono text-sm" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-start mb-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-300 uppercase tracking-wide" }, "Splunk Query"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, canUseSplunkDeeplinks && /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => openSplunkSearchFromChat(msg.spl_query),
-          className: "px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors",
-          title: "Open this search in Splunk Web"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt mr-1" }),
-        "Open in Splunk"
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: (event2) => {
-            navigator.clipboard.writeText(msg.spl_query);
-            const btn = event2.currentTarget;
-            const originalHTML2 = btn.innerHTML;
-            btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-            setTimeout(() => btn.innerHTML = originalHTML2, 2e3);
-          },
-          className: "px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors",
-          title: "Copy to clipboard",
-          "aria-label": "Copy executed SPL query to clipboard"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy mr-1" }),
-        "Copy"
-      ))), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }), "SPL Query (Not Executed)"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 p-4 bg-gray-900 text-amber-300 rounded-lg font-mono text-sm" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-start mb-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-300 uppercase tracking-wide" }, "Suggested Query"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, canUseSplunkDeeplinks && /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => openSplunkSearchFromChat(msg.spl_in_text),
-          className: "px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors",
-          title: "Open this search in Splunk Web"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt mr-1" }),
-        "Open in Splunk"
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: (event2) => {
-            navigator.clipboard.writeText(msg.spl_in_text);
-            const btn = event2.currentTarget;
-            const originalHTML2 = btn.innerHTML;
-            btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-            setTimeout(() => btn.innerHTML = originalHTML2, 2e3);
-          },
-          className: "px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors",
-          title: "Copy to clipboard",
-          "aria-label": "Copy suggested SPL query to clipboard"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy mr-1" }),
-        "Copy"
-      ))), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_in_text))), msg.visualization_spec && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-cyan-300 hover:text-cyan-100" : "text-cyan-700 hover:text-cyan-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line mr-2" }), "Visualization Preview"), renderVisualizationPreview(msg.visualization_spec, {
+      ))), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4", style: fullscreenChatConversationStyle }, chatMessages.length === 0 && /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-4xl mb-4" }), /* @__PURE__ */ React.createElement("p", { className: "text-lg" }, "Start a conversation with your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "Ask questions about your data, indexes, searches, or get help with SPL queries")), chatMessages.map((msg) => /* @__PURE__ */ React.createElement("div", { key: msg.id, className: `flex min-w-0 ${msg.type === "user" ? "justify-end" : "justify-start"}` }, /* @__PURE__ */ React.createElement("div", { className: `max-w-3xl min-w-0 p-4 rounded-lg ${msg.type === "user" ? "bg-indigo-600 text-white" : msg.type === "error" ? isDarkTheme ? "bg-red-900 text-red-100 border border-red-700" : "bg-red-50 text-red-800 border border-red-200" : msg.type === "warning" ? isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-900 border border-amber-200" : isDarkTheme ? "bg-gray-700 text-gray-100 border border-gray-600" : "bg-gray-100 text-gray-800"}`, style: getChatBubbleStyle(msg.type) }, msg.type === "user" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("i", { className: "fas fa-user ml-3 mt-1" })), msg.type === "assistant" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot mr-3 mt-1 text-green-600" }), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), msg.spl_query && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium text-indigo-600 hover:text-indigo-800 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }), "SPL Query Executed"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 p-4 bg-gray-900 text-green-300 rounded-lg font-mono text-sm" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-300 uppercase tracking-wide" }, "Splunk Query"), renderSplQueryActionButtons2(msg.spl_query, {
+        originKind: "chat_assistant",
+        originLabel: "Chat assistant response",
+        sourceLabel: "Chat assistant response",
+        contextExcerpt: msg.content,
+        className: "sm:justify-end"
+      })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }), "SPL Query (Not Executed)"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 p-4 bg-gray-900 text-amber-300 rounded-lg font-mono text-sm" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-300 uppercase tracking-wide" }, "Suggested Query"), renderSplQueryActionButtons2(msg.spl_in_text, {
+        originKind: "chat_assistant_suggestion",
+        originLabel: "Chat assistant suggestion",
+        sourceLabel: "Chat assistant suggestion",
+        contextExcerpt: msg.content,
+        className: "sm:justify-end"
+      })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_in_text))), msg.visualization_spec && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-cyan-300 hover:text-cyan-100" : "text-cyan-700 hover:text-cyan-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line mr-2" }), "Visualization Preview"), renderVisualizationPreview(msg.visualization_spec, {
         sourceQuery: msg.spl_query || msg.spl_in_text,
         canOpenSplunk: canUseSplunkDeeplinks,
         onOpenSplunk: openSplunkSearchFromChat
-      })), Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-emerald-300 hover:text-emerald-100" : "text-emerald-700 hover:text-emerald-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-2" }), "Capability Evidence (", msg.capability_usage.length, ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-emerald-50 border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-emerald-900 text-emerald-100 border border-emerald-700" : "bg-emerald-100 text-emerald-800 border border-emerald-300"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-emerald-100 text-emerald-800 border border-emerald-300"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-[11px] ${mutedTextClass}` }, "score ", chunk.score)), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))), msg.status_timeline && msg.status_timeline.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium text-blue-600 hover:text-blue-800 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2" }), "Investigation Timeline (", msg.iterations, " iterations, ", msg.execution_time, ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between px-3 py-2 rounded border-l-4 border-blue-400 ${isDarkTheme ? "bg-gray-800" : "bg-gradient-to-r from-blue-50 to-purple-50"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, status.time.toFixed(1), "s"))))), msg.mcp_data && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-database mr-1" }), "View Raw Data"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), msg.has_follow_on && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border rounded ${isDarkTheme ? "bg-indigo-900 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1" }), /* @__PURE__ */ React.createElement("span", null, "Suggested next actions")), Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, msg.follow_on_actions.map((action, idx) => {
+      })), Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && /* @__PURE__ */ React.createElement(
+        "details",
+        {
+          className: "mt-3",
+          "data-testid": "chat-capability-evidence",
+          open: msg.capability_usage.some((usage) => Array.isArray(usage == null ? void 0 : usage.reusable_queries) && usage.reusable_queries.length > 0)
+        },
+        /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-emerald-300 hover:text-emerald-100" : "text-emerald-700 hover:text-emerald-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-2" }), "Capability Evidence (", msg.capability_usage.length, ")"),
+        /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-emerald-50 border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-emerald-900 text-emerald-100 border border-emerald-700" : "bg-emerald-100 text-emerald-800 border border-emerald-300"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), renderCapabilityReusableQueryCards(usage), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-emerald-100 text-emerald-800 border border-emerald-300"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-[11px] ${mutedTextClass}` }, "score ", chunk.score)), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))
+      ), msg.status_timeline && msg.status_timeline.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium text-blue-600 hover:text-blue-800 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2" }), "Investigation Timeline (", msg.iterations, " iterations, ", msg.execution_time, ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between px-3 py-2 rounded border-l-4 border-blue-400 ${isDarkTheme ? "bg-gray-800" : "bg-gradient-to-r from-blue-50 to-purple-50"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, status.time.toFixed(1), "s"))))), msg.mcp_data && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-database mr-1" }), "View Raw Data"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), msg.has_follow_on && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border rounded ${isDarkTheme ? "bg-indigo-900 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1" }), /* @__PURE__ */ React.createElement("span", null, "Suggested next actions")), Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, msg.follow_on_actions.map((action, idx) => {
         const actionLabel = typeof action === "string" ? action : action.label || action.prompt || "Follow-up action";
         const actionPrompt = typeof action === "string" ? action : action.prompt || action.label || "";
         return /* @__PURE__ */ React.createElement(
@@ -6639,15 +7059,13 @@ ${query.spl}`,
               onChange: () => toggleStepCompletion(currentSessionId, taskIndex, step.number),
               className: "mt-1 w-5 h-5 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 cursor-pointer"
             }
-          ), /* @__PURE__ */ React.createElement("div", { className: "flex-shrink-0 w-8 h-8 bg-indigo-600 text-white rounded-full flex items-center justify-center font-bold text-sm" }, isCompleted ? "✓" : step.number), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: `text-sm font-medium leading-6 ${isCompleted ? "text-gray-500 line-through" : isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, step.action))), step.spl && /* @__PURE__ */ React.createElement("div", { className: "mt-3 sm:ml-16" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Step SPL"), /* @__PURE__ */ React.createElement(
-            "button",
-            {
-              onClick: () => copyToClipboard(step.spl, "Step SPL"),
-              className: "px-2 py-1 bg-gray-700 hover:bg-gray-800 text-white rounded text-xs"
-            },
-            /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy mr-1" }),
-            "Copy"
-          )), /* @__PURE__ */ React.createElement("pre", { className: "max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400" }, step.spl)));
+          ), /* @__PURE__ */ React.createElement("div", { className: "flex-shrink-0 w-8 h-8 bg-indigo-600 text-white rounded-full flex items-center justify-center font-bold text-sm" }, isCompleted ? "✓" : step.number), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: `text-sm font-medium leading-6 ${isCompleted ? "text-gray-500 line-through" : isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, step.action))), step.spl && /* @__PURE__ */ React.createElement("div", { className: "mt-3 sm:ml-16" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Step SPL"), renderSplQueryActionButtons2(step.spl, {
+            originKind: "summary_task_step",
+            originLabel: task.title || `Task ${taskIndex + 1}`,
+            sourceLabel: task.title || "Summary task",
+            contextExcerpt: step.action,
+            className: "sm:justify-end"
+          })), /* @__PURE__ */ React.createElement("pre", { className: "max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400" }, step.spl)));
         })))), /* @__PURE__ */ React.createElement("div", { className: "space-y-4 min-w-0" }, task.verification_spl && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "border-blue-800 bg-blue-950/40" : "border-blue-200 bg-blue-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h5", { className: `font-semibold flex items-center ${isDarkTheme ? "text-blue-200" : "text-blue-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle mr-2" }), "Verification"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 rounded-lg border px-3 py-3 text-sm ${isDarkTheme ? "border-blue-900 bg-gray-950 text-blue-100" : "border-blue-100 bg-white text-blue-900"}` }, /* @__PURE__ */ React.createElement("strong", null, "Expected Outcome:"), " ", task.expected_outcome)), /* @__PURE__ */ React.createElement(
           "button",
           {
@@ -6656,15 +7074,13 @@ ${query.spl}`,
             className: `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-all ${verifyingTask === taskIndex ? "bg-gray-400 text-white cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700 text-white shadow-sm hover:shadow"}`
           },
           verifyingTask === taskIndex ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-2" }), "Verifying...") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-play-circle mr-2" }), "Run Verification")
-        )), /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-semibold ${isDarkTheme ? "text-blue-300 hover:text-blue-200" : "text-blue-700 hover:text-blue-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-1" }), "View Verification SPL"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex items-center justify-end mb-2" }, /* @__PURE__ */ React.createElement(
-          "button",
-          {
-            onClick: () => copyToClipboard(task.verification_spl, "Verification SPL"),
-            className: "px-2 py-1 bg-blue-700 hover:bg-blue-800 text-white rounded text-xs"
-          },
-          /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy mr-1" }),
-          "Copy"
-        )), /* @__PURE__ */ React.createElement("pre", { className: "max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400" }, task.verification_spl)), (() => {
+        )), /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-semibold ${isDarkTheme ? "text-blue-300 hover:text-blue-200" : "text-blue-700 hover:text-blue-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-1" }), "View Verification SPL"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center justify-end gap-2 mb-2" }, renderSplQueryActionButtons2(task.verification_spl, {
+          originKind: "summary_verification",
+          originLabel: task.title || `Task ${taskIndex + 1}`,
+          sourceLabel: task.title || "Verification task",
+          contextExcerpt: task.expected_outcome,
+          className: "justify-end"
+        })), /* @__PURE__ */ React.createElement("pre", { className: "max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400" }, task.verification_spl)), (() => {
           const verResult = getVerificationResult(currentSessionId, taskIndex);
           if (!verResult) return null;
           const verificationResultSurfaceClass = verResult.status === "success" ? isDarkTheme ? "bg-green-950/40 border-green-700" : "bg-green-50 border-green-200" : verResult.status === "partial" ? isDarkTheme ? "bg-amber-950/40 border-amber-700" : "bg-amber-50 border-amber-200" : verResult.status === "failed" ? isDarkTheme ? "bg-red-950/40 border-red-700" : "bg-red-50 border-red-200" : isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200";

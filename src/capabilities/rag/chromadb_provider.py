@@ -50,3 +50,6 @@ class ChromaRAGProvider(BaseRAGProvider):
 
     def build_context_preview(self, query: str, max_chunks: int = 4) -> Dict[str, Any]:
         return self.indexer.build_context_preview(query=query, max_chunks=max_chunks)
+
+    def record_spl_query_feedback(self, query: str, status: str, feedback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.indexer.record_spl_query_feedback(query=query, status=status, feedback=feedback)

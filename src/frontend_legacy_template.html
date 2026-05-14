@@ -775,6 +775,22 @@
                             category: typeof usage?.category === 'string' ? usage.category : undefined,
                             used_in: typeof usage?.used_in === 'string' ? usage.used_in : undefined,
                             contribution: typeof usage?.contribution === 'string' ? usage.contribution : '',
+                            reusable_queries: Array.isArray(usage?.reusable_queries)
+                                ? usage.reusable_queries.slice(0, 2).map((candidate, candidateIdx) => ({
+                                    title: typeof candidate?.title === 'string' ? candidate.title : `Reusable query ${candidateIdx + 1}`,
+                                    query: typeof candidate?.query === 'string' ? candidate.query : '',
+                                    reuse_tier: typeof candidate?.reuse_tier === 'string' ? candidate.reuse_tier : undefined,
+                                    known_good: Boolean(candidate?.known_good),
+                                    why_reuse: typeof candidate?.why_reuse === 'string' ? candidate.why_reuse : '',
+                                    environment_fit_status: typeof candidate?.environment_fit_status === 'string' ? candidate.environment_fit_status : undefined,
+                                    validation_status: typeof candidate?.validation_status === 'string' ? candidate.validation_status : undefined,
+                                    success_count: Number.isFinite(Number(candidate?.success_count)) ? Number(candidate.success_count) : 0,
+                                    failure_count: Number.isFinite(Number(candidate?.failure_count)) ? Number(candidate.failure_count) : 0,
+                                    app: typeof candidate?.app === 'string' ? candidate.app : undefined,
+                                    earliest: typeof candidate?.earliest === 'string' ? candidate.earliest : undefined,
+                                    latest: typeof candidate?.latest === 'string' ? candidate.latest : undefined,
+                                })).filter((candidate) => candidate.query)
+                                : [],
                             chunks: Array.isArray(usage?.chunks)
                                 ? usage.chunks.slice(0, 3).map((chunk, chunkIdx) => ({
                                     source: typeof chunk?.source === 'string' ? chunk.source : `artifact_${chunkIdx + 1}`,
@@ -1127,24 +1143,14 @@
                                         No source SPL query was attached to this visualization preview.
                                     </div>
                                 )}
-                                <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-                                    {hasSplunkAction ? (
-                                        <button
-                                            type="button"
-                                            data-testid={`${chartTestId}-open-splunk`}
-                                            onClick={() => onOpenSplunk(sourceQueryPreview)}
-                                            className={`px-3 py-2 rounded-lg text-xs font-semibold ${chartType === 'line'
-                                                ? 'bg-sky-600 hover:bg-sky-700 text-white'
-                                                : 'bg-cyan-600 hover:bg-cyan-700 text-white'}`}
-                                        >
-                                            <i className="fas fa-external-link-alt mr-2"></i>
-                                            Open Source Search in Splunk
-                                        </button>
-                                    ) : sourceQueryPreview ? (
-                                        <div className={`text-xs ${mutedTextClass}`}>
-                                            Splunk deeplink launch is unavailable until the deeplink tool is ready.
-                                        </div>
-                                    ) : null}
+                                <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                    {sourceQueryPreview ? renderSplQueryActionButtons(sourceQueryPreview, {
+                                        originKind: 'visualization_preview',
+                                        originLabel: spec?.title || 'Visualization Preview',
+                                        sourceLabel: spec?.title || 'Visualization Preview',
+                                        contextExcerpt: spec?.summary_text || spec?.title || '',
+                                        className: 'sm:justify-start',
+                                    }) : <div className={`text-xs ${mutedTextClass}`}>SPL actions appear when a source query is attached.</div>}
                                     <button
                                         type="button"
                                         onClick={closeSelectionCard}
@@ -1657,6 +1663,7 @@
             const [availableModels, setAvailableModels] = useState([]); // Available models from API
             const [isLoadingModels, setIsLoadingModels] = useState(false); // Loading state for model fetch
             const [selectedModel, setSelectedModel] = useState(''); // Currently selected model
+            const SPL_LIBRARY_ASSET_TYPE = 'spl_query_library';
             const defaultRagAssetDraft = {
                 title: '',
                 asset_type: 'reference_document',
@@ -1834,6 +1841,7 @@
             const ragDisplayedAssets = Array.isArray(ragAssetWorkspace.assets) ? ragAssetWorkspace.assets : [];
             const ragDisplayedAssetCount = ragAssetWorkspace.summary?.asset_count ?? ragKnowledgeAssetSummary?.asset_count ?? 0;
             const ragDisplayedAssetDir = ragAssetWorkspace.summary?.asset_dir || ragKnowledgeAssetSummary?.asset_dir || 'output/rag/assets';
+            const ragSplLibraryAssetCount = ragDisplayedAssets.filter((asset) => String(asset?.asset_type || '').toLowerCase() === SPL_LIBRARY_ASSET_TYPE).length;
             const ragLibraryStatusCounts = ragAssetWorkspace.summary?.library_status_counts && typeof ragAssetWorkspace.summary.library_status_counts === 'object'
                 ? ragAssetWorkspace.summary.library_status_counts
                 : (ragKnowledgeAssetSummary?.library_status_counts && typeof ragKnowledgeAssetSummary.library_status_counts === 'object'
@@ -1847,6 +1855,9 @@
                 ?? ragDisplayedAssets.filter((asset) => String(asset?.library_status || '').toLowerCase() === 'checked_out').length;
             const ragLibraryAssets = ragDisplayedAssets.filter((asset) => {
                 const libraryStatus = String(asset?.library_status || 'checked_in').toLowerCase();
+                if (ragLibraryFilter === 'spl_library') {
+                    return String(asset?.asset_type || '').toLowerCase() === SPL_LIBRARY_ASSET_TYPE;
+                }
                 if (ragLibraryFilter === 'checked_in') {
                     return libraryStatus !== 'checked_out';
                 }
@@ -2839,6 +2850,8 @@
 
             const formatKnowledgeAssetTypeLabel = (assetType) => {
                 switch (String(assetType || '').toLowerCase()) {
+                    case 'spl_query_library':
+                        return 'SPL Library Query';
                     case 'splunk_documentation':
                         return 'Splunk Documentation';
                     case 'monitored_system_context':
@@ -3065,17 +3078,26 @@
                 return `search ${query}`;
             };
 
-            const buildSplunkSearchUrl = (splQuery) => {
+            const getDefaultSplunkDeeplinkPayload = (overrides = {}) => {
+                const capabilityConfig = deeplinkCapability?.config || {};
+                return {
+                    app: String(overrides.app || deeplinkCapability?.default_app || capabilityConfig.default_app || 'search').trim().replace(/^\/+|\/+$/g, '') || 'search',
+                    earliest: String(overrides.earliest || capabilityConfig.default_earliest || '-24h').trim() || '-24h',
+                    latest: String(overrides.latest || capabilityConfig.default_latest || 'now').trim() || 'now',
+                };
+            };
+
+            const buildSplunkSearchUrl = (splQuery, overrides = {}) => {
                 if (!canUseSplunkDeeplinks) {
                     return '';
                 }
 
                 const normalizedQuery = normalizeSplunkSearchQuery(splQuery);
                 const baseUrl = String(deeplinkCapability?.resolved_web_base_url || '').trim().replace(/\/+$/, '');
-                const capabilityConfig = deeplinkCapability?.config || {};
-                const appName = String(deeplinkCapability?.default_app || capabilityConfig.default_app || 'search').trim().replace(/^\/+|\/+$/g, '') || 'search';
-                const earliest = String(capabilityConfig.default_earliest || '-24h').trim() || '-24h';
-                const latest = String(capabilityConfig.default_latest || 'now').trim() || 'now';
+                const deeplinkDefaults = getDefaultSplunkDeeplinkPayload(overrides);
+                const appName = deeplinkDefaults.app;
+                const earliest = deeplinkDefaults.earliest;
+                const latest = deeplinkDefaults.latest;
 
                 if (!normalizedQuery || !baseUrl) {
                     return '';
@@ -3090,12 +3112,16 @@
                 return `${baseUrl}/en-US/app/${encodeURIComponent(appName)}/search?${params.toString()}`;
             };
 
-            const openSplunkSearchFromChat = async (splQuery) => {
+            const openSplunkSearch = async (splQuery, overrides = {}) => {
                 if (!splQuery || !canUseSplunkDeeplinks) {
                     return;
                 }
 
-                const directUrl = buildSplunkSearchUrl(splQuery);
+                const deeplinkPayload = {
+                    query: splQuery,
+                    ...getDefaultSplunkDeeplinkPayload(overrides),
+                };
+                const directUrl = buildSplunkSearchUrl(deeplinkPayload.query, deeplinkPayload);
                 if (directUrl) {
                     const launchedWindow = window.open(directUrl, '_blank', 'noopener,noreferrer');
                     if (!launchedWindow) {
@@ -3104,20 +3130,459 @@
                     return;
                 }
 
-                const capabilityConfig = deeplinkCapability?.config || {};
                 await buildCapabilityDeeplink(
-                    {
-                        query: splQuery,
-                        earliest: capabilityConfig.default_earliest || '-24h',
-                        latest: capabilityConfig.default_latest || 'now',
-                        app: capabilityConfig.default_app || 'search',
-                    },
+                    deeplinkPayload,
                     {
                         name: 'splunk_deeplink_tools',
                         openAfterBuild: true,
                         suppressNotice: true,
                         storeResult: false,
                     }
+                );
+            };
+
+            const openSplunkSearchFromChat = async (splQuery) => {
+                await openSplunkSearch(splQuery);
+            };
+
+            const buildSplLibraryTitle = (splQuery, options = {}) => {
+                const explicitTitle = String(options.title || '').trim();
+                if (explicitTitle) {
+                    return explicitTitle;
+                }
+
+                const singleLineQuery = normalizeSplunkSearchQuery(splQuery).replace(/\s+/g, ' ').trim();
+                const preview = singleLineQuery.length > 72 ? `${singleLineQuery.slice(0, 72).trim()}...` : singleLineQuery;
+                return preview ? `SPL Library: ${preview}` : 'SPL Library Query';
+            };
+
+            const buildSplLibraryTags = (options = {}) => {
+                const rawTags = [
+                    'spl',
+                    'spl-library',
+                    String(options.originKind || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+                    ...(Array.isArray(options.tags) ? options.tags : []),
+                ];
+                const tags = [];
+                const seen = new Set();
+                rawTags.forEach((rawTag) => {
+                    const cleanedTag = String(rawTag || '').trim();
+                    if (!cleanedTag) {
+                        return;
+                    }
+                    const normalizedTag = cleanedTag.toLowerCase();
+                    if (seen.has(normalizedTag)) {
+                        return;
+                    }
+                    seen.add(normalizedTag);
+                    tags.push(cleanedTag);
+                });
+                return tags.slice(0, 12);
+            };
+
+            const buildSplLibraryPayload = (splQuery, options = {}) => {
+                const trimmedQuery = String(splQuery || '').trim();
+                if (!trimmedQuery) {
+                    return null;
+                }
+
+                const sourceLabel = String(options.sourceLabel || options.originLabel || '').trim();
+                const originKind = String(options.originKind || 'interface_spl_query').trim() || 'interface_spl_query';
+                const contextExcerpt = String(options.contextExcerpt || '').trim();
+                const deeplinkDefaults = getDefaultSplunkDeeplinkPayload(options.deeplinkOptions || {});
+                const singleLineQuery = normalizeSplunkSearchQuery(trimmedQuery).replace(/\s+/g, ' ').trim();
+                const contentLines = [
+                    'Saved SPL query for reuse in Splunk Web and follow-on chat workflows.',
+                    `Query summary: ${singleLineQuery}`,
+                ];
+
+                if (sourceLabel) {
+                    contentLines.push(`Saved from: ${sourceLabel}.`);
+                }
+
+                contentLines.push('', '## Query', trimmedQuery);
+
+                if (contextExcerpt) {
+                    contentLines.push('', '## Context', contextExcerpt.slice(0, 900));
+                }
+
+                return {
+                    title: buildSplLibraryTitle(trimmedQuery, options),
+                    content: contentLines.join('\n'),
+                    asset_type: SPL_LIBRARY_ASSET_TYPE,
+                    source_label: sourceLabel || 'Interface SPL Query',
+                    description: String(options.description || 'Saved reusable SPL query for direct Splunk launch and chat reuse.').trim(),
+                    tags: buildSplLibraryTags(options),
+                    attributes: {
+                        spl_query: trimmedQuery,
+                        app: deeplinkDefaults.app,
+                        earliest: deeplinkDefaults.earliest,
+                        latest: deeplinkDefaults.latest,
+                        origin_kind: originKind,
+                        origin_label: sourceLabel,
+                    },
+                };
+            };
+
+            const getKnowledgeAssetAttributes = (asset) => {
+                return asset?.attributes && typeof asset.attributes === 'object' ? asset.attributes : {};
+            };
+
+            const getKnowledgeAssetSplIntelligence = (attributes) => {
+                return attributes?.spl_intelligence && typeof attributes.spl_intelligence === 'object'
+                    ? attributes.spl_intelligence
+                    : {};
+            };
+
+            const formatSplIntelligenceLabel = (value, fallback = 'Unknown') => {
+                const normalized = String(value || '').trim().toLowerCase();
+                if (!normalized) {
+                    return fallback;
+                }
+                if (normalized === 'known_good') {
+                    return 'Known Good';
+                }
+                return formatTokenLabel(normalized) || fallback;
+            };
+
+            const getSplEnvironmentFitClasses = (status) => {
+                switch (String(status || '').toLowerCase()) {
+                    case 'strong':
+                        return isDarkTheme
+                            ? 'bg-emerald-950 border-emerald-800 text-emerald-100'
+                            : 'bg-emerald-50 border-emerald-200 text-emerald-800';
+                    case 'partial':
+                        return isDarkTheme
+                            ? 'bg-amber-950 border-amber-800 text-amber-100'
+                            : 'bg-amber-50 border-amber-200 text-amber-800';
+                    case 'weak':
+                    case 'mismatch':
+                        return isDarkTheme
+                            ? 'bg-rose-950 border-rose-800 text-rose-100'
+                            : 'bg-rose-50 border-rose-200 text-rose-800';
+                    default:
+                        return isDarkTheme
+                            ? 'bg-gray-800 border-gray-600 text-gray-200'
+                            : 'bg-gray-100 border-gray-300 text-gray-700';
+                }
+            };
+
+            const getSplValidationClasses = (status) => {
+                switch (String(status || '').toLowerCase()) {
+                    case 'known_good':
+                        return isDarkTheme
+                            ? 'bg-emerald-950 border-emerald-800 text-emerald-100'
+                            : 'bg-emerald-50 border-emerald-200 text-emerald-800';
+                    case 'mixed':
+                        return isDarkTheme
+                            ? 'bg-amber-950 border-amber-800 text-amber-100'
+                            : 'bg-amber-50 border-amber-200 text-amber-800';
+                    case 'failing':
+                        return isDarkTheme
+                            ? 'bg-rose-950 border-rose-800 text-rose-100'
+                            : 'bg-rose-50 border-rose-200 text-rose-800';
+                    case 'unvalidated':
+                    default:
+                        return isDarkTheme
+                            ? 'bg-gray-800 border-gray-600 text-gray-200'
+                            : 'bg-gray-100 border-gray-300 text-gray-700';
+                }
+            };
+
+            const getSplReuseTierClasses = (tier, knownGood = false) => {
+                if (knownGood || String(tier || '').toLowerCase() === 'known_good') {
+                    return isDarkTheme
+                        ? 'bg-emerald-950 border-emerald-800 text-emerald-100'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-800';
+                }
+
+                switch (String(tier || '').toLowerCase()) {
+                    case 'high':
+                    case 'preferred':
+                        return isDarkTheme
+                            ? 'bg-sky-950 border-sky-800 text-sky-100'
+                            : 'bg-sky-50 border-sky-200 text-sky-800';
+                    case 'medium':
+                    case 'candidate':
+                        return isDarkTheme
+                            ? 'bg-gray-800 border-gray-600 text-gray-200'
+                            : 'bg-gray-100 border-gray-300 text-gray-700';
+                    case 'low':
+                        return isDarkTheme
+                            ? 'bg-amber-950 border-amber-800 text-amber-100'
+                            : 'bg-amber-50 border-amber-200 text-amber-800';
+                    default:
+                        return isDarkTheme
+                            ? 'bg-gray-800 border-gray-600 text-gray-200'
+                            : 'bg-gray-100 border-gray-300 text-gray-700';
+                }
+            };
+
+            const renderSplQueryIntelligence = (attributes, options = {}) => {
+                const splIntelligence = getKnowledgeAssetSplIntelligence(attributes);
+                const environmentFit = splIntelligence.environment_fit && typeof splIntelligence.environment_fit === 'object'
+                    ? splIntelligence.environment_fit
+                    : {};
+                const validation = splIntelligence.validation && typeof splIntelligence.validation === 'object'
+                    ? splIntelligence.validation
+                    : {};
+                const reuse = splIntelligence.reuse && typeof splIntelligence.reuse === 'object'
+                    ? splIntelligence.reuse
+                    : {};
+                const fitStatus = String(environmentFit.status || '').trim().toLowerCase();
+                const fitReason = String(environmentFit.reason || '').trim();
+                const validationStatus = String(validation.status || '').trim().toLowerCase();
+                const reuseTier = String(reuse.tier || '').trim().toLowerCase();
+                const reuseGuidance = String(reuse.guidance || '').trim();
+                const successCount = Number(validation.success_count || 0);
+                const failureCount = Number(validation.failure_count || 0);
+                const executionCount = Number(validation.execution_count || 0);
+                const knownGood = Boolean(reuse.known_good) || validationStatus === 'known_good';
+                const testIdPrefix = typeof options.testIdPrefix === 'string' ? options.testIdPrefix.trim() : '';
+                const buildTestId = (suffix) => (testIdPrefix ? `${testIdPrefix}-${suffix}` : undefined);
+                const hasIntelligence = fitStatus || validationStatus || reuseTier || executionCount > 0 || successCount > 0 || failureCount > 0 || fitReason || reuseGuidance;
+
+                if (!hasIntelligence) {
+                    return null;
+                }
+
+                return (
+                    <div data-testid={buildTestId('intelligence-panel')} className="mt-3 space-y-2">
+                        <div className="flex flex-wrap gap-2 text-[11px]">
+                            {fitStatus && (
+                                <span data-testid={buildTestId('fit-status')} className={`rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}`}>
+                                    Environment Fit: {formatSplIntelligenceLabel(fitStatus, 'Unknown')}
+                                </span>
+                            )}
+                            {validationStatus && (
+                                <span data-testid={buildTestId('validation-status')} className={`rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}`}>
+                                    Validation: {formatSplIntelligenceLabel(validationStatus, 'Unknown')}
+                                </span>
+                            )}
+                            {(reuseTier || knownGood) && (
+                                <span data-testid={buildTestId('reuse-tier')} className={`rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}`}>
+                                    Reuse: {knownGood ? 'Known Good' : formatSplIntelligenceLabel(reuseTier, 'Candidate')}
+                                </span>
+                            )}
+                            {(executionCount > 0 || successCount > 0 || failureCount > 0) && (
+                                <span data-testid={buildTestId('feedback-counts')} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-200' : 'bg-white border-gray-300 text-gray-700'}`}>
+                                    Observed Runs: {successCount} success / {failureCount} failure
+                                </span>
+                            )}
+                        </div>
+                        {(fitReason || reuseGuidance) && (
+                            <div data-testid={buildTestId('intelligence-notes')} className={`text-xs ${subtextClass}`}>
+                                {[fitReason, reuseGuidance].filter(Boolean).join(' ')}
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+
+            const saveSplQueryToLibrary = async (splQuery, options = {}) => {
+                const payload = buildSplLibraryPayload(splQuery, options);
+                if (!payload) {
+                    return null;
+                }
+
+                setCapabilityActionState(prev => ({
+                    ...prev,
+                    rag_chromadb: 'import-asset'
+                }));
+
+                try {
+                    const response = await fetch('/api/capabilities/rag/assets/import/text', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || 'Failed to save SPL query to the library.');
+                    }
+
+                    const savedAssetId = result?.details?.asset?.asset_id || null;
+
+                    setCapabilityNotice({
+                        type: 'success',
+                        message: result?.message || 'SPL query saved to the context library.'
+                    });
+                    await loadCapabilities();
+                    if (savedAssetId && ragAssetWorkspace.detailAssetId === savedAssetId) {
+                        await loadRagAssetDetail(savedAssetId, { force: true });
+                    }
+                    return result?.details?.asset || null;
+                } catch (error) {
+                    console.error('Failed to save SPL query to library:', error);
+                    setCapabilityNotice({
+                        type: 'error',
+                        message: error.message || 'Failed to save SPL query to the library.'
+                    });
+                    return null;
+                } finally {
+                    setCapabilityActionState(prev => {
+                        const next = { ...prev };
+                        delete next.rag_chromadb;
+                        return next;
+                    });
+                    setTimeout(() => setCapabilityNotice(null), 3500);
+                }
+            };
+
+            const useSplQueryInChat = (splQuery, options = {}) => {
+                const trimmedQuery = String(splQuery || '').trim();
+                if (!trimmedQuery) {
+                    return;
+                }
+
+                const contextLabel = String(options.originLabel || options.sourceLabel || 'saved SPL query').trim() || 'saved SPL query';
+                const prompt = String(options.chatPrompt || '').trim() || [
+                    `Help me work with this ${contextLabel}:`,
+                    '',
+                    '```spl',
+                    trimmedQuery,
+                    '```',
+                    '',
+                    'Explain it, refine it, or run it if appropriate.',
+                ].join('\n');
+
+                openChatSurface();
+                setChatInput(prompt);
+                setTimeout(() => chatInputRef.current?.focus(), 0);
+            };
+
+            const renderSplQueryActionButtons = (splQuery, options = {}) => {
+                const trimmedQuery = String(splQuery || '').trim();
+                if (!trimmedQuery) {
+                    return null;
+                }
+
+                const deeplinkOptions = options.deeplinkOptions || {};
+                return (
+                    <div className={`flex flex-wrap items-center gap-2 ${options.className || ''}`}>
+                        {canUseSplunkDeeplinks && (
+                            <button
+                                type="button"
+                                onClick={() => openSplunkSearch(trimmedQuery, deeplinkOptions)}
+                                className="px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors"
+                                title="Open this search in Splunk Web"
+                            >
+                                <i className="fas fa-external-link-alt mr-1"></i>
+                                Open in Splunk
+                            </button>
+                        )}
+                        {options.allowSave !== false && (
+                            <button
+                                type="button"
+                                onClick={() => saveSplQueryToLibrary(trimmedQuery, options)}
+                                disabled={isRagBusy}
+                                className={`px-2 py-1 text-xs rounded transition-colors ${!isRagBusy ? 'text-emerald-100 bg-emerald-700 hover:bg-emerald-800' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                title="Save this query to the managed SPL library"
+                            >
+                                <i className="fas fa-bookmark mr-1"></i>
+                                {ragActionInProgress === 'import-asset' ? 'Saving...' : 'Save to Library'}
+                            </button>
+                        )}
+                        {options.allowUseInChat !== false && (
+                            <button
+                                type="button"
+                                onClick={() => useSplQueryInChat(trimmedQuery, options)}
+                                className="px-2 py-1 text-xs text-violet-100 hover:text-white bg-violet-700 hover:bg-violet-800 rounded transition-colors"
+                                title="Bring this query into the chat workspace"
+                            >
+                                <i className="fas fa-comments mr-1"></i>
+                                Use in Chat
+                            </button>
+                        )}
+                        {options.allowCopy !== false && (
+                            <button
+                                type="button"
+                                onClick={() => copyToClipboard(trimmedQuery)}
+                                className="px-2 py-1 text-xs text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+                                title="Copy this query to the clipboard"
+                            >
+                                <i className="fas fa-copy mr-1"></i>
+                                Copy
+                            </button>
+                        )}
+                    </div>
+                );
+            };
+
+            const renderCapabilityReusableQueryCards = (usage) => {
+                const reusableQueries = Array.isArray(usage?.reusable_queries)
+                    ? usage.reusable_queries.filter((candidate) => typeof candidate?.query === 'string' && candidate.query.trim()).slice(0, 3)
+                    : [];
+                if (reusableQueries.length === 0) {
+                    return null;
+                }
+
+                return (
+                    <div className="space-y-2 mt-3" data-testid="chat-capability-reusable-query-list">
+                        <div className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${mutedTextClass}`}>
+                            Reusable SPL Candidates
+                        </div>
+                        {reusableQueries.map((candidate, candidateIdx) => {
+                            const query = String(candidate.query || '').trim();
+                            const reuseTier = String(candidate.reuse_tier || '').trim().toLowerCase();
+                            const fitStatus = String(candidate.environment_fit_status || '').trim().toLowerCase();
+                            const validationStatus = String(candidate.validation_status || '').trim().toLowerCase();
+                            const successCount = Number(candidate.success_count || 0);
+                            const failureCount = Number(candidate.failure_count || 0);
+                            const knownGood = Boolean(candidate.known_good) || validationStatus === 'known_good';
+
+                            return (
+                                <div key={`${usage?.name || 'capability'}-candidate-${candidateIdx}`} data-testid="chat-capability-reusable-query-card" className={`rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-emerald-200'}`}>
+                                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                        <div>
+                                            <div className={`text-sm font-medium ${headingClass}`}>{candidate.title || 'Saved SPL Query'}</div>
+                                            {candidate.why_reuse && (
+                                                <div className={`mt-1 text-xs ${subtextClass}`}>{candidate.why_reuse}</div>
+                                            )}
+                                        </div>
+                                        {renderSplQueryActionButtons(query, {
+                                            allowSave: false,
+                                            originKind: 'chat_capability_reuse',
+                                            originLabel: candidate.title || usage?.title || 'Reusable SPL candidate',
+                                            sourceLabel: usage?.title || usage?.name || 'Capability Evidence',
+                                            contextExcerpt: candidate.why_reuse || usage?.contribution || '',
+                                            deeplinkOptions: {
+                                                app: candidate.app,
+                                                earliest: candidate.earliest,
+                                                latest: candidate.latest,
+                                            },
+                                            className: 'sm:justify-end',
+                                        })}
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                                        {(reuseTier || knownGood) && (
+                                            <span data-testid="chat-capability-reusable-query-reuse-tier" className={`rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}`}>
+                                                Reuse: {knownGood ? 'Known Good' : formatSplIntelligenceLabel(reuseTier, 'Candidate')}
+                                            </span>
+                                        )}
+                                        {fitStatus && (
+                                            <span data-testid="chat-capability-reusable-query-fit-status" className={`rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}`}>
+                                                Environment Fit: {formatSplIntelligenceLabel(fitStatus, 'Unknown')}
+                                            </span>
+                                        )}
+                                        {validationStatus && (
+                                            <span data-testid="chat-capability-reusable-query-validation-status" className={`rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}`}>
+                                                Validation: {formatSplIntelligenceLabel(validationStatus, 'Unknown')}
+                                            </span>
+                                        )}
+                                        {(successCount > 0 || failureCount > 0) && (
+                                            <span data-testid="chat-capability-reusable-query-feedback-counts" className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-gray-100 border-gray-300 text-gray-700'}`}>
+                                                Observed Runs: {successCount} success / {failureCount} failure
+                                            </span>
+                                        )}
+                                    </div>
+                                    <pre data-testid="chat-capability-reusable-query" className={`mt-2 max-h-32 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-950 border-gray-700 text-gray-100' : 'bg-gray-50 border-gray-200 text-gray-900'}`}>
+{query}
+                                    </pre>
+                                </div>
+                            );
+                        })}
+                    </div>
                 );
             };
 
@@ -3630,11 +4095,17 @@
             };
 
             const openCapabilitiesOverview = () => {
+                setWorkspaceTab('capabilities');
                 setCapabilitiesView('overview');
+                loadCapabilities();
             };
 
-            const openRagCapabilitiesWorkspace = () => {
+            const openRagCapabilitiesWorkspace = (options = {}) => {
+                setWorkspaceTab('capabilities');
                 setCapabilitiesView('rag');
+                if (options.libraryFilter) {
+                    setRagLibraryFilter(options.libraryFilter);
+                }
                 loadCapabilities();
             };
 
@@ -4105,7 +4576,7 @@
             const renderRagWorkspaceView = () => {
                 if (!ragCapability) {
                     return (
-                        <div className={`rounded-lg shadow-sm p-6 border ${panelClass}`}>
+                                                                            <div data-testid="context-library-detail-panel" className={`rounded-lg shadow-sm p-6 border ${panelClass}`}>
                             <h3 className={`text-lg font-semibold ${headingClass}`}>RAG Workspace</h3>
                             <p className={`mt-2 text-sm ${subtextClass}`}>The dedicated retrieval workspace is unavailable because the `rag_chromadb` capability was not returned by the capabilities API.</p>
                         </div>
@@ -4292,6 +4763,7 @@
                                             onChange={(event) => updateRagAssetDraft('asset_type', event.target.value)}
                                             className={`rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
                                         >
+                                                                                        <option value={SPL_LIBRARY_ASSET_TYPE}>SPL Library Query</option>
                                             <option value="reference_document">Reference Document</option>
                                             <option value="splunk_documentation">Splunk Documentation</option>
                                             <option value="monitored_system_context">Monitored System Context</option>
@@ -4581,6 +5053,42 @@
                                                     </div>
                                                 </div>
 
+                                                {(() => {
+                                                    const detailAttributes = getKnowledgeAssetAttributes(ragAssetWorkspace.assetDetail.asset);
+                                                    const detailSplQuery = String(detailAttributes.spl_query || '').trim();
+                                                    if (!detailSplQuery) {
+                                                        return null;
+                                                    }
+
+                                                    return (
+                                                        <div data-testid="context-library-detail-spl-query" className={`rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
+                                                            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                                                <div>
+                                                                    <div className={`text-sm font-medium ${headingClass}`}>Saved SPL Query</div>
+                                                                    <div className={`mt-1 text-xs ${subtextClass}`}>Run this query in Splunk Web, reuse it in chat, or keep it parked in the context library.</div>
+                                                                </div>
+                                                                {renderSplQueryActionButtons(detailSplQuery, {
+                                                                    allowSave: false,
+                                                                    originKind: 'spl_library_asset',
+                                                                    originLabel: ragAssetWorkspace.assetDetail.asset.title || 'Saved SPL Library Query',
+                                                                    sourceLabel: ragAssetWorkspace.assetDetail.asset.source_label || ragAssetWorkspace.assetDetail.asset.title || 'SPL Library Query',
+                                                                    contextExcerpt: ragAssetWorkspace.assetDetail.asset.summary || ragAssetWorkspace.assetDetail.asset.preview || '',
+                                                                    deeplinkOptions: {
+                                                                        app: detailAttributes.app,
+                                                                        earliest: detailAttributes.earliest,
+                                                                        latest: detailAttributes.latest,
+                                                                    },
+                                                                    className: 'sm:justify-end',
+                                                                })}
+                                                            </div>
+                                                            <pre className={`mt-3 max-h-40 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-950 border-gray-700 text-gray-100' : 'bg-gray-50 border-gray-200 text-gray-900'}`}>
+{detailSplQuery}
+                                                            </pre>
+                                                            {renderSplQueryIntelligence(detailAttributes, { testIdPrefix: 'context-library-detail-spl' })}
+                                                        </div>
+                                                    );
+                                                })()}
+
                                                 <div className="grid grid-cols-1 2xl:grid-cols-2 gap-3">
                                                     <div className={`rounded-lg border px-3 py-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
                                                         <div className={`text-sm font-medium mb-2 ${headingClass}`}>Stored Sections</div>
@@ -4705,6 +5213,7 @@
                                 <div className="flex flex-wrap gap-2">
                                     {[
                                         { key: 'all', label: `All (${ragDisplayedAssetCount})` },
+                                        { key: 'spl_library', label: `SPL Library (${ragSplLibraryAssetCount})` },
                                         { key: 'checked_in', label: `Checked In (${ragLibraryStatusCounts?.checked_in ?? ragCheckedInAssetCount})` },
                                         { key: 'checked_out', label: `Checked Out (${ragLibraryStatusCounts?.checked_out ?? ragCheckedOutAssetCount})` },
                                     ].map((filterOption) => {
@@ -4712,6 +5221,7 @@
                                         return (
                                             <button
                                                 key={filterOption.key}
+                                                data-testid={`context-library-filter-${filterOption.key}`}
                                                 type="button"
                                                 onClick={() => setRagLibraryFilter(filterOption.key)}
                                                 className={`px-3 py-1.5 rounded text-xs font-medium border ${isActive
@@ -4735,11 +5245,13 @@
                                 </div>
                             ) : ragLibraryAssets.length === 0 ? (
                                 <div className={`text-xs rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}`}>
-                                    {ragLibraryFilter === 'checked_in'
+                                    {ragLibraryFilter === 'spl_library'
+                                        ? 'No SPL library queries have been saved into the context workspace yet.'
+                                        : (ragLibraryFilter === 'checked_in'
                                         ? 'No checked-in knowledge assets are currently in active library circulation.'
                                         : (ragLibraryFilter === 'checked_out'
                                             ? 'No knowledge assets are currently checked out of circulation.'
-                                            : 'No managed knowledge assets have been imported yet.')}
+                                            : 'No managed knowledge assets have been imported yet.'))}
                                 </div>
                             ) : (
                                 <div className="space-y-2 max-h-[42rem] overflow-y-auto pr-1">
@@ -4747,112 +5259,203 @@
                                         const assetLibraryStatus = String(asset.library_status || 'checked_in').toLowerCase();
                                         const isAssetCheckedOut = assetLibraryStatus === 'checked_out';
                                         const libraryActionKey = isAssetCheckedOut ? 'check-in-asset' : 'check-out-asset';
+                                        const assetAttributes = getKnowledgeAssetAttributes(asset);
+                                        const savedSplQuery = String(assetAttributes.spl_query || '').trim();
+                                        const isSplLibraryOnlyView = ragLibraryFilter === 'spl_library' && Boolean(savedSplQuery);
+                                        const splIntelligenceSummary = renderSplQueryIntelligence(assetAttributes, {
+                                            testIdPrefix: isSplLibraryOnlyView ? 'context-library-spl' : '',
+                                        });
+                                        const splQueryActionOptions = {
+                                            allowSave: false,
+                                            originKind: 'spl_library_asset',
+                                            originLabel: asset.title || 'Saved SPL Library Query',
+                                            sourceLabel: asset.source_label || asset.title || 'SPL Library Query',
+                                            contextExcerpt: asset.summary || asset.preview || '',
+                                            deeplinkOptions: {
+                                                app: assetAttributes.app,
+                                                earliest: assetAttributes.earliest,
+                                                latest: assetAttributes.latest,
+                                            },
+                                            className: 'sm:justify-end',
+                                        };
                                         return (
-                                            <div key={asset.asset_id || asset.content_path || asset.title} className={`rounded-lg border px-3 py-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
-                                                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
-                                                    <div>
-                                                        <div className="flex flex-wrap items-center gap-2">
-                                                            <div className={`text-sm font-medium ${headingClass}`}>{asset.title || 'Knowledge Asset'}</div>
-                                                            <span className={`rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? 'bg-sky-950 border-sky-800 text-sky-100' : 'bg-sky-50 border-sky-200 text-sky-800'}`}>
-                                                                {formatKnowledgeAssetTypeLabel(asset.asset_type)}
-                                                            </span>
-                                                            <span className={`rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-gray-100 border-gray-300 text-gray-700'}`}>
-                                                                {formatKnowledgeAssetImportMethodLabel(asset.import_method)}
-                                                            </span>
-                                                            <span className={`rounded-full px-2 py-0.5 border text-[11px] ${getKnowledgeAssetLibraryStatusClasses(assetLibraryStatus)}`}>
-                                                                {formatKnowledgeAssetLibraryStatusLabel(assetLibraryStatus)}
-                                                            </span>
+                                            <div key={asset.asset_id || asset.content_path || asset.title} data-testid={savedSplQuery ? 'context-library-spl-asset-card' : 'context-library-asset-card'} className={`rounded-lg border px-3 py-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
+                                                {isSplLibraryOnlyView ? (
+                                                    <div className="space-y-3">
+                                                        <div data-testid="context-library-spl-query-card" className={`rounded-lg border px-3 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                                                            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                                                <div className={`text-[11px] font-semibold uppercase tracking-wide ${mutedTextClass}`}>Saved SPL Query</div>
+                                                                {renderSplQueryActionButtons(savedSplQuery, splQueryActionOptions)}
+                                                            </div>
+                                                            <pre data-testid="context-library-spl-only-query" className={`mt-2 max-h-[26rem] overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}>
+{savedSplQuery}
+                                                            </pre>
+                                                            {splIntelligenceSummary}
                                                         </div>
-                                                        {asset.source_label && (
-                                                            <div className={`mt-1 text-xs ${mutedTextClass}`}>Source: {asset.source_label}</div>
+                                                        <div className="flex flex-wrap gap-2">
+                                                            <button
+                                                                type="button"
+                                                                data-testid="context-library-view-spl-details"
+                                                                onClick={() => loadRagAssetDetail(asset.asset_id)}
+                                                                disabled={ragAssetWorkspace.detailStatus === 'loading' || !asset.asset_id}
+                                                                className={`px-3 py-1.5 rounded text-sm font-medium ${ragAssetWorkspace.detailStatus !== 'loading' && asset.asset_id ? 'bg-slate-700 hover:bg-slate-800 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                            >
+                                                                {ragAssetWorkspace.detailStatus === 'loading' && ragAssetWorkspace.detailAssetId === asset.asset_id
+                                                                    ? 'Loading Detail...'
+                                                                    : ragAssetWorkspace.assetDetail?.asset?.asset_id === asset.asset_id
+                                                                        ? 'Hide Details'
+                                                                        : 'View Details'}
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setRagKnowledgeAssetLibraryStatus(asset.asset_id, asset.title, isAssetCheckedOut ? 'checked_in' : 'checked_out')}
+                                                                disabled={isRagBusy || !asset.asset_id}
+                                                                className={`px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy && asset.asset_id
+                                                                    ? (isAssetCheckedOut
+                                                                        ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                                                        : 'bg-amber-600 hover:bg-amber-700 text-white')
+                                                                    : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                            >
+                                                                {ragActionInProgress === libraryActionKey
+                                                                    ? (isAssetCheckedOut ? 'Checking In...' : 'Checking Out...')
+                                                                    : (isAssetCheckedOut ? 'Check In' : 'Check Out')}
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => deleteRagKnowledgeAsset(asset.asset_id, asset.title)}
+                                                                disabled={isRagBusy}
+                                                                className={`px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy ? 'bg-rose-600 hover:bg-rose-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                            >
+                                                                {ragActionInProgress === 'delete-asset' ? 'Removing...' : 'Remove'}
+                                                            </button>
+                                                        </div>
+                                                        {isAssetCheckedOut && (
+                                                            <div className={`text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? 'bg-amber-950 border-amber-800 text-amber-100' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                                                                Checked out of active circulation. Retrieval previews and chat RAG will ignore this asset until it is checked back in.
+                                                            </div>
                                                         )}
                                                     </div>
-                                                    <div className="flex flex-wrap gap-2">
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => loadRagAssetDetail(asset.asset_id)}
-                                                            disabled={ragAssetWorkspace.detailStatus === 'loading' || !asset.asset_id}
-                                                            className={`px-3 py-1.5 rounded text-sm font-medium ${ragAssetWorkspace.detailStatus !== 'loading' && asset.asset_id ? 'bg-slate-700 hover:bg-slate-800 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                        >
-                                                            {ragAssetWorkspace.detailStatus === 'loading' && ragAssetWorkspace.detailAssetId === asset.asset_id
-                                                                ? 'Loading Detail...'
-                                                                : ragAssetWorkspace.assetDetail?.asset?.asset_id === asset.asset_id
-                                                                    ? 'Hide Details'
-                                                                    : 'View Details'}
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => setRagKnowledgeAssetLibraryStatus(asset.asset_id, asset.title, isAssetCheckedOut ? 'checked_in' : 'checked_out')}
-                                                            disabled={isRagBusy || !asset.asset_id}
-                                                            className={`px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy && asset.asset_id
-                                                                ? (isAssetCheckedOut
-                                                                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
-                                                                    : 'bg-amber-600 hover:bg-amber-700 text-white')
-                                                                : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                        >
-                                                            {ragActionInProgress === libraryActionKey
-                                                                ? (isAssetCheckedOut ? 'Checking In...' : 'Checking Out...')
-                                                                : (isAssetCheckedOut ? 'Check In' : 'Check Out')}
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => deleteRagKnowledgeAsset(asset.asset_id, asset.title)}
-                                                            disabled={isRagBusy}
-                                                            className={`px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy ? 'bg-rose-600 hover:bg-rose-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
-                                                        >
-                                                            {ragActionInProgress === 'delete-asset' ? 'Removing...' : 'Remove'}
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                                <div className={`mt-2 text-xs ${subtextClass}`}>{asset.summary || asset.preview || 'No summary available.'}</div>
-                                                {isAssetCheckedOut && (
-                                                    <div className={`mt-2 text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? 'bg-amber-950 border-amber-800 text-amber-100' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
-                                                        Checked out of active circulation. Retrieval previews and chat RAG will ignore this asset until it is checked back in.
-                                                    </div>
-                                                )}
-                                                {asset.description && (
-                                                    <div className={`mt-2 text-xs ${mutedTextClass}`}>Purpose: {asset.description}</div>
-                                                )}
-                                                {Array.isArray(asset.tags) && asset.tags.length > 0 && (
-                                                    <div className="flex flex-wrap gap-2 mt-2 text-[11px]">
-                                                        {asset.tags.map((tag) => (
-                                                            <span key={`${asset.asset_id || asset.title}-${tag}`} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-gray-100 border-gray-300 text-gray-700'}`}>
-                                                                {tag}
-                                                            </span>
-                                                        ))}
-                                                    </div>
-                                                )}
-                                                {Array.isArray(asset.focus_terms) && asset.focus_terms.length > 0 && (
-                                                    <div className="flex flex-wrap gap-2 mt-2 text-[11px]">
-                                                        {asset.focus_terms.slice(0, 8).map((term) => (
-                                                            <span key={`${asset.asset_id || asset.title}-focus-${term}`} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-sky-950 border-sky-800 text-sky-100' : 'bg-sky-50 border-sky-200 text-sky-800'}`}>
-                                                                {term}
-                                                            </span>
-                                                        ))}
-                                                    </div>
-                                                )}
-                                                {Array.isArray(asset.key_points) && asset.key_points.length > 0 && (
-                                                    <ul className={`mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}`}>
-                                                        {asset.key_points.slice(0, 2).map((point, pointIndex) => (
-                                                            <li key={`${asset.asset_id || asset.title}-point-${pointIndex}`}>{point}</li>
-                                                        ))}
-                                                    </ul>
-                                                )}
-                                                {Array.isArray(asset.usage_guidance) && asset.usage_guidance.length > 0 && (
-                                                    <div className={`mt-2 text-xs ${mutedTextClass}`}>Best used for: {asset.usage_guidance[0]}</div>
-                                                )}
-                                                <div className="grid grid-cols-2 gap-2 mt-3 text-[11px]">
-                                                    <div className={mutedTextClass}>Words: {asset.word_count || 0}</div>
-                                                    <div className={mutedTextClass}>Characters: {asset.text_char_count || 0}</div>
-                                                    <div className={mutedTextClass}>Imported: {asset.created_at ? new Date(asset.created_at).toLocaleString() : 'Unknown'}</div>
-                                                    <div className={mutedTextClass}>Last checked in: {asset.last_checked_in_at ? new Date(asset.last_checked_in_at).toLocaleString() : 'Not recorded'}</div>
-                                                </div>
-                                                {asset.checked_out_at ? (
-                                                    <div className={`mt-1 text-[11px] ${mutedTextClass}`}>Checked out: {new Date(asset.checked_out_at).toLocaleString()}</div>
                                                 ) : (
-                                                    <div className={`mt-1 text-[11px] ${mutedTextClass}`}>Available for preview and chat retrieval while checked in.</div>
+                                                    <>
+                                                        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
+                                                            <div>
+                                                                <div className="flex flex-wrap items-center gap-2">
+                                                                    <div className={`text-sm font-medium ${headingClass}`}>{asset.title || 'Knowledge Asset'}</div>
+                                                                    <span className={`rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? 'bg-sky-950 border-sky-800 text-sky-100' : 'bg-sky-50 border-sky-200 text-sky-800'}`}>
+                                                                        {formatKnowledgeAssetTypeLabel(asset.asset_type)}
+                                                                    </span>
+                                                                    <span className={`rounded-full px-2 py-0.5 border text-[11px] ${isDarkTheme ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-gray-100 border-gray-300 text-gray-700'}`}>
+                                                                        {formatKnowledgeAssetImportMethodLabel(asset.import_method)}
+                                                                    </span>
+                                                                    <span className={`rounded-full px-2 py-0.5 border text-[11px] ${getKnowledgeAssetLibraryStatusClasses(assetLibraryStatus)}`}>
+                                                                        {formatKnowledgeAssetLibraryStatusLabel(assetLibraryStatus)}
+                                                                    </span>
+                                                                </div>
+                                                                {asset.source_label && (
+                                                                    <div className={`mt-1 text-xs ${mutedTextClass}`}>Source: {asset.source_label}</div>
+                                                                )}
+                                                            </div>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                <button
+                                                                    type="button"
+                                                                    data-testid={savedSplQuery ? 'context-library-view-spl-details' : undefined}
+                                                                    onClick={() => loadRagAssetDetail(asset.asset_id)}
+                                                                    disabled={ragAssetWorkspace.detailStatus === 'loading' || !asset.asset_id}
+                                                                    className={`px-3 py-1.5 rounded text-sm font-medium ${ragAssetWorkspace.detailStatus !== 'loading' && asset.asset_id ? 'bg-slate-700 hover:bg-slate-800 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                >
+                                                                    {ragAssetWorkspace.detailStatus === 'loading' && ragAssetWorkspace.detailAssetId === asset.asset_id
+                                                                        ? 'Loading Detail...'
+                                                                        : ragAssetWorkspace.assetDetail?.asset?.asset_id === asset.asset_id
+                                                                            ? 'Hide Details'
+                                                                            : 'View Details'}
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => setRagKnowledgeAssetLibraryStatus(asset.asset_id, asset.title, isAssetCheckedOut ? 'checked_in' : 'checked_out')}
+                                                                    disabled={isRagBusy || !asset.asset_id}
+                                                                    className={`px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy && asset.asset_id
+                                                                        ? (isAssetCheckedOut
+                                                                            ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                                                            : 'bg-amber-600 hover:bg-amber-700 text-white')
+                                                                        : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                >
+                                                                    {ragActionInProgress === libraryActionKey
+                                                                        ? (isAssetCheckedOut ? 'Checking In...' : 'Checking Out...')
+                                                                        : (isAssetCheckedOut ? 'Check In' : 'Check Out')}
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => deleteRagKnowledgeAsset(asset.asset_id, asset.title)}
+                                                                    disabled={isRagBusy}
+                                                                    className={`px-3 py-1.5 rounded text-sm font-medium ${!isRagBusy ? 'bg-rose-600 hover:bg-rose-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                                >
+                                                                    {ragActionInProgress === 'delete-asset' ? 'Removing...' : 'Remove'}
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                        <div className={`mt-2 text-xs ${subtextClass}`}>{asset.summary || asset.preview || 'No summary available.'}</div>
+                                                        {savedSplQuery && (
+                                                            <div data-testid="context-library-spl-query-card" className={`mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                                                                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                                                    <div className={`text-[11px] font-semibold uppercase tracking-wide ${mutedTextClass}`}>Saved SPL Query</div>
+                                                                    {renderSplQueryActionButtons(savedSplQuery, splQueryActionOptions)}
+                                                                </div>
+                                                                <pre className={`mt-2 max-h-32 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}>
+{savedSplQuery}
+                                                                </pre>
+                                                                {splIntelligenceSummary}
+                                                            </div>
+                                                        )}
+                                                        {isAssetCheckedOut && (
+                                                            <div className={`mt-2 text-xs rounded-lg border px-3 py-2 ${isDarkTheme ? 'bg-amber-950 border-amber-800 text-amber-100' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                                                                Checked out of active circulation. Retrieval previews and chat RAG will ignore this asset until it is checked back in.
+                                                            </div>
+                                                        )}
+                                                        {asset.description && (
+                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>Purpose: {asset.description}</div>
+                                                        )}
+                                                        {Array.isArray(asset.tags) && asset.tags.length > 0 && (
+                                                            <div className="flex flex-wrap gap-2 mt-2 text-[11px]">
+                                                                {asset.tags.map((tag) => (
+                                                                    <span key={`${asset.asset_id || asset.title}-${tag}`} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-gray-100 border-gray-300 text-gray-700'}`}>
+                                                                        {tag}
+                                                                    </span>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                        {Array.isArray(asset.focus_terms) && asset.focus_terms.length > 0 && (
+                                                            <div className="flex flex-wrap gap-2 mt-2 text-[11px]">
+                                                                {asset.focus_terms.slice(0, 8).map((term) => (
+                                                                    <span key={`${asset.asset_id || asset.title}-focus-${term}`} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-sky-950 border-sky-800 text-sky-100' : 'bg-sky-50 border-sky-200 text-sky-800'}`}>
+                                                                        {term}
+                                                                    </span>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                        {Array.isArray(asset.key_points) && asset.key_points.length > 0 && (
+                                                            <ul className={`mt-2 list-disc pl-4 space-y-1 text-xs ${subtextClass}`}>
+                                                                {asset.key_points.slice(0, 2).map((point, pointIndex) => (
+                                                                    <li key={`${asset.asset_id || asset.title}-point-${pointIndex}`}>{point}</li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                        {Array.isArray(asset.usage_guidance) && asset.usage_guidance.length > 0 && (
+                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>Best used for: {asset.usage_guidance[0]}</div>
+                                                        )}
+                                                        <div className="grid grid-cols-2 gap-2 mt-3 text-[11px]">
+                                                            <div className={mutedTextClass}>Words: {asset.word_count || 0}</div>
+                                                            <div className={mutedTextClass}>Characters: {asset.text_char_count || 0}</div>
+                                                            <div className={mutedTextClass}>Imported: {asset.created_at ? new Date(asset.created_at).toLocaleString() : 'Unknown'}</div>
+                                                            <div className={mutedTextClass}>Last checked in: {asset.last_checked_in_at ? new Date(asset.last_checked_in_at).toLocaleString() : 'Not recorded'}</div>
+                                                        </div>
+                                                        {asset.checked_out_at ? (
+                                                            <div className={`mt-1 text-[11px] ${mutedTextClass}`}>Checked out: {new Date(asset.checked_out_at).toLocaleString()}</div>
+                                                        ) : (
+                                                            <div className={`mt-1 text-[11px] ${mutedTextClass}`}>Available for preview and chat retrieval while checked in.</div>
+                                                        )}
+                                                        <div className={`mt-1 text-[11px] ${mutedTextClass}`}>Stored as: {asset.content_path || 'managed asset'}</div>
+                                                    </>
                                                 )}
-                                                <div className={`mt-1 text-[11px] ${mutedTextClass}`}>Stored as: {asset.content_path || 'managed asset'}</div>
                                             </div>
                                         );
                                     })}
@@ -7576,6 +8179,10 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                 const selectedReportType = String(selectedWorkspaceReportRecord?.type || reportContent?.type || 'file').toUpperCase();
                 const selectedReportSize = selectedWorkspaceReportRecord?.size_bytes ?? selectedWorkspaceReportRecord?.size ?? null;
                 const selectedReportModifiedAt = selectedWorkspaceReportRecord?.modified_at || selectedWorkspaceReportRecord?.modified || null;
+                const reportSplQueries = Array.isArray(reportContent?.spl_queries) ? reportContent.spl_queries : [];
+                const reportContextExcerpt = reportContent?.type === 'text'
+                    ? String(reportContent?.content || '').slice(0, 900)
+                    : '';
 
                 return (
                     <div className={`rounded-lg shadow-sm border ${panelClass}`}>
@@ -7622,6 +8229,31 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                             className="p-6 overflow-y-auto scroll-container"
                             style={{ height: `${reportViewerHeight}px` }}
                         >
+                            {reportSplQueries.length > 0 && (
+                                <div className="mb-6 space-y-3" data-testid="report-viewer-spl-blocks">
+                                    <div className={`rounded-lg border px-4 py-3 ${panelMutedClass}`}>
+                                        <div className={`text-sm font-medium ${headingClass}`}>Detected SPL Blocks</div>
+                                        <div className={`mt-1 text-xs ${subtextClass}`}>Save report-visible SPL into the context library, open it in Splunk Web, or bring it into chat.</div>
+                                    </div>
+                                    {reportSplQueries.map((splQuery, splIndex) => (
+                                        <div key={`${selectedReport || 'report'}-spl-${splIndex}`} data-testid="report-viewer-spl-card" className={`rounded-lg border px-4 py-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
+                                            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                                <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>SPL Block {splIndex + 1}</div>
+                                                {renderSplQueryActionButtons(splQuery, {
+                                                    originKind: 'report_viewer',
+                                                    originLabel: selectedReport || 'Report Viewer',
+                                                    sourceLabel: selectedReport || 'Report Viewer',
+                                                    contextExcerpt: reportContextExcerpt,
+                                                    className: 'sm:justify-end',
+                                                })}
+                                            </div>
+                                            <pre className={`mt-3 max-h-40 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-950 border-gray-700 text-gray-100' : 'bg-gray-50 border-gray-200 text-gray-900'}`}>
+{splQuery}
+                                            </pre>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
                             {reportContent.type === 'image' ? (
                                 <div className="h-full flex flex-col gap-4">
                                     <div className={`text-xs uppercase tracking-[0.18em] ${mutedTextClass}`}>
@@ -7717,6 +8349,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         {yearData.visible && (
                                             <button
                                                 type="button"
+                                                data-testid="discovery-report-year-toggle"
                                                 className={`w-full p-3 border-b text-left font-semibold ${isDarkTheme ? 'bg-indigo-900 border-gray-700 hover:bg-indigo-800' : 'bg-gradient-to-r from-indigo-100 to-purple-100 border-gray-200'}`}
                                                 onClick={() => toggleYear(yearKey)}
                                                 aria-expanded={!!expandedYears[yearKey]}
@@ -7733,6 +8366,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 {monthData.visible && (
                                                     <button
                                                         type="button"
+                                                        data-testid="discovery-report-month-toggle"
                                                         className={`w-full p-3 border-b text-left ${isDarkTheme ? 'bg-blue-900 border-gray-700 hover:bg-blue-800' : 'bg-gradient-to-r from-blue-50 to-indigo-50 border-gray-200'}`}
                                                         onClick={() => toggleMonth(monthKey)}
                                                         style={{paddingLeft: yearData.visible ? '1.5rem' : '0.75rem'}}
@@ -7749,6 +8383,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     <div key={dayKey}>
                                                         <button
                                                             type="button"
+                                                            data-testid="discovery-report-day-toggle"
                                                             className={`w-full p-3 border-b text-left ${dayData.isToday ? (isDarkTheme ? 'bg-green-900' : 'bg-green-50') : (isDarkTheme ? 'bg-gray-800' : 'bg-gray-50')} ${isDarkTheme ? 'hover:bg-gray-700 border-gray-700' : 'hover:bg-gray-100 border-gray-200'}`}
                                                             onClick={() => toggleDay(dayKey)}
                                                             style={{paddingLeft: monthData.visible ? (yearData.visible ? '3rem' : '1.5rem') : (yearData.visible ? '1.5rem' : '0.75rem')}}
@@ -7766,6 +8401,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             return (
                                                                 <div key={session.timestamp}>
                                                                     <div
+                                                                        data-testid="discovery-report-session-toggle"
                                                                         className={`p-4 border-b cursor-pointer transition-colors overflow-hidden ${isDarkTheme ? 'bg-gray-800 hover:bg-gray-700 border-gray-700' : 'bg-white hover:bg-gray-50 border-gray-200'}`}
                                                                         onClick={() => toggleSession(session.timestamp)}
                                                                         onKeyDown={(event) => handleKeyActivate(event, () => toggleSession(session.timestamp))}
@@ -7820,6 +8456,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                             {session.reports.map((report) => (
                                                                                 <div
                                                                                     key={report.name}
+                                                                                    data-testid="discovery-report-row"
                                                                                     className={`p-4 cursor-pointer ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-50'} ${
                                                                                         selectedReport === report.name ? (isDarkTheme ? 'bg-indigo-900 border-r-4 border-indigo-400' : 'bg-indigo-50 border-r-4 border-indigo-500') : ''
                                                                                     }`}
@@ -7910,6 +8547,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 <button
                                                     type="button"
                                                     id="workspace-tab-discovery"
+                                                    data-testid="workspace-tab-discovery"
                                                     role="tab"
                                                     aria-selected={isArtifactsTab}
                                                     tabIndex={isArtifactsTab ? 0 : -1}
@@ -7924,15 +8562,26 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 </button>
                                                 <button
                                                     type="button"
-                                                    id="workspace-tab-capabilities"
+                                                    id="workspace-tab-context"
+                                                    data-testid="workspace-tab-context"
                                                     role="tab"
-                                                    aria-selected={isCapabilitiesTab}
-                                                    tabIndex={isCapabilitiesTab ? 0 : -1}
-                                                    onClick={() => {
-                                                        setWorkspaceTab('capabilities');
-                                                        refreshCapabilitiesWorkspace();
-                                                    }}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
+                                                    aria-selected={isCapabilitiesRagView}
+                                                    tabIndex={isCapabilitiesRagView ? 0 : -1}
+                                                    onClick={() => openRagCapabilitiesWorkspace({ libraryFilter: 'spl_library' })}
+                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesRagView ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
+                                                    title="Context tab: managed SPL library and indexed retrieval workspace"
+                                                >
+                                                    Context
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    id="workspace-tab-capabilities"
+                                                    data-testid="workspace-tab-capabilities"
+                                                    role="tab"
+                                                    aria-selected={isCapabilitiesOverview}
+                                                    tabIndex={isCapabilitiesOverview ? 0 : -1}
+                                                    onClick={openCapabilitiesOverview}
+                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesOverview ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
                                                     title="Capabilities tab: optional capability packs, health, and control surface"
                                                 >
                                                     Capabilities
@@ -8005,13 +8654,22 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         <i className="fas fa-folder-open mr-1"></i>Refresh Discovery
                                                     </button>
                                                 )}
-                                                {isCapabilitiesTab && (
+                                                {isCapabilitiesOverview && (
                                                     <button
                                                         onClick={refreshCapabilitiesWorkspace}
                                                         className="px-2.5 sm:px-3 py-1.5 rounded bg-violet-600 hover:bg-violet-700 text-white"
                                                         title="Refresh optional capability inventory and health"
                                                     >
                                                         <i className="fas fa-puzzle-piece mr-1"></i>Refresh Capabilities
+                                                    </button>
+                                                )}
+                                                {isCapabilitiesRagView && (
+                                                    <button
+                                                        onClick={() => openRagCapabilitiesWorkspace({ libraryFilter: ragLibraryFilter })}
+                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-700 text-white"
+                                                        title="Refresh the context workspace and managed SPL library"
+                                                    >
+                                                        <i className="fas fa-book-open mr-1"></i>Refresh Context
                                                     </button>
                                                 )}
                                                 <button
@@ -9192,6 +9850,42 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                                             </div>
                                                                                         </div>
 
+                                                                                        {(() => {
+                                                                                            const detailAttributes = getKnowledgeAssetAttributes(ragAssetWorkspace.assetDetail.asset);
+                                                                                            const detailSplQuery = String(detailAttributes.spl_query || '').trim();
+                                                                                            if (!detailSplQuery) {
+                                                                                                return null;
+                                                                                            }
+
+                                                                                            return (
+                                                                                                <div data-testid="context-library-detail-spl-query" className={`rounded-lg border px-3 py-3 mb-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
+                                                                                                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                                                                                        <div>
+                                                                                                            <div className={`text-sm font-medium ${headingClass}`}>Saved SPL Query</div>
+                                                                                                            <div className={`mt-1 text-xs ${subtextClass}`}>Run this query in Splunk Web, reuse it in chat, or keep it parked in the context library.</div>
+                                                                                                        </div>
+                                                                                                        {renderSplQueryActionButtons(detailSplQuery, {
+                                                                                                            allowSave: false,
+                                                                                                            originKind: 'spl_library_asset',
+                                                                                                            originLabel: ragAssetWorkspace.assetDetail.asset.title || 'Saved SPL Library Query',
+                                                                                                            sourceLabel: ragAssetWorkspace.assetDetail.asset.source_label || ragAssetWorkspace.assetDetail.asset.title || 'SPL Library Query',
+                                                                                                            contextExcerpt: ragAssetWorkspace.assetDetail.asset.summary || ragAssetWorkspace.assetDetail.asset.preview || '',
+                                                                                                            deeplinkOptions: {
+                                                                                                                app: detailAttributes.app,
+                                                                                                                earliest: detailAttributes.earliest,
+                                                                                                                latest: detailAttributes.latest,
+                                                                                                            },
+                                                                                                            className: 'sm:justify-end',
+                                                                                                        })}
+                                                                                                    </div>
+                                                                                                    <pre className={`mt-3 max-h-40 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-950 border-gray-700 text-gray-100' : 'bg-gray-50 border-gray-200 text-gray-900'}`}>
+{detailSplQuery}
+                                                                                                    </pre>
+                                                                                                    {renderSplQueryIntelligence(detailAttributes, { testIdPrefix: 'context-library-detail-spl' })}
+                                                                                                </div>
+                                                                                            );
+                                                                                        })()}
+
                                                                                         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                                                                                             <div className={`rounded-lg border px-3 py-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
                                                                                                 <div className={`text-sm font-medium mb-2 ${headingClass}`}>Stored Sections</div>
@@ -9783,37 +10477,15 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                         SPL Query Executed
                                                                     </summary>
                                                                     <div className="mt-2 p-4 bg-gray-900 text-green-300 rounded-lg font-mono text-sm">
-                                                                        <div className="flex justify-between items-start mb-2">
+                                                                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2">
                                                                             <span className="text-xs text-gray-300 uppercase tracking-wide">Splunk Query</span>
-                                                                            <div className="flex items-center gap-2">
-                                                                                {canUseSplunkDeeplinks && (
-                                                                                    <button
-                                                                                        type="button"
-                                                                                        onClick={() => openSplunkSearchFromChat(msg.spl_query)}
-                                                                                        className="px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors"
-                                                                                        title="Open this search in Splunk Web"
-                                                                                    >
-                                                                                        <i className="fas fa-external-link-alt mr-1"></i>
-                                                                                        Open in Splunk
-                                                                                    </button>
-                                                                                )}
-                                                                                <button
-                                                                                    type="button"
-                                                                                    onClick={(event) => {
-                                                                                        navigator.clipboard.writeText(msg.spl_query);
-                                                                                        const btn = event.currentTarget;
-                                                                                        const originalHTML = btn.innerHTML;
-                                                                                        btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-                                                                                        setTimeout(() => btn.innerHTML = originalHTML, 2000);
-                                                                                    }}
-                                                                                    className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
-                                                                                    title="Copy to clipboard"
-                                                                                    aria-label="Copy executed SPL query to clipboard"
-                                                                                >
-                                                                                    <i className="fas fa-copy mr-1"></i>
-                                                                                    Copy
-                                                                                </button>
-                                                                            </div>
+                                                                            {renderSplQueryActionButtons(msg.spl_query, {
+                                                                                originKind: 'chat_assistant',
+                                                                                originLabel: 'Chat assistant response',
+                                                                                sourceLabel: 'Chat assistant response',
+                                                                                contextExcerpt: msg.content,
+                                                                                className: 'sm:justify-end',
+                                                                            })}
                                                                         </div>
                                                                         <pre className="whitespace-pre-wrap break-all">{msg.spl_query}</pre>
                                                                     </div>
@@ -9828,37 +10500,15 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                         SPL Query (Not Executed)
                                                                     </summary>
                                                                     <div className="mt-2 p-4 bg-gray-900 text-amber-300 rounded-lg font-mono text-sm">
-                                                                        <div className="flex justify-between items-start mb-2">
+                                                                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2">
                                                                             <span className="text-xs text-gray-300 uppercase tracking-wide">Suggested Query</span>
-                                                                            <div className="flex items-center gap-2">
-                                                                                {canUseSplunkDeeplinks && (
-                                                                                    <button
-                                                                                        type="button"
-                                                                                        onClick={() => openSplunkSearchFromChat(msg.spl_in_text)}
-                                                                                        className="px-2 py-1 text-xs text-sky-200 hover:text-white bg-sky-900 hover:bg-sky-800 rounded transition-colors"
-                                                                                        title="Open this search in Splunk Web"
-                                                                                    >
-                                                                                        <i className="fas fa-external-link-alt mr-1"></i>
-                                                                                        Open in Splunk
-                                                                                    </button>
-                                                                                )}
-                                                                                <button
-                                                                                    type="button"
-                                                                                    onClick={(event) => {
-                                                                                        navigator.clipboard.writeText(msg.spl_in_text);
-                                                                                        const btn = event.currentTarget;
-                                                                                        const originalHTML = btn.innerHTML;
-                                                                                        btn.innerHTML = '<i className="fas fa-check"></i> Copied!';
-                                                                                        setTimeout(() => btn.innerHTML = originalHTML, 2000);
-                                                                                    }}
-                                                                                    className="px-2 py-1 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
-                                                                                    title="Copy to clipboard"
-                                                                                    aria-label="Copy suggested SPL query to clipboard"
-                                                                                >
-                                                                                    <i className="fas fa-copy mr-1"></i>
-                                                                                    Copy
-                                                                                </button>
-                                                                            </div>
+                                                                            {renderSplQueryActionButtons(msg.spl_in_text, {
+                                                                                originKind: 'chat_assistant_suggestion',
+                                                                                originLabel: 'Chat assistant suggestion',
+                                                                                sourceLabel: 'Chat assistant suggestion',
+                                                                                contextExcerpt: msg.content,
+                                                                                className: 'sm:justify-end',
+                                                                            })}
                                                                         </div>
                                                                         <pre className="whitespace-pre-wrap break-all">{msg.spl_in_text}</pre>
                                                                     </div>
@@ -9880,7 +10530,11 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             )}
 
                                                             {Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && (
-                                                                <details className="mt-3">
+                                                                <details
+                                                                    className="mt-3"
+                                                                    data-testid="chat-capability-evidence"
+                                                                    open={msg.capability_usage.some((usage) => Array.isArray(usage?.reusable_queries) && usage.reusable_queries.length > 0)}
+                                                                >
                                                                     <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-emerald-300 hover:text-emerald-100' : 'text-emerald-700 hover:text-emerald-900'}`}>
                                                                         <i className="fas fa-puzzle-piece mr-2"></i>
                                                                         Capability Evidence ({msg.capability_usage.length})
@@ -9904,6 +10558,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                                 {usage.contribution && (
                                                                                     <div className={`text-sm mb-2 ${subtextClass}`}>{usage.contribution}</div>
                                                                                 )}
+                                                                                {renderCapabilityReusableQueryCards(usage)}
                                                                                 {Array.isArray(usage.chunks) && usage.chunks.length > 0 && (
                                                                                     <div className="space-y-2">
                                                                                         {usage.chunks.map((chunk, chunkIdx) => (
@@ -11833,15 +12488,15 @@ ${query.spl}`,
 
                                                                                                             {step.spl && (
                                                                                                                 <div className="mt-3 sm:ml-16">
-                                                                                                                    <div className="flex items-center justify-between gap-2 mb-2">
+                                                                                                                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-2">
                                                                                                                         <span className={`text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>Step SPL</span>
-                                                                                                                        <button
-                                                                                                                            onClick={() => copyToClipboard(step.spl, 'Step SPL')}
-                                                                                                                            className="px-2 py-1 bg-gray-700 hover:bg-gray-800 text-white rounded text-xs"
-                                                                                                                        >
-                                                                                                                            <i className="fas fa-copy mr-1"></i>
-                                                                                                                            Copy
-                                                                                                                        </button>
+                                                                                                                            {renderSplQueryActionButtons(step.spl, {
+                                                                                                                                originKind: 'summary_task_step',
+                                                                                                                                originLabel: task.title || `Task ${taskIndex + 1}`,
+                                                                                                                                sourceLabel: task.title || 'Summary task',
+                                                                                                                                contextExcerpt: step.action,
+                                                                                                                                className: 'sm:justify-end',
+                                                                                                                            })}
                                                                                                                     </div>
                                                                                                                     <pre className="max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400">
 {step.spl}
@@ -11897,14 +12552,14 @@ ${query.spl}`,
                                                                                                         <i className="fas fa-code mr-1"></i>
                                                                                                         View Verification SPL
                                                                                                     </summary>
-                                                                                                    <div className="mt-2 flex items-center justify-end mb-2">
-                                                                                                        <button
-                                                                                                            onClick={() => copyToClipboard(task.verification_spl, 'Verification SPL')}
-                                                                                                            className="px-2 py-1 bg-blue-700 hover:bg-blue-800 text-white rounded text-xs"
-                                                                                                        >
-                                                                                                            <i className="fas fa-copy mr-1"></i>
-                                                                                                            Copy
-                                                                                                        </button>
+                                                                                                    <div className="mt-2 flex flex-wrap items-center justify-end gap-2 mb-2">
+                                                                                                        {renderSplQueryActionButtons(task.verification_spl, {
+                                                                                                            originKind: 'summary_verification',
+                                                                                                            originLabel: task.title || `Task ${taskIndex + 1}`,
+                                                                                                            sourceLabel: task.title || 'Verification task',
+                                                                                                            contextExcerpt: task.expected_outcome,
+                                                                                                            className: 'justify-end',
+                                                                                                        })}
                                                                                                     </div>
                                                                                                     <pre className="max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400">
 {task.verification_spl}

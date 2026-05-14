@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import uvicorn
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # DT4SMS: Use encrypted config manager instead of YAML
 from config_manager import ConfigManager
@@ -1971,12 +1971,39 @@ def build_capability_usage_from_rag_result(rag_result: Dict[str, Any]) -> List[D
             }
         )
 
+    reusable_queries = rag_result.get("reusable_spl_queries", []) if isinstance(rag_result.get("reusable_spl_queries"), list) else []
+    normalized_reusable_queries = []
+    for candidate in reusable_queries[:3]:
+        if not isinstance(candidate, dict):
+            continue
+        query = str(candidate.get("query") or "").strip()
+        if not query:
+            continue
+        normalized_reusable_queries.append(
+            {
+                "title": str(candidate.get("title") or "Saved SPL Query").strip() or "Saved SPL Query",
+                "query": query,
+                "reuse_tier": str(candidate.get("reuse_tier") or "candidate").strip(),
+                "known_good": bool(candidate.get("known_good")),
+                "why_reuse": str(candidate.get("why_reuse") or "").strip(),
+                "environment_fit_status": str(candidate.get("environment_fit_status") or "").strip() or None,
+                "validation_status": str(candidate.get("validation_status") or "").strip() or None,
+                "success_count": _safe_int(candidate.get("success_count", 0)),
+                "failure_count": _safe_int(candidate.get("failure_count", 0)),
+                "app": str(candidate.get("app") or "").strip() or None,
+                "earliest": str(candidate.get("earliest") or "").strip() or None,
+                "latest": str(candidate.get("latest") or "").strip() or None,
+            }
+        )
+
     chunk_count = len(normalized_chunks)
     contribution = (
         f"Added {chunk_count} matching artifact snippet{'s' if chunk_count != 1 else ''} to the LLM prompt context."
         if chunk_count > 0
         else "Added optional capability context to the LLM prompt."
     )
+    if normalized_reusable_queries:
+        contribution = f"{contribution} Surfaced {len(normalized_reusable_queries)} reusable SPL candidate{'s' if len(normalized_reusable_queries) != 1 else ''}."
 
     return [
         {
@@ -1986,6 +2013,7 @@ def build_capability_usage_from_rag_result(rag_result: Dict[str, Any]) -> List[D
             "used_in": "llm_prompt",
             "contribution": contribution,
             "chunks": normalized_chunks,
+            "reusable_queries": normalized_reusable_queries,
         }
     ]
 
@@ -1999,6 +2027,16 @@ def build_capability_usage_brief(capability_usage: Optional[List[Dict[str, Any]]
     for usage in capability_usage:
         if not isinstance(usage, dict):
             continue
+        reusable_queries = usage.get("reusable_queries", []) if isinstance(usage.get("reusable_queries"), list) else []
+        for candidate in reusable_queries[:1]:
+            if not isinstance(candidate, dict):
+                continue
+            query = _compact_memory_text(candidate.get("query"), limit=180)
+            if query:
+                tier = str(candidate.get("reuse_tier") or "candidate").replace("_", " ")
+                lines.append(f"- Reusable SPL ({tier}): {query}")
+        if lines:
+            break
         chunks = usage.get("chunks", []) if isinstance(usage.get("chunks", []), list) else []
         for chunk in chunks[:limit]:
             if not isinstance(chunk, dict):
@@ -2022,6 +2060,50 @@ def get_optional_rag_context(user_message: str, max_chunks: int = 3) -> Tuple[st
     context_text = str(rag_result.get("context_text") or "") if isinstance(rag_result, dict) else ""
     capability_usage = build_capability_usage_from_rag_result(rag_result)
     return context_text, capability_usage
+
+
+def _extract_mcp_result_rows(mcp_response: Any) -> List[Dict[str, Any]]:
+    if not isinstance(mcp_response, dict):
+        return []
+    result = mcp_response.get("result") if isinstance(mcp_response.get("result"), dict) else {}
+    structured_content = result.get("structuredContent") if isinstance(result.get("structuredContent"), dict) else {}
+    structured_results = structured_content.get("results") if isinstance(structured_content.get("results"), list) else []
+    if structured_results:
+        return [row for row in structured_results if isinstance(row, dict)]
+    direct_results = result.get("results") if isinstance(result.get("results"), list) else []
+    return [row for row in direct_results if isinstance(row, dict)]
+
+
+def maybe_record_rag_spl_query_feedback(
+    tool_name: str,
+    tool_arguments: Optional[Dict[str, Any]],
+    mcp_response: Optional[Dict[str, Any]] = None,
+    error_payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    normalized_tool_name = str(tool_name or "").strip().lower()
+    arguments = tool_arguments if isinstance(tool_arguments, dict) else {}
+    query = str(arguments.get("query") or "").strip()
+    if normalized_tool_name != "splunk_run_query" or not query:
+        return
+
+    feedback = {
+        "row_count": len(_extract_mcp_result_rows(mcp_response)),
+        "earliest_time": str(arguments.get("earliest_time") or "").strip(),
+        "latest_time": str(arguments.get("latest_time") or "").strip(),
+    }
+    status = "success"
+
+    if isinstance(error_payload, dict) and (error_payload.get("error") or error_payload.get("detail")):
+        status = "failure"
+        feedback["error"] = str(error_payload.get("detail") or error_payload.get("error") or "").strip()
+    elif isinstance(mcp_response, dict) and mcp_response.get("error"):
+        status = "failure"
+        feedback["error"] = str(mcp_response.get("error") or "").strip()
+
+    try:
+        capability_manager.record_rag_spl_query_feedback("rag_chromadb", query, status, feedback)
+    except Exception as exc:
+        debug_log(f"Failed to record SPL query feedback: {exc}", "warning")
 
 
 def detect_basic_inventory_intent(user_message: str, memory: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -2252,6 +2334,370 @@ def extract_spl_from_response_text(response_text: str) -> Optional[str]:
             return candidate
 
     return None
+
+
+def _normalize_extracted_spl_query(candidate: Any) -> str:
+    if not isinstance(candidate, str):
+        return ""
+
+    normalized_text = str(candidate).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized_text:
+        return ""
+
+    normalized_lines: List[str] = []
+    for index, raw_line in enumerate(normalized_text.split("\n")):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if index == 0:
+            line = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line)
+            prefix_match = re.match(r"(?i)^(?:spl(?:[_\s]+query)?|verification[_\s]+spl|query)\s*:\s*(.+)$", line)
+            if prefix_match:
+                line = prefix_match.group(1).strip()
+        normalized_lines.append(line)
+
+    return "\n".join(normalized_lines).strip()
+
+
+def _looks_like_spl_query_start(candidate: str) -> bool:
+    line = _normalize_extracted_spl_query(candidate)
+    if not line:
+        return False
+
+    return bool(
+        re.match(
+            r"(?is)^(?:search\s+|index=|\|\s*(?:tstats|mstats|from|inputlookup|metadata|rest|makeresults|dbinspect|walklex|pivot|savedsearch|multisearch|union|set))",
+            line,
+        )
+    )
+
+
+def _append_extracted_spl_query(results: List[str], seen: set, candidate: Any, max_queries: int = 8) -> None:
+    if len(results) >= max_queries:
+        return
+
+    normalized_query = _normalize_extracted_spl_query(candidate)
+    if not _looks_like_spl_query_start(normalized_query):
+        return
+
+    dedupe_key = re.sub(r"\s+", " ", normalized_query).strip().lower()
+    if not dedupe_key or dedupe_key in seen:
+        return
+
+    seen.add(dedupe_key)
+    results.append(normalized_query)
+
+
+def extract_spl_queries_from_text(text: Any, max_queries: int = 8) -> List[str]:
+    """Return distinct SPL queries that are visibly present in a text blob."""
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    results: List[str] = []
+    seen = set()
+
+    for block_match in re.finditer(r"```(?:\w+)?\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE):
+        block_content = block_match.group(1).strip()
+        first_line = next((line.strip() for line in block_content.splitlines() if line.strip()), "")
+        if _looks_like_spl_query_start(first_line):
+            _append_extracted_spl_query(results, seen, block_content, max_queries=max_queries)
+        if len(results) >= max_queries:
+            return results
+
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    line_index = 0
+    while line_index < len(lines) and len(results) < max_queries:
+        stripped_line = lines[line_index].strip()
+        candidate_start = _normalize_extracted_spl_query(stripped_line)
+        if _looks_like_spl_query_start(candidate_start):
+            block_lines = [candidate_start]
+            next_index = line_index + 1
+            while next_index < len(lines):
+                next_line = lines[next_index].strip()
+                if not next_line:
+                    break
+                if next_line.startswith("|"):
+                    block_lines.append(next_line)
+                    next_index += 1
+                    continue
+                break
+            _append_extracted_spl_query(results, seen, "\n".join(block_lines), max_queries=max_queries)
+            line_index = next_index
+            continue
+        line_index += 1
+
+    return results
+
+
+def _normalized_spl_query_signature(candidate: Any) -> str:
+    normalized_query = _normalize_extracted_spl_query(candidate)
+    if not normalized_query:
+        return ""
+    return re.sub(r"\s+", " ", normalized_query).strip().lower()
+
+
+def _iter_capability_reusable_queries(capability_usage: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    reusable_queries: List[Dict[str, Any]] = []
+    if not isinstance(capability_usage, list):
+        return reusable_queries
+
+    for usage in capability_usage:
+        if not isinstance(usage, dict):
+            continue
+        for candidate in usage.get("reusable_queries", []):
+            if not isinstance(candidate, dict):
+                continue
+            query = str(candidate.get("query") or "").strip()
+            if query:
+                reusable_queries.append(candidate)
+
+    return reusable_queries
+
+
+def _select_reusable_query_reference(
+    capability_usage: Optional[List[Dict[str, Any]]],
+    response_text: Any,
+    preferred_query: Any = None,
+) -> Any:
+    reusable_queries = _iter_capability_reusable_queries(capability_usage)
+    if not reusable_queries:
+        return None, False
+
+    target_signatures: List[str] = []
+    preferred_signature = _normalized_spl_query_signature(preferred_query)
+    if preferred_signature:
+        target_signatures.append(preferred_signature)
+
+    for extracted_query in extract_spl_queries_from_text(response_text, max_queries=3):
+        extracted_signature = _normalized_spl_query_signature(extracted_query)
+        if extracted_signature and extracted_signature not in target_signatures:
+            target_signatures.append(extracted_signature)
+
+    if not target_signatures:
+        return None, False
+
+    for target_signature in target_signatures:
+        for candidate in reusable_queries:
+            candidate_signature = _normalized_spl_query_signature(candidate.get("query"))
+            if not candidate_signature:
+                continue
+            if target_signature == candidate_signature:
+                return candidate, False
+            if candidate_signature in target_signature or target_signature in candidate_signature:
+                return candidate, True
+
+    return None, False
+
+
+def _build_reusable_query_reference_text(candidate: Dict[str, Any], adapted: bool = False) -> str:
+    title = str(candidate.get("title") or "").strip()
+    query = str(candidate.get("query") or "").strip()
+    if not title:
+        compact_query = re.sub(r"\s+", " ", _normalize_extracted_spl_query(query)).strip()
+        title = compact_query[:72].rstrip() + "..." if len(compact_query) > 72 else compact_query or "Saved SPL Query"
+
+    qualifiers: List[str] = []
+    validation_status = str(candidate.get("validation_status") or "").strip().lower()
+    environment_fit_status = str(candidate.get("environment_fit_status") or "").strip().lower()
+    success_count = _safe_int(candidate.get("success_count", 0))
+    failure_count = _safe_int(candidate.get("failure_count", 0))
+
+    if bool(candidate.get("known_good")) or validation_status == "known_good":
+        qualifiers.append("known good")
+    elif validation_status:
+        qualifiers.append(validation_status.replace("_", " "))
+
+    if environment_fit_status:
+        qualifiers.append(f"{environment_fit_status.replace('_', ' ')} fit")
+
+    if success_count or failure_count:
+        qualifiers.append(f"{success_count} success / {failure_count} failure")
+
+    qualifier_text = f" ({', '.join(qualifiers)})" if qualifiers else ""
+    prefix = "Reusable SPL reference: adapted from" if adapted else "Reusable SPL reference:"
+    return f"{prefix} \"{title}\"{qualifier_text}."
+
+
+def apply_reusable_query_reference_to_response(
+    response_text: Any,
+    capability_usage: Optional[List[Dict[str, Any]]],
+    preferred_query: Any = None,
+) -> str:
+    cleaned_response = str(response_text or "").strip()
+    if not cleaned_response or not isinstance(capability_usage, list):
+        return cleaned_response
+    if "Reusable SPL reference:" in cleaned_response:
+        return cleaned_response
+
+    candidate, adapted = _select_reusable_query_reference(
+        capability_usage,
+        cleaned_response,
+        preferred_query=preferred_query,
+    )
+    if not isinstance(candidate, dict):
+        return cleaned_response
+
+    citation = _build_reusable_query_reference_text(candidate, adapted=adapted)
+    if citation.lower() in cleaned_response.lower():
+        return cleaned_response
+    return f"{citation}\n\n{cleaned_response}"
+
+
+def _build_reusable_query_candidate_from_asset(asset: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(asset, dict):
+        return None
+
+    attributes = asset.get("attributes") if isinstance(asset.get("attributes"), dict) else {}
+    query = str(attributes.get("spl_query") or "").strip()
+    if not query:
+        return None
+
+    intelligence = attributes.get("spl_intelligence") if isinstance(attributes.get("spl_intelligence"), dict) else {}
+    environment_fit = intelligence.get("environment_fit") if isinstance(intelligence.get("environment_fit"), dict) else {}
+    validation = intelligence.get("validation") if isinstance(intelligence.get("validation"), dict) else {}
+    reuse = intelligence.get("reuse") if isinstance(intelligence.get("reuse"), dict) else {}
+
+    validation_status = str(validation.get("status") or "").strip()
+    return {
+        "title": str(asset.get("title") or "Saved SPL Query").strip() or "Saved SPL Query",
+        "query": query,
+        "reuse_tier": str(reuse.get("tier") or "candidate").strip() or "candidate",
+        "known_good": bool(reuse.get("known_good")) or validation_status == "known_good",
+        "why_reuse": str(reuse.get("guidance") or asset.get("description") or "").strip(),
+        "environment_fit_status": str(environment_fit.get("status") or "").strip() or None,
+        "environment_fit_score": _safe_int(environment_fit.get("score", 0)),
+        "validation_status": validation_status or None,
+        "success_count": _safe_int(validation.get("success_count", 0)),
+        "failure_count": _safe_int(validation.get("failure_count", 0)),
+        "app": str(attributes.get("app") or "").strip() or None,
+        "earliest": str(attributes.get("earliest") or "").strip() or None,
+        "latest": str(attributes.get("latest") or "").strip() or None,
+    }
+
+
+def _find_live_reusable_query_candidate(preferred_query: Any) -> Optional[Dict[str, Any]]:
+    preferred_signature = _normalized_spl_query_signature(preferred_query)
+    if not preferred_signature:
+        return None
+
+    try:
+        result = capability_manager.list_rag_assets("rag_chromadb")
+    except Exception:
+        return None
+
+    if not bool(getattr(result, "ok", False)):
+        return None
+
+    assets = result.details.get("assets", []) if isinstance(getattr(result, "details", {}), dict) else []
+    exact_matches: List[Dict[str, Any]] = []
+    partial_matches: List[Dict[str, Any]] = []
+
+    for asset in assets:
+        candidate = _build_reusable_query_candidate_from_asset(asset)
+        if not isinstance(candidate, dict):
+            continue
+        candidate_signature = _normalized_spl_query_signature(candidate.get("query"))
+        if not candidate_signature:
+            continue
+        if candidate_signature == preferred_signature:
+            exact_matches.append(candidate)
+            continue
+        if candidate_signature in preferred_signature or preferred_signature in candidate_signature:
+            partial_matches.append(candidate)
+
+    def candidate_rank(candidate: Dict[str, Any]) -> Any:
+        return (
+            int(bool(candidate.get("known_good"))),
+            _safe_int(candidate.get("success_count", 0)) - _safe_int(candidate.get("failure_count", 0)),
+            _safe_int(candidate.get("environment_fit_score", 0)),
+        )
+
+    if exact_matches:
+        return sorted(exact_matches, key=candidate_rank, reverse=True)[0]
+    if partial_matches:
+        return sorted(partial_matches, key=candidate_rank, reverse=True)[0]
+    return None
+
+
+def _capability_usage_contains_reusable_query(capability_usage: Optional[List[Dict[str, Any]]], query: Any) -> bool:
+    query_signature = _normalized_spl_query_signature(query)
+    if not query_signature or not isinstance(capability_usage, list):
+        return False
+
+    for usage in capability_usage:
+        if not isinstance(usage, dict):
+            continue
+        for candidate in usage.get("reusable_queries", []):
+            if not isinstance(candidate, dict):
+                continue
+            if _normalized_spl_query_signature(candidate.get("query")) == query_signature:
+                return True
+    return False
+
+
+def enrich_response_with_live_reusable_query_reference(
+    response_text: Any,
+    capability_usage: Optional[List[Dict[str, Any]]],
+    tool_calls: Optional[List[Dict[str, Any]]],
+) -> Any:
+    merged_usage = list(capability_usage or []) if isinstance(capability_usage, list) else []
+    primary_spl_query = extract_primary_spl_query(tool_calls)
+    if primary_spl_query and not _capability_usage_contains_reusable_query(merged_usage, primary_spl_query):
+        live_candidate = _find_live_reusable_query_candidate(primary_spl_query)
+        if isinstance(live_candidate, dict):
+            definition = capability_registry.get_definition("rag_chromadb")
+            merged_usage.append(
+                {
+                    "name": "rag_chromadb",
+                    "title": definition.title if definition else "RAG ChromaDB",
+                    "category": definition.category if definition else "capability",
+                    "used_in": "query_library_match",
+                    "contribution": "Matched the executed SPL against the saved SPL library.",
+                    "chunks": [],
+                    "reusable_queries": [live_candidate],
+                }
+            )
+
+    return (
+        apply_reusable_query_reference_to_response(
+            response_text,
+            merged_usage,
+            preferred_query=primary_spl_query,
+        ),
+        merged_usage,
+    )
+
+
+def extract_spl_queries_from_payload(payload: Any, max_queries: int = 8) -> List[str]:
+    """Return distinct SPL queries from nested report payloads or other structured content."""
+    results: List[str] = []
+    seen = set()
+
+    def visit(value: Any) -> None:
+        if len(results) >= max_queries:
+            return
+        if isinstance(value, str):
+            for query in extract_spl_queries_from_text(value, max_queries=max_queries - len(results)):
+                _append_extracted_spl_query(results, seen, query, max_queries=max_queries)
+            return
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                if len(results) >= max_queries:
+                    return
+                key_name = str(key or "").strip().lower()
+                if key_name in {"spl", "spl_query", "verification_spl", "query"}:
+                    _append_extracted_spl_query(results, seen, nested_value, max_queries=max_queries)
+                    continue
+                visit(nested_value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                if len(results) >= max_queries:
+                    return
+                visit(item)
+
+    visit(payload)
+    return results
 
 
 def user_requested_spl_explanation(user_message: str) -> bool:
@@ -5008,7 +5454,11 @@ async def get_report(filename: str):
         if file_path.suffix.lower() == ".json":
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = json.load(f)
-            return {"content": content, "type": "json"}
+            return {
+                "content": content,
+                "type": "json",
+                "spl_queries": extract_spl_queries_from_payload(content),
+            }
         if file_path.suffix.lower() in IMAGE_ARTIFACT_EXTENSIONS:
             image_format = 'jpeg' if file_path.suffix.lower() == '.jpg' else file_path.suffix[1:].lower()
             return {
@@ -5019,7 +5469,11 @@ async def get_report(filename: str):
         else:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            return {"content": content, "type": "text"}
+            return {
+                "content": content,
+                "type": "text",
+                "spl_queries": extract_spl_queries_from_text(content),
+            }
     except HTTPException:
         raise
     except Exception as e:
@@ -5132,6 +5586,7 @@ class RAGKnowledgeAssetImportRequest(BaseModel):
     source_label: Optional[str] = None
     description: Optional[str] = None
     tags: List[str] = []
+    attributes: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RAGContextPreviewRequest(BaseModel):
@@ -5442,6 +5897,7 @@ async def import_rag_text_asset(import_request: RAGKnowledgeAssetImportRequest):
             "source_label": import_request.source_label,
             "description": import_request.description,
             "tags": list(import_request.tags or []),
+            "attributes": dict(import_request.attributes or {}),
         },
     ).to_dict()
     _raise_for_capability_result(result)
@@ -9440,6 +9896,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
             report_context_brief = build_capability_usage_brief(report_capability_usage)
             if report_context_brief:
                 response_text = f"{response_text}\n\n{report_context_brief}"
+            response_text = apply_reusable_query_reference_to_response(response_text, report_capability_usage)
             follow_on_actions = build_report_follow_on_actions(
                 report_intent,
                 report_knowledge,
@@ -9560,6 +10017,13 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 elif index_names:
                     response_text += "\n\nIf helpful, I can list all currently available indexes."
 
+                await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
+                visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
+                response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
+                    response_text,
+                    capability_usage,
+                    latest_tool_calls,
+                )
                 updated_memory = update_chat_memory(
                     chat_session_id,
                     user_message,
@@ -9573,8 +10037,6 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                     latest_tool_calls,
                     assistant_response=response_text,
                 )
-                await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
-                visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
                 return {
                     "response": response_text,
                     "initial_response": user_message,
@@ -9653,6 +10115,13 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                     f"with `search index={normalized_index_name} | sort - _time | head 1`."
                 )
 
+            await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
+            response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
+                response_text,
+                capability_usage,
+                latest_tool_calls,
+            )
             updated_memory = update_chat_memory(
                 chat_session_id,
                 user_message,
@@ -9666,8 +10135,6 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 latest_tool_calls,
                 assistant_response=response_text,
             )
-            await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
-            visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
@@ -9806,6 +10273,13 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                         "If you use a naming convention, I can search for that exact prefix next."
                     )
 
+            await push_status(skill_status_timeline, "✅ Finalizing response", max(1, len(skill_tool_calls)))
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(skill_tool_calls)
+            response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
+                response_text,
+                capability_usage,
+                skill_tool_calls,
+            )
             updated_memory = update_chat_memory(
                 chat_session_id,
                 user_message,
@@ -9819,8 +10293,6 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 skill_tool_calls,
                 assistant_response=response_text,
             )
-            await push_status(skill_status_timeline, "✅ Finalizing response", max(1, len(skill_tool_calls)))
-            visualization_spec, capability_usage = augment_capability_usage_with_visualization(skill_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
@@ -9943,6 +10415,13 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                     f"If you want, I can retry with a custom index list or alternate status keywords used in your environment."
                 )
 
+            await push_status(offline_status_timeline, "✅ Finalizing response", max(1, len(offline_tool_calls)))
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(offline_tool_calls)
+            response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
+                response_text,
+                capability_usage,
+                offline_tool_calls,
+            )
             updated_memory = update_chat_memory(
                 chat_session_id,
                 user_message,
@@ -9956,8 +10435,6 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 offline_tool_calls,
                 assistant_response=response_text,
             )
-            await push_status(offline_status_timeline, "✅ Finalizing response", max(1, len(offline_tool_calls)))
-            visualization_spec, capability_usage = augment_capability_usage_with_visualization(offline_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
@@ -10330,6 +10807,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 basic_tool_calls.append({"iteration": 1, "tool": knowledge_tool_name, "args": args, "spl_query": None, "result": result, "summary": {"type": knowledge_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(templates)} template-like objects"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
 
             await push_status(basic_status_timeline, "✅ Finalizing response", max(1, len(basic_tool_calls)))
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(basic_tool_calls)
+            response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
+                response_text,
+                capability_usage,
+                basic_tool_calls,
+            )
             updated_memory = update_chat_memory(
                 chat_session_id,
                 user_message,
@@ -10343,7 +10826,6 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
                 basic_tool_calls,
                 assistant_response=response_text,
             )
-            visualization_spec, capability_usage = augment_capability_usage_with_visualization(basic_tool_calls)
             return {
                 "response": response_text,
                 "initial_response": user_message,
@@ -10391,6 +10873,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
 {rag_context}
 {memory_context}
 
+If optional context includes reusable SPL query candidates, prefer adapting the highest-confidence known-good query that matches the request and environment before inventing a brand-new search.
+
     Tool format: <TOOL_CALL>{{"tool": "{query_tool_name}", "args": {{"query": "YOUR_SPL_HERE"}}}}</TOOL_CALL>"""
         else:
             # Full agentic prompt for OpenAI (larger context window, better instruction following)
@@ -10408,6 +10892,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
 {rag_context}
 {discovery_age_warning if 'discovery_age_warning' in locals() else ''}
 {memory_context}
+
+When optional context includes reusable SPL query candidates, prefer adapting the highest-confidence known-good query that matches the request and environment before inventing a brand-new search.
 
 📊 DISCOVERY DATA AVAILABLE:
 Latest discovery reports are available in the output/ folder with comprehensive insights:
@@ -11654,6 +12140,13 @@ Based on your previous response, provide your next query NOW using the proper fo
                 final_answer,
                 DEFAULT_TOOL_INVESTIGATION_RESPONSE,
             )
+            primary_spl_query = extract_primary_spl_query(all_tool_calls)
+            visualization_spec, capability_usage = augment_capability_usage_with_visualization(all_tool_calls, capability_usage)
+            user_facing_final_answer = apply_reusable_query_reference_to_response(
+                user_facing_final_answer,
+                capability_usage,
+                preferred_query=primary_spl_query,
+            )
             updated_memory = update_chat_memory(
                 chat_session_id,
                 user_message,
@@ -11667,12 +12160,11 @@ Based on your previous response, provide your next query NOW using the proper fo
                 all_tool_calls,
                 assistant_response=user_facing_final_answer,
             )
-            visualization_spec, capability_usage = augment_capability_usage_with_visualization(all_tool_calls, capability_usage)
             return {
                 "response": user_facing_final_answer,
                 "initial_response": user_message,
                 "tool_calls": all_tool_calls,
-                "spl_query": extract_primary_spl_query(all_tool_calls),
+                "spl_query": primary_spl_query,
                 "visualization_spec": visualization_spec,
                 "iterations": iteration,
                 "execution_time": f"{time_module.time() - start_time:.2f}s",
@@ -11702,6 +12194,7 @@ Based on your previous response, provide your next query NOW using the proper fo
             clean_response,
             DEFAULT_DIRECT_CHAT_RESPONSE,
         )
+        direct_response = apply_reusable_query_reference_to_response(direct_response, capability_usage)
         updated_memory = update_chat_memory(
             chat_session_id,
             user_message,
@@ -11818,6 +12311,8 @@ async def execute_mcp_tool_call(tool_call, config):
                 "arguments": resolved_args
             }
         }
+        executed_tool_name = resolved_tool_name
+        executed_args = resolved_args
 
         # Debug: Log the tool call being sent
         tool_name = resolved_tool_name
@@ -11886,6 +12381,8 @@ async def execute_mcp_tool_call(tool_call, config):
                 }
             }
             response = await _post_tool_call(retried_payload)
+            executed_tool_name = retried_tool_name
+            executed_args = retried_args
             print(f"🔁 Retry response status: {response.status_code}")
         
         if response.status_code == 200:
@@ -11931,6 +12428,8 @@ async def execute_mcp_tool_call(tool_call, config):
                     "response_preview": str(mcp_response)[:200]
                 })
 
+            maybe_record_rag_spl_query_feedback(executed_tool_name, executed_args, mcp_response=mcp_response)
+
             return mcp_response
 
         error_detail = response.text[:200] if response.text else "No error details"
@@ -11940,12 +12439,14 @@ async def execute_mcp_tool_call(tool_call, config):
         fatal_statuses = {401, 403, 404}  # Auth, forbidden, not found
         is_fatal = response.status_code in fatal_statuses
 
-        return {
+        error_payload = {
             "error": f"MCP call failed: {response.status_code}",
             "detail": error_detail,
             "status_code": response.status_code,
             "fatal": is_fatal  # Signal that retrying won't help
         }
+        maybe_record_rag_spl_query_feedback(executed_tool_name, executed_args, error_payload=error_payload)
+        return error_payload
                 
     except httpx.HTTPError as e:
         print(f"❌ HTTP ERROR: {type(e).__name__} - {str(e)}")

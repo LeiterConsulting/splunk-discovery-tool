@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from capabilities.models import CapabilityConfig, CapabilityDefinition
-from capabilities.rag.asset_manager import KnowledgeAssetManager
+from capabilities.rag.asset_manager import KnowledgeAssetManager, normalize_knowledge_asset_attributes
 from capabilities.rag.base import RetrievalChunk
 
 
@@ -217,6 +217,59 @@ def _serialize_retrieval_chunk(chunk: RetrievalChunk) -> Dict[str, Any]:
     return payload
 
 
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metadata_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "known_good"}
+
+
+def _join_metadata_list(items: Any, limit: int = 8) -> str:
+    if not isinstance(items, list):
+        return ""
+    cleaned_items = [str(item).strip() for item in items if str(item).strip()]
+    return ", ".join(cleaned_items[:limit])
+
+
+def _extract_runtime_spl_metadata(asset: Dict[str, Any]) -> Dict[str, Any]:
+    attributes = normalize_knowledge_asset_attributes(asset.get("attributes") or {})
+    spl_intelligence = attributes.get("spl_intelligence") if isinstance(attributes.get("spl_intelligence"), dict) else {}
+    environment_fit = spl_intelligence.get("environment_fit") if isinstance(spl_intelligence.get("environment_fit"), dict) else {}
+    validation = spl_intelligence.get("validation") if isinstance(spl_intelligence.get("validation"), dict) else {}
+    reuse = spl_intelligence.get("reuse") if isinstance(spl_intelligence.get("reuse"), dict) else {}
+
+    return {
+        "asset_spl_query": str(attributes.get("spl_query") or "").strip(),
+        "asset_spl_intent": str(spl_intelligence.get("query_intent") or "").strip(),
+        "asset_spl_commands": _join_metadata_list(spl_intelligence.get("commands") or [], limit=10),
+        "asset_spl_indexes": _join_metadata_list(spl_intelligence.get("indexes") or [], limit=8),
+        "asset_spl_sourcetypes": _join_metadata_list(spl_intelligence.get("sourcetypes") or [], limit=8),
+        "asset_spl_hosts": _join_metadata_list(spl_intelligence.get("hosts") or [], limit=8),
+        "asset_spl_sources": _join_metadata_list(spl_intelligence.get("sources") or [], limit=8),
+        "asset_spl_environment_fit_status": str(environment_fit.get("status") or "").strip(),
+        "asset_spl_environment_fit_score": _safe_int_value(environment_fit.get("score"), 0),
+        "asset_spl_environment_fit_reason": str(environment_fit.get("reason") or "").strip(),
+        "asset_spl_validation_status": str(validation.get("status") or "").strip(),
+        "asset_spl_execution_count": _safe_int_value(validation.get("execution_count"), 0),
+        "asset_spl_success_count": _safe_int_value(validation.get("success_count"), 0),
+        "asset_spl_failure_count": _safe_int_value(validation.get("failure_count"), 0),
+        "asset_spl_last_status": str(validation.get("last_status") or "").strip(),
+        "asset_spl_reuse_tier": str(reuse.get("tier") or "").strip(),
+        "asset_spl_reuse_score": _safe_int_value(reuse.get("score"), 0),
+        "asset_spl_known_good": bool(reuse.get("known_good")) or str(validation.get("status") or "") == "known_good",
+        "asset_spl_reuse_guidance": str(reuse.get("guidance") or "").strip(),
+        "asset_app": str(attributes.get("app") or "").strip(),
+        "asset_earliest": str(attributes.get("earliest") or "").strip(),
+        "asset_latest": str(attributes.get("latest") or "").strip(),
+    }
+
+
 def _query_terms(text: Any) -> List[str]:
     terms: List[str] = []
     seen = set()
@@ -325,6 +378,11 @@ class ArtifactSourceIndexer:
         self.config = config
         self.definition = definition
         self._asset_metadata_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._asset_payload_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+    def _invalidate_asset_caches(self) -> None:
+        self._asset_metadata_cache = None
+        self._asset_payload_cache = None
 
     def get_source_dir(self) -> Path:
         return Path(str(self.config.config.get("source_dir") or self.definition.default_config.get("source_dir") or "output"))
@@ -353,6 +411,7 @@ class ArtifactSourceIndexer:
         return KnowledgeAssetManager(
             asset_dir=self.get_asset_dir(),
             manifest_path=self.get_asset_manifest_path(),
+            source_dir=self.get_source_dir(),
         )
 
     def get_index_summary(self) -> Dict[str, Any]:
@@ -407,7 +466,7 @@ class ArtifactSourceIndexer:
 
         asset_payload = detail.get("asset") if isinstance(detail.get("asset"), dict) else {}
         content_path = self.get_asset_dir() / str(asset_payload.get("content_path") or "")
-        self._asset_metadata_cache = None
+        self._invalidate_asset_caches()
         chunk_sections: List[Dict[str, Any]] = []
         if content_path.exists() and content_path.is_file():
             for document in self._documents_from_path(content_path, self.get_source_dir()):
@@ -461,7 +520,7 @@ class ArtifactSourceIndexer:
         if not source_dir.exists():
             return []
 
-        self._asset_metadata_cache = None
+        self._invalidate_asset_caches()
 
         allowed_extensions = {
             str(extension).lower()
@@ -496,7 +555,7 @@ class ArtifactSourceIndexer:
         return documents[:max_documents]
 
     def reindex(self) -> Dict[str, Any]:
-        self._asset_metadata_cache = None
+        self._invalidate_asset_caches()
         documents = self.collect_documents()
         storage_dir = self.get_storage_dir()
         storage_dir.mkdir(parents=True, exist_ok=True)
@@ -547,16 +606,33 @@ class ArtifactSourceIndexer:
         if not chunks:
             return self._empty_result(summary)
 
+        reusable_spl_queries = self._collect_reusable_spl_queries(user_message=user_message, chunks=chunks)
         lines = ["📚 OPTIONAL CHROMADB RAG CONTEXT:"]
         for index, chunk in enumerate(chunks, 1):
             source_type = str(chunk.metadata.get("source_type") or "artifact").replace("_", " ")
             lines.append(f"{index}. [{source_type}] [{chunk.source}] {chunk.snippet}")
+
+        if reusable_spl_queries:
+            lines.extend(["", "🔁 REUSABLE SPL QUERY CANDIDATES:"])
+            for index, candidate in enumerate(reusable_spl_queries, 1):
+                confidence = str(candidate.get("reuse_tier") or "candidate").replace("_", " ")
+                fit_status = str(candidate.get("environment_fit_status") or "unknown")
+                validation_status = str(candidate.get("validation_status") or "unvalidated").replace("_", " ")
+                success_count = _safe_int_value(candidate.get("success_count"), 0)
+                failure_count = _safe_int_value(candidate.get("failure_count"), 0)
+                lines.append(
+                    f"{index}. [{confidence}] [{fit_status} fit] [{validation_status}; {success_count} success / {failure_count} failure] {candidate.get('title') or 'Saved SPL Query'}"
+                )
+                lines.append(f"   Query: {candidate.get('query')}")
+                if candidate.get("why_reuse"):
+                    lines.append(f"   Why: {candidate.get('why_reuse')}")
 
         return {
             "capability": self.definition.name,
             "provider": self.definition.name,
             "context_text": "\n".join(lines),
             "chunks": [_serialize_retrieval_chunk(chunk) for chunk in chunks],
+            "reusable_spl_queries": reusable_spl_queries,
             "index_summary": summary,
         }
 
@@ -568,6 +644,7 @@ class ArtifactSourceIndexer:
         source_label: str = "",
         description: str = "",
         tags: Optional[List[str]] = None,
+        attributes: Optional[Dict[str, Any]] = None,
         auto_reindex: bool = False,
     ) -> Dict[str, Any]:
         asset = self.get_asset_manager().import_text_asset(
@@ -577,11 +654,13 @@ class ArtifactSourceIndexer:
             source_label=source_label,
             description=description,
             tags=tags,
+            attributes=attributes,
         )
-        self._asset_metadata_cache = None
+        self._invalidate_asset_caches()
         index_summary = self.reindex() if auto_reindex else self.get_index_summary()
         return {
             "asset": asset.to_dict(),
+            "asset_import_action": getattr(asset, "last_import_action", "created"),
             "asset_summary": self.get_knowledge_asset_summary(),
             "index_summary": index_summary,
             "auto_reindexed": bool(auto_reindex),
@@ -596,6 +675,7 @@ class ArtifactSourceIndexer:
         source_label: str = "",
         description: str = "",
         tags: Optional[List[str]] = None,
+        attributes: Optional[Dict[str, Any]] = None,
         auto_reindex: bool = False,
     ) -> Dict[str, Any]:
         asset = self.get_asset_manager().import_file_asset(
@@ -606,11 +686,13 @@ class ArtifactSourceIndexer:
             source_label=source_label,
             description=description,
             tags=tags,
+            attributes=attributes,
         )
-        self._asset_metadata_cache = None
+        self._invalidate_asset_caches()
         index_summary = self.reindex() if auto_reindex else self.get_index_summary()
         return {
             "asset": asset.to_dict(),
+            "asset_import_action": getattr(asset, "last_import_action", "created"),
             "asset_summary": self.get_knowledge_asset_summary(),
             "index_summary": index_summary,
             "auto_reindexed": bool(auto_reindex),
@@ -618,7 +700,7 @@ class ArtifactSourceIndexer:
 
     def delete_knowledge_asset(self, asset_id: str, auto_reindex: bool = False) -> Dict[str, Any]:
         deleted = self.get_asset_manager().delete_asset(asset_id=asset_id)
-        self._asset_metadata_cache = None
+        self._invalidate_asset_caches()
         if deleted is None:
             return {
                 "deleted": False,
@@ -635,6 +717,21 @@ class ArtifactSourceIndexer:
             "asset_summary": self.get_knowledge_asset_summary(),
             "index_summary": index_summary,
             "auto_reindexed": bool(auto_reindex),
+        }
+
+    def record_spl_query_feedback(self, query: str, status: str, feedback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        updated_asset = self.get_asset_manager().record_spl_query_feedback(
+            query=query,
+            status=status,
+            feedback=feedback,
+        )
+        self._invalidate_asset_caches()
+        return {
+            "found": updated_asset is not None,
+            "asset": updated_asset.to_dict() if updated_asset is not None else None,
+            "asset_summary": self.get_knowledge_asset_summary(),
+            "index_summary": self.get_index_summary(),
+            "feedback_recorded": updated_asset is not None,
         }
 
     def check_in_knowledge_asset(self, asset_id: str, auto_reindex: bool = False) -> Dict[str, Any]:
@@ -674,7 +771,7 @@ class ArtifactSourceIndexer:
         else:
             updated_asset = manager.check_out_asset(asset_id)
 
-        self._asset_metadata_cache = None
+        self._invalidate_asset_caches()
         if updated_asset is None:
             return {
                 "found": False,
@@ -704,6 +801,7 @@ class ArtifactSourceIndexer:
             source_type="knowledge_asset",
         )
         asset_summary = self.get_knowledge_asset_summary()
+        reusable_spl_queries = self._collect_reusable_spl_queries(user_message=normalized_query, chunks=chunks)
         if not chunks:
             return {
                 "query": normalized_query,
@@ -711,6 +809,7 @@ class ArtifactSourceIndexer:
                 "operator_brief": "",
                 "chunks": [],
                 "matched_assets": [],
+                "reusable_spl_queries": [],
                 "retrieved_key_points": [],
                 "recommended_uses": [],
                 "coverage_gaps": [],
@@ -768,6 +867,14 @@ class ArtifactSourceIndexer:
                     "focus_terms": focus_terms,
                     "key_points": key_points,
                     "usage_guidance": usage_guidance,
+                    "spl_query": str(metadata.get("asset_spl_query") or "").strip() or None,
+                    "reuse_tier": str(metadata.get("asset_spl_reuse_tier") or "").strip() or None,
+                    "reuse_score": _safe_int_value(metadata.get("asset_spl_reuse_score"), 0),
+                    "known_good": _metadata_truthy(metadata.get("asset_spl_known_good")),
+                    "validation_status": str(metadata.get("asset_spl_validation_status") or "").strip() or None,
+                    "environment_fit_status": str(metadata.get("asset_spl_environment_fit_status") or "").strip() or None,
+                    "environment_fit_score": _safe_int_value(metadata.get("asset_spl_environment_fit_score"), 0),
+                    "environment_fit_reason": str(metadata.get("asset_spl_environment_fit_reason") or "").strip(),
                     "matched_sections": matched_sections,
                     "matched_chunk_ids": [chunk_document_id] if chunk_document_id else [],
                     "matched_chunks": _merge_traceable_chunk_refs([], [chunk_reference], limit=6),
@@ -820,6 +927,7 @@ class ArtifactSourceIndexer:
             "operator_brief": brief["text"],
             "chunks": serialized_chunks,
             "matched_assets": matched_assets,
+            "reusable_spl_queries": reusable_spl_queries,
             "retrieved_key_points": brief["key_points"],
             "recommended_uses": brief["recommended_uses"],
             "coverage_gaps": brief["coverage_gaps"],
@@ -854,9 +962,10 @@ class ArtifactSourceIndexer:
         except Exception:
             return summary, []
 
+        requested_results = max(1, min(int(max_chunks or 3), 6))
         query_kwargs: Dict[str, Any] = {
             "query_texts": [user_message],
-            "n_results": max(1, min(int(max_chunks or 3), 6)),
+            "n_results": max(requested_results, min(12, requested_results * 3)),
             "include": ["documents", "metadatas", "distances"],
         }
         if source_type:
@@ -876,19 +985,27 @@ class ArtifactSourceIndexer:
             if not isinstance(snippet, str) or not snippet.strip():
                 continue
             metadata = result_metadatas[index] if index < len(result_metadatas) and isinstance(result_metadatas[index], dict) else {}
+            metadata = self._merge_live_asset_metadata(metadata)
             distance = result_distances[index] if index < len(result_distances) else None
             section = str(metadata.get("section") or "").strip()
             source_name = str(metadata.get("source_name") or metadata.get("source_path") or "artifact").strip() or "artifact"
             source_label = f"{source_name} :: {section}" if section and section != source_name else source_name
+            base_score = self._distance_to_score(distance, index)
+            reuse_bonus, reuse_reason = self._score_reusable_spl_bonus(user_message=user_message, metadata=metadata)
+            if reuse_bonus:
+                metadata = dict(metadata)
+                metadata["asset_spl_reuse_bonus"] = reuse_bonus
+                metadata["asset_spl_reuse_reason"] = reuse_reason
             chunks.append(
                 RetrievalChunk(
                     source=source_label,
-                    score=self._distance_to_score(distance, index),
+                    score=max(1, min(100, base_score + reuse_bonus)),
                     snippet=snippet.strip(),
                     metadata=metadata,
                 )
             )
-        return summary, chunks
+        chunks.sort(key=lambda chunk: -(chunk.score or 0))
+        return summary, chunks[:requested_results]
 
     def _documents_from_path(self, file_path: Path, source_root: Path) -> List[IndexedArtifactDocument]:
         if file_path.suffix.lower() == ".json":
@@ -1078,6 +1195,156 @@ class ArtifactSourceIndexer:
         raw = f"{source_path}:{suffix}".encode("utf-8")
         return hashlib.sha1(raw).hexdigest()
 
+    def _current_asset_payload_by_id(self) -> Dict[str, Dict[str, Any]]:
+        if self._asset_payload_cache is None:
+            self._asset_payload_cache = {}
+            for asset in self.get_asset_manager().list_assets().get("assets", []):
+                if not isinstance(asset, dict):
+                    continue
+                asset_id = str(asset.get("asset_id") or "").strip()
+                if not asset_id:
+                    continue
+                self._asset_payload_cache[asset_id] = dict(asset)
+        return self._asset_payload_cache
+
+    def _merge_live_asset_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        asset_id = str((metadata or {}).get("asset_id") or "").strip()
+        if not asset_id:
+            return dict(metadata or {})
+
+        asset = self._current_asset_payload_by_id().get(asset_id)
+        if not isinstance(asset, dict):
+            return dict(metadata or {})
+
+        merged = dict(metadata or {})
+        merged.update(
+            {
+                "asset_title": str(asset.get("title") or merged.get("asset_title") or "").strip(),
+                "asset_type": str(asset.get("asset_type") or merged.get("asset_type") or "reference_document").strip(),
+                "asset_source_label": str(asset.get("source_label") or merged.get("asset_source_label") or "").strip(),
+                "asset_summary": str(asset.get("summary") or merged.get("asset_summary") or "").strip(),
+                "asset_tags": ", ".join(asset.get("tags") or []),
+                "asset_focus_terms": ", ".join(asset.get("focus_terms") or []),
+                "asset_key_points": "\n".join(asset.get("key_points") or []),
+                "asset_usage_guidance": "\n".join(asset.get("usage_guidance") or []),
+                **_extract_runtime_spl_metadata(asset),
+            }
+        )
+        return merged
+
+    def _score_reusable_spl_bonus(self, user_message: str, metadata: Dict[str, Any]) -> Any:
+        if str(metadata.get("asset_type") or "").strip().lower() != "spl_query_library":
+            return 0, ""
+
+        query_terms = set(_query_terms(user_message))
+        overlap_terms = self._match_focus_terms(
+            query_terms,
+            metadata.get("asset_title"),
+            metadata.get("asset_source_label"),
+            _split_metadata_list(metadata.get("asset_focus_terms"), limit=8),
+            _split_metadata_list(metadata.get("asset_spl_indexes"), limit=8),
+            _split_metadata_list(metadata.get("asset_spl_sourcetypes"), limit=8),
+            metadata.get("asset_spl_query"),
+            metadata.get("asset_spl_intent"),
+        )
+
+        bonus = 4
+        reasons: List[str] = []
+        reuse_score = _safe_int_value(metadata.get("asset_spl_reuse_score"), 0)
+        fit_score = _safe_int_value(metadata.get("asset_spl_environment_fit_score"), 0)
+        validation_status = str(metadata.get("asset_spl_validation_status") or "").strip().lower()
+
+        bonus += min(16, reuse_score // 6)
+        bonus += min(10, fit_score // 10)
+
+        if _metadata_truthy(metadata.get("asset_spl_known_good")):
+            bonus += 18
+            reasons.append("known good in this environment")
+        elif validation_status == "mixed":
+            bonus += 6
+            reasons.append("partially validated")
+        elif validation_status == "failing":
+            bonus -= 10
+            reasons.append("recent failures recorded")
+
+        if overlap_terms:
+            bonus += min(14, len(overlap_terms) * 4)
+            reasons.append(f"matched request terms: {', '.join(overlap_terms[:4])}")
+
+        bonus = max(-10, min(36, bonus))
+        return bonus, "; ".join(reasons[:3])
+
+    def _collect_reusable_spl_queries(self, user_message: str, chunks: List[RetrievalChunk]) -> List[Dict[str, Any]]:
+        query_terms = set(_query_terms(user_message))
+        candidates: List[Dict[str, Any]] = []
+        seen = set()
+
+        for chunk in chunks:
+            metadata = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+            if str(metadata.get("asset_type") or "").strip().lower() != "spl_query_library":
+                continue
+            spl_query = str(metadata.get("asset_spl_query") or "").strip()
+            if not spl_query:
+                continue
+
+            asset_id = str(metadata.get("asset_id") or "").strip()
+            dedupe_key = asset_id or re.sub(r"\s+", " ", spl_query).strip().lower()
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            matched_terms = self._match_focus_terms(
+                query_terms,
+                metadata.get("asset_title"),
+                metadata.get("asset_source_label"),
+                _split_metadata_list(metadata.get("asset_focus_terms"), limit=8),
+                _split_metadata_list(metadata.get("asset_spl_indexes"), limit=8),
+                _split_metadata_list(metadata.get("asset_spl_sourcetypes"), limit=8),
+                spl_query,
+                metadata.get("asset_spl_intent"),
+            )
+
+            reasons: List[str] = []
+            reuse_reason = str(metadata.get("asset_spl_reuse_guidance") or metadata.get("asset_spl_reuse_reason") or "").strip()
+            if reuse_reason:
+                reasons.append(reuse_reason)
+            fit_reason = str(metadata.get("asset_spl_environment_fit_reason") or "").strip()
+            if fit_reason:
+                reasons.append(fit_reason)
+            if matched_terms:
+                reasons.append(f"Matched request terms: {', '.join(matched_terms[:4])}.")
+
+            candidates.append(
+                {
+                    "asset_id": asset_id,
+                    "title": str(metadata.get("asset_title") or "Saved SPL Query").strip() or "Saved SPL Query",
+                    "query": spl_query,
+                    "source_label": str(metadata.get("asset_source_label") or "").strip(),
+                    "intent": str(metadata.get("asset_spl_intent") or "").strip(),
+                    "environment_fit_status": str(metadata.get("asset_spl_environment_fit_status") or "").strip(),
+                    "environment_fit_score": _safe_int_value(metadata.get("asset_spl_environment_fit_score"), 0),
+                    "validation_status": str(metadata.get("asset_spl_validation_status") or "").strip(),
+                    "success_count": _safe_int_value(metadata.get("asset_spl_success_count"), 0),
+                    "failure_count": _safe_int_value(metadata.get("asset_spl_failure_count"), 0),
+                    "reuse_tier": str(metadata.get("asset_spl_reuse_tier") or "candidate").strip(),
+                    "reuse_score": _safe_int_value(metadata.get("asset_spl_reuse_score"), 0),
+                    "known_good": _metadata_truthy(metadata.get("asset_spl_known_good")),
+                    "why_reuse": " ".join(reasons[:3]).strip(),
+                    "app": str(metadata.get("asset_app") or "").strip(),
+                    "earliest": str(metadata.get("asset_earliest") or "").strip(),
+                    "latest": str(metadata.get("asset_latest") or "").strip(),
+                }
+            )
+
+        candidates.sort(
+            key=lambda candidate: (
+                -int(bool(candidate.get("known_good"))),
+                -_safe_int_value(candidate.get("reuse_score"), 0),
+                -_safe_int_value(candidate.get("environment_fit_score"), 0),
+            )
+        )
+        return candidates[:3]
+
     def _knowledge_asset_metadata(self, source_path: str) -> Dict[str, Any]:
         if self._asset_metadata_cache is None:
             self._asset_metadata_cache = {}
@@ -1100,6 +1367,7 @@ class ArtifactSourceIndexer:
                     "asset_usage_guidance": "\n".join(asset.get("usage_guidance") or []),
                     "asset_import_method": str(asset.get("import_method") or "text").strip(),
                     "asset_original_filename": str(asset.get("original_filename") or "").strip(),
+                    **_extract_runtime_spl_metadata(asset),
                 }
 
         return dict(self._asset_metadata_cache.get(Path(source_path).name, {}))
@@ -1169,6 +1437,13 @@ class ArtifactSourceIndexer:
             lines.extend([f"- {item}" for item in key_points[:4]])
         if focus_terms:
             lines.extend(["", f"Focus terms: {', '.join(focus_terms[:8])}"])
+        reusable_spl_assets = [asset for asset in matched_assets if asset.get("spl_query")]
+        if reusable_spl_assets:
+            lines.extend(["", "Reusable SPL candidates:"])
+            for asset in reusable_spl_assets[:2]:
+                tier = str(asset.get("reuse_tier") or "candidate").replace("_", " ")
+                fit_status = str(asset.get("environment_fit_status") or "unknown")
+                lines.append(f"- {asset.get('title')}: {tier} reuse, {fit_status} fit.")
         if coverage_gaps:
             lines.extend(["", "Potential gaps:"])
             lines.extend([f"- {item}" for item in coverage_gaps[:3]])
