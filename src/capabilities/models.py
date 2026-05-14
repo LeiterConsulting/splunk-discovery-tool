@@ -12,6 +12,9 @@ class CapabilityDefinition:
     title: str
     category: str
     description: str
+    purpose: str = ""
+    intent: str = ""
+    capability_set: List[str] = field(default_factory=list)
     install_method: str = "internal"
     dependency_packages: List[str] = field(default_factory=list)
     module_probes: List[str] = field(default_factory=list)

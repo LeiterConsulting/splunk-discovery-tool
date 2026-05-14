@@ -594,11 +594,163 @@ def _build_response_follow_on_label(prompt: str, limit: int = 72) -> str:
     return f"{shortened or label[:limit].strip()}..."
 
 
+_RESPONSE_FOLLOW_ON_LIST_ITEM_PATTERN = re.compile(r"^\s*(?:[-*•]+|\d+[.)])\s+(?P<action>.+?)\s*$")
+_RESPONSE_FOLLOW_ON_INLINE_MARKER_PATTERN = re.compile(r"(?:(?<=^)|(?<=[\s,;]))(?P<marker>\d+[.)]|[-*•])\s+")
+_RESPONSE_FOLLOW_ON_TRUNCATED_INLINE_PATTERN = re.compile(r":\s*(?:\d+[.)]?|[-*•])$")
+
+
+def _is_response_follow_on_list_lead_in(line: str) -> bool:
+    normalized = re.sub(r'\s+', ' ', str(line or '')).strip().lower().rstrip(' :;,.')
+    if not normalized:
+        return False
+
+    trigger_match = (
+        normalized.startswith("if you'd like")
+        or normalized.startswith("if you’d like")
+        or normalized.startswith("if you would like")
+        or normalized.startswith("if you want")
+        or normalized.startswith("if helpful")
+        or normalized.startswith("things i can do next")
+        or normalized.startswith("next steps i can")
+        or normalized.startswith("here are")
+        or normalized.startswith("here's")
+    )
+    if not trigger_match:
+        return False
+
+    return (
+        normalized.endswith("i can")
+        or normalized.endswith("following")
+        or normalized.endswith("make this")
+        or normalized.endswith("turn this into")
+        or "next steps" in normalized
+        or "options" in normalized
+        or "things i can do next" in normalized
+        or "things i can" in normalized
+    )
+
+
+def _is_response_follow_on_wrapper_prompt(prompt: str) -> bool:
+    normalized = re.sub(r'\s+', ' ', str(prompt or '')).strip().lower().rstrip(' :;,.')
+    if not normalized:
+        return False
+    if normalized in {"following", "the following", "next steps", "options", "things i can do next"}:
+        return True
+    return bool(re.fullmatch(
+        r"(?:do|help with|take|offer)(?:\s+(?:any|one|some))?\s*(?:of\s+)?(?:the|these)?\s*(?:following|next steps|options)",
+        normalized,
+    ))
+
+
+def _expand_response_follow_on_inline_actions(action_text: str) -> List[str]:
+    raw_action = re.sub(r'\s+', ' ', str(action_text or '')).strip()
+    if not raw_action:
+        return []
+
+    prefix, separator, suffix = raw_action.partition(':')
+    if not separator:
+        normalized_action = _normalize_response_follow_on_text(raw_action)
+        return [normalized_action] if normalized_action else []
+
+    matches = list(_RESPONSE_FOLLOW_ON_INLINE_MARKER_PATTERN.finditer(suffix))
+    if not matches:
+        normalized_action = _normalize_response_follow_on_text(raw_action)
+        return [normalized_action] if normalized_action else []
+
+    cleaned_prefix = _normalize_response_follow_on_text(prefix)
+    prompts: List[str] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(suffix)
+        item_text = suffix[start:end].strip(" \t\r\n,;")
+        item_text = re.sub(r'^(?:and|or)\s+', '', item_text, flags=re.IGNORECASE)
+        item_text = re.sub(r'(?:,|;)\s*(?:and|or)\s*$', '', item_text, flags=re.IGNORECASE)
+        if not item_text:
+            continue
+
+        if cleaned_prefix and not _is_response_follow_on_wrapper_prompt(cleaned_prefix):
+            combined_prompt = _normalize_response_follow_on_text(f"{prefix.strip()} {item_text}")
+            if combined_prompt:
+                prompts.append(combined_prompt)
+            continue
+
+        normalized_item = _normalize_response_follow_on_text(item_text)
+        if normalized_item:
+            prompts.append(normalized_item)
+
+    if prompts:
+        return prompts
+
+    normalized_action = _normalize_response_follow_on_text(raw_action)
+    return [normalized_action] if normalized_action else []
+
+
+def _extract_response_follow_on_list_actions(
+    cleaned_response: str,
+    seen_prompts: set[str],
+    ignored_prefixes: Tuple[str, ...],
+) -> List[Dict[str, str]]:
+    actions: List[Dict[str, str]] = []
+    lines = str(cleaned_response or '').splitlines()
+    line_index = 0
+
+    while line_index < len(lines):
+        if not _is_response_follow_on_list_lead_in(lines[line_index]):
+            line_index += 1
+            continue
+
+        candidate_index = line_index + 1
+        found_list_item = False
+
+        while candidate_index < len(lines):
+            raw_line = lines[candidate_index]
+            stripped_line = raw_line.strip()
+            if not stripped_line:
+                if found_list_item:
+                    break
+                candidate_index += 1
+                continue
+
+            match = _RESPONSE_FOLLOW_ON_LIST_ITEM_PATTERN.match(raw_line)
+            if not match:
+                break
+
+            found_list_item = True
+            prompt = _normalize_response_follow_on_text(match.group('action'))
+            lowered_prompt = prompt.lower()
+            if (
+                len(prompt.split()) >= 3
+                and not lowered_prompt.startswith(ignored_prefixes)
+                and not _is_response_follow_on_wrapper_prompt(prompt)
+                and lowered_prompt not in seen_prompts
+            ):
+                seen_prompts.add(lowered_prompt)
+                actions.append(_make_follow_on_action(
+                    _build_response_follow_on_label(prompt),
+                    prompt,
+                    'assistant_response_follow_up',
+                ))
+
+            candidate_index += 1
+
+        line_index = candidate_index if candidate_index > line_index else line_index + 1
+
+    return actions
+
+
 def _extract_response_follow_on_actions(assistant_response: str) -> List[Dict[str, str]]:
     cleaned_response = sanitize_llm_response_text(str(assistant_response or ''))
     if not cleaned_response:
         return []
 
+    inline_list_patterns = [
+        r"\bif you(?:'d|’d|\swould)? like,?\s+i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bif you want(?:\s+[^,.!?\n]+)?[,;]?\s+i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bif helpful,?\s+i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bor i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bi can also\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bi can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
+    ]
     patterns = [
         r"\ba good follow[ -]?up(?: question| step| action)?\s+(?:would be(?: to)?|is|might be|could be)\s+(?P<action>[^.!?\n]+)",
         r"\bif you(?:'d|’d|\swould)? like,?\s+i can\s+(?P<action>[^.!?\n]+)",
@@ -619,20 +771,47 @@ def _extract_response_follow_on_actions(assistant_response: str) -> List[Dict[st
 
     actions: List[Dict[str, str]] = []
     seen_prompts = set()
+    actions.extend(_extract_response_follow_on_list_actions(cleaned_response, seen_prompts, ignored_prefixes))
+
+    for pattern in inline_list_patterns:
+        for match in re.finditer(pattern, cleaned_response, flags=re.IGNORECASE):
+            for prompt in _expand_response_follow_on_inline_actions(match.group('action')):
+                lowered_prompt = prompt.lower()
+                if (
+                    len(prompt.split()) < 3
+                    or lowered_prompt.startswith(ignored_prefixes)
+                    or _is_response_follow_on_wrapper_prompt(prompt)
+                    or _RESPONSE_FOLLOW_ON_TRUNCATED_INLINE_PATTERN.search(prompt)
+                ):
+                    continue
+                if lowered_prompt in seen_prompts:
+                    continue
+                seen_prompts.add(lowered_prompt)
+                actions.append(_make_follow_on_action(
+                    _build_response_follow_on_label(prompt),
+                    prompt,
+                    'assistant_response_follow_up',
+                ))
+
     for pattern in patterns:
         for match in re.finditer(pattern, cleaned_response, flags=re.IGNORECASE):
-            prompt = _normalize_response_follow_on_text(match.group('action'))
-            lowered_prompt = prompt.lower()
-            if len(prompt.split()) < 3 or lowered_prompt.startswith(ignored_prefixes):
-                continue
-            if lowered_prompt in seen_prompts:
-                continue
-            seen_prompts.add(lowered_prompt)
-            actions.append(_make_follow_on_action(
-                _build_response_follow_on_label(prompt),
-                prompt,
-                'assistant_response_follow_up',
-            ))
+            for prompt in _expand_response_follow_on_inline_actions(match.group('action')):
+                lowered_prompt = prompt.lower()
+                if (
+                    len(prompt.split()) < 3
+                    or lowered_prompt.startswith(ignored_prefixes)
+                    or _is_response_follow_on_wrapper_prompt(prompt)
+                    or _RESPONSE_FOLLOW_ON_TRUNCATED_INLINE_PATTERN.search(prompt)
+                ):
+                    continue
+                if lowered_prompt in seen_prompts:
+                    continue
+                seen_prompts.add(lowered_prompt)
+                actions.append(_make_follow_on_action(
+                    _build_response_follow_on_label(prompt),
+                    prompt,
+                    'assistant_response_follow_up',
+                ))
 
     return _dedupe_follow_on_actions(actions, limit=3)
 

@@ -134,6 +134,9 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 self.assertTrue(state["enabled"])
                 self.assertEqual(state["config"]["source_dir"], str(output_dir))
                 self.assertEqual(state["health_status"], "ready")
+                self.assertTrue(state["purpose"])
+                self.assertTrue(state["intent"])
+                self.assertGreaterEqual(len(state["capability_set"]), 1)
             finally:
                 os.chdir(original_cwd)
 

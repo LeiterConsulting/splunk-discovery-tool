@@ -11,6 +11,13 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         title="Local Artifact Search",
         category="rag",
         description="Quick search across recent DT4SMS discovery outputs stored locally.",
+        purpose="Provide lightweight local retrieval over recent discovery outputs without requiring an external index service.",
+        intent="Help operators quickly reference generated artifacts and reports during active investigation or follow-on questioning.",
+        capability_set=[
+            "Search recent discovery reports, summaries, and runbooks stored in the local output workspace.",
+            "Extract short context snippets from matching files for assistant follow-up questions.",
+            "Operate with bundled application logic and no additional runtime services.",
+        ],
         install_method="internal",
         default_config={
             "source_dir": "output",
@@ -30,6 +37,13 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         title="Indexed Artifact Search",
         category="rag",
         description="Indexed artifact search plus managed knowledge assets for context-rich retrieval.",
+        purpose="Provide indexed retrieval and managed knowledge assets for deeper, reusable operator context.",
+        intent="Support context-rich investigations where generated artifacts alone are not enough and the assistant needs indexed history, documentation, and operator-authored context.",
+        capability_set=[
+            "Index discovery artifacts into persistent retrieval storage for higher-recall context assembly.",
+            "Manage imported knowledge assets such as runbooks, reference notes, and connected-system context.",
+            "Preview the exact context chunks retrieval will assemble before using them in chat.",
+        ],
         install_method="pip",
         dependency_packages=["chromadb"],
         module_probes=["chromadb"],
@@ -58,6 +72,13 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         title="Splunk Deeplink Tools",
         category="tool_pack",
         description="Deep link generation for investigations and operator pivots.",
+        purpose="Generate direct Splunk Web links that turn assistant output into an operator handoff path.",
+        intent="Reduce friction between analysis in DT4SMS and action in Splunk by making searches easy to open, validate, and share.",
+        capability_set=[
+            "Build deep links for SPL searches with app and time-range controls.",
+            "Expose open-in-Splunk actions from assistant query responses and capability tools.",
+            "Resolve and validate the target Splunk Web base URL used for pivots.",
+        ],
         install_method="internal",
         default_config={
             "web_base_url": "",
@@ -76,6 +97,13 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         title="Visualization Tools",
         category="tool_pack",
         description="Charting and visual artifact generation from Splunk results.",
+        purpose="Turn chartable query results into visual previews that are easier to scan than raw tables.",
+        intent="Improve operator comprehension when a trend, breakdown, or aggregate is better understood visually than text-only output.",
+        capability_set=[
+            "Render inline preview charts for supported query results.",
+            "Support common operational chart types such as line and bar views.",
+            "Control preview limits and supported result-shape handling.",
+        ],
         install_method="internal",
         default_config={
             "preview_enabled": True,
@@ -92,6 +120,13 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         title="Export Tools",
         category="tool_pack",
         description="Create report packages for reports and presentations.",
+        purpose="Package discovery outputs into reusable report bundles for handoff, review, and presentations.",
+        intent="Give operators a fast way to collect the current session narrative, artifacts, and supporting files into a portable deliverable.",
+        capability_set=[
+            "Build downloadable report packages from discovery outputs and runbook content.",
+            "Emit manifest and summary-note artifacts alongside bundle exports.",
+            "Track available sessions and recently generated packages inside the app.",
+        ],
         install_method="internal",
         default_config={
             "source_dir": "output",
