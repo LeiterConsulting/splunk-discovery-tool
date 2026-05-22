@@ -147,6 +147,16 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertNotIn("await loadCredentialIntoSettings(data.active_credential_name);", template_source)
         self.assertNotIn("Credential Loaded!", template_source)
 
+    def test_settings_modal_declares_first_party_ollama_provider(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("<option value=\"ollama\">Ollama</option>", template_source)
+        self.assertIn("selectedProvider === 'ollama' ? 'http://localhost:11434' :", template_source)
+        self.assertIn("selectedProvider === 'ollama' ? 'gpt-oss:20b or llama3.2:1b' :", template_source)
+        self.assertIn("Optional for local Ollama", template_source)
+        self.assertIn("Ollama uses the native <span className=\"font-mono\">/api/tags</span> model inventory", template_source)
+        self.assertIn("endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : null", template_source)
+
     def test_discovery_status_declares_passive_polling_fallback(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 

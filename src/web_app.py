@@ -45,10 +45,12 @@ from capabilities import CapabilityManager, CapabilityRegistry
 from discovery.engine import DiscoveryEngine
 from discovery.v2_pipeline import DiscoveryV2Pipeline
 from llm.factory import (
+    DEFAULT_OLLAMA_ENDPOINT_URL,
     LLMClientFactory,
     filter_openai_generation_models,
     get_openai_model_capabilities,
     is_openai_image_generation_model,
+    normalize_ollama_endpoint_url,
     normalize_provider_name,
 )
 from discovery.context_manager import get_context_manager
@@ -12153,6 +12155,39 @@ async def list_models(request: Request):
                         models.append(name)
                 return {'models': sorted({m for m in models if isinstance(m, str)})}
 
+            if provider == 'ollama':
+                base = normalize_ollama_endpoint_url(endpoint_url)
+                models = []
+
+                response = await client.get(f"{base}/api/tags")
+                response.raise_for_status()
+                payload = response.json()
+
+                for item in payload.get('models', []):
+                    if not isinstance(item, dict):
+                        continue
+                    model_name = item.get('name') or item.get('model') or item.get('id')
+                    if isinstance(model_name, str) and model_name.strip():
+                        models.append(model_name)
+
+                if not models:
+                    try:
+                        fallback_response = await client.get(f"{base}/v1/models")
+                        fallback_response.raise_for_status()
+                        fallback_payload = fallback_response.json()
+                        models.extend([
+                            item.get('id')
+                            for item in fallback_payload.get('data', [])
+                            if isinstance(item, dict) and item.get('id')
+                        ])
+                    except Exception:
+                        pass
+
+                if not models:
+                    raise HTTPException(status_code=400, detail="Could not fetch models from Ollama endpoint")
+
+                return {'models': sorted({m for m in models if isinstance(m, str)})}
+
             if provider == 'custom':
                 if not endpoint_url:
                     raise HTTPException(status_code=400, detail="Endpoint URL required for custom provider")
@@ -12452,6 +12487,9 @@ async def assess_max_tokens(request: Request):
         api_key = llm_payload.get("api_key", config.llm.api_key)
         model = llm_payload.get("model", config.llm.model)
         endpoint_url = llm_payload.get("endpoint_url", config.llm.endpoint_url)
+
+        if provider == "ollama":
+            endpoint_url = normalize_ollama_endpoint_url(endpoint_url)
         
         if provider in {"openai", "azure", "anthropic", "gemini"} and not api_key:
             raise HTTPException(status_code=400, detail="LLM API key not configured")
@@ -12469,6 +12507,7 @@ async def assess_max_tokens(request: Request):
                 "azure": 8000,
                 "anthropic": 8192,
                 "gemini": 8192,
+                "ollama": 4096,
                 "custom": 4000,
             }
             fallback = defaults.get(provider, 4000)
@@ -12558,6 +12597,9 @@ async def test_llm_connection(request: Request):
         max_tokens = int(llm_payload.get("max_tokens", current_config.llm.max_tokens or 1000))
         temperature = float(llm_payload.get("temperature", current_config.llm.temperature or 0.7))
 
+        if provider == "ollama":
+            endpoint_url = normalize_ollama_endpoint_url(endpoint_url)
+
         if provider in {"azure", "custom"} and not endpoint_url:
             return {
                 "status": "error",
@@ -12590,6 +12632,7 @@ async def test_llm_connection(request: Request):
                 "openai": "https://api.openai.com",
                 "anthropic": "https://api.anthropic.com",
                 "gemini": "https://generativelanguage.googleapis.com",
+                "ollama": DEFAULT_OLLAMA_ENDPOINT_URL,
             }.get(provider, "n/a"),
             "tests": {}
         }
@@ -12656,6 +12699,22 @@ async def test_llm_connection(request: Request):
                     probe = await client.get(f"{base}/v1beta/models?key={quote(api_key)}")
                     probe.raise_for_status()
                     results["tests"]["connection"] = {"status": "success", "message": "Gemini models endpoint reachable"}
+
+                elif provider == "ollama":
+                    base = normalize_ollama_endpoint_url(endpoint_url)
+                    probe = await client.get(f"{base}/api/tags")
+                    probe.raise_for_status()
+                    probe_payload = probe.json() if hasattr(probe, "json") else {}
+                    ollama_models = []
+                    for item in probe_payload.get("models", []):
+                        if not isinstance(item, dict):
+                            continue
+                        model_name = item.get("name") or item.get("model") or item.get("id")
+                        if isinstance(model_name, str) and model_name.strip():
+                            ollama_models.append(model_name)
+                    if ollama_models:
+                        results["available_models"] = sorted({name for name in ollama_models})
+                    results["tests"]["connection"] = {"status": "success", "message": "Ollama model inventory reachable"}
 
                 else:  # custom
                     base = endpoint_url.rstrip('/')
@@ -12743,6 +12802,8 @@ async def test_llm_connection(request: Request):
                 recommended_max = max(512, min(max_tokens, 8192))
             elif provider == "anthropic":
                 recommended_max = max(512, min(max_tokens, 8192))
+            elif provider == "ollama":
+                recommended_max = max(512, min(max_tokens, 4096))
             elif provider == "custom":
                 recommended_max = max(512, min(max_tokens, 4096))
 

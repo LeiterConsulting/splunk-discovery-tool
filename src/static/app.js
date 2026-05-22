@@ -394,6 +394,7 @@
     if (value === "azure openai") return "azure";
     if (value === "claude") return "anthropic";
     if (value === "google" || value === "google ai") return "gemini";
+    if (value === "local ollama" || value === "ollama endpoint") return "ollama";
     return value;
   };
   class ErrorBoundary extends React.Component {
@@ -1926,8 +1927,21 @@
     ];
     const handleSettingsChange = () => {
     };
+    const getApiKeyPlaceholderForProvider = (provider, hasStoredKey = false) => {
+      if (hasStoredKey) {
+        return "(Already Configured)";
+      }
+      const normalizedProvider = normalizeProvider(provider);
+      if (normalizedProvider === "ollama") {
+        return "Optional for secured or proxied Ollama";
+      }
+      if (normalizedProvider === "custom") {
+        return "Optional for local LLMs";
+      }
+      return "Enter API key";
+    };
     const handleApiKeyChange = () => {
-      setApiKeyPlaceholder("Enter API key");
+      setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(selectedProvider));
       handleSettingsChange();
     };
     const SECURITY_ROLE_OPTIONS = ["admin", "analyst", "viewer"];
@@ -4798,7 +4812,7 @@
         setConfig(data);
         setSelectedProvider(normalizeProvider(data.llm.provider || "openai"));
         setSelectedModel(data.llm.model || "");
-        setApiKeyPlaceholder(data.llm.api_key === "***" ? "(Already Configured)" : "Enter API key");
+        setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(data.llm.provider, data.llm.api_key === "***"));
         setMCPTokenPlaceholder(data.mcp.token === "***" ? "(Already Configured)" : "Enter token");
         if (data.active_mcp_config_name) {
           setLoadedMCPConfigName(data.active_mcp_config_name);
@@ -5169,7 +5183,7 @@ This permanently deletes the token record from DT4SMS.`);
           setConfig(newConfig);
           setSelectedProvider(normalizeProvider(newConfig.llm.provider));
           setLoadedCredentialName(name);
-          setApiKeyPlaceholder("(Already Configured)");
+          setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(newConfig.llm.provider, true));
           setShowConfigForm(true);
           setSelectedModel(newConfig.llm.model);
           setAvailableModels([]);
@@ -9903,7 +9917,7 @@ ${query.spl}`,
         onClick: () => {
           setShowConfigForm(true);
           setLoadedCredentialName(null);
-          setApiKeyPlaceholder("Enter API key");
+          setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(selectedProvider));
         },
         className: "w-full px-4 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
       },
@@ -9928,6 +9942,8 @@ ${query.spl}`,
         id: "llm-provider",
         onChange: (e) => {
           setSelectedProvider(e.target.value);
+          setAvailableModels([]);
+          setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(e.target.value));
           handleSettingsChange();
         }
       },
@@ -9935,18 +9951,19 @@ ${query.spl}`,
       /* @__PURE__ */ React.createElement("option", { value: "azure" }, "Azure OpenAI"),
       /* @__PURE__ */ React.createElement("option", { value: "anthropic" }, "Anthropic (Claude)"),
       /* @__PURE__ */ React.createElement("option", { value: "gemini" }, "Google Gemini"),
+      /* @__PURE__ */ React.createElement("option", { value: "ollama" }, "Ollama"),
       /* @__PURE__ */ React.createElement("option", { value: "custom" }, "Custom Endpoint")
-    )), selectedProvider !== "openai" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "Endpoint URL", /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(", selectedProvider === "custom" ? "used exactly as configured" : "base URL or full API path", ")")), /* @__PURE__ */ React.createElement(
+    )), selectedProvider !== "openai" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "Endpoint URL", /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(", selectedProvider === "custom" ? "used exactly as configured" : selectedProvider === "ollama" ? "base URL for local or remote Ollama" : "base URL or full API path", ")")), /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "text",
         defaultValue: config.llm.endpoint_url || "",
-        placeholder: selectedProvider === "azure" ? "https://YOUR-RESOURCE.openai.azure.com" : selectedProvider === "anthropic" ? "https://api.anthropic.com (optional)" : selectedProvider === "gemini" ? "https://generativelanguage.googleapis.com (optional)" : "http://localhost:8000/v1/chat/completions",
+        placeholder: selectedProvider === "azure" ? "https://YOUR-RESOURCE.openai.azure.com" : selectedProvider === "anthropic" ? "https://api.anthropic.com (optional)" : selectedProvider === "gemini" ? "https://generativelanguage.googleapis.com (optional)" : selectedProvider === "ollama" ? "http://localhost:11434" : "http://localhost:8000/v1/chat/completions",
         className: "w-full px-3 py-2 border border-gray-300 rounded-md",
         id: "llm-endpoint-url",
         onChange: handleSettingsChange
       }
-    ), selectedProvider === "custom" && /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-xs text-gray-500" }, "✅ ", /* @__PURE__ */ React.createElement("strong", null, "Full API Path (Recommended):"), " ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "http://localhost:8000/v1/chat/completions"), /* @__PURE__ */ React.createElement("br", null), "⚠️ ", /* @__PURE__ */ React.createElement("strong", null, "Base URL (Slower):"), " ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "http://localhost:8000"), " - requires auto-detection", /* @__PURE__ */ React.createElement("br", null), /* @__PURE__ */ React.createElement("span", { className: "italic" }, "URL is used exactly as entered. No automatic path manipulation."))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "API Key", selectedProvider === "custom" && /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(Optional for local LLMs)")), /* @__PURE__ */ React.createElement(
+    ), selectedProvider === "ollama" && /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-xs text-gray-500" }, "Ollama uses the native ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "/api/tags"), " model inventory and will default to ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "http://localhost:11434"), " if you leave this blank."), selectedProvider === "custom" && /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-xs text-gray-500" }, "✅ ", /* @__PURE__ */ React.createElement("strong", null, "Full API Path (Recommended):"), " ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "http://localhost:8000/v1/chat/completions"), /* @__PURE__ */ React.createElement("br", null), "⚠️ ", /* @__PURE__ */ React.createElement("strong", null, "Base URL (Slower):"), " ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "http://localhost:8000"), " - requires auto-detection", /* @__PURE__ */ React.createElement("br", null), /* @__PURE__ */ React.createElement("span", { className: "italic" }, "URL is used exactly as entered. No automatic path manipulation."))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "API Key", (selectedProvider === "custom" || selectedProvider === "ollama") && /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(", selectedProvider === "ollama" ? "Optional for local Ollama" : "Optional for local LLMs", ")")), /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "password",
@@ -10014,7 +10031,7 @@ ${query.spl}`,
       {
         type: "text",
         defaultValue: config.llm.model,
-        placeholder: selectedProvider === "openai" ? "gpt-4o" : selectedProvider === "azure" ? "your-azure-deployment-name" : selectedProvider === "anthropic" ? "claude-3-5-sonnet-latest" : selectedProvider === "gemini" ? "gemini-1.5-pro" : "e.g., llama3.2:3b",
+        placeholder: selectedProvider === "openai" ? "gpt-4o" : selectedProvider === "azure" ? "your-azure-deployment-name" : selectedProvider === "anthropic" ? "claude-3-5-sonnet-latest" : selectedProvider === "gemini" ? "gemini-1.5-pro" : selectedProvider === "ollama" ? "gpt-oss:20b or llama3.2:1b" : "e.g., llama3.2:3b",
         className: "w-full px-3 py-2 border border-gray-300 rounded-md",
         id: "llm-model",
         onChange: (e) => {
@@ -10377,7 +10394,7 @@ This action cannot be undone.`);
                 provider,
                 api_key: document.getElementById("llm-api-key").value,
                 model: document.getElementById("llm-model").value,
-                endpoint_url: provider === "custom" && endpointUrlInput ? endpointUrlInput.value : null,
+                endpoint_url: provider !== "openai" && endpointUrlInput ? endpointUrlInput.value : null,
                 max_tokens: parseInt(document.getElementById("llm-max-tokens").value),
                 temperature: parseFloat(document.getElementById("llm-temperature").value)
               })

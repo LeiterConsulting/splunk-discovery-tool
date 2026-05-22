@@ -80,10 +80,42 @@ def normalize_provider_name(provider: Optional[str]) -> str:
         "gemini": "gemini",
         "google": "gemini",
         "google ai": "gemini",
+        "ollama": "ollama",
+        "local ollama": "ollama",
+        "ollama endpoint": "ollama",
         "custom": "custom",
         "custom endpoint": "custom",
     }
     return aliases.get(value, value)
+
+
+DEFAULT_OLLAMA_ENDPOINT_URL = "http://localhost:11434"
+
+
+def normalize_ollama_endpoint_url(endpoint_url: Optional[str]) -> str:
+    """Normalize Ollama endpoints to a base URL so native paths can be derived safely."""
+    base = str(endpoint_url or "").strip() or DEFAULT_OLLAMA_ENDPOINT_URL
+    base = base.rstrip("/")
+
+    known_suffixes = [
+        "/api/tags",
+        "/api/chat",
+        "/api/generate",
+        "/v1/models",
+        "/v1/chat/completions",
+        "/chat/completions",
+        "/v1/completions",
+        "/completions",
+        "/v1",
+    ]
+
+    lower_base = base.lower()
+    for suffix in known_suffixes:
+        if lower_base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+
+    return base.rstrip("/") or DEFAULT_OLLAMA_ENDPOINT_URL
 
 
 def messages_to_plain_text(messages: list) -> str:
@@ -883,7 +915,8 @@ class CustomLLMClient:
         self.provider = normalize_provider_name(provider)
         
         # Detect LLM provider type for connection strategy
-        self.provider_type = self._detect_provider(endpoint_url)
+        detected_provider_type = self._detect_provider(endpoint_url)
+        self.provider_type = "ollama" if self.provider == "ollama" else detected_provider_type
         
         # Connection strategy: Some providers (vLLM) need fresh connections, others benefit from session reuse
         import requests
@@ -1747,6 +1780,15 @@ class LLMClientFactory:
                 provider="custom"
             )
 
+        if normalized_provider == "ollama":
+            return CustomLLMClient(
+                normalize_ollama_endpoint_url(custom_endpoint),
+                api_key=api_key,
+                model=model,
+                rate_limit_display_callback=rate_limit_display_callback,
+                provider="ollama"
+            )
+
         if normalized_provider in {"azure", "anthropic", "gemini"}:
             class _ProviderAdapter:
                 def __init__(self, provider_name: str, endpoint: Optional[str], key: Optional[str], model_name: str):
@@ -1811,4 +1853,4 @@ class LLMClientFactory:
     @staticmethod
     def get_available_providers() -> list[str]:
         """Get list of available LLM providers."""
-        return ["openai", "azure", "anthropic", "gemini", "custom"]
+        return ["openai", "azure", "anthropic", "gemini", "ollama", "custom"]

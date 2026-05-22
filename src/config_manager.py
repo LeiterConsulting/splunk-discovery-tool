@@ -44,7 +44,7 @@ class MCPCredential:
 @dataclass
 class LLMConfig:
     """LLM configuration (active settings)"""
-    provider: str = "openai"  # openai, azure, anthropic, gemini, custom
+    provider: str = "openai"  # openai, azure, anthropic, gemini, ollama, custom
     api_key: str = ""
     model: str = "gpt-4o-mini"
     endpoint_url: Optional[str] = None

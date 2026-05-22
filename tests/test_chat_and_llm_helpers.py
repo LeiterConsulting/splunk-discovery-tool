@@ -531,6 +531,110 @@ class CustomLLMClientCompatibilityTests(unittest.TestCase):
 
 
 class LLMSettingsTests(unittest.TestCase):
+    def test_create_client_supports_ollama_default_endpoint(self):
+        client = web_app.LLMClientFactory.create_client(
+            provider="ollama",
+            custom_endpoint=None,
+            api_key=None,
+            model="gpt-oss:20b",
+        )
+
+        self.assertIsInstance(client, CustomLLMClient)
+        self.assertEqual(client.provider, "ollama")
+        self.assertEqual(client.provider_type, "ollama")
+        self.assertEqual(client.endpoint_url, web_app.DEFAULT_OLLAMA_ENDPOINT_URL)
+
+    def test_list_models_supports_ollama_tags_inventory(self):
+        request_payload = {
+            "provider": "ollama",
+            "endpoint_url": "",
+        }
+
+        class StubRequest:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def json(self):
+                return self._payload
+
+        class StubResponse:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class StubAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                if url == f"{web_app.DEFAULT_OLLAMA_ENDPOINT_URL}/api/tags":
+                    return StubResponse({
+                        "models": [
+                            {"name": "gpt-oss:20b"},
+                            {"model": "llama3.2:1b"},
+                        ]
+                    })
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        with patch.object(web_app.httpx, "AsyncClient", StubAsyncClient):
+            result = asyncio.run(web_app.list_models(StubRequest(request_payload)))
+
+        self.assertEqual(result["models"], ["gpt-oss:20b", "llama3.2:1b"])
+
+    def test_assess_max_tokens_uses_provider_safe_default_for_ollama(self):
+        stub_config = type(
+            "StubConfig",
+            (),
+            {
+                "llm": type(
+                    "StubLLM",
+                    (),
+                    {
+                        "provider": "ollama",
+                        "api_key": "",
+                        "model": "gpt-oss:20b",
+                        "endpoint_url": None,
+                        "max_tokens": 16000,
+                        "temperature": 0.7,
+                    },
+                )()
+            },
+        )()
+
+        request_payload = {
+            "llm": {
+                "provider": "ollama",
+                "model": "gpt-oss:20b",
+            }
+        }
+
+        class StubRequest:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def json(self):
+                return self._payload
+
+        with patch.object(web_app.config_manager, "get", return_value=stub_config):
+            result = asyncio.run(web_app.assess_max_tokens(StubRequest(request_payload)))
+
+        self.assertEqual(result["status"], "info")
+        self.assertEqual(result["recommended_max_tokens"], 4096)
+        self.assertIn("provider-safe default", result["message"])
+
     def test_assess_max_tokens_skips_openai_image_models(self):
         stub_config = type(
             "StubConfig",
@@ -654,6 +758,97 @@ class LLMSettingsTests(unittest.TestCase):
         self.assertIn("Skipped text completion probe", result["tests"]["model"]["message"])
         self.assertEqual(result["tests"]["max_tokens"]["status"], "info")
         self.assertNotIn("max_tokens", result.get("recommended_config", {}))
+
+    def test_test_llm_connection_supports_ollama_without_api_key(self):
+        stub_config = type(
+            "StubConfig",
+            (),
+            {
+                "llm": type(
+                    "StubLLM",
+                    (),
+                    {
+                        "provider": "ollama",
+                        "api_key": "",
+                        "model": "gpt-oss:20b",
+                        "endpoint_url": None,
+                        "max_tokens": 16000,
+                        "temperature": 0.7,
+                    },
+                )()
+            },
+        )()
+
+        request_payload = {
+            "llm": {
+                "provider": "ollama",
+                "model": "gpt-oss:20b",
+                "endpoint_url": "",
+                "max_tokens": 16000,
+                "temperature": 0.7,
+            }
+        }
+
+        class StubRequest:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def json(self):
+                return self._payload
+
+        class StubResponse:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class StubAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                if url == f"{web_app.DEFAULT_OLLAMA_ENDPOINT_URL}/api/tags":
+                    return StubResponse({"models": [{"name": "gpt-oss:20b"}]})
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        class StubLLMClient:
+            async def generate_response(self, messages, max_tokens, temperature):
+                return "test successful"
+
+        with patch.object(web_app.config_manager, "get", return_value=stub_config), patch.object(
+            web_app.httpx,
+            "AsyncClient",
+            StubAsyncClient,
+        ), patch.object(
+            web_app.LLMClientFactory,
+            "create_client",
+            return_value=StubLLMClient(),
+        ) as create_client_mock:
+            result = asyncio.run(web_app.test_llm_connection(StubRequest(request_payload)))
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["endpoint"], web_app.DEFAULT_OLLAMA_ENDPOINT_URL)
+        self.assertEqual(result["tests"]["connection"]["status"], "success")
+        self.assertEqual(result["tests"]["model"]["status"], "success")
+        self.assertEqual(result["tests"]["max_tokens"]["detected_max"], 4096)
+        create_client_mock.assert_called_once_with(
+            provider="ollama",
+            custom_endpoint=web_app.DEFAULT_OLLAMA_ENDPOINT_URL,
+            api_key="",
+            model="gpt-oss:20b",
+        )
 
 
 class ChatSettingsTests(unittest.TestCase):

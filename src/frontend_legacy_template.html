@@ -901,6 +901,7 @@
             if (value === 'azure openai') return 'azure';
             if (value === 'claude') return 'anthropic';
             if (value === 'google' || value === 'google ai') return 'gemini';
+            if (value === 'local ollama' || value === 'ollama endpoint') return 'ollama';
             return value;
         };
 
@@ -2848,9 +2849,24 @@
                 // The button logic will handle whether it's an update or new save
             };
 
+            const getApiKeyPlaceholderForProvider = (provider, hasStoredKey = false) => {
+                if (hasStoredKey) {
+                    return '(Already Configured)';
+                }
+
+                const normalizedProvider = normalizeProvider(provider);
+                if (normalizedProvider === 'ollama') {
+                    return 'Optional for secured or proxied Ollama';
+                }
+                if (normalizedProvider === 'custom') {
+                    return 'Optional for local LLMs';
+                }
+                return 'Enter API key';
+            };
+
             // Function specifically for API key changes
             const handleApiKeyChange = () => {
-                setApiKeyPlaceholder('Enter API key');
+                setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(selectedProvider));
                 handleSettingsChange();
             };
 
@@ -7197,7 +7213,7 @@
                     setSelectedProvider(normalizeProvider(data.llm.provider || 'openai'));
                     setSelectedModel(data.llm.model || '');
                     // Set API key placeholder based on whether key exists
-                    setApiKeyPlaceholder(data.llm.api_key === '***' ? '(Already Configured)' : 'Enter API key');
+                    setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(data.llm.provider, data.llm.api_key === '***'));
                     // Set MCP token placeholder based on whether token exists
                     setMCPTokenPlaceholder(data.mcp.token === '***' ? '(Already Configured)' : 'Enter token');
 
@@ -7617,7 +7633,7 @@
                         setConfig(newConfig);
                         setSelectedProvider(normalizeProvider(newConfig.llm.provider));
                         setLoadedCredentialName(name); // Track which credential is loaded
-                        setApiKeyPlaceholder('(Already Configured)'); // Update placeholder
+                        setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(newConfig.llm.provider, true));
                         setShowConfigForm(true); // Show the config form when loading a credential
                         setSelectedModel(newConfig.llm.model); // Set the selected model
                         setAvailableModels([]); // Clear fetched models when loading credential
@@ -17272,7 +17288,7 @@ ${query.spl}`,
                                                         onClick={() => {
                                                             setShowConfigForm(true);
                                                             setLoadedCredentialName(null);
-                                                            setApiKeyPlaceholder('Enter API key');
+                                                            setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(selectedProvider));
                                                         }}
                                                         className="w-full px-4 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
                                                     >
@@ -17315,6 +17331,8 @@ ${query.spl}`,
                                                         id="llm-provider"
                                                         onChange={(e) => {
                                                             setSelectedProvider(e.target.value);
+                                                            setAvailableModels([]);
+                                                            setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(e.target.value));
                                                             handleSettingsChange();
                                                         }}
                                                     >
@@ -17322,6 +17340,7 @@ ${query.spl}`,
                                                         <option value="azure">Azure OpenAI</option>
                                                         <option value="anthropic">Anthropic (Claude)</option>
                                                         <option value="gemini">Google Gemini</option>
+                                                        <option value="ollama">Ollama</option>
                                                         <option value="custom">Custom Endpoint</option>
                                                     </select>
                                                 </div>
@@ -17330,7 +17349,7 @@ ${query.spl}`,
                                                     <label className="block text-sm font-medium text-gray-700 mb-1">
                                                         Endpoint URL
                                                         <span className="ml-2 text-xs text-gray-500">
-                                                            ({selectedProvider === 'custom' ? 'used exactly as configured' : 'base URL or full API path'})
+                                                            ({selectedProvider === 'custom' ? 'used exactly as configured' : selectedProvider === 'ollama' ? 'base URL for local or remote Ollama' : 'base URL or full API path'})
                                                         </span>
                                                     </label>
                                                     <input
@@ -17340,12 +17359,18 @@ ${query.spl}`,
                                                             selectedProvider === 'azure' ? 'https://YOUR-RESOURCE.openai.azure.com' :
                                                             selectedProvider === 'anthropic' ? 'https://api.anthropic.com (optional)' :
                                                             selectedProvider === 'gemini' ? 'https://generativelanguage.googleapis.com (optional)' :
+                                                            selectedProvider === 'ollama' ? 'http://localhost:11434' :
                                                             'http://localhost:8000/v1/chat/completions'
                                                         }
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="llm-endpoint-url"
                                                         onChange={handleSettingsChange}
                                                     />
+                                                    {selectedProvider === 'ollama' && (
+                                                        <p className="mt-1 text-xs text-gray-500">
+                                                            Ollama uses the native <span className="font-mono">/api/tags</span> model inventory and will default to <span className="font-mono">http://localhost:11434</span> if you leave this blank.
+                                                        </p>
+                                                    )}
                                                     {selectedProvider === 'custom' && (
                                                         <p className="mt-1 text-xs text-gray-500">
                                                             ✅ <strong>Full API Path (Recommended):</strong> <span className="font-mono">http://localhost:8000/v1/chat/completions</span><br/>
@@ -17358,8 +17383,8 @@ ${query.spl}`,
                                             <div>
                                                 <label className="block text-sm font-medium text-gray-700 mb-1">
                                                     API Key
-                                                    {selectedProvider === 'custom' && (
-                                                        <span className="ml-2 text-xs text-gray-500">(Optional for local LLMs)</span>
+                                                    {(selectedProvider === 'custom' || selectedProvider === 'ollama') && (
+                                                        <span className="ml-2 text-xs text-gray-500">({selectedProvider === 'ollama' ? 'Optional for local Ollama' : 'Optional for local LLMs'})</span>
                                                     )}
                                                 </label>
                                                 <input
@@ -17437,6 +17462,7 @@ ${query.spl}`,
                                                             selectedProvider === 'azure' ? 'your-azure-deployment-name' :
                                                             selectedProvider === 'anthropic' ? 'claude-3-5-sonnet-latest' :
                                                             selectedProvider === 'gemini' ? 'gemini-1.5-pro' :
+                                                            selectedProvider === 'ollama' ? 'gpt-oss:20b or llama3.2:1b' :
                                                             'e.g., llama3.2:3b'
                                                         }
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
@@ -17929,7 +17955,7 @@ This action cannot be undone.`);
                                                             provider: provider,
                                                             api_key: document.getElementById('llm-api-key').value,
                                                             model: document.getElementById('llm-model').value,
-                                                            endpoint_url: (provider === 'custom' && endpointUrlInput) ? endpointUrlInput.value : null,
+                                                            endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : null,
                                                             max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
                                                             temperature: parseFloat(document.getElementById('llm-temperature').value)
                                                         })
