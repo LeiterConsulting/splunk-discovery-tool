@@ -4,13 +4,17 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Version](https://img.shields.io/badge/version-1.1.0--dev-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases)
 
-> AI-powered Splunk environment discovery, intelligence reporting, and admin assistance with MCP integration.
+> AI-powered Splunk environment discovery, operator workspaces, secured external access, and MCP-backed investigation.
 
 ## ✨ What’s Included
 
-- V2 discovery pipeline with intelligence artifacts (`v2_intelligence_blueprint_*`, `v2_insights_brief_*`, `v2_operator_runbook_*`, `v2_developer_handoff_*`)
-- Unified web workspace with static top bar and tabs for Mission, Intelligence, and Artifacts
-- AI summarization endpoint (`/summarize-session`) generating contextual SPL queries and admin tasks
+- Discovery pipeline with intelligence artifacts and stable compatibility filenames (`v2_intelligence_blueprint_*`, `v2_insights_brief_*`, `v2_operator_runbook_*`, `v2_developer_handoff_*`)
+- Unified web workspace with Mission, Intelligence, Discovery, Context, Capabilities, and focused Chat/Summary surfaces
+- Durable worker-backed runtime state for discovery and summarization, including persisted progress and restart-safe recovery
+- AI summarization endpoint (`/summarize-session`) generating contextual SPL queries, investigation tracks, and admin tasks
+- Managed SPL Library and local RAG context workspace for reusable queries and operator-facing knowledge assets
+- Optional local auth, OIDC sign-in, per-user MCP assignment, and admin-managed external token issuance
+- Read-only external RAG REST API and inbound MCP surface (HTTP plus stdio bridge)
 - Deterministic + agentic chat flows with MCP tool aliasing and robust tool-call parsing
 - Encrypted credential/config storage using Fernet (no plaintext secrets)
 - Universal installers for Windows (`install.ps1`) and Unix/macOS (`install.sh`)
@@ -53,6 +57,7 @@ After startup, open the URL printed in the console (typically **http://localhost
    - MCP URL / token / SSL settings
    - LLM provider / API key / endpoint URL (if required) / model / token limits
    - Web server options (port, debug mode)
+  - Optional security/auth settings, external API exposure, and OIDC provider details
 4. Save settings and restart service
 
 ### LLM Setup Notes
@@ -68,9 +73,26 @@ After startup, open the URL printed in the console (typically **http://localhost
 
 ## 🧠 Workspace Overview
 
-- **Mission**: Run discovery, monitor live progress/log, review generated sessions
-- **Intelligence**: View V2 blueprint KPIs, coverage gaps, capability graph, trends
-- **Artifacts**: Browse and open V2 outputs and generated summaries
+- **Mission**: Current discovery handoff, snapshot deltas, admin next actions, analyst tracks, and executive framing
+- **Intelligence**: Blueprint briefings, priority board, coverage gaps, and role-adapted operator readouts
+- **Discovery**: Live runtime monitor, stage ledger, durable session outputs, and summary launch/resume controls
+- **Context**: Managed knowledge assets, SPL Library, reusable query evidence, and operator-facing context previews
+- **Capabilities**: Optional packs for RAG, exports, visualization, and Splunk deeplink workflows
+- **Chat and Summary**: Full-screen investigation chat plus generated runbook/summary surfaces when operators need to go deep
+
+## 📸 Current Workspace Snapshots
+
+### First-run splash and workspace shell
+
+![Current DT4SMS welcome splash and workspace shell](docs/screenshots/welcome-splash-current.png)
+
+### Mission workspace
+
+![Current Mission workspace showing handoff, deltas, and operator action layers](docs/screenshots/workspace-mission-current.png)
+
+### Intelligence workspace
+
+![Current Intelligence workspace showing blueprint briefing and priority board](docs/screenshots/workspace-intelligence-current.png)
 
 ## 📸 SPL Library Workflow
 
@@ -94,6 +116,10 @@ The SPL Library keeps reusable SPL in the managed context workspace so operators
 
 ## 🔐 Security
 
+- Optional local username/password auth with first-login password reset flow
+- OIDC sign-in with provider metadata, claim mapping, and local-user linking support
+- Per-user MCP assignment plus admin-managed connection, user, and token controls
+- Read-only external RAG REST API and inbound MCP access with scoped tokens and rate limiting
 - Credentials encrypted at rest (`config.encrypted`, `.config.key`)
 - No plaintext secret persistence
 - Configurable SSL verification and CA bundle support
@@ -104,12 +130,18 @@ The SPL Library keeps reusable SPL in the managed context workspace so operators
 ```text
 install.ps1 / install.sh       Installer + service control
 src/main.py                    Runtime entrypoint
-src/web_app.py                 FastAPI API + embedded React UI
+src/web_app.py                 FastAPI API + frontend delivery/runtime orchestration
+src/frontend_legacy_template.html Source-of-truth frontend template
+src/frontend_legacy.py         Frontend template loader for runtime and build tooling
 src/static/                    Shipped local frontend bundle
-src/discovery/v2_pipeline.py   V2 discovery pipeline + artifact packaging
+src/discovery/v2_pipeline.py   Discovery pipeline + artifact packaging
 src/config_manager.py          Encrypted config manager
-tools/build_frontend.mjs       Rebuild shipped frontend assets from the inline source
+src/security_manager.py        Local auth, OIDC, sessions, roles, and token management
+src/runtime_job_worker.py      Detached worker entrypoint for durable discovery/summary jobs
+tools/build_frontend.mjs       Rebuild shipped frontend assets from src/frontend_legacy_template.html
 tools/check_frontend_sync.py   Validate frontend bundle sync before release
+tools/test_auth_browser.mjs    Browser auth/OIDC regression harness
+tools/run_account_function_tests.mjs Account/auth regression entrypoint
 .github/workflows/repo-validation.yml  GitHub Actions validation workflow for repo quality gates
 output/                        Discovery and summary artifacts
 ```
@@ -121,7 +153,26 @@ Public-facing docs in this repository:
 - `CHANGELOG.md` — release history and notable changes
 - `CONFIGURATION_VARIABLES.md` — configuration reference
 - `docs/DEVELOPER_REFERENCE.md` — developer extension/reference guide
-- `docs/V2_REWRITE_GUIDE.md` — V2 architecture and migration guidance
+- `docs/AUTH_TESTING.md` — local-password, OIDC, and account-function test guidance
+- `docs/EXTERNAL_RAG_API_QUICKSTART.md` — read-only external RAG API setup and examples
+- `docs/EXTERNAL_MCP_QUICKSTART.md` — inbound MCP setup, helper client, and stdio bridge usage
+- `docs/SECURITY_ACCESS_ROADMAP.md` — shipped-state security model plus extension notes
+- `docs/DISCOVERY_ARCHITECTURE_GUIDE.md` — discovery architecture and migration guidance
+
+## ✅ Validation
+
+From an activated virtual environment, the main local release checks are:
+
+```bash
+npm run build:frontend
+python tools/check_frontend_sync.py
+npm run test:browser
+npm run test:auth-browser
+npm run test:account-functions
+python -m ruff check src tests
+python -W error::SyntaxWarning -m compileall -q src tests
+python -m unittest discover -v
+```
 
 ## 🛠️ Installer Commands
 
@@ -186,7 +237,7 @@ $env:PIP_INDEX_URL = "https://pypi.org/simple"
 ### Frontend changes are not showing up or startup warns about stale assets
 
 - The shipped UI is served from checked-in files under `src/static/`.
-- After editing the legacy inline frontend source in `src/web_app.py`, rebuild and verify the shipped bundle:
+- After editing the frontend source template in `src/frontend_legacy_template.html`, rebuild and verify the shipped bundle:
 
 ```bash
 npm run build:frontend
@@ -200,9 +251,16 @@ npx playwright install chromium
 npm run test:browser
 ```
 
+- To validate auth-enabled flows and the account-function matrix, run:
+
+```bash
+npm run test:auth-browser
+npm run test:account-functions
+```
+
 ## 🤝 Contributing
 
-Contributions are welcome via pull requests. Repo validation is also mirrored in `.github/workflows/repo-validation.yml`, which runs the documented frontend build, sync, browser regression, lint, compile, and unittest gates on GitHub-hosted runners.
+Contributions are welcome via pull requests. Repo validation is also mirrored in `.github/workflows/repo-validation.yml`, which runs the documented frontend build, sync, browser regression, auth/account checks, lint, compile, and unittest gates on GitHub-hosted runners.
 
 ## 📄 License
 

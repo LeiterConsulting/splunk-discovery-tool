@@ -264,6 +264,44 @@ class OpenAIModelHelperTests(unittest.TestCase):
         self.assertIn("Large indexes dominate the environment.", payload["patterns"][0]["description"])
         self.assertEqual(payload["patterns"][0]["signal"], "netops: 88M, _internal: 84M")
 
+    def test_normalize_v2_notable_patterns_for_ui_recovers_truncated_blob(self):
+        raw_patterns = [
+            '{"patterns": [{"category": "Data volume and distribution", "insight": "Large indexes dominate the environment.", "evidence": ["netops: 88M", "_internal: 84M"]}, {"category": "Temporal patterns", "insight": "Most active sources are near-real-time.", "evidence": ["recent data"]}'
+        ]
+
+        normalized = web_app._normalize_v2_notable_patterns_for_ui(raw_patterns)
+
+        self.assertGreaterEqual(len(normalized), 2)
+        self.assertEqual(normalized[0]["title"], "Data volume and distribution")
+        self.assertIn("Large indexes dominate the environment.", normalized[0]["description"])
+        self.assertEqual(normalized[0]["signal"], "netops: 88M, _internal: 84M")
+        self.assertEqual(normalized[0]["evidence"], ["netops: 88M", "_internal: 84M"])
+
+    def test_normalize_v2_notable_patterns_for_ui_merges_duplicate_headlines(self):
+        raw_patterns = [
+            {
+                "patterns": [
+                    {
+                        "category": "data_volume_and_distribution",
+                        "insight": "Event volume is highly concentrated in a few large indexes.",
+                        "evidence": ["_internal: 110M", "netops: 88M"],
+                    },
+                    {
+                        "category": "data-volume-and-distribution",
+                        "insight": "Storage usage is not perfectly proportional to event count.",
+                        "evidence": ["wmata: 8175 MB / 45.4M events", "netops: 4099 MB / 88.5M events"],
+                    },
+                ]
+            }
+        ]
+
+        normalized = web_app._normalize_v2_notable_patterns_for_ui(raw_patterns)
+
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0]["title"], "data_volume_and_distribution")
+        self.assertIn("_internal: 110M", normalized[0]["evidence"])
+        self.assertIn("wmata: 8175 MB / 45.4M events", normalized[0]["evidence"])
+
 
 class CustomLLMClientCompatibilityTests(unittest.TestCase):
     class _StubMetrics:
@@ -1648,8 +1686,13 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             def get_specific_context(self, _context_type):
                 return None
 
+        class StubHttpRequest:
+            def __init__(self):
+                self.state = type("State", (), {"auth_user": None})()
+
         async def collect_stream_body():
             response = await web_app.chat_with_splunk_stream(
+                StubHttpRequest(),
                 {
                     "message": "Summarize the current state.",
                     "history": [],

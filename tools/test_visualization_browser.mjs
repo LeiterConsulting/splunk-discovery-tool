@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { access, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
@@ -180,6 +181,186 @@ async function routeSse(page, url, events, status = 200) {
     });
 }
 
+async function dismissWelcomeSplashIfPresent(page, options = {}) {
+    const welcomeSplash = page.locator('[data-testid="welcome-splash-modal"]');
+    const isVisible = await welcomeSplash.isVisible().catch(() => false);
+    if (!isVisible) {
+        return false;
+    }
+
+    await page.getByRole('heading', { name: 'Welcome to DT4SMS' }).waitFor({ timeout: 30000 });
+    if (options.dontShowAgain) {
+        await welcomeSplash.locator('[data-testid="welcome-splash-dismiss-checkbox"]').check();
+    }
+    await welcomeSplash.getByRole('button', { name: 'Enter Workspace' }).click();
+    await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
+    return true;
+}
+
+async function pathExists(targetPath) {
+    try {
+        await access(targetPath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function readJsonFile(filePath) {
+    return JSON.parse(await readFile(filePath, 'utf8'));
+}
+
+function buildCompletedDiscoveryPhasePlan(completedAt) {
+    const phases = [
+        { key: 'pipeline_boot', label: 'Bootstrap', detail: 'Runtime validation complete.' },
+        { key: 'signal_capture', label: 'Signal Capture', detail: 'Environment signal capture complete.' },
+        { key: 'evidence_collection', label: 'Evidence Collection', detail: 'Evidence collection complete.' },
+        { key: 'classification_map', label: 'Classification Map', detail: 'Classification map generated.' },
+        { key: 'recommendation_queue', label: 'Recommendation Queue', detail: 'Recommendations generated.' },
+        { key: 'use_case_generation', label: 'Use Case Generation', detail: 'Use cases generated.' },
+        { key: 'blueprint_assembly', label: 'Blueprint Assembly', detail: 'Blueprint assembled.' },
+        { key: 'artifact_packaging', label: 'Artifact Packaging', detail: 'Artifacts packaged to output.' },
+    ];
+
+    return phases.map((phase, index) => ({
+        key: phase.key,
+        label: phase.label,
+        title: phase.label,
+        description: phase.detail,
+        progress_start: index === 0 ? 0 : Math.round((index / phases.length) * 100),
+        progress_end: Math.round(((index + 1) / phases.length) * 100),
+        baseline_seconds: 60,
+        progress_percent: Math.round(((index + 1) / phases.length) * 100),
+        status: 'completed',
+        started_at: completedAt,
+        completed_at: completedAt,
+        last_detail: phase.detail,
+    }));
+}
+
+async function findLatestSummarySession() {
+    const outputDir = path.join(repoRoot, 'output');
+    const manifestPath = path.join(outputDir, 'discovery_sessions.json');
+    let sessions = [];
+
+    if (await pathExists(manifestPath)) {
+        const payload = await readJsonFile(manifestPath);
+        if (Array.isArray(payload)) {
+            sessions = payload
+                .filter((session) => session && typeof session.timestamp === 'string')
+                .sort((left, right) => String(right.timestamp).localeCompare(String(left.timestamp)));
+        }
+    }
+
+    for (const session of sessions) {
+        const summaryPath = path.join(outputDir, `v2_ai_summary_${session.timestamp}.json`);
+        if (await pathExists(summaryPath)) {
+            return {
+                timestamp: session.timestamp,
+                createdAt: session.created_at || null,
+                reportPaths: Array.isArray(session.report_paths) ? session.report_paths : [],
+            };
+        }
+    }
+
+    const outputEntries = await readdir(outputDir, { withFileTypes: true });
+    const summaryTimestamps = outputEntries
+        .filter((entry) => entry.isFile())
+        .map((entry) => {
+            const match = /^v2_ai_summary_(\d{8}_\d{6})\.json$/i.exec(entry.name);
+            return match ? match[1] : null;
+        })
+        .filter(Boolean)
+        .sort((left, right) => String(right).localeCompare(String(left)));
+
+    assert(summaryTimestamps.length > 0, 'No cached V2 summary artifacts are available in output/.');
+
+    const timestamp = summaryTimestamps[0];
+    const reportPaths = outputEntries
+        .filter((entry) => entry.isFile() && entry.name.includes(timestamp) && entry.name.startsWith('v2_'))
+        .map((entry) => entry.name)
+        .sort();
+
+    return {
+        timestamp,
+        createdAt: null,
+        reportPaths,
+    };
+}
+
+async function seedOperatorRuntimeState() {
+    const runtimeStatePath = path.join(repoRoot, 'output', 'runtime_state.json');
+    const exportDir = path.join(repoRoot, 'output', 'exports');
+    const originalRuntimeState = await pathExists(runtimeStatePath)
+        ? await readFile(runtimeStatePath, 'utf8')
+        : null;
+    const latestSession = await findLatestSummarySession();
+    const completedAt = new Date().toISOString();
+    const phasePlan = buildCompletedDiscoveryPhasePlan(completedAt);
+    const reportCount = latestSession.reportPaths.length;
+    const runtimeStatePayload = {
+        schema_version: 1,
+        saved_at: completedAt,
+        discovery_runtime_state: {
+            status: 'completed',
+            session_id: `operator-regression-${latestSession.timestamp}`,
+            pipeline_version: 'v2',
+            started_at: latestSession.createdAt || completedAt,
+            updated_at: completedAt,
+            completed_at: completedAt,
+            result_timestamp: latestSession.timestamp,
+            report_count: reportCount,
+            error: null,
+            current_phase_key: 'artifact_packaging',
+            current_phase_title: 'Artifact Packaging',
+            phase_plan: phasePlan,
+            last_run_outcome: {
+                status: 'completed',
+                title: 'Discovery run completed',
+                summary: `Finished at ${completedAt} and produced ${reportCount} report artifact${reportCount === 1 ? '' : 's'}.`,
+                completed_at: completedAt,
+                result_timestamp: latestSession.timestamp,
+                report_count: reportCount,
+                phase_title: 'Artifact Packaging',
+                error: null,
+            },
+            progress: {
+                percentage: 100,
+                current_step: 100,
+                total_steps: 100,
+                description: 'Artifact packaging complete.',
+                eta_seconds: 0,
+                eta_method: 'stage_calibrated',
+            },
+        },
+        summarization_progress: {
+            [latestSession.timestamp]: {
+                session_id: latestSession.timestamp,
+                stage: 'complete',
+                progress: 100,
+                message: 'Summary available from cache.',
+                started_at: completedAt,
+                updated_at: completedAt,
+                completed_at: completedAt,
+            },
+        },
+    };
+
+    await writeFile(runtimeStatePath, JSON.stringify(runtimeStatePayload, null, 2), 'utf8');
+
+    return {
+        exportDir,
+        latestSession,
+        async restore() {
+            if (originalRuntimeState === null) {
+                await rm(runtimeStatePath, { force: true });
+                return;
+            }
+            await writeFile(runtimeStatePath, originalRuntimeState, 'utf8');
+        },
+    };
+}
+
 async function assertChatPromptContains(page, expectedText) {
     const dialog = page.getByRole('dialog');
     await dialog.waitFor({ state: 'visible' });
@@ -290,6 +471,47 @@ async function runBrowserRegression(baseUrl) {
             linePoints,
             truncatedLabels: truncatedLabels.length,
         };
+    } finally {
+        await page.close();
+        await browser.close();
+    }
+}
+
+async function runWelcomeSplashRegression(baseUrl) {
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
+    const pageErrors = [];
+    page.on('pageerror', (error) => pageErrors.push(error instanceof Error ? error.message : String(error)));
+
+    try {
+        await page.goto(baseUrl, { waitUntil: 'networkidle' });
+        const welcomeSplash = page.locator('[data-testid="welcome-splash-modal"]');
+        await welcomeSplash.waitFor({ state: 'visible', timeout: 30000 });
+        await page.getByRole('heading', { name: 'Welcome to DT4SMS' }).waitFor({ timeout: 30000 });
+        await page.getByText('DT4SMS turns Splunk discovery, investigation, reporting, and operator handoff into one guided workspace.').waitFor({ timeout: 30000 });
+
+        const splashCheckbox = welcomeSplash.locator('[data-testid="welcome-splash-dismiss-checkbox"]');
+        assert(!(await splashCheckbox.isChecked()), 'Welcome splash do-not-show checkbox should be off by default.');
+
+        await welcomeSplash.getByRole('button', { name: 'Enter Workspace' }).click();
+        await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
+        await page.getByRole('button', { name: 'Open settings' }).click();
+        await page.getByTestId('settings-reset-welcome-splash').click();
+        await page.getByRole('button', { name: 'Close settings' }).click();
+
+        await page.reload({ waitUntil: 'networkidle' });
+        await welcomeSplash.waitFor({ state: 'visible', timeout: 30000 });
+        await splashCheckbox.check();
+        await welcomeSplash.getByRole('button', { name: 'Enter Workspace' }).click();
+        await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
+
+        await page.reload({ waitUntil: 'networkidle' });
+        await page.getByRole('button', { name: 'Open settings' }).waitFor({ timeout: 30000 });
+        const splashStillVisible = await welcomeSplash.isVisible().catch(() => false);
+        assert(!splashStillVisible, 'Welcome splash should stay hidden after selecting do-not-show-again.');
+        assert(pageErrors.length === 0, `Welcome splash regression encountered page errors: ${pageErrors.join(' | ')}`);
+
+        return { persistedDismissal: true };
     } finally {
         await page.close();
         await browser.close();
@@ -585,6 +807,7 @@ async function runWorkspaceSmoke(baseUrl) {
         await routeJson(page, `${baseUrl}/api/discovery/dashboard`, { has_data: false, message: 'No dashboard fixture needed.' });
 
         await page.goto(baseUrl, { waitUntil: 'networkidle' });
+        await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
         assert(pageErrors.length === 0, `Workspace smoke encountered page errors: ${pageErrors.join(' | ')}`);
 
         await page.getByTestId('workspace-tab-discovery').click({ force: true });
@@ -664,19 +887,212 @@ async function runWorkspaceSmoke(baseUrl) {
     }
 }
 
-async function main() {
-    let serverHandle = null;
+async function runOperatorWorkflowRegression(baseUrl, seededRuntimeState) {
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
+    const pageErrors = [];
+    const dialogMessages = [];
+    const generatedArtifacts = [];
+    page.on('pageerror', (error) => pageErrors.push(error instanceof Error ? error.message : String(error)));
+    page.on('dialog', async (dialog) => {
+        dialogMessages.push(`${dialog.type()}: ${dialog.message()}`);
+        await dialog.accept();
+    });
 
     try {
+        await page.goto(baseUrl, { waitUntil: 'networkidle' });
+        await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
+
+        await page.locator('#workspace-tab-mission').click({ force: true });
+        await page.getByText('Mission Handoff').waitFor({ state: 'visible' });
+        await page.getByText('Discovery run completed').first().waitFor({ state: 'visible' });
+
+        const buildPackageButton = page.getByRole('button', { name: 'Build Report Package' });
+        await buildPackageButton.waitFor({ state: 'visible' });
+        assert(!(await buildPackageButton.isDisabled()), 'Build Report Package is disabled; export tools are not ready.');
+
+        const buildResponsePromise = page.waitForResponse((response) => {
+            return response.url().endsWith('/api/capabilities/exports/build') && response.request().method() === 'POST';
+        });
+        await buildPackageButton.click();
+        const buildResponse = await buildResponsePromise;
+        assert(buildResponse.ok(), `Build Report Package returned HTTP ${buildResponse.status()}.`);
+        const buildPayload = await buildResponse.json();
+        const exportDetails = buildPayload?.details || {};
+        const generatedFiles = Array.isArray(exportDetails.generated_files) ? exportDetails.generated_files : [];
+        for (const fileName of generatedFiles) {
+            generatedArtifacts.push(path.join(seededRuntimeState.exportDir, fileName));
+        }
+
+        await page.getByText('Current Report Package').first().waitFor({ state: 'visible' });
+        await page.getByText('This package was built from the selected session and the active persona runbook.').waitFor({ state: 'visible' });
+
+        await page.getByTestId('workspace-tab-discovery').click({ force: true });
+        await page.getByText('Discovery Stage Ledger').waitFor({ state: 'visible' });
+
+        const summaryAction = page.getByTestId('discovery-ledger-summary-action');
+        await summaryAction.waitFor({ state: 'visible' });
+        const summaryActionLabel = ((await summaryAction.textContent()) || '').trim();
+        assert(summaryActionLabel.length > 0, 'Discovery ledger summary action did not render a usable label.');
+
+        await expandDiscoveryReportHierarchy(page, 'cached summary session');
+        const cachedSummaryButtons = page.getByTestId('discovery-report-session-toggle').locator('button').filter({ hasText: 'View Summary' });
+        assert(await cachedSummaryButtons.count() > 0, `Expected at least one cached summary path in Discovery, but ledger action was "${summaryActionLabel}" and no View Summary buttons were available.`);
+        const summaryResponsePromise = page.waitForResponse((response) => {
+            return response.url().endsWith('/summarize-session') && response.request().method() === 'POST';
+        });
+        await cachedSummaryButtons.first().scrollIntoViewIfNeeded();
+        await cachedSummaryButtons.first().click({ force: true });
+        const summaryResponse = await summaryResponsePromise;
+        assert(summaryResponse.ok(), `View Summary returned HTTP ${summaryResponse.status()}.`);
+
+        const summaryTitle = page.locator('#summary-modal-title');
+        await summaryTitle.waitFor({ state: 'visible' });
+        await page.getByText('Priority Actions').first().waitFor({ state: 'visible' });
+        await page.getByText('Quick Wins').first().waitFor({ state: 'visible' });
+        const reviewLoopCount = await page.getByText(/Next Review Loop|Recursive Next Loop/i).count();
+        assert(reviewLoopCount > 0, 'Summary dialog did not render a next-review section.');
+        const summarySurfaceText = (await page.locator('body').textContent()) || '';
+        assert(summarySurfaceText.includes(seededRuntimeState.latestSession.timestamp), 'Summary surface did not identify the seeded session.');
+
+        await page.locator('#summary-tab-context').click();
+        await page.locator('#summary-tabpanel-context').waitFor({ state: 'visible' });
+        await page.locator('#summary-tab-queries').click();
+        await page.locator('#summary-tabpanel-queries').waitFor({ state: 'visible' });
+        await page.locator('#summary-tab-tasks').click();
+        await page.locator('#summary-tabpanel-tasks').waitFor({ state: 'visible' });
+        assert(dialogMessages.length === 0, `Expected first-party summary flow without native dialogs, but received: ${dialogMessages.join(' | ')}`);
+
+        assert(pageErrors.length === 0, `Operator workflow regression encountered page errors: ${pageErrors.join(' | ')}`);
+
+        return {
+            bundleName: exportDetails.bundle_name || null,
+            dialogCount: dialogMessages.length,
+            sessionTimestamp: seededRuntimeState.latestSession.timestamp,
+        };
+    } finally {
+        for (const artifactPath of generatedArtifacts) {
+            await rm(artifactPath, { force: true });
+        }
+        await page.close();
+        await browser.close();
+    }
+}
+
+async function runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState) {
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
+    const pageErrors = [];
+    const dialogMessages = [];
+    const summaryProgressPath = `${baseUrl}/summarize-progress/${seededRuntimeState.latestSession.timestamp}`;
+    const summarizeSessionPath = `${baseUrl}/summarize-session`;
+    const abortSummaryPath = `${baseUrl}/abort-summary`;
+    const activeWorkerProgress = {
+        session_id: seededRuntimeState.latestSession.timestamp,
+        stage: 'ai_analysis',
+        progress: 72,
+        message: 'Worker-backed summary analysis is already running.',
+        worker_pid: 424242,
+        execution_mode: 'worker',
+    };
+    const abortedWorkerProgress = {
+        ...activeWorkerProgress,
+        stage: 'aborted',
+        message: 'Summary aborted by operator.',
+        worker_pid: null,
+    };
+    let summarizeSessionRequestCount = 0;
+    let abortSummaryRequestCount = 0;
+
+    page.on('pageerror', (error) => pageErrors.push(error instanceof Error ? error.message : String(error)));
+    page.on('dialog', async (dialog) => {
+        dialogMessages.push(`${dialog.type()}: ${dialog.message()}`);
+        await dialog.accept();
+    });
+
+    try {
+        await page.route(summaryProgressPath, async (route) => {
+            await route.fulfill(jsonRoutePayload(activeWorkerProgress));
+        });
+
+        await page.route(summarizeSessionPath, async (route) => {
+            summarizeSessionRequestCount += 1;
+            await delay(5000);
+            await route.fulfill(jsonRoutePayload({ detail: 'Request was expected to be aborted by the operator.' }, 504));
+        });
+
+        await page.route(abortSummaryPath, async (route) => {
+            abortSummaryRequestCount += 1;
+            await route.fulfill(jsonRoutePayload({ status: 'aborted', progress: abortedWorkerProgress }));
+        });
+
+        await page.goto(baseUrl, { waitUntil: 'networkidle' });
+        await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
+        await page.getByTestId('workspace-tab-discovery').click({ force: true });
+        await page.getByText('Discovery Stage Ledger').waitFor({ state: 'visible' });
+
+        await expandDiscoveryReportHierarchy(page, 'active summary worker session');
+        const cachedSummaryButtons = page.getByTestId('discovery-report-session-toggle').locator('button').filter({ hasText: 'View Summary' });
+        assert(await cachedSummaryButtons.count() > 0, 'Expected a cached summary entry for the active-summary worker regression.');
+        await cachedSummaryButtons.first().scrollIntoViewIfNeeded();
+        await cachedSummaryButtons.first().click({ force: true });
+
+        await page.getByRole('dialog').waitFor({ state: 'visible' });
+        await page.getByText('Reconnect to the running summary worker?').waitFor({ state: 'visible' });
+        await page.getByText('Use the loading workspace Abort Summary control if you need to stop the worker after reconnecting.').waitFor({ state: 'visible' });
+
+        const resumeSummaryButton = page.getByRole('button', { name: 'Resume Summary' });
+        await resumeSummaryButton.click();
+
+        await page.getByText('Analyzing Your Splunk Environment').waitFor({ state: 'visible' });
+        await page.getByText('Connected to worker PID 424242. You can close the workspace and resume this summary later, or stop it now.').waitFor({ state: 'visible' });
+
+        const abortSummaryButton = page.getByRole('button', { name: 'Abort Summary' });
+        await abortSummaryButton.waitFor({ state: 'visible' });
+        await abortSummaryButton.click();
+
+        await page.getByText('Discovery Stage Ledger').waitFor({ state: 'visible' });
+        await page.getByText('Reconnect to the running summary worker?').waitFor({ state: 'hidden' });
+        assert(summarizeSessionRequestCount === 1, `Expected exactly one summarize-session request, received ${summarizeSessionRequestCount}.`);
+        assert(abortSummaryRequestCount === 1, `Expected exactly one abort-summary request, received ${abortSummaryRequestCount}.`);
+        assert(dialogMessages.length === 0, `Expected first-party summary worker flow without native dialogs, but received: ${dialogMessages.join(' | ')}`);
+        assert(pageErrors.length === 0, `Active summary worker regression encountered page errors: ${pageErrors.join(' | ')}`);
+
+        return {
+            sessionTimestamp: seededRuntimeState.latestSession.timestamp,
+            summarizeSessionRequestCount,
+            abortSummaryRequestCount,
+        };
+    } finally {
+        await page.unroute(summaryProgressPath);
+        await page.unroute(summarizeSessionPath);
+        await page.unroute(abortSummaryPath);
+        await page.close();
+        await browser.close();
+    }
+}
+
+async function main() {
+    let serverHandle = null;
+    let seededRuntimeState = null;
+
+    try {
+        seededRuntimeState = await seedOperatorRuntimeState();
         const port = await findFreePort();
         const baseUrl = `http://127.0.0.1:${port}`;
         serverHandle = startServer(port);
         await waitForServer(baseUrl);
 
         const visualizationResult = await runBrowserRegression(baseUrl);
+        const welcomeSplashResult = await runWelcomeSplashRegression(baseUrl);
         const workspaceResult = await runWorkspaceSmoke(baseUrl);
+        const operatorResult = await runOperatorWorkflowRegression(baseUrl, seededRuntimeState);
+        const activeSummaryWorkerResult = await runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState);
         console.log(`Visualization browser regression passed: ${visualizationResult.barHeights.length} bars, ${visualizationResult.linePoints} line points, ${visualizationResult.truncatedLabels} truncated dense labels.`);
+        console.log(`Welcome splash regression passed: persisted dismissal ${welcomeSplashResult.persistedDismissal ? 'verified' : 'not verified'}.`);
         console.log(`Workspace browser smoke passed: ${workspaceResult.reportSplCardCount} report SPL card and ${workspaceResult.libraryCardCount} SPL library card verified.`);
+        console.log(`Operator workflow regression passed: Mission handoff, report package build, and cached summary verified for session ${operatorResult.sessionTimestamp}${operatorResult.bundleName ? ` using ${operatorResult.bundleName}` : ''}.`);
+        console.log(`Active summary worker regression passed: resume and abort controls validated for session ${activeSummaryWorkerResult.sessionTimestamp}.`);
     } catch (error) {
         console.error('Visualization browser regression failed.');
         console.error(error instanceof Error ? error.stack || error.message : String(error));
@@ -690,6 +1106,9 @@ async function main() {
         process.exitCode = 1;
     } finally {
         await stopServer(serverHandle);
+        if (seededRuntimeState) {
+            await seededRuntimeState.restore();
+        }
     }
 }
 

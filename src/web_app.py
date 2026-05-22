@@ -6,25 +6,36 @@ animated progress indicators, and comprehensive report management.
 """
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import asyncio
 import base64
+import copy
+from contextlib import suppress
+from collections import deque
+import hashlib
+import html
 import json
 import os
 import re
+import secrets
+import signal
 import time
 import sys
 import socket
 import subprocess
-from urllib.parse import quote
+import threading
+from urllib.parse import quote, urlencode
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import uvicorn
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, padding, rsa, utils
 from pydantic import BaseModel, Field
 
 # DT4SMS: Use encrypted config manager instead of YAML
@@ -41,6 +52,7 @@ from llm.factory import (
 )
 from discovery.context_manager import get_context_manager
 from frontend_legacy import get_frontend_html
+from security_manager import SecurityManager
 
 # Ensure console/log prints do not crash on Windows code pages (cp1252, etc.)
 try:
@@ -55,10 +67,2429 @@ except Exception:
 config_manager = ConfigManager("config.encrypted")
 capability_registry = CapabilityRegistry()
 capability_manager = CapabilityManager(config_manager, registry=capability_registry)
+security_manager = SecurityManager("security.db")
+
+AUTH_SESSION_COOKIE_NAME = "dt4sms_session"
+SUPPORTED_AUTH_PROVIDERS = {"local_password", "oidc"}
+OIDC_STATE_TTL_SECONDS = 600
+OIDC_JWKS_CACHE_TTL_SECONDS = 300
+DEFAULT_EXTERNAL_API_RATE_LIMIT_REQUESTS = 30
+DEFAULT_EXTERNAL_API_RATE_LIMIT_WINDOW_SECONDS = 60
+DEFAULT_EXTERNAL_MCP_RATE_LIMIT_REQUESTS = 30
+DEFAULT_EXTERNAL_MCP_RATE_LIMIT_WINDOW_SECONDS = 60
 
 # Module-level LLM client cache for performance
 _cached_llm_client = None
 _cached_config_hash = None
+_cached_oidc_provider_jwks: Dict[str, Dict[str, Any]] = {}
+
+
+class ExternalSurfaceRateLimiter:
+    """Simple fixed-window limiter for external DT4SMS surfaces."""
+
+    def __init__(self, time_source=None):
+        self._time_source = time_source or time.monotonic
+        self._lock = threading.Lock()
+        self._request_windows: Dict[str, deque] = {}
+
+    def check_request(self, bucket_key: str, max_requests: int, window_seconds: int) -> Tuple[bool, int, int]:
+        max_requests = int(max_requests or 0)
+        window_seconds = int(window_seconds or 0)
+        if max_requests <= 0 or window_seconds <= 0:
+            return True, 0, max_requests
+
+        now = float(self._time_source())
+        cutoff = now - float(window_seconds)
+
+        with self._lock:
+            request_window = self._request_windows.get(bucket_key)
+            if request_window is None:
+                request_window = deque()
+                self._request_windows[bucket_key] = request_window
+
+            while request_window and request_window[0] <= cutoff:
+                request_window.popleft()
+
+            if len(request_window) >= max_requests:
+                retry_after = max(1, int((request_window[0] + float(window_seconds)) - now + 0.999))
+                return False, retry_after, 0
+
+            request_window.append(now)
+            remaining = max(0, max_requests - len(request_window))
+            return True, 0, remaining
+
+
+class OIDCLoginStateStore:
+    """Track in-flight OIDC authorization attempts for the single-process app runtime."""
+
+    def __init__(self, time_source=None):
+        self._time_source = time_source or time.monotonic
+        self._lock = threading.Lock()
+        self._states: Dict[str, Dict[str, Any]] = {}
+
+    def _purge_expired_locked(self) -> None:
+        now = float(self._time_source())
+        expired_states = [
+            state
+            for state, payload in self._states.items()
+            if (now - float(payload.get("issued_at", 0.0))) > OIDC_STATE_TTL_SECONDS
+        ]
+        for state in expired_states:
+            self._states.pop(state, None)
+
+    def issue(self, payload: Dict[str, Any]) -> str:
+        state = secrets.token_urlsafe(32)
+        record = dict(payload or {})
+        record["issued_at"] = float(self._time_source())
+        with self._lock:
+            self._purge_expired_locked()
+            self._states[state] = record
+        return state
+
+    def consume(self, state: str) -> Optional[Dict[str, Any]]:
+        normalized_state = str(state or "").strip()
+        if not normalized_state:
+            return None
+        with self._lock:
+            self._purge_expired_locked()
+            payload = self._states.pop(normalized_state, None)
+        return dict(payload) if isinstance(payload, dict) else None
+
+
+external_surface_rate_limiter = ExternalSurfaceRateLimiter()
+oidc_login_state_store = OIDCLoginStateStore()
+
+
+def get_security_config() -> Any:
+    return getattr(config_manager.get(), "security", None)
+
+
+def is_auth_enabled() -> bool:
+    security_config = get_security_config()
+    return bool(security_config and getattr(security_config, "auth_enabled", False))
+
+
+def get_auth_provider() -> str:
+    security_config = get_security_config()
+    provider = str(getattr(security_config, "auth_provider", "local_password") or "local_password").strip().lower()
+    return provider if provider in SUPPORTED_AUTH_PROVIDERS else "local_password"
+
+
+def get_oidc_config() -> Any:
+    security_config = get_security_config()
+    return getattr(security_config, "oidc", None) if security_config else None
+
+
+def _snapshot_oidc_settings(oidc_config: Any = None) -> Dict[str, Any]:
+    config_ref = oidc_config if oidc_config is not None else get_oidc_config()
+    return {
+        "issuer_url": str(getattr(config_ref, "issuer_url", "") or "").strip() if config_ref else "",
+        "client_id": str(getattr(config_ref, "client_id", "") or "").strip() if config_ref else "",
+        "client_secret": str(getattr(config_ref, "client_secret", "") or "").strip() if config_ref else "",
+        "audience": str(getattr(config_ref, "audience", "") or "").strip() if config_ref else "",
+        "scopes": list(getattr(config_ref, "scopes", []) or ["openid", "profile", "email"]) if config_ref else ["openid", "profile", "email"],
+        "username_claim": str(getattr(config_ref, "username_claim", "preferred_username") or "preferred_username") if config_ref else "preferred_username",
+        "email_claim": str(getattr(config_ref, "email_claim", "email") or "email") if config_ref else "email",
+        "role_claim": str(getattr(config_ref, "role_claim", "roles") or "roles") if config_ref else "roles",
+        "default_role": str(getattr(config_ref, "default_role", "viewer") or "viewer") if config_ref else "viewer",
+        "mcp_assignment_claim": str(getattr(config_ref, "mcp_assignment_claim", "") or "") if config_ref else "",
+    }
+
+
+def _get_oidc_well_known_url(issuer_url: str) -> str:
+    normalized_issuer = str(issuer_url or "").strip()
+    if not normalized_issuer:
+        raise ValueError("OIDC issuer URL is required")
+    if normalized_issuer.endswith("/.well-known/openid-configuration"):
+        return normalized_issuer
+    return f"{normalized_issuer.rstrip('/')}/.well-known/openid-configuration"
+
+
+def _coerce_oidc_claim_values(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item or "").strip() for item in value if str(item or "").strip()]
+    if isinstance(value, tuple):
+        return [str(item or "").strip() for item in value if str(item or "").strip()]
+    if isinstance(value, str):
+        return [item for item in re.split(r"[,\s]+", value) if item]
+    if value in (None, ""):
+        return []
+    return [str(value).strip()]
+
+
+def _resolve_oidc_role(claims: Dict[str, Any], oidc_settings: Dict[str, Any]) -> str:
+    default_role = str(oidc_settings.get("default_role") or "viewer").strip().lower()
+    candidate_roles = _coerce_oidc_claim_values(claims.get(oidc_settings.get("role_claim") or "roles"))
+    for candidate in candidate_roles:
+        normalized_candidate = str(candidate or "").strip().lower()
+        if normalized_candidate in {"admin", "analyst", "viewer"}:
+            return normalized_candidate
+    return default_role if default_role in {"admin", "analyst", "viewer"} else "viewer"
+
+
+def _resolve_oidc_role_sync_behavior(claims: Dict[str, Any], oidc_settings: Dict[str, Any]) -> Tuple[str, bool]:
+    role_claim_name = str(oidc_settings.get("role_claim") or "roles").strip() or "roles"
+    candidate_roles = _coerce_oidc_claim_values(claims.get(role_claim_name))
+    for candidate in candidate_roles:
+        normalized_candidate = str(candidate or "").strip().lower()
+        if normalized_candidate in {"admin", "analyst", "viewer"}:
+            return normalized_candidate, True
+    return _resolve_oidc_role(claims, oidc_settings), False
+
+
+def _resolve_oidc_mcp_assignment(claims: Dict[str, Any], oidc_settings: Dict[str, Any]) -> Optional[str]:
+    claim_name = str(oidc_settings.get("mcp_assignment_claim") or "").strip()
+    if not claim_name:
+        return None
+
+    raw_value = claims.get(claim_name)
+    candidates = _coerce_oidc_claim_values(raw_value)
+    saved_configs = getattr(config_manager.get(), "saved_mcp_configs", {}) or {}
+    available_names = {str(name): str(name) for name in saved_configs.keys()}
+    for candidate in candidates:
+        if candidate in available_names:
+            return available_names[candidate]
+    return None
+
+
+def _resolve_oidc_mcp_assignment_sync_behavior(claims: Dict[str, Any], oidc_settings: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+    claim_name = str(oidc_settings.get("mcp_assignment_claim") or "").strip()
+    if not claim_name or claim_name not in claims:
+        return None, False
+
+    resolved_assignment = _resolve_oidc_mcp_assignment(claims, oidc_settings)
+    return resolved_assignment, resolved_assignment is not None
+
+
+def _resolve_oidc_identity_fields(claims: Dict[str, Any], oidc_settings: Dict[str, Any]) -> Dict[str, Any]:
+    subject = str(claims.get("sub") or "").strip()
+    if not subject:
+        raise ValueError("OIDC userinfo response did not include a subject")
+
+    username_claim = str(oidc_settings.get("username_claim") or "preferred_username").strip() or "preferred_username"
+    email_claim = str(oidc_settings.get("email_claim") or "email").strip() or "email"
+
+    username = str(claims.get(username_claim) or "").strip()
+    email = str(claims.get(email_claim) or "").strip().lower()
+    if not username and email:
+        username = email.split("@", 1)[0]
+    if not username:
+        username = subject
+
+    resolved_role, sync_role = _resolve_oidc_role_sync_behavior(claims, oidc_settings)
+    resolved_assignment, sync_assignment = _resolve_oidc_mcp_assignment_sync_behavior(claims, oidc_settings)
+
+    return {
+        "subject": subject,
+        "username": username,
+        "email": email or None,
+        "role": resolved_role,
+        "sync_role": sync_role,
+        "mcp_config_name": resolved_assignment,
+        "sync_mcp_config_name": sync_assignment,
+    }
+
+
+async def load_oidc_provider_metadata(oidc_settings: Dict[str, Any]) -> Dict[str, Any]:
+    discovery_url = _get_oidc_well_known_url(str(oidc_settings.get("issuer_url") or ""))
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        response = await client.get(discovery_url)
+        response.raise_for_status()
+        metadata = response.json()
+
+    for field_name in ("authorization_endpoint", "token_endpoint", "userinfo_endpoint"):
+        if not str(metadata.get(field_name) or "").strip():
+            raise ValueError(f"OIDC discovery document is missing {field_name}")
+    return metadata
+
+
+async def load_oidc_provider_jwks(provider_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    jwks_uri = str(provider_metadata.get("jwks_uri") or "").strip()
+    if not jwks_uri:
+        raise ValueError("OIDC discovery document is missing jwks_uri")
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        response = await client.get(jwks_uri)
+        response.raise_for_status()
+        jwks_payload = response.json()
+
+    if not isinstance(jwks_payload, dict):
+        raise ValueError("OIDC JWKS endpoint did not return a JSON object")
+    if not isinstance(jwks_payload.get("keys"), list):
+        raise ValueError("OIDC JWKS response did not include signing keys")
+    return jwks_payload
+
+
+def clear_oidc_provider_jwks_cache() -> None:
+    _cached_oidc_provider_jwks.clear()
+
+
+async def _load_cached_oidc_provider_jwks(provider_metadata: Dict[str, Any], force_refresh: bool = False) -> Tuple[Dict[str, Any], bool]:
+    jwks_uri = str(provider_metadata.get("jwks_uri") or "").strip()
+    if not jwks_uri:
+        raise ValueError("OIDC discovery document is missing jwks_uri")
+
+    cached_entry = _cached_oidc_provider_jwks.get(jwks_uri)
+    now = time.time()
+    if (
+        not force_refresh
+        and isinstance(cached_entry, dict)
+        and isinstance(cached_entry.get("payload"), dict)
+        and isinstance(cached_entry.get("payload", {}).get("keys"), list)
+        and (now - float(cached_entry.get("timestamp") or 0.0)) < OIDC_JWKS_CACHE_TTL_SECONDS
+    ):
+        return cached_entry["payload"], True
+
+    jwks_payload = await load_oidc_provider_jwks(provider_metadata)
+    _cached_oidc_provider_jwks[jwks_uri] = {
+        "payload": jwks_payload,
+        "timestamp": time.time(),
+    }
+    return jwks_payload, False
+
+
+async def exchange_oidc_authorization_code(
+    oidc_settings: Dict[str, Any],
+    provider_metadata: Dict[str, Any],
+    code: str,
+    redirect_uri: str,
+) -> Dict[str, Any]:
+    form_data = {
+        "grant_type": "authorization_code",
+        "code": str(code or "").strip(),
+        "redirect_uri": redirect_uri,
+        "client_id": str(oidc_settings.get("client_id") or "").strip(),
+        "client_secret": str(oidc_settings.get("client_secret") or "").strip(),
+    }
+    audience = str(oidc_settings.get("audience") or "").strip()
+    if audience:
+        form_data["audience"] = audience
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        response = await client.post(
+            str(provider_metadata.get("token_endpoint") or "").strip(),
+            data=form_data,
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
+        token_payload = response.json()
+
+    return _validate_oidc_token_payload(token_payload)
+
+
+def _validate_oidc_token_payload(token_payload: Any) -> Dict[str, Any]:
+    if not isinstance(token_payload, dict):
+        raise ValueError("OIDC token exchange did not return a JSON object")
+
+    access_token = str(token_payload.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError("OIDC token exchange did not return an access token")
+
+    token_type = str(token_payload.get("token_type") or "").strip()
+    if token_type and token_type.lower() != "bearer":
+        raise ValueError(f"OIDC token exchange returned unsupported token type '{token_type}'")
+    return token_payload
+
+
+def _normalize_oidc_issuer_for_comparison(issuer: Any) -> str:
+    return str(issuer or "").strip().rstrip("/")
+
+
+def _decode_oidc_base64url_bytes(value: Any, error_message: str) -> bytes:
+    segment = str(value or "").strip()
+    if not segment:
+        raise ValueError(error_message)
+
+    padding_value = "=" * (-len(segment) % 4)
+    try:
+        return base64.urlsafe_b64decode(f"{segment}{padding_value}")
+    except (ValueError, TypeError):
+        raise ValueError(error_message)
+
+
+def _decode_oidc_jwt_json_segment(segment: Any, error_message: str) -> Dict[str, Any]:
+    try:
+        decoded_bytes = _decode_oidc_base64url_bytes(segment, error_message)
+        decoded_value = json.loads(decoded_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError(error_message)
+
+    if not isinstance(decoded_value, dict):
+        raise ValueError(error_message)
+    return decoded_value
+
+
+def _decode_oidc_id_token(id_token: Any) -> Dict[str, Any]:
+    token_value = str(id_token or "").strip()
+    token_segments = token_value.split(".")
+    if len(token_segments) == 5:
+        raise ValueError("OIDC token exchange returned an encrypted id_token, which DT4SMS does not support")
+    if len(token_segments) != 3:
+        raise ValueError("OIDC token exchange returned a malformed id_token")
+
+    header_segment, payload_segment, signature_segment = token_segments
+    return {
+        "header": _decode_oidc_jwt_json_segment(header_segment, "OIDC token exchange returned a malformed id_token"),
+        "claims": _decode_oidc_jwt_json_segment(payload_segment, "OIDC token exchange returned a malformed id_token"),
+        "signature": _decode_oidc_base64url_bytes(signature_segment, "OIDC token exchange returned a malformed id_token")
+        if signature_segment
+        else b"",
+        "signing_input": f"{header_segment}.{payload_segment}".encode("ascii"),
+    }
+
+
+def _get_oidc_signature_hash_algorithm(algorithm: str):
+    normalized_algorithm = str(algorithm or "").strip().upper()
+    if normalized_algorithm.startswith("HS"):
+        raise ValueError(
+            f"OIDC id_token used unsupported symmetric signing algorithm '{str(algorithm or '').strip() or 'unknown'}'"
+        )
+    hash_algorithms = {
+        "RS256": hashes.SHA256,
+        "RS384": hashes.SHA384,
+        "RS512": hashes.SHA512,
+        "PS256": hashes.SHA256,
+        "PS384": hashes.SHA384,
+        "PS512": hashes.SHA512,
+        "ES256": hashes.SHA256,
+        "ES384": hashes.SHA384,
+        "ES512": hashes.SHA512,
+        "EDDSA": None,
+    }
+    hash_algorithm_factory = hash_algorithms.get(normalized_algorithm)
+    if hash_algorithm_factory is None:
+        if normalized_algorithm == "EDDSA":
+            return None
+        raise ValueError(f"OIDC id_token used unsupported signing algorithm '{str(algorithm or '').strip() or 'unknown'}'")
+    return hash_algorithm_factory()
+
+
+def _get_oidc_signature_padding(algorithm: str, hash_algorithm: hashes.HashAlgorithm):
+    normalized_algorithm = str(algorithm or "").strip().upper()
+    if normalized_algorithm.startswith("PS"):
+        return padding.PSS(mgf=padding.MGF1(hash_algorithm), salt_length=padding.PSS.DIGEST_LENGTH)
+    return padding.PKCS1v15()
+
+
+def _get_oidc_expected_jwk_key_types(algorithm: str) -> Tuple[str, ...]:
+    normalized_algorithm = str(algorithm or "").strip().upper()
+    if normalized_algorithm.startswith(("RS", "PS")):
+        return ("RSA",)
+    if normalized_algorithm.startswith("ES"):
+        return ("EC",)
+    if normalized_algorithm == "EDDSA":
+        return ("OKP",)
+    return ()
+
+
+def _oidc_jwk_allows_signature_verification(jwk: Dict[str, Any]) -> bool:
+    key_use = str(jwk.get("use") or "").strip().lower()
+    if key_use and key_use != "sig":
+        return False
+
+    key_operations = {
+        str(operation or "").strip().lower()
+        for operation in _coerce_oidc_claim_values(jwk.get("key_ops"))
+        if str(operation or "").strip()
+    }
+    if key_operations and "verify" not in key_operations:
+        return False
+    return True
+
+
+def _decode_oidc_base64url_int(value: Any, error_message: str) -> int:
+    decoded_bytes = _decode_oidc_base64url_bytes(value, error_message)
+    if not decoded_bytes:
+        raise ValueError(error_message)
+    return int.from_bytes(decoded_bytes, "big")
+
+
+def _select_oidc_signing_jwk(header: Dict[str, Any], jwks_payload: Dict[str, Any]) -> Dict[str, Any]:
+    token_algorithm = str(header.get("alg") or "").strip().upper()
+    expected_key_types = set(_get_oidc_expected_jwk_key_types(token_algorithm))
+    key_candidates = [
+        key
+        for key in jwks_payload.get("keys") or []
+        if isinstance(key, dict)
+        and str(key.get("kty") or "").strip().upper() in expected_key_types
+        and _oidc_jwk_allows_signature_verification(key)
+    ]
+
+    token_kid = str(header.get("kid") or "").strip()
+    if token_kid:
+        key_candidates = [key for key in key_candidates if str(key.get("kid") or "").strip() == token_kid]
+        if not key_candidates:
+            raise ValueError("OIDC JWKS did not contain the signing key referenced by the id_token")
+
+    matching_algorithm_candidates = [
+        key for key in key_candidates if not str(key.get("alg") or "").strip() or str(key.get("alg") or "").strip().upper() == token_algorithm
+    ]
+    if matching_algorithm_candidates:
+        key_candidates = matching_algorithm_candidates
+
+    if len(key_candidates) != 1:
+        raise ValueError("OIDC JWKS did not identify a unique signing key for the id_token")
+    return key_candidates[0]
+
+
+def _build_oidc_rsa_public_key(jwk: Dict[str, Any]):
+    modulus = _decode_oidc_base64url_int(jwk.get("n"), "OIDC JWKS signing key was missing RSA modulus data")
+    exponent = _decode_oidc_base64url_int(jwk.get("e"), "OIDC JWKS signing key was missing RSA exponent data")
+    return rsa.RSAPublicNumbers(exponent, modulus).public_key()
+
+
+def _get_oidc_ec_curve(curve_name: Any):
+    normalized_curve_name = str(curve_name or "").strip()
+    curves = {
+        "P-256": ec.SECP256R1,
+        "P-384": ec.SECP384R1,
+        "P-521": ec.SECP521R1,
+    }
+    curve_factory = curves.get(normalized_curve_name)
+    if curve_factory is None:
+        raise ValueError(f"OIDC JWKS signing key used unsupported EC curve '{normalized_curve_name or 'unknown'}'")
+    return curve_factory()
+
+
+def _build_oidc_ec_public_key(jwk: Dict[str, Any]):
+    curve = _get_oidc_ec_curve(jwk.get("crv"))
+    x_coordinate = _decode_oidc_base64url_int(jwk.get("x"), "OIDC JWKS signing key was missing EC x-coordinate data")
+    y_coordinate = _decode_oidc_base64url_int(jwk.get("y"), "OIDC JWKS signing key was missing EC y-coordinate data")
+    try:
+        return ec.EllipticCurvePublicNumbers(x_coordinate, y_coordinate, curve).public_key()
+    except ValueError:
+        raise ValueError("OIDC JWKS signing key contained invalid EC coordinates")
+
+
+def _build_oidc_okp_public_key(jwk: Dict[str, Any]):
+    curve_name = str(jwk.get("crv") or "").strip()
+    public_key_bytes = _decode_oidc_base64url_bytes(jwk.get("x"), "OIDC JWKS signing key was missing OKP public key data")
+    key_factories = {
+        "Ed25519": ed25519.Ed25519PublicKey.from_public_bytes,
+        "Ed448": ed448.Ed448PublicKey.from_public_bytes,
+    }
+    key_factory = key_factories.get(curve_name)
+    if key_factory is None:
+        raise ValueError(f"OIDC JWKS signing key used unsupported OKP curve '{curve_name or 'unknown'}'")
+    try:
+        return key_factory(public_key_bytes)
+    except ValueError:
+        raise ValueError("OIDC JWKS signing key contained invalid OKP public key data")
+
+
+def _build_oidc_signing_public_key(jwk: Dict[str, Any]):
+    key_type = str(jwk.get("kty") or "").strip().upper()
+    if key_type == "RSA":
+        return _build_oidc_rsa_public_key(jwk)
+    if key_type == "EC":
+        return _build_oidc_ec_public_key(jwk)
+    if key_type == "OKP":
+        return _build_oidc_okp_public_key(jwk)
+    raise ValueError(f"OIDC JWKS signing key used unsupported key type '{key_type or 'unknown'}'")
+
+
+def _normalize_oidc_ecdsa_signature_for_verification(signature: bytes, jwk: Dict[str, Any]) -> bytes:
+    curve = _get_oidc_ec_curve(jwk.get("crv"))
+    coordinate_length = (curve.key_size + 7) // 8
+    if len(signature) != coordinate_length * 2:
+        raise ValueError("OIDC id_token signature did not match the advertised EC curve")
+
+    r_value = int.from_bytes(signature[:coordinate_length], "big")
+    s_value = int.from_bytes(signature[coordinate_length:], "big")
+    return utils.encode_dss_signature(r_value, s_value)
+
+
+def _validate_oidc_id_token_signature(
+    decoded_token: Dict[str, Any],
+    token_header: Dict[str, Any],
+    jwks_payload: Dict[str, Any],
+    signing_hash_algorithm: Optional[hashes.HashAlgorithm],
+) -> None:
+    signing_jwk = _select_oidc_signing_jwk(token_header, jwks_payload)
+    public_key = _build_oidc_signing_public_key(signing_jwk)
+    token_algorithm = str(token_header.get("alg") or "").strip().upper()
+
+    try:
+        if token_algorithm == "EDDSA":
+            public_key.verify(decoded_token["signature"], decoded_token["signing_input"])
+        elif token_algorithm.startswith("ES"):
+            normalized_signature = _normalize_oidc_ecdsa_signature_for_verification(decoded_token["signature"], signing_jwk)
+            public_key.verify(normalized_signature, decoded_token["signing_input"], ec.ECDSA(signing_hash_algorithm))
+        else:
+            signature_padding = _get_oidc_signature_padding(token_algorithm, signing_hash_algorithm)
+            public_key.verify(decoded_token["signature"], decoded_token["signing_input"], signature_padding, signing_hash_algorithm)
+    except InvalidSignature:
+        raise ValueError("OIDC id_token signature validation failed")
+
+
+def _should_refresh_cached_oidc_jwks(validation_error: ValueError) -> bool:
+    return str(validation_error) in {
+        "OIDC JWKS did not contain the signing key referenced by the id_token",
+        "OIDC JWKS did not identify a unique signing key for the id_token",
+        "OIDC id_token signature validation failed",
+    }
+
+
+async def _validate_oidc_id_token_claims(
+    token_payload: Dict[str, Any],
+    provider_metadata: Dict[str, Any],
+    oidc_settings: Dict[str, Any],
+    state_record: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    id_token = str(token_payload.get("id_token") or "").strip()
+    if not id_token:
+        return None
+
+    decoded_token = _decode_oidc_id_token(id_token)
+    token_header = decoded_token["header"]
+    token_algorithm = str(token_header.get("alg") or "").strip()
+    if not token_algorithm or token_algorithm.lower() == "none":
+        raise ValueError("OIDC id_token used unsupported signing algorithm 'none'")
+
+    signing_hash_algorithm = _get_oidc_signature_hash_algorithm(token_algorithm)
+    jwks_payload, jwks_from_cache = await _load_cached_oidc_provider_jwks(provider_metadata)
+    try:
+        _validate_oidc_id_token_signature(decoded_token, token_header, jwks_payload, signing_hash_algorithm)
+    except ValueError as exc:
+        if not jwks_from_cache or not _should_refresh_cached_oidc_jwks(exc):
+            raise
+        refreshed_jwks_payload, _ = await _load_cached_oidc_provider_jwks(provider_metadata, force_refresh=True)
+        _validate_oidc_id_token_signature(decoded_token, token_header, refreshed_jwks_payload, signing_hash_algorithm)
+
+    claims = decoded_token["claims"]
+
+    expected_issuer = _normalize_oidc_issuer_for_comparison(oidc_settings.get("issuer_url"))
+    token_issuer = _normalize_oidc_issuer_for_comparison(claims.get("iss"))
+    if not token_issuer or token_issuer != expected_issuer:
+        raise ValueError("OIDC id_token issuer did not match the configured issuer")
+
+    token_subject = str(claims.get("sub") or "").strip()
+    if not token_subject:
+        raise ValueError("OIDC id_token did not include a subject")
+
+    expected_client_id = str(oidc_settings.get("client_id") or "").strip()
+    token_audiences = _coerce_oidc_claim_values(claims.get("aud"))
+    if not expected_client_id or expected_client_id not in token_audiences:
+        raise ValueError("OIDC id_token audience did not include the configured client_id")
+
+    try:
+        expires_at = int(float(claims.get("exp")))
+    except (TypeError, ValueError):
+        raise ValueError("OIDC id_token did not include a valid expiration")
+    if expires_at <= int(time.time()):
+        raise ValueError("OIDC id_token is expired")
+
+    expected_nonce = str(state_record.get("nonce") or "").strip()
+    if expected_nonce:
+        token_nonce = str(claims.get("nonce") or "").strip()
+        if not token_nonce:
+            raise ValueError("OIDC id_token did not include the expected nonce")
+        if token_nonce != expected_nonce:
+            raise ValueError("OIDC id_token nonce did not match the authorization request")
+
+    return claims
+
+
+def _validate_oidc_subject_coherence(
+    id_token_claims: Optional[Dict[str, Any]],
+    userinfo_claims: Dict[str, Any],
+) -> None:
+    if not isinstance(id_token_claims, dict):
+        return
+
+    id_token_subject = str(id_token_claims.get("sub") or "").strip()
+    userinfo_subject = str(userinfo_claims.get("sub") or "").strip()
+    if id_token_subject and userinfo_subject and id_token_subject != userinfo_subject:
+        raise ValueError("OIDC userinfo subject did not match the id_token subject")
+
+
+async def fetch_oidc_userinfo(provider_metadata: Dict[str, Any], access_token: str) -> Dict[str, Any]:
+    userinfo_endpoint = str(provider_metadata.get("userinfo_endpoint") or "").strip()
+    if not userinfo_endpoint:
+        raise ValueError("OIDC discovery document is missing userinfo_endpoint")
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        response = await client.get(
+            userinfo_endpoint,
+            headers={
+                "Authorization": f"Bearer {str(access_token or '').strip()}",
+                "Accept": "application/json",
+            },
+        )
+        response.raise_for_status()
+        claims = response.json()
+
+    if not isinstance(claims, dict):
+        raise ValueError("OIDC userinfo response was not a JSON object")
+    return claims
+
+
+def is_external_api_enabled() -> bool:
+    security_config = get_security_config()
+    return bool(security_config and getattr(security_config, "external_api_enabled", False))
+
+
+def is_external_mcp_enabled() -> bool:
+    security_config = get_security_config()
+    return bool(security_config and getattr(security_config, "external_mcp_enabled", False))
+
+
+def _build_oidc_provider_status() -> Dict[str, Any]:
+    oidc_settings = _snapshot_oidc_settings()
+    configured = any(
+        [
+            oidc_settings["issuer_url"],
+            oidc_settings["client_id"],
+            oidc_settings["client_secret"],
+            oidc_settings["audience"],
+            oidc_settings["mcp_assignment_claim"],
+        ]
+    )
+    ready = bool(oidc_settings["issuer_url"] and oidc_settings["client_id"] and oidc_settings["client_secret"])
+    return {
+        "implemented": True,
+        "configured": configured,
+        "ready": ready,
+        "can_enable_auth": ready,
+        "issuer_url": oidc_settings["issuer_url"],
+        "client_id": oidc_settings["client_id"],
+        "client_secret_configured": bool(oidc_settings["client_secret"]),
+        "audience": oidc_settings["audience"],
+        "scopes": oidc_settings["scopes"],
+        "username_claim": oidc_settings["username_claim"],
+        "email_claim": oidc_settings["email_claim"],
+        "role_claim": oidc_settings["role_claim"],
+        "default_role": oidc_settings["default_role"],
+        "mcp_assignment_claim": oidc_settings["mcp_assignment_claim"],
+    }
+
+
+async def _build_oidc_logout_plan(request: Request) -> Dict[str, Any]:
+    redirect_uri = str(request.url_for("serve_frontend"))
+    logout_plan = {
+        "provider": "oidc",
+        "supported": False,
+        "mode": "local_session_only",
+        "url": None,
+        "post_logout_redirect_uri": redirect_uri,
+        "reason": "provider_end_session_endpoint_unavailable",
+    }
+
+    if not _build_oidc_provider_status().get("ready"):
+        logout_plan["reason"] = "provider_not_ready"
+        return logout_plan
+
+    try:
+        provider_metadata = await load_oidc_provider_metadata(_snapshot_oidc_settings())
+    except (ValueError, httpx.HTTPError):
+        logout_plan["reason"] = "provider_metadata_unavailable"
+        return logout_plan
+
+    end_session_endpoint = str(provider_metadata.get("end_session_endpoint") or "").strip()
+    if not end_session_endpoint:
+        return logout_plan
+
+    query_params = {"post_logout_redirect_uri": redirect_uri}
+    client_id = str(_snapshot_oidc_settings().get("client_id") or "").strip()
+    if client_id:
+        query_params["client_id"] = client_id
+
+    separator = "&" if "?" in end_session_endpoint else "?"
+    logout_plan.update(
+        {
+            "supported": True,
+            "mode": "front_channel_redirect",
+            "url": f"{end_session_endpoint}{separator}{urlencode(query_params)}",
+            "reason": None,
+        }
+    )
+    return logout_plan
+
+
+def ensure_local_auth_bootstrap_state() -> Dict[str, Any]:
+    security_config = get_security_config()
+    if not security_config or not getattr(security_config, "auth_enabled", False):
+        return {"created": False}
+    if get_auth_provider() != "local_password":
+        return {"created": False}
+    return security_manager.ensure_bootstrap_admin(
+        require_password_reset=bool(getattr(security_config, "require_password_reset_on_first_login", True))
+    )
+
+
+def _is_public_auth_path(path: str) -> bool:
+    return path in {
+        "/",
+        "/api/auth/status",
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/oidc/start",
+        "/api/auth/oidc/callback",
+        "/api/auth/reset-password",
+    }
+
+
+def _is_password_reset_allowed_path(path: str) -> bool:
+    return path in {
+        "/",
+        "/api/auth/status",
+        "/api/auth/logout",
+        "/api/auth/reset-password",
+    }
+
+
+def _is_external_api_path(path: str) -> bool:
+    return str(path or "").startswith("/api/external/")
+
+
+def _serialize_authenticated_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(user, dict):
+        return None
+    return {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "role": user.get("role"),
+        "mcp_config_name": user.get("mcp_config_name"),
+        "require_password_reset": bool(user.get("require_password_reset")),
+        "last_login_at": user.get("last_login_at"),
+        "session_expires_at": user.get("session_expires_at"),
+    }
+
+
+def _serialize_security_user_record(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(user, dict):
+        return None
+    return {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "role": user.get("role"),
+        "is_enabled": bool(user.get("is_enabled")),
+        "require_password_reset": bool(user.get("require_password_reset")),
+        "mcp_config_name": user.get("mcp_config_name"),
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+        "last_login_at": user.get("last_login_at"),
+    }
+
+
+def _serialize_external_identity_record(identity: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(identity, dict):
+        return None
+    return {
+        "id": identity.get("id"),
+        "auth_provider": identity.get("auth_provider"),
+        "subject": identity.get("subject"),
+        "user_id": identity.get("user_id"),
+        "email": identity.get("email"),
+        "claims": identity.get("claims", {}),
+        "created_at": identity.get("created_at"),
+        "updated_at": identity.get("updated_at"),
+        "last_login_at": identity.get("last_login_at"),
+        "user": _serialize_security_user_record(identity.get("user")),
+    }
+
+
+def _serialize_security_token_record(token: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(token, dict):
+        return None
+    return {
+        "id": token.get("id"),
+        "name": token.get("name"),
+        "token_type": token.get("token_type"),
+        "token_prefix": token.get("token_prefix"),
+        "owner_user_id": token.get("owner_user_id"),
+        "owner_username": token.get("owner_username"),
+        "created_by_user_id": token.get("created_by_user_id"),
+        "created_by_username": token.get("created_by_username"),
+        "scopes": token.get("scopes", []),
+        "created_at": token.get("created_at"),
+        "updated_at": token.get("updated_at"),
+        "expires_at": token.get("expires_at"),
+        "revoked_at": token.get("revoked_at"),
+        "last_used_at": token.get("last_used_at"),
+        "last_used_from": token.get("last_used_from"),
+        "use_count": token.get("use_count", 0),
+    }
+
+
+def require_authenticated_user(request: Request) -> Optional[Dict[str, Any]]:
+    if not is_auth_enabled():
+        return None
+    current_user = getattr(request.state, "auth_user", None)
+    if not isinstance(current_user, dict):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return current_user
+
+
+def require_admin_user(request: Request) -> Optional[Dict[str, Any]]:
+    current_user = require_authenticated_user(request)
+    if current_user is None:
+        return None
+    if str(current_user.get("role") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+def validate_assigned_mcp_config_name(mcp_config_name: Optional[str]) -> Optional[str]:
+    cleaned = str(mcp_config_name or "").strip()
+    if not cleaned:
+        return None
+    if cleaned not in config_manager.list_mcp_configs():
+        raise HTTPException(status_code=400, detail=f"Assigned MCP configuration '{cleaned}' does not exist")
+    return cleaned
+
+
+def require_external_api_enabled() -> None:
+    if not is_external_api_enabled():
+        raise HTTPException(status_code=404, detail="External API is not enabled")
+
+
+def require_external_mcp_enabled() -> None:
+    if not is_external_mcp_enabled():
+        raise HTTPException(status_code=404, detail="External MCP server is not enabled")
+
+
+def _get_external_surface_rate_limit(surface_name: str) -> Tuple[int, int]:
+    security_config = get_security_config()
+    if surface_name == "external_mcp":
+        default_requests = DEFAULT_EXTERNAL_MCP_RATE_LIMIT_REQUESTS
+        default_window_seconds = DEFAULT_EXTERNAL_MCP_RATE_LIMIT_WINDOW_SECONDS
+        request_attr = "external_mcp_rate_limit_requests"
+        window_attr = "external_mcp_rate_limit_window_seconds"
+    else:
+        default_requests = DEFAULT_EXTERNAL_API_RATE_LIMIT_REQUESTS
+        default_window_seconds = DEFAULT_EXTERNAL_API_RATE_LIMIT_WINDOW_SECONDS
+        request_attr = "external_api_rate_limit_requests"
+        window_attr = "external_api_rate_limit_window_seconds"
+
+    max_requests = default_requests
+    window_seconds = default_window_seconds
+    if security_config is not None:
+        max_requests = int(getattr(security_config, request_attr, default_requests) or default_requests)
+        window_seconds = int(getattr(security_config, window_attr, default_window_seconds) or default_window_seconds)
+    return max_requests, window_seconds
+
+
+def _enforce_external_surface_rate_limit(surface_name: str, token_record: Dict[str, Any]) -> None:
+    max_requests, window_seconds = _get_external_surface_rate_limit(surface_name)
+    token_key = token_record.get("id") or token_record.get("token_prefix") or "anonymous"
+    bucket_key = f"{surface_name}:{token_key}"
+    allowed, retry_after, _remaining = external_surface_rate_limiter.check_request(
+        bucket_key,
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+    )
+    if allowed:
+        return
+
+    surface_label = "External MCP" if surface_name == "external_mcp" else "External API"
+    raise HTTPException(
+        status_code=429,
+        detail=f"{surface_label} rate limit exceeded. Retry in {retry_after} seconds.",
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _extract_bearer_token(request: Request) -> Optional[str]:
+    authorization_header = str(request.headers.get("Authorization") or "").strip()
+    if not authorization_header.lower().startswith("bearer "):
+        return None
+    token = authorization_header[7:].strip()
+    return token or None
+
+
+def require_external_api_token(request: Request, required_scopes: Optional[List[str]] = None) -> Dict[str, Any]:
+    require_external_api_enabled()
+    access_token = _extract_bearer_token(request)
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Bearer token required for external API access")
+
+    token_record = security_manager.resolve_access_token(
+        access_token,
+        token_type="external_api",
+        record_usage=False,
+    )
+    if token_record is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired external API token")
+
+    scoped_record = security_manager.resolve_access_token(
+        access_token,
+        required_scopes=list(required_scopes or []),
+        token_type="external_api",
+        record_usage=False,
+    )
+    if scoped_record is None:
+        raise HTTPException(status_code=403, detail="External API token does not include the required scope")
+
+    _enforce_external_surface_rate_limit("external_api", scoped_record)
+
+    used_from = str(request.headers.get("X-Forwarded-For") or "").strip() or (request.client.host if request.client else None)
+    recorded_record = security_manager.resolve_access_token(
+        access_token,
+        required_scopes=list(required_scopes or []),
+        token_type="external_api",
+        used_from=used_from,
+        record_usage=True,
+    )
+    if recorded_record is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired external API token")
+    return recorded_record
+
+
+def require_external_mcp_token(request: Request, required_scopes: Optional[List[str]] = None) -> Dict[str, Any]:
+    require_external_mcp_enabled()
+    access_token = _extract_bearer_token(request)
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Bearer token required for external MCP access")
+
+    token_record = security_manager.resolve_access_token(
+        access_token,
+        token_type="inbound_mcp",
+        record_usage=False,
+    )
+    if token_record is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired external MCP token")
+
+    scoped_record = security_manager.resolve_access_token(
+        access_token,
+        required_scopes=list(required_scopes or []),
+        token_type="inbound_mcp",
+        record_usage=False,
+    )
+    if scoped_record is None:
+        raise HTTPException(status_code=403, detail="External MCP token does not include the required scope")
+
+    _enforce_external_surface_rate_limit("external_mcp", scoped_record)
+
+    used_from = str(request.headers.get("X-Forwarded-For") or "").strip() or (request.client.host if request.client else None)
+    recorded_record = security_manager.resolve_access_token(
+        access_token,
+        required_scopes=list(required_scopes or []),
+        token_type="inbound_mcp",
+        used_from=used_from,
+        record_usage=True,
+    )
+    if recorded_record is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired external MCP token")
+    return recorded_record
+
+
+def _sanitize_external_rag_index_summary(summary: Any) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {}
+    sanitized: Dict[str, Any] = {}
+    for key in (
+        "collection_name",
+        "index_schema_version",
+        "document_count",
+        "source_file_count",
+        "source_type_counts",
+        "sample_sources",
+        "last_indexed_at",
+        "error",
+    ):
+        if key in summary:
+            sanitized[key] = summary.get(key)
+    return sanitized
+
+
+def _sanitize_external_rag_asset(asset: Any) -> Dict[str, Any]:
+    if not isinstance(asset, dict):
+        return {}
+    sanitized: Dict[str, Any] = {}
+    for key in (
+        "asset_id",
+        "title",
+        "asset_type",
+        "source_label",
+        "description",
+        "summary",
+        "preview",
+        "headings",
+        "key_points",
+        "focus_terms",
+        "usage_guidance",
+        "tags",
+        "attributes",
+        "library_status",
+        "checked_out_at",
+        "last_checked_in_at",
+        "import_method",
+        "original_filename",
+        "created_at",
+        "updated_at",
+        "text_char_count",
+        "word_count",
+    ):
+        if key in asset:
+            sanitized[key] = asset.get(key)
+    return sanitized
+
+
+def _sanitize_external_rag_asset_summary(summary: Any) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        "asset_count": int(summary.get("asset_count") or 0),
+        "checked_in_asset_count": int(summary.get("checked_in_asset_count") or 0),
+        "checked_out_asset_count": int(summary.get("checked_out_asset_count") or 0),
+        "library_status_counts": dict(summary.get("library_status_counts") or {}),
+        "asset_type_counts": dict(summary.get("asset_type_counts") or {}),
+        "assets": [
+            _sanitize_external_rag_asset(asset)
+            for asset in (summary.get("assets") or [])
+            if isinstance(asset, dict)
+        ],
+    }
+
+
+def _sanitize_external_rag_chunk(chunk: Any) -> Dict[str, Any]:
+    if not isinstance(chunk, dict):
+        return {}
+    metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+    sanitized: Dict[str, Any] = {
+        "source": chunk.get("source"),
+        "score": chunk.get("score"),
+        "snippet": chunk.get("snippet"),
+        "document_id": chunk.get("document_id") or metadata.get("document_id"),
+        "section": chunk.get("section") or metadata.get("section"),
+        "asset_id": chunk.get("asset_id") or metadata.get("asset_id"),
+        "asset_title": chunk.get("asset_title") or metadata.get("asset_title"),
+    }
+    if metadata.get("source_type"):
+        sanitized["source_type"] = metadata.get("source_type")
+    if metadata.get("asset_type"):
+        sanitized["asset_type"] = metadata.get("asset_type")
+    if metadata.get("asset_source_label"):
+        sanitized["asset_source_label"] = metadata.get("asset_source_label")
+    return sanitized
+
+
+def _sanitize_external_rag_match_chunk(chunk: Any) -> Dict[str, Any]:
+    if not isinstance(chunk, dict):
+        return {}
+    return {
+        "document_id": chunk.get("document_id"),
+        "section": chunk.get("section"),
+        "score": chunk.get("score"),
+        "snippet": chunk.get("snippet"),
+        "source": chunk.get("source"),
+    }
+
+
+def _sanitize_external_rag_matched_asset(asset: Any) -> Dict[str, Any]:
+    sanitized = _sanitize_external_rag_asset(asset)
+    if not isinstance(asset, dict):
+        return sanitized
+    for key in (
+        "spl_query",
+        "reuse_tier",
+        "reuse_score",
+        "known_good",
+        "validation_status",
+        "environment_fit_status",
+        "environment_fit_score",
+        "environment_fit_reason",
+        "matched_sections",
+        "matched_chunk_ids",
+        "best_excerpt",
+        "best_chunk_document_id",
+        "match_score",
+        "why_matched",
+    ):
+        if key in asset:
+            sanitized[key] = asset.get(key)
+    sanitized["matched_chunks"] = [
+        _sanitize_external_rag_match_chunk(chunk)
+        for chunk in (asset.get("matched_chunks") or [])
+        if isinstance(chunk, dict)
+    ]
+    return sanitized
+
+
+def _sanitize_external_rag_chunk_section(section: Any) -> Dict[str, Any]:
+    if not isinstance(section, dict):
+        return {}
+    metadata = section.get("metadata") if isinstance(section.get("metadata"), dict) else {}
+    sanitized_metadata: Dict[str, Any] = {}
+    for key in ("source_type", "asset_type", "asset_source_label"):
+        if key in metadata:
+            sanitized_metadata[key] = metadata.get(key)
+    return {
+        "document_id": section.get("document_id"),
+        "section": section.get("section"),
+        "content": section.get("content"),
+        "character_count": section.get("character_count"),
+        "source_name": section.get("source_name"),
+        "metadata": sanitized_metadata,
+    }
+
+
+def _sanitize_external_reusable_spl_query(candidate: Any) -> Dict[str, Any]:
+    if not isinstance(candidate, dict):
+        return {}
+    sanitized: Dict[str, Any] = {}
+    for key in (
+        "asset_id",
+        "title",
+        "query",
+        "source_label",
+        "intent",
+        "environment_fit_status",
+        "environment_fit_score",
+        "validation_status",
+        "success_count",
+        "failure_count",
+        "reuse_tier",
+        "reuse_score",
+        "known_good",
+        "why_reuse",
+        "app",
+        "earliest",
+        "latest",
+    ):
+        if key in candidate:
+            sanitized[key] = candidate.get(key)
+    return sanitized
+
+
+def _sanitize_external_rag_search_result(details: Any) -> Dict[str, Any]:
+    if not isinstance(details, dict):
+        return {}
+    return {
+        "provider": "rag_chromadb",
+        "query": str(details.get("query") or "").strip(),
+        "message": str(details.get("message") or "").strip(),
+        "context_text": str(details.get("context_text") or "").strip(),
+        "operator_brief": str(details.get("operator_brief") or "").strip(),
+        "chunks": [
+            _sanitize_external_rag_chunk(chunk)
+            for chunk in (details.get("chunks") or [])
+            if isinstance(chunk, dict)
+        ],
+        "matched_assets": [
+            _sanitize_external_rag_matched_asset(asset)
+            for asset in (details.get("matched_assets") or [])
+            if isinstance(asset, dict)
+        ],
+        "reusable_spl_queries": [
+            _sanitize_external_reusable_spl_query(candidate)
+            for candidate in (details.get("reusable_spl_queries") or [])
+            if isinstance(candidate, dict)
+        ],
+        "retrieved_key_points": list(details.get("retrieved_key_points") or []),
+        "recommended_uses": list(details.get("recommended_uses") or []),
+        "coverage_gaps": list(details.get("coverage_gaps") or []),
+        "coverage_summary": dict(details.get("coverage_summary") or {}),
+        "index_summary": _sanitize_external_rag_index_summary(details.get("index_summary") or {}),
+        "asset_summary": _sanitize_external_rag_asset_summary(details.get("asset_summary") or {}),
+    }
+
+
+def _sanitize_external_rag_asset_detail(detail: Any) -> Dict[str, Any]:
+    if not isinstance(detail, dict):
+        return {}
+    return {
+        "asset": _sanitize_external_rag_asset(detail.get("asset") or {}),
+        "stored_sections": list(detail.get("stored_sections") or []),
+        "context_body": detail.get("context_body"),
+        "context_character_count": detail.get("context_character_count"),
+        "chunk_sections": [
+            _sanitize_external_rag_chunk_section(section)
+            for section in (detail.get("chunk_sections") or [])
+            if isinstance(section, dict)
+        ],
+        "chunk_count": int(detail.get("chunk_count") or 0),
+        "index_summary": _sanitize_external_rag_index_summary(detail.get("index_summary") or {}),
+    }
+
+
+def _sanitize_external_artifact_metadata(metadata: Any) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    sanitized: Dict[str, Any] = {}
+    for key in (
+        "name",
+        "size",
+        "size_bytes",
+        "modified",
+        "modified_at",
+        "type",
+        "artifact_kind",
+        "session_timestamp",
+    ):
+        if key in metadata:
+            sanitized[key] = metadata.get(key)
+    return sanitized
+
+
+def _sanitize_external_capability_state(state: Any) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+
+    sanitized: Dict[str, Any] = {}
+    for key in (
+        "name",
+        "title",
+        "category",
+        "description",
+        "purpose",
+        "intent",
+        "capability_set",
+        "dependency_packages",
+        "runtime_available",
+        "requires_restart_on_install",
+        "maturity",
+        "installed",
+        "enabled",
+        "version",
+        "health_status",
+        "health_message",
+        "last_tested_at",
+        "restart_required",
+        "installed_at",
+    ):
+        if key in state:
+            sanitized[key] = copy.deepcopy(state.get(key))
+
+    if isinstance(state.get("index_summary"), dict):
+        sanitized["index_summary"] = _sanitize_external_rag_index_summary(state.get("index_summary") or {})
+    if isinstance(state.get("knowledge_asset_summary"), dict):
+        sanitized["knowledge_asset_summary"] = _sanitize_external_rag_asset_summary(
+            state.get("knowledge_asset_summary") or {}
+        )
+
+    export_summary: Dict[str, Any] = {}
+    for key in (
+        "supported_outputs",
+        "max_bundle_files",
+        "available_session_count",
+        "latest_session_timestamp",
+        "bundle_count",
+    ):
+        if key in state:
+            export_summary[key] = copy.deepcopy(state.get(key))
+
+    latest_bundle = state.get("latest_bundle") if isinstance(state.get("latest_bundle"), dict) else None
+    if latest_bundle is not None:
+        export_summary["latest_bundle"] = {
+            key: latest_bundle.get(key)
+            for key in ("name", "size_bytes", "modified_at")
+            if key in latest_bundle
+        }
+
+    if export_summary:
+        sanitized.update(export_summary)
+
+    if "preview_enabled" in state:
+        sanitized["preview_enabled"] = bool(state.get("preview_enabled"))
+
+    if any(key in state for key in ("web_base_url", "base_url", "mcp_url")):
+        sanitized["web_base_url_configured"] = bool(
+            state.get("web_base_url") or state.get("base_url") or state.get("mcp_url")
+        )
+
+    return sanitized
+
+
+def _sanitize_external_discovery_session_summary(session: Any) -> Dict[str, Any]:
+    if not isinstance(session, dict):
+        return {}
+    overview = session.get("overview") if isinstance(session.get("overview"), dict) else {}
+    stats = session.get("stats") if isinstance(session.get("stats"), dict) else {}
+    mcp_capabilities = session.get("mcp_capabilities") if isinstance(session.get("mcp_capabilities"), dict) else {}
+    return {
+        "timestamp": session.get("timestamp"),
+        "readiness_score": _safe_int(session.get("readiness_score")),
+        "overview": {
+            "total_indexes": _safe_int(overview.get("total_indexes")),
+            "total_sourcetypes": _safe_int(overview.get("total_sourcetypes")),
+            "total_hosts": _safe_int(overview.get("total_hosts")),
+            "license_state": str(overview.get("license_state", "unknown") or "unknown"),
+        },
+        "stats": {
+            "recommendation_count": _safe_int(stats.get("recommendation_count")),
+        },
+        "mcp_capabilities": {
+            "tool_count": _safe_int(mcp_capabilities.get("tool_count")),
+        },
+    }
+
+
+def _sanitize_external_discovery_value(value: Any) -> Any:
+    blocked_keys = {
+        "path",
+        "content_path",
+        "stored_path",
+        "storage_dir",
+        "source_dir",
+        "asset_dir",
+        "export_dir",
+        "output_dir",
+        "manifest_path",
+        "sensitive_local_path",
+        "local_path",
+    }
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, nested_value in value.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in blocked_keys:
+                continue
+            sanitized[str(key)] = _sanitize_external_discovery_value(nested_value)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_external_discovery_value(item) for item in value]
+    return copy.deepcopy(value)
+
+
+EXTERNAL_MCP_PROTOCOL_VERSION = "2025-03-26"
+EXTERNAL_MCP_SERVER_NAME = "dt4sms-external-mcp"
+EXTERNAL_MCP_TOOL_DEFINITIONS = [
+    {
+        "name": "rag_search",
+        "description": "Search the managed DT4SMS RAG asset plane and return sanitized read-only results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search prompt or problem statement."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of indexed chunks to retrieve.",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 4,
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "rag_list_assets",
+        "description": "List sanitized metadata for managed RAG knowledge assets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "rag_get_asset_detail",
+        "description": "Load sanitized detail for one managed RAG knowledge asset.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string", "description": "Managed knowledge asset identifier."},
+            },
+            "required": ["asset_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "rag_build_context",
+        "description": "Build a sanitized RAG context pack for a query, including matched assets and retrieved chunks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search prompt or problem statement."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of indexed chunks to retrieve.",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 4,
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "system_get_runtime_summary",
+        "description": "Return a sanitized read-only DT4SMS runtime summary, including auth posture, configured integrations, discovery coverage, and artifact availability.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "capabilities_list",
+        "description": "List sanitized capability state and health summaries for the DT4SMS capability plane.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refresh_health": {
+                    "type": "boolean",
+                    "description": "When true, refresh capability health before returning the summary.",
+                    "default": False,
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "capabilities_get_detail",
+        "description": "Load sanitized detail for one DT4SMS capability, including capability-specific readiness summaries when available.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "capability_name": {"type": "string", "description": "Registered DT4SMS capability name."},
+                "refresh_health": {
+                    "type": "boolean",
+                    "description": "When true, refresh capability health before returning the detail.",
+                    "default": False,
+                },
+            },
+            "required": ["capability_name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "artifacts_list",
+        "description": "List sanitized generated DT4SMS artifacts from the local output catalog.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of artifacts to return.",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 20,
+                },
+                "session_timestamp": {
+                    "type": "string",
+                    "description": "Optional session timestamp filter in YYYYMMDD_HHMMSS format.",
+                },
+                "artifact_kind": {
+                    "type": "string",
+                    "description": "Optional artifact kind filter.",
+                    "enum": ["report", "infographic"],
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "artifacts_get_detail",
+        "description": "Load sanitized metadata and a bounded preview for one generated DT4SMS artifact.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "artifact_name": {"type": "string", "description": "Artifact filename from the DT4SMS output catalog."},
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum preview characters to inline for textual artifacts.",
+                    "minimum": 256,
+                    "maximum": 50000,
+                    "default": 12000,
+                },
+            },
+            "required": ["artifact_name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "discovery_get_dashboard",
+        "description": "Return a compact read-only discovery dashboard summary with current KPIs, trends, and recent session summaries.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "discovery_get_latest_intelligence",
+        "description": "Return the latest discovery intelligence blueprint with sanitized artifact metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "discovery_get_runbook",
+        "description": "Build a persona-scoped discovery runbook for a selected session and return a compact read-only payload.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "timestamp": {
+                    "type": "string",
+                    "description": "Optional session timestamp selection in YYYYMMDD_HHMMSS format.",
+                },
+                "persona": {
+                    "type": "string",
+                    "description": "Runbook persona selection.",
+                    "enum": ["admin", "analyst", "executive"],
+                    "default": "admin",
+                },
+                "voice": {
+                    "type": "string",
+                    "description": "Operator voice used to frame the returned runbook.",
+                    "enum": ["direct", "evidence", "executive"],
+                    "default": "direct",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "discovery_compare_sessions",
+        "description": "Compare two discovery sessions and return compact metrics, deltas, and selected session summaries.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "current_selection": {
+                    "type": "string",
+                    "description": "Optional current session selector such as latest, previous, or a concrete timestamp.",
+                },
+                "baseline_selection": {
+                    "type": "string",
+                    "description": "Optional baseline session selector such as previous or a concrete timestamp.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def _build_external_rag_index_summary_payload() -> Dict[str, Any]:
+    rag_state = capability_manager.get_capability_state("rag_chromadb", refresh_health=False)
+    return {
+        "provider": "rag_chromadb",
+        "installed": bool(rag_state.get("installed")),
+        "enabled": bool(rag_state.get("enabled")),
+        "health_status": rag_state.get("health_status"),
+        "index_summary": _sanitize_external_rag_index_summary(rag_state.get("index_summary") or {}),
+        "asset_summary": _sanitize_external_rag_asset_summary(rag_state.get("knowledge_asset_summary") or {}),
+    }
+
+
+def _normalize_external_rag_limit(value: Any, default: int = 4, maximum: int = 10) -> int:
+    try:
+        limit = int(value if value is not None else default)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Tool argument 'limit' must be an integer") from exc
+    return max(1, min(limit, maximum))
+
+
+def _build_external_rag_search_payload(query: str, limit: int = 4) -> Dict[str, Any]:
+    result = capability_manager.build_rag_context_preview(
+        "rag_chromadb",
+        query,
+        max_chunks=_normalize_external_rag_limit(limit),
+    ).to_dict()
+    _raise_for_capability_result(result)
+    return _sanitize_external_rag_search_result(result.get("details") or {})
+
+
+def _list_external_rag_assets_payload() -> Dict[str, Any]:
+    result = capability_manager.list_rag_assets("rag_chromadb").to_dict()
+    _raise_for_capability_result(result)
+    return _sanitize_external_rag_asset_summary(result.get("details") or {})
+
+
+def _get_external_rag_asset_detail_payload(asset_id: str) -> Dict[str, Any]:
+    result = capability_manager.get_rag_asset_detail("rag_chromadb", asset_id).to_dict()
+    _raise_for_capability_result(result)
+    return _sanitize_external_rag_asset_detail(result.get("details") or {})
+
+
+def _normalize_external_boolean(value: Any, field_name: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"Tool argument '{field_name}' must be a boolean")
+
+
+def _normalize_external_artifact_list_limit(value: Any, default: int = 20, maximum: int = 50) -> int:
+    try:
+        limit = int(value if value is not None else default)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Tool argument 'limit' must be an integer") from exc
+    return max(1, min(limit, maximum))
+
+
+def _normalize_external_artifact_preview_limit(value: Any, default: int = 12000, maximum: int = 50000) -> int:
+    try:
+        limit = int(value if value is not None else default)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Tool argument 'max_chars' must be an integer") from exc
+    return max(256, min(limit, maximum))
+
+
+def _normalize_external_persona(value: Any, default: str = "admin") -> str:
+    persona = str(value or default).strip().lower()
+    return persona if persona in {"admin", "analyst", "executive"} else default
+
+
+def _normalize_operator_voice(value: Any, default: str = "direct") -> str:
+    voice = str(value or default).strip().lower()
+    return voice if voice in {"direct", "evidence", "executive"} else default
+
+
+def _operator_voice_label(value: Any) -> str:
+    voice = _normalize_operator_voice(value)
+    if voice == "evidence":
+        return "Evidence-led"
+    if voice == "executive":
+        return "Executive Brief"
+    return "Direct Ops"
+
+
+def _build_operator_voice_admin_item(action: Dict[str, Any], voice: str) -> Dict[str, str]:
+    title = str(action.get("title") or "Admin control follow-up").strip() or "Admin control follow-up"
+    why = str(action.get("why") or "This control path needs a concrete owner and implementation sequence.").strip()
+    next_step = str(action.get("next_step") or "Review the full runbook for sequencing.").strip()
+    effort = str(action.get("effort") or "unknown").strip() or "unknown"
+
+    if voice == "evidence":
+        return {
+            "title": title,
+            "summary": why,
+            "meta": f"Evidence path: {next_step}",
+            "badge": f"Validation effort: {effort}",
+        }
+    if voice == "executive":
+        return {
+            "title": title,
+            "summary": f"Risk if ignored: {why}",
+            "meta": f"Leadership ask: {next_step}",
+            "badge": f"Investment shape: {effort}",
+        }
+    return {
+        "title": title,
+        "summary": why,
+        "meta": f"Next move: {next_step}",
+        "badge": f"Effort lane: {effort}",
+    }
+
+
+def _build_operator_voice_analyst_item(track: Dict[str, Any], voice: str) -> Dict[str, str]:
+    title = str(track.get("title") or "Investigation track").strip() or "Investigation track"
+    question = str(track.get("question") or "Define the detection hypothesis and validate it against current telemetry.").strip()
+    success_metric = str(track.get("success_metric") or "Define a measurable validation path in the runbook.").strip()
+
+    if voice == "evidence":
+        return {
+            "title": title,
+            "summary": question,
+            "meta": f"Validation signal: {success_metric}",
+        }
+    if voice == "executive":
+        return {
+            "title": title,
+            "summary": f"If confirmed: {question}",
+            "meta": f"Why it matters: {success_metric}",
+        }
+    return {
+        "title": title,
+        "summary": f"Test now: {question}",
+        "meta": f"Success signal: {success_metric}",
+    }
+
+
+def _build_operator_voice_executive_item(item: Any, voice: str, index: int, item_type: str = "theme") -> Dict[str, str]:
+    summary = str(item or "No executive framing was captured.").strip() or "No executive framing was captured."
+
+    if voice == "evidence":
+        return {
+            "title": f"{'Evidence Theme' if item_type == 'theme' else '90-Day Validation'} {index}",
+            "summary": summary,
+            "meta": "Use this to justify telemetry and control investment." if item_type == "theme" else "Use this to set measurable leadership checkpoints.",
+        }
+    if voice == "executive":
+        return {
+            "title": f"{'Board Theme' if item_type == 'theme' else 'Quarter Priority'} {index}",
+            "summary": summary,
+            "meta": "Frame this as business exposure and resilience upside." if item_type == "theme" else "Carry this into the next planning cycle with an accountable owner.",
+        }
+    return {
+        "title": f"{'Value Lever' if item_type == 'theme' else '90-Day Move'} {index}",
+        "summary": summary,
+        "meta": "Use this to align the next operator handoff." if item_type == "theme" else "Turn this into a scheduled operating move.",
+    }
+
+
+def _build_external_runtime_summary_payload() -> Dict[str, Any]:
+    config = config_manager.get()
+    artifact_catalog = build_v2_artifact_catalog()
+    artifact_items = [
+        _sanitize_external_artifact_metadata(artifact)
+        for artifact in (artifact_catalog.get("artifacts") or [])
+        if isinstance(artifact, dict)
+    ]
+    discovery_sessions = load_discovery_sessions()
+    latest_session = discovery_sessions[0] if discovery_sessions else None
+    latest_blueprint = load_latest_v2_blueprint()
+    latest_blueprint_artifact = None
+    if isinstance(latest_blueprint, dict):
+        latest_blueprint_artifact = _sanitize_external_artifact_metadata(latest_blueprint.get("_artifact") or {})
+
+    return {
+        "version": str(getattr(config, "version", "1.0.0") or "1.0.0"),
+        "security": {
+            "auth_enabled": bool(config.security.auth_enabled),
+            "auth_provider": str(config.security.auth_provider or "local_password"),
+            "external_api_enabled": bool(config.security.external_api_enabled),
+            "external_mcp_enabled": bool(config.security.external_mcp_enabled),
+            "session_timeout_minutes": int(config.security.session_timeout_minutes or 0),
+            "password_min_length": int(config.security.password_min_length or 0),
+            "oidc": {
+                "issuer_configured": bool(config.security.oidc.issuer_url),
+                "client_id_configured": bool(config.security.oidc.client_id),
+                "client_secret_configured": bool(config.security.oidc.client_secret),
+                "audience_configured": bool(config.security.oidc.audience),
+                "scopes": list(config.security.oidc.scopes or []),
+            },
+        },
+        "llm": {
+            "provider": str(config.llm.provider or ""),
+            "model": str(config.llm.model or ""),
+            "endpoint_configured": bool(config.llm.endpoint_url),
+            "api_key_configured": bool(config.llm.api_key),
+            "active_credential_name": config.active_credential_name,
+        },
+        "mcp": {
+            "url_configured": bool(config.mcp.url),
+            "verify_ssl": bool(config.mcp.verify_ssl),
+            "ca_bundle_configured": bool(config.mcp.ca_bundle_path),
+            "active_config_name": config.active_mcp_config_name,
+        },
+        "server": {
+            "port": int(config.server.port or 0),
+            "debug_mode": bool(config.server.debug_mode),
+        },
+        "capabilities": capability_manager.get_summary(),
+        "discovery": {
+            "session_count": len(discovery_sessions),
+            "latest_session_timestamp": latest_session.get("timestamp") if isinstance(latest_session, dict) else None,
+            "latest_readiness_score": _safe_int(latest_session.get("readiness_score")) if isinstance(latest_session, dict) else 0,
+        },
+        "artifacts": {
+            "count": int(artifact_catalog.get("count") or 0),
+            "latest": artifact_items[0] if artifact_items else None,
+            "latest_blueprint": latest_blueprint_artifact,
+        },
+    }
+
+
+def _build_external_capabilities_list_payload(refresh_health: bool = False) -> Dict[str, Any]:
+    capability_states = capability_manager.list_capabilities(refresh_health=bool(refresh_health))
+    sanitized_capabilities = [
+        _sanitize_external_capability_state(state)
+        for _, state in sorted(capability_states.items(), key=lambda item: item[0])
+    ]
+    return {
+        "summary": capability_manager.get_summary(),
+        "capabilities": sanitized_capabilities,
+    }
+
+
+def _build_external_capability_detail_payload(capability_name: str, refresh_health: bool = False) -> Dict[str, Any]:
+    try:
+        state = capability_manager.get_capability_state(capability_name, refresh_health=bool(refresh_health))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown capability '{capability_name}'") from exc
+    return {
+        "capability": _sanitize_external_capability_state(state),
+    }
+
+
+def _build_external_artifacts_list_payload(
+    *,
+    limit: int = 20,
+    session_timestamp: Optional[str] = None,
+    artifact_kind: Optional[str] = None,
+) -> Dict[str, Any]:
+    catalog = build_v2_artifact_catalog()
+    artifacts = [artifact for artifact in (catalog.get("artifacts") or []) if isinstance(artifact, dict)]
+
+    selected_session_timestamp = str(session_timestamp or "").strip()
+    if selected_session_timestamp:
+        selected_session_timestamp = validate_session_id(selected_session_timestamp)
+        artifacts = [
+            artifact
+            for artifact in artifacts
+            if str(artifact.get("session_timestamp") or "") == selected_session_timestamp
+        ]
+
+    selected_artifact_kind = str(artifact_kind or "").strip().lower()
+    if selected_artifact_kind:
+        if selected_artifact_kind not in {"report", "infographic"}:
+            raise ValueError("Tool argument 'artifact_kind' must be 'report' or 'infographic'")
+        artifacts = [
+            artifact
+            for artifact in artifacts
+            if str(artifact.get("artifact_kind") or "").strip().lower() == selected_artifact_kind
+        ]
+
+    limited_artifacts = artifacts[: _normalize_external_artifact_list_limit(limit)]
+    return {
+        "has_data": len(artifacts) > 0,
+        "count": len(artifacts),
+        "returned": len(limited_artifacts),
+        "artifacts": [_sanitize_external_artifact_metadata(artifact) for artifact in limited_artifacts],
+    }
+
+
+def _build_external_artifact_detail_payload(artifact_name: str, max_chars: int = 12000) -> Dict[str, Any]:
+    artifact_path = _resolve_external_catalog_artifact_path(artifact_name)
+    artifact_metadata = _sanitize_external_artifact_metadata(_build_artifact_metadata(artifact_path))
+    suffix = artifact_path.suffix.lower()
+
+    if suffix in IMAGE_ARTIFACT_EXTENSIONS:
+        return {
+            "artifact": artifact_metadata,
+            "content_kind": "binary",
+            "top_level_kind": None,
+            "top_level_keys": [],
+            "preview": None,
+            "truncated": False,
+            "total_chars": 0,
+            "preview_unavailable_reason": "Binary artifacts are not inlined over the external MCP surface.",
+        }
+
+    raw_text = artifact_path.read_text(encoding="utf-8", errors="replace")
+    preview_source = raw_text
+    content_kind = "text"
+    top_level_kind: Optional[str] = None
+    top_level_keys: List[str] = []
+
+    if suffix == ".json":
+        try:
+            parsed_payload = json.loads(raw_text)
+        except json.JSONDecodeError:
+            parsed_payload = None
+        else:
+            content_kind = "json"
+            if isinstance(parsed_payload, dict):
+                top_level_kind = "object"
+                top_level_keys = sorted(str(key) for key in parsed_payload.keys())[:50]
+            elif isinstance(parsed_payload, list):
+                top_level_kind = "array"
+            else:
+                top_level_kind = type(parsed_payload).__name__
+            preview_source = json.dumps(parsed_payload, indent=2, ensure_ascii=False)
+
+    preview_limit = _normalize_external_artifact_preview_limit(max_chars)
+    return {
+        "artifact": artifact_metadata,
+        "content_kind": content_kind,
+        "top_level_kind": top_level_kind,
+        "top_level_keys": top_level_keys,
+        "preview": truncate_prompt_text(preview_source, preview_limit, "\n... [artifact preview truncated]"),
+        "truncated": len(preview_source) > preview_limit,
+        "total_chars": len(preview_source),
+    }
+
+
+def _build_external_discovery_dashboard_payload() -> Dict[str, Any]:
+    payload = build_discovery_dashboard_payload()
+    sessions = [
+        _sanitize_external_discovery_session_summary(session)
+        for session in (payload.get("sessions") or [])
+        if isinstance(session, dict)
+    ]
+    if not payload.get("has_data"):
+        return {
+            "has_data": False,
+            "message": str(payload.get("message") or "No discovery sessions available yet."),
+            "sessions": sessions,
+        }
+    return {
+        "has_data": True,
+        "kpis": dict(payload.get("kpis") or {}),
+        "trends": dict(payload.get("trends") or {}),
+        "latest_session": _sanitize_external_discovery_session_summary(payload.get("latest") or {}),
+        "previous_session": _sanitize_external_discovery_session_summary(payload.get("previous") or {}),
+        "sessions": sessions,
+    }
+
+
+def _build_external_latest_intelligence_payload() -> Dict[str, Any]:
+    payload = load_latest_v2_blueprint()
+    if not isinstance(payload, dict):
+        return {
+            "has_data": False,
+            "message": "No intelligence blueprint found.",
+        }
+    blueprint = _sanitize_external_discovery_value(
+        {
+            key: value
+            for key, value in payload.items()
+            if key != "_artifact"
+        }
+    )
+    return {
+        "has_data": True,
+        "artifact": _sanitize_external_artifact_metadata(payload.get("_artifact") or {}),
+        "top_level_keys": sorted(str(key) for key in blueprint.keys())[:50],
+        "blueprint": blueprint,
+    }
+def _build_external_discovery_runbook_payload(
+    timestamp: Optional[str] = None,
+    persona: str = "admin",
+    voice: str = "direct",
+) -> Dict[str, Any]:
+    payload = build_session_runbook_payload(
+        timestamp,
+        _normalize_external_persona(persona),
+        _normalize_operator_voice(voice),
+    )
+    sessions = [
+        _sanitize_external_discovery_session_summary(session)
+        for session in (payload.get("sessions") or [])
+        if isinstance(session, dict)
+    ]
+    if not payload.get("has_data"):
+        return {
+            "has_data": False,
+            "message": str(payload.get("message") or "No discovery sessions available."),
+            "sessions": sessions,
+        }
+    return {
+        "has_data": True,
+        "persona": str(payload.get("persona") or _normalize_external_persona(persona)),
+        "voice": str(payload.get("voice") or _normalize_operator_voice(voice)),
+        "voice_label": str(payload.get("voice_label") or _operator_voice_label(voice)),
+        "title": str(payload.get("title") or "Discovery Runbook"),
+        "filename": str(payload.get("filename") or "runbook.md"),
+        "markdown": str(payload.get("markdown") or ""),
+        "steps": list(payload.get("steps") or []),
+        "session": _sanitize_external_discovery_session_summary(payload.get("session") or {}),
+        "sessions": sessions,
+    }
+
+
+def _build_external_discovery_compare_payload(
+    current_selection: Optional[str] = None,
+    baseline_selection: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload = build_discovery_compare_payload(current_selection, baseline_selection)
+    sessions = [
+        _sanitize_external_discovery_session_summary(session)
+        for session in (payload.get("sessions") or [])
+        if isinstance(session, dict)
+    ]
+    if not payload.get("has_data"):
+        return {
+            "has_data": False,
+            "message": str(payload.get("message") or "Unable to compare discovery sessions."),
+            "sessions": sessions,
+            "current_session": _sanitize_external_discovery_session_summary(payload.get("current") or {}),
+            "baseline_session": _sanitize_external_discovery_session_summary(payload.get("baseline") or {}),
+        }
+    return {
+        "has_data": True,
+        "metrics": copy.deepcopy(payload.get("metrics") or {}),
+        "persona_deltas": copy.deepcopy(payload.get("persona_deltas") or {}),
+        "current_session": _sanitize_external_discovery_session_summary(payload.get("current") or {}),
+        "baseline_session": _sanitize_external_discovery_session_summary(payload.get("baseline") or {}),
+        "sessions": sessions,
+    }
+
+
+def _build_external_mcp_info_payload() -> Dict[str, Any]:
+    return {
+        "server_name": EXTERNAL_MCP_SERVER_NAME,
+        "status": "available",
+        "version": "v1",
+        "transport": "jsonrpc-http",
+        "endpoint": "/api/external/mcp",
+        "authentication": {
+            "scheme": "bearer",
+            "header": "Authorization: Bearer <token>",
+            "token_type": "inbound_mcp",
+            "required_scopes": ["mcp:tools:read"],
+        },
+        "protocol": {
+            "jsonrpc": "2.0",
+            "mcp_protocol_version": EXTERNAL_MCP_PROTOCOL_VERSION,
+        },
+        "tools": [
+            {
+                "name": tool.get("name"),
+                "description": tool.get("description"),
+                "required_scope": "mcp:tools:read",
+            }
+            for tool in EXTERNAL_MCP_TOOL_DEFINITIONS
+        ],
+    }
+
+
+def _build_external_mcp_initialize_result() -> Dict[str, Any]:
+    version = str(getattr(config_manager.get(), "version", "1.0.0") or "1.0.0")
+    return {
+        "protocolVersion": EXTERNAL_MCP_PROTOCOL_VERSION,
+        "serverInfo": {
+            "name": EXTERNAL_MCP_SERVER_NAME,
+            "version": version,
+        },
+        "capabilities": {
+            "tools": {
+                "listChanged": False,
+            }
+        },
+        "instructions": "Use bearer auth with an inbound_mcp token scoped for mcp:tools:read. All tools are read-only wrappers over DT4SMS RAG, artifact, capability, and runtime summary surfaces.",
+    }
+
+
+def _build_jsonrpc_success_response(request_id: Any, result: Dict[str, Any], status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result,
+        },
+    )
+
+
+def _build_jsonrpc_error_response(
+    request_id: Any,
+    code: int,
+    message: str,
+    *,
+    data: Optional[Any] = None,
+    status_code: int = 400,
+) -> JSONResponse:
+    error: Dict[str, Any] = {
+        "code": code,
+        "message": message,
+    }
+    if data is not None:
+        error["data"] = data
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": error,
+        },
+    )
+
+
+def _handle_external_mcp_tool_call(request_id: Any, params: Any) -> JSONResponse:
+    if not isinstance(params, dict):
+        return _build_jsonrpc_error_response(request_id, -32602, "MCP tools/call requires an object params payload")
+
+    tool_name = str(params.get("name") or "").strip()
+    arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+    if not tool_name:
+        return _build_jsonrpc_error_response(request_id, -32602, "Tool name is required")
+
+    try:
+        if tool_name == "rag_search":
+            query = str(arguments.get("query") or "").strip()
+            if not query:
+                return _build_jsonrpc_error_response(request_id, -32602, "Tool argument 'query' is required")
+            payload = _build_external_rag_search_payload(query, arguments.get("limit", 4))
+            message = f"Retrieved read-only RAG search results for '{query}'."
+        elif tool_name == "rag_build_context":
+            query = str(arguments.get("query") or "").strip()
+            if not query:
+                return _build_jsonrpc_error_response(request_id, -32602, "Tool argument 'query' is required")
+            payload = _build_external_rag_search_payload(query, arguments.get("limit", 4))
+            message = f"Built a read-only RAG context pack for '{query}'."
+        elif tool_name == "rag_list_assets":
+            payload = _list_external_rag_assets_payload()
+            message = f"Retrieved {int(payload.get('asset_count') or 0)} managed RAG asset(s)."
+        elif tool_name == "rag_get_asset_detail":
+            asset_id = str(arguments.get("asset_id") or "").strip()
+            if not asset_id:
+                return _build_jsonrpc_error_response(request_id, -32602, "Tool argument 'asset_id' is required")
+            payload = _get_external_rag_asset_detail_payload(asset_id)
+            message = f"Retrieved managed RAG asset detail for '{asset_id}'."
+        elif tool_name == "system_get_runtime_summary":
+            payload = _build_external_runtime_summary_payload()
+            message = "Retrieved a sanitized DT4SMS runtime summary."
+        elif tool_name == "capabilities_list":
+            payload = _build_external_capabilities_list_payload(
+                refresh_health=_normalize_external_boolean(arguments.get("refresh_health"), "refresh_health", False)
+            )
+            message = f"Retrieved {len(payload.get('capabilities') or [])} sanitized capability summary record(s)."
+        elif tool_name == "capabilities_get_detail":
+            capability_name = str(arguments.get("capability_name") or "").strip()
+            if not capability_name:
+                return _build_jsonrpc_error_response(request_id, -32602, "Tool argument 'capability_name' is required")
+            payload = _build_external_capability_detail_payload(
+                capability_name,
+                refresh_health=_normalize_external_boolean(arguments.get("refresh_health"), "refresh_health", False),
+            )
+            message = f"Retrieved sanitized capability detail for '{capability_name}'."
+        elif tool_name == "artifacts_list":
+            payload = _build_external_artifacts_list_payload(
+                limit=arguments.get("limit", 20),
+                session_timestamp=arguments.get("session_timestamp"),
+                artifact_kind=arguments.get("artifact_kind"),
+            )
+            message = f"Retrieved {int(payload.get('returned') or 0)} sanitized artifact record(s)."
+        elif tool_name == "artifacts_get_detail":
+            artifact_name = str(arguments.get("artifact_name") or "").strip()
+            if not artifact_name:
+                return _build_jsonrpc_error_response(request_id, -32602, "Tool argument 'artifact_name' is required")
+            payload = _build_external_artifact_detail_payload(
+                artifact_name,
+                max_chars=arguments.get("max_chars", 12000),
+            )
+            message = f"Retrieved sanitized artifact detail for '{artifact_name}'."
+        elif tool_name == "discovery_get_dashboard":
+            payload = _build_external_discovery_dashboard_payload()
+            message = "Retrieved the sanitized discovery dashboard summary."
+        elif tool_name == "discovery_get_latest_intelligence":
+            payload = _build_external_latest_intelligence_payload()
+            message = "Retrieved the latest sanitized discovery intelligence blueprint."
+        elif tool_name == "discovery_get_runbook":
+            payload = _build_external_discovery_runbook_payload(
+                timestamp=str(arguments.get("timestamp") or "").strip() or None,
+                persona=_normalize_external_persona(arguments.get("persona"), "admin"),
+                voice=_normalize_operator_voice(arguments.get("voice"), "direct"),
+            )
+            message = f"Retrieved the sanitized discovery runbook for persona '{payload.get('persona', 'admin')}'."
+        elif tool_name == "discovery_compare_sessions":
+            payload = _build_external_discovery_compare_payload(
+                current_selection=str(arguments.get("current_selection") or "").strip() or None,
+                baseline_selection=str(arguments.get("baseline_selection") or "").strip() or None,
+            )
+            message = "Retrieved the sanitized discovery session comparison payload."
+        else:
+            return _build_jsonrpc_error_response(request_id, -32601, f"Unknown MCP tool '{tool_name}'")
+    except ValueError as exc:
+        return _build_jsonrpc_error_response(request_id, -32602, str(exc))
+    except HTTPException as exc:
+        return _build_jsonrpc_error_response(
+            request_id,
+            -32000,
+            str(exc.detail),
+            status_code=exc.status_code,
+        )
+    except Exception as exc:
+        return _build_jsonrpc_error_response(request_id, -32000, f"Tool execution failed: {str(exc)}", status_code=500)
+
+    return _build_jsonrpc_success_response(
+        request_id,
+        {
+            "content": [{"type": "text", "text": message}],
+            "structuredContent": payload,
+        },
+    )
+
+
+def build_login_page() -> str:
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DT4SMS Sign In</title>
+    <style>
+        body { margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f172a, #1e293b 55%, #334155); color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .panel { width: min(420px, calc(100vw - 32px)); background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 18px; box-shadow: 0 24px 80px rgba(15, 23, 42, 0.45); padding: 32px; }
+        .eyebrow { text-transform: uppercase; letter-spacing: 0.18em; font-size: 11px; color: #93c5fd; }
+        h1 { margin: 10px 0 8px; font-size: 28px; }
+        p { color: #cbd5e1; line-height: 1.5; }
+        label { display: block; font-size: 13px; font-weight: 600; margin: 18px 0 8px; color: #e2e8f0; }
+        input { width: 100%; box-sizing: border-box; border: 1px solid #475569; border-radius: 10px; padding: 12px 14px; background: #0f172a; color: #f8fafc; }
+        button { margin-top: 20px; width: 100%; border: 0; border-radius: 10px; padding: 12px 14px; background: #2563eb; color: white; font-weight: 700; cursor: pointer; }
+        button:hover { background: #1d4ed8; }
+        .hint { margin-top: 18px; font-size: 12px; color: #94a3b8; }
+        .error { margin-top: 14px; min-height: 20px; color: #fda4af; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <div class="eyebrow">Security Enabled</div>
+        <h1>DT4SMS Sign In</h1>
+        <p>Authentication is enabled for this installation. Sign in to continue.</p>
+        <form id="login-form">
+            <label for="username">Username</label>
+            <input id="username" name="username" autocomplete="username" required />
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" required />
+            <button type="submit">Sign In</button>
+            <div id="login-error" class="error" aria-live="polite"></div>
+        </form>
+        <div class="hint">A password reset may be required before normal access is granted.</div>
+    </div>
+    <script>
+        const form = document.getElementById('login-form');
+        const errorNode = document.getElementById('login-error');
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            errorNode.textContent = '';
+            const payload = {
+                username: document.getElementById('username').value,
+                password: document.getElementById('password').value,
+            };
+            const response = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                errorNode.textContent = data.detail || 'Sign in failed.';
+                return;
+            }
+            window.location.href = '/';
+        });
+    </script>
+</body>
+</html>
+"""
+
+
+def build_oidc_login_page(provider_status: Dict[str, Any]) -> str:
+    issuer_url = html.escape(str(provider_status.get("issuer_url") or "Not configured"))
+    button_disabled = "disabled" if not provider_status.get("ready") else ""
+    button_label = "Sign In With OpenID Connect" if provider_status.get("ready") else "OIDC Provider Not Ready"
+    helper_text = (
+        "Use the configured identity provider to sign in to DT4SMS."
+        if provider_status.get("ready")
+        else "OIDC authentication is enabled, but issuer URL, client ID, or client secret is still incomplete."
+    )
+    button_opacity = "opacity:0.55; cursor:not-allowed;" if button_disabled else ""
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DT4SMS Sign In</title>
+    <style>
+        body {{ margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f172a, #1e293b 55%, #1d4ed8); color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+        .panel {{ width: min(460px, calc(100vw - 32px)); background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 18px; box-shadow: 0 24px 80px rgba(15, 23, 42, 0.45); padding: 32px; }}
+        .eyebrow {{ text-transform: uppercase; letter-spacing: 0.18em; font-size: 11px; color: #93c5fd; }}
+        h1 {{ margin: 10px 0 8px; font-size: 28px; }}
+        p {{ color: #cbd5e1; line-height: 1.5; }}
+        .issuer {{ margin-top: 18px; padding: 12px 14px; border-radius: 12px; background: rgba(15, 23, 42, 0.7); border: 1px solid rgba(148, 163, 184, 0.25); font-size: 12px; color: #cbd5e1; word-break: break-word; }}
+        .button {{ margin-top: 22px; display: inline-flex; width: 100%; align-items: center; justify-content: center; gap: 10px; box-sizing: border-box; border-radius: 12px; padding: 13px 16px; background: #2563eb; color: #fff; font-weight: 700; text-decoration: none; {button_opacity} }}
+        .button:hover {{ background: #1d4ed8; }}
+        .hint {{ margin-top: 18px; font-size: 12px; color: #94a3b8; }}
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <div class="eyebrow">Security Enabled</div>
+        <h1>DT4SMS Sign In</h1>
+        <p>{html.escape(helper_text)}</p>
+        <div class="issuer"><strong>Issuer:</strong> {issuer_url}</div>
+        <a class="button" href="/api/auth/oidc/start" {button_disabled}>
+            <span>OpenID Connect</span>
+            <span>{html.escape(button_label)}</span>
+        </a>
+        <div class="hint">DT4SMS will establish the same app session model after OIDC authentication completes.</div>
+    </div>
+</body>
+</html>
+"""
+
+
+def build_auth_error_page(title: str, message: str) -> str:
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{html.escape(title)}</title>
+    <style>
+        body {{ margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #111827, #1f2937); color: #e5e7eb; min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+        .panel {{ width: min(460px, calc(100vw - 32px)); background: rgba(17, 24, 39, 0.95); border: 1px solid rgba(248, 113, 113, 0.25); border-radius: 18px; padding: 32px; box-shadow: 0 24px 80px rgba(15, 23, 42, 0.45); }}
+        h1 {{ margin: 0 0 12px; font-size: 26px; }}
+        p {{ color: #d1d5db; line-height: 1.6; }}
+        a {{ color: #93c5fd; }}
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <h1>{html.escape(title)}</h1>
+        <p>{html.escape(message)}</p>
+        <p><a href="/">Return to sign-in</a></p>
+    </div>
+</body>
+</html>
+"""
+
+
+def build_password_reset_page(username: str) -> str:
+    safe_username = html.escape(str(username or ""))
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DT4SMS Password Reset</title>
+    <style>
+        body {{ margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #111827, #1f2937 55%, #374151); color: #e5e7eb; min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+        .panel {{ width: min(460px, calc(100vw - 32px)); background: rgba(17, 24, 39, 0.95); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 18px; box-shadow: 0 24px 80px rgba(15, 23, 42, 0.45); padding: 32px; }}
+        .eyebrow {{ text-transform: uppercase; letter-spacing: 0.18em; font-size: 11px; color: #fbbf24; }}
+        h1 {{ margin: 10px 0 8px; font-size: 28px; }}
+        p {{ color: #d1d5db; line-height: 1.5; }}
+        label {{ display: block; font-size: 13px; font-weight: 600; margin: 18px 0 8px; color: #f3f4f6; }}
+        input {{ width: 100%; box-sizing: border-box; border: 1px solid #4b5563; border-radius: 10px; padding: 12px 14px; background: #111827; color: #f9fafb; }}
+        button {{ margin-top: 20px; width: 100%; border: 0; border-radius: 10px; padding: 12px 14px; background: #d97706; color: white; font-weight: 700; cursor: pointer; }}
+        button:hover {{ background: #b45309; }}
+        .error {{ margin-top: 14px; min-height: 20px; color: #fda4af; font-size: 13px; }}
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <div class="eyebrow">Action Required</div>
+        <h1>Reset Password</h1>
+        <p>Signed in as <strong>{safe_username}</strong>. A password reset is required before normal access is granted.</p>
+        <form id="reset-form">
+            <label for="current_password">Current Password</label>
+            <input id="current_password" name="current_password" type="password" autocomplete="current-password" required />
+            <label for="new_password">New Password</label>
+            <input id="new_password" name="new_password" type="password" autocomplete="new-password" required />
+            <label for="confirm_password">Confirm New Password</label>
+            <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required />
+            <button type="submit">Update Password</button>
+            <div id="reset-error" class="error" aria-live="polite"></div>
+        </form>
+    </div>
+    <script>
+        const form = document.getElementById('reset-form');
+        const errorNode = document.getElementById('reset-error');
+        form.addEventListener('submit', async (event) => {{
+            event.preventDefault();
+            errorNode.textContent = '';
+            const payload = {{
+                current_password: document.getElementById('current_password').value,
+                new_password: document.getElementById('new_password').value,
+                confirm_password: document.getElementById('confirm_password').value,
+            }};
+            const response = await fetch('/api/auth/reset-password', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(payload),
+            }});
+            const data = await response.json().catch(() => ({{}}));
+            if (!response.ok) {{
+                errorNode.textContent = data.detail || 'Password reset failed.';
+                return;
+            }}
+            window.location.href = '/';
+        }});
+    </script>
+</body>
+</html>
+"""
 
 
 def should_enable_rag_context_by_default() -> bool:
@@ -185,14 +2616,14 @@ def sync_chat_settings_with_capability_defaults() -> None:
 def get_or_create_llm_client(config):
     """Get cached LLM client or create new one if config changed."""
     global _cached_llm_client, _cached_config_hash
-    
+
     # Generate hash from relevant config values
     config_hash = hash(f"{config.llm.provider}{config.llm.endpoint_url}{config.llm.model}{config.llm.api_key}")
-    
+
     # Return cached client if config hasn't changed
     if _cached_llm_client is not None and _cached_config_hash == config_hash:
         return _cached_llm_client
-    
+
     provider_name = normalize_provider_name(config.llm.provider)
     endpoint_url = config.llm.endpoint_url
 
@@ -206,7 +2637,7 @@ def get_or_create_llm_client(config):
         model=config.llm.model
     )
     print(f"[LLM Cache] Created {provider_name} client ({config.llm.model})")
-    
+
     _cached_config_hash = config_hash
     return _cached_llm_client
 
@@ -245,6 +2676,292 @@ app.add_middleware(
 active_connections: List[WebSocket] = []
 current_discovery_session = None
 summarization_progress: Dict[str, Dict[str, Any]] = {}  # Track progress by session_id
+DISCOVERY_ACTIVE_STATUSES = {"starting", "running"}
+DISCOVERY_ACTIVITY_LOG_LIMIT = 160
+SUMMARIZATION_TERMINAL_STAGES = {"idle", "complete", "error", "interrupted", "aborted"}
+RUNTIME_STATE_FILENAME = "runtime_state.json"
+RUNTIME_STATE_SCHEMA_VERSION = 1
+RUNTIME_JOB_DIRNAME = "runtime_jobs"
+RUNTIME_JOB_WORKER_ENV = "DT4SMS_RUNTIME_WORKER"
+RUNTIME_STATE_BRIDGE_POLL_INTERVAL_SECONDS = 0.5
+runtime_state_bridge_task: Optional[asyncio.Task] = None
+runtime_state_bridge_last_file_marker: Optional[Tuple[int, int]] = None
+runtime_state_bridge_last_discovery_signature: Optional[str] = None
+
+
+def _utcnow_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def _is_runtime_worker_process() -> bool:
+    return str(os.getenv(RUNTIME_JOB_WORKER_ENV, "")).strip() == "1"
+
+
+def _coerce_process_id(value: Any) -> Optional[int]:
+    try:
+        pid = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _is_process_running(value: Any) -> bool:
+    pid = _coerce_process_id(value)
+    if pid is None:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _normalize_discovery_activity_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+
+    message_type = str(entry.get("type") or "").strip().lower()
+    if not message_type:
+        return None
+
+    timestamp = str(entry.get("timestamp") or _utcnow_iso()).strip() or _utcnow_iso()
+    payload = copy.deepcopy(entry.get("data"))
+    identifier = str(entry.get("id") or f"{timestamp}:{message_type}:{secrets.token_hex(4)}").strip()
+
+    return {
+        "id": identifier,
+        "type": message_type,
+        "data": payload,
+        "timestamp": timestamp,
+    }
+
+
+def _normalize_discovery_activity_log(entries: Any) -> List[Dict[str, Any]]:
+    if not isinstance(entries, list):
+        return []
+
+    normalized_entries: List[Dict[str, Any]] = []
+    for entry in entries:
+        normalized_entry = _normalize_discovery_activity_entry(entry)
+        if normalized_entry is not None:
+            normalized_entries.append(normalized_entry)
+
+    return normalized_entries[-DISCOVERY_ACTIVITY_LOG_LIMIT:]
+
+
+def _default_summarization_progress_payload() -> Dict[str, Any]:
+    return {
+        "stage": "idle",
+        "progress": 0,
+        "message": "Not started",
+    }
+
+
+def _normalize_discovery_progress_payload(payload: Any = None) -> Dict[str, Any]:
+    progress_payload = payload if isinstance(payload, dict) else {}
+
+    try:
+        percentage = float(progress_payload.get("percentage", 0) or 0)
+    except (TypeError, ValueError):
+        percentage = 0.0
+    percentage = max(0.0, min(100.0, percentage))
+
+    try:
+        current_step = int(progress_payload.get("current_step", 0) or 0)
+    except (TypeError, ValueError):
+        current_step = 0
+
+    try:
+        total_steps = int(progress_payload.get("total_steps", 0) or 0)
+    except (TypeError, ValueError):
+        total_steps = 0
+
+    eta_seconds_raw = progress_payload.get("eta_seconds")
+    try:
+        eta_seconds = float(eta_seconds_raw) if eta_seconds_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        eta_seconds = None
+
+    eta_method = str(progress_payload.get("eta_method") or "").strip() or None
+
+    return {
+        "percentage": percentage,
+        "current_step": max(0, current_step),
+        "total_steps": max(0, total_steps),
+        "description": str(progress_payload.get("description") or "").strip(),
+        "eta_seconds": eta_seconds,
+        "eta_method": eta_method,
+    }
+
+
+def _build_discovery_runtime_state() -> Dict[str, Any]:
+    return {
+        "status": "idle",
+        "session_id": None,
+        "worker_pid": None,
+        "execution_mode": None,
+        "pipeline_version": None,
+        "started_at": None,
+        "updated_at": None,
+        "completed_at": None,
+        "result_timestamp": None,
+        "report_count": 0,
+        "error": None,
+        "current_phase_key": None,
+        "current_phase_title": None,
+        "phase_plan": [],
+        "activity_log": [],
+        "last_run_outcome": None,
+        "progress": _normalize_discovery_progress_payload(),
+    }
+
+
+discovery_runtime_state: Dict[str, Any] = _build_discovery_runtime_state()
+
+
+def _snapshot_discovery_runtime_state() -> Dict[str, Any]:
+    snapshot = copy.deepcopy(discovery_runtime_state)
+    snapshot["is_active"] = snapshot.get("status") in DISCOVERY_ACTIVE_STATUSES
+    return snapshot
+
+
+def _update_discovery_runtime_state(
+    *,
+    reset: bool = False,
+    status: Optional[str] = None,
+    progress: Any = None,
+    **fields: Any,
+) -> Dict[str, Any]:
+    global discovery_runtime_state
+
+    snapshot = _build_discovery_runtime_state() if reset else copy.deepcopy(discovery_runtime_state)
+
+    if status is not None:
+        normalized_status = str(status or "idle").strip().lower() or "idle"
+        snapshot["status"] = normalized_status
+
+    if progress is not None:
+        snapshot["progress"] = _normalize_discovery_progress_payload(progress)
+
+    append_activity = fields.pop("append_activity", None)
+
+    if "worker_pid" in fields:
+        fields["worker_pid"] = _coerce_process_id(fields.get("worker_pid"))
+    if "execution_mode" in fields:
+        fields["execution_mode"] = str(fields.get("execution_mode") or "").strip().lower() or None
+    if "activity_log" in fields:
+        fields["activity_log"] = _normalize_discovery_activity_log(fields.get("activity_log"))
+
+    for field_name, field_value in fields.items():
+        snapshot[field_name] = field_value
+
+    if append_activity is not None:
+        appended_entries = append_activity if isinstance(append_activity, list) else [append_activity]
+        snapshot["activity_log"] = _normalize_discovery_activity_log(
+            list(snapshot.get("activity_log") or []) + appended_entries
+        )
+
+    phase_plan = snapshot.get("phase_plan")
+    if isinstance(phase_plan, list) and phase_plan:
+        active_phase = next((item for item in phase_plan if item.get("status") == "active"), None)
+        if active_phase is not None:
+            snapshot["current_phase_key"] = active_phase.get("key")
+            snapshot["current_phase_title"] = active_phase.get("title") or active_phase.get("label")
+
+            description = str((snapshot.get("progress") or {}).get("description") or "").strip()
+            if description:
+                active_phase["last_detail"] = description
+
+            try:
+                percentage = float((snapshot.get("progress") or {}).get("percentage") or 0.0)
+            except (TypeError, ValueError):
+                percentage = 0.0
+            active_phase["progress_percent"] = max(
+                float(active_phase.get("progress_percent") or 0.0),
+                percentage,
+            )
+
+    if snapshot.get("progress"):
+        calibrated_eta_seconds = _calculate_stage_calibrated_eta_seconds(snapshot)
+        if calibrated_eta_seconds is not None:
+            snapshot["progress"]["eta_seconds"] = calibrated_eta_seconds
+            snapshot["progress"]["eta_method"] = "stage_calibrated"
+
+    snapshot["updated_at"] = _utcnow_iso()
+    discovery_runtime_state = snapshot
+    _persist_runtime_state()
+    return _snapshot_discovery_runtime_state()
+
+
+def _append_discovery_runtime_activity(message_type: str, data: Any) -> Dict[str, Any]:
+    return _update_discovery_runtime_state(
+        append_activity={
+            "type": message_type,
+            "data": data,
+            "timestamp": _utcnow_iso(),
+        }
+    )
+
+
+def _build_websocket_message(message_type: str, data: Any) -> Dict[str, Any]:
+    return {
+        "type": message_type,
+        "data": data,
+        "timestamp": _utcnow_iso(),
+    }
+
+
+async def _broadcast_websocket_message(message_type: str, data: Any):
+    message = _build_websocket_message(message_type, data)
+
+    disconnected = []
+    for connection in active_connections:
+        try:
+            await connection.send_text(json.dumps(message))
+        except Exception:
+            disconnected.append(connection)
+
+    for conn in disconnected:
+        if conn in active_connections:
+            active_connections.remove(conn)
+
+
+async def _broadcast_discovery_runtime_state(snapshot: Optional[Dict[str, Any]] = None):
+    discovery_snapshot = snapshot or _snapshot_discovery_runtime_state()
+    _remember_runtime_state_bridge_snapshot(discovery_snapshot)
+    await _broadcast_websocket_message("discovery_status", discovery_snapshot)
+
+
+@app.on_event("startup")
+async def start_runtime_state_bridge() -> None:
+    global runtime_state_bridge_task
+
+    if _is_runtime_worker_process():
+        return
+
+    _sync_runtime_state_from_disk()
+    _remember_runtime_state_bridge_snapshot()
+    if runtime_state_bridge_task is None or runtime_state_bridge_task.done():
+        runtime_state_bridge_task = asyncio.create_task(_runtime_state_bridge_loop())
+
+
+@app.on_event("shutdown")
+async def stop_runtime_state_bridge() -> None:
+    global runtime_state_bridge_task
+
+    task = runtime_state_bridge_task
+    runtime_state_bridge_task = None
+    if task is None:
+        return
+
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 # Debug mode support
 debug_connections: List[WebSocket] = []  # WebSocket connections for debug log streaming
@@ -284,7 +3001,7 @@ MCP_TOOL_DESCRIPTIONS = {
 }
 
 _cached_mcp_tools = {
-    "url": None,
+    "identity": None,
     "tools": set(),
     "timestamp": 0.0
 }
@@ -296,6 +3013,731 @@ MAX_INFOGRAPHIC_BRIEF_CHARS = 12000
 SUMMARY_INFOGRAPHIC_DIRNAME = "summary_infographics"
 SUMMARY_INFOGRAPHIC_PREFIX = "summary_infographic_"
 IMAGE_ARTIFACT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+DISCOVERY_PHASE_MODELS = {
+    "v2": [
+        {
+            "key": "pipeline_boot",
+            "label": "Bootstrap",
+            "description": "Validate runtime settings and initialize the discovery pipeline.",
+            "progress_start": 0.0,
+            "progress_end": 8.0,
+            "baseline_seconds": 45.0,
+            "match_tokens": ["v2 discovery pipeline"],
+        },
+        {
+            "key": "signal_capture",
+            "label": "Signal Capture",
+            "description": "Capture environment topology and establish the discovery scope.",
+            "progress_start": 2.0,
+            "progress_end": 12.0,
+            "baseline_seconds": 75.0,
+            "match_tokens": ["environment signal capture"],
+        },
+        {
+            "key": "evidence_collection",
+            "label": "Evidence Collection",
+            "description": "Enumerate environment evidence and collect detailed telemetry for analysis.",
+            "progress_start": 10.0,
+            "progress_end": 78.0,
+            "baseline_seconds": 300.0,
+            "match_tokens": ["evidence collection"],
+        },
+        {
+            "key": "classification_map",
+            "label": "Classification Map",
+            "description": "Classify the captured telemetry and normalize findings into an analyst-ready map.",
+            "progress_start": 78.0,
+            "progress_end": 84.0,
+            "baseline_seconds": 70.0,
+            "match_tokens": ["classification map"],
+        },
+        {
+            "key": "recommendation_queue",
+            "label": "Recommendation Queue",
+            "description": "Generate prioritized follow-on actions from the classified evidence.",
+            "progress_start": 84.0,
+            "progress_end": 90.0,
+            "baseline_seconds": 70.0,
+            "match_tokens": ["recommendation queue"],
+        },
+        {
+            "key": "use_case_generation",
+            "label": "Use Case Generation",
+            "description": "Assemble suggested detection and response use cases from the discovery findings.",
+            "progress_start": 90.0,
+            "progress_end": 94.0,
+            "baseline_seconds": 80.0,
+            "match_tokens": ["use case generation"],
+        },
+        {
+            "key": "blueprint_assembly",
+            "label": "Blueprint Assembly",
+            "description": "Build the intelligence blueprint and operator handoff package.",
+            "progress_start": 94.0,
+            "progress_end": 97.0,
+            "baseline_seconds": 45.0,
+            "match_tokens": ["blueprint assembly"],
+        },
+        {
+            "key": "artifact_packaging",
+            "label": "Artifact Packaging",
+            "description": "Write reports, package artifacts, and register the discovery output.",
+            "progress_start": 97.0,
+            "progress_end": 100.0,
+            "baseline_seconds": 50.0,
+            "match_tokens": ["artifact packaging"],
+        },
+    ],
+    "legacy": [
+        {
+            "key": "quick_overview",
+            "label": "Quick Overview",
+            "description": "Collect a baseline overview and size the environment.",
+            "progress_start": 0.0,
+            "progress_end": 12.0,
+            "baseline_seconds": 75.0,
+            "match_tokens": ["quick overview"],
+        },
+        {
+            "key": "environment_discovery",
+            "label": "Environment Discovery",
+            "description": "Walk the environment and collect detailed discovery evidence.",
+            "progress_start": 12.0,
+            "progress_end": 58.0,
+            "baseline_seconds": 300.0,
+            "match_tokens": ["detailed environment discovery"],
+        },
+        {
+            "key": "classification_analysis",
+            "label": "Classification Analysis",
+            "description": "Classify and score the collected findings.",
+            "progress_start": 58.0,
+            "progress_end": 72.0,
+            "baseline_seconds": 95.0,
+            "match_tokens": ["data classification analysis"],
+        },
+        {
+            "key": "recommendation_generation",
+            "label": "Recommendation Generation",
+            "description": "Generate prioritized recommendations from the discovery output.",
+            "progress_start": 72.0,
+            "progress_end": 82.0,
+            "baseline_seconds": 90.0,
+            "match_tokens": ["recommendation generation"],
+        },
+        {
+            "key": "legacy_use_case_generation",
+            "label": "Use Case Generation",
+            "description": "Draft suggested use cases from the environment findings.",
+            "progress_start": 82.0,
+            "progress_end": 90.0,
+            "baseline_seconds": 85.0,
+            "match_tokens": ["suggested use case generation"],
+        },
+        {
+            "key": "report_export",
+            "label": "Report Export",
+            "description": "Export final reports and persist the discovery results.",
+            "progress_start": 90.0,
+            "progress_end": 100.0,
+            "baseline_seconds": 75.0,
+            "match_tokens": ["report export"],
+        },
+    ],
+}
+
+DISCOVERY_HEAVY_PHASE_KEYS = {"evidence_collection", "environment_discovery"}
+
+
+def _normalize_discovery_phase_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+
+def _build_discovery_phase_plan(pipeline_version: Optional[str] = None) -> List[Dict[str, Any]]:
+    models = DISCOVERY_PHASE_MODELS.get((pipeline_version or DISCOVERY_PIPELINE_VERSION).strip().lower())
+    if not models:
+        models = DISCOVERY_PHASE_MODELS["v2"]
+
+    return [
+        {
+            "key": item["key"],
+            "label": item["label"],
+            "title": item["label"],
+            "description": item["description"],
+            "progress_start": float(item["progress_start"]),
+            "progress_end": float(item["progress_end"]),
+            "baseline_seconds": float(item["baseline_seconds"]),
+            "progress_percent": float(item["progress_start"]),
+            "status": "pending",
+            "started_at": None,
+            "completed_at": None,
+            "last_detail": "",
+        }
+        for item in models
+    ]
+
+
+def _resolve_discovery_phase_definition(title: str, pipeline_version: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    normalized_title = _normalize_discovery_phase_token(title)
+    if not normalized_title:
+        return None
+
+    models = DISCOVERY_PHASE_MODELS.get((pipeline_version or DISCOVERY_PIPELINE_VERSION).strip().lower())
+    if not models:
+        models = DISCOVERY_PHASE_MODELS["v2"]
+
+    for item in models:
+        if any(token in normalized_title for token in item.get("match_tokens", [])):
+            return item
+    return None
+
+
+def _parse_runtime_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _calculate_stage_calibrated_eta_seconds(snapshot: Dict[str, Any]) -> Optional[float]:
+    progress = snapshot.get("progress") or {}
+    try:
+        percentage = float(progress.get("percentage") or 0.0)
+    except (TypeError, ValueError):
+        percentage = 0.0
+
+    phase_plan = snapshot.get("phase_plan") or []
+    started_at = _parse_runtime_datetime(snapshot.get("started_at"))
+    if not phase_plan or started_at is None:
+        return None
+
+    active_index = next((index for index, item in enumerate(phase_plan) if item.get("status") == "active"), None)
+    if active_index is None:
+        return None
+
+    active_phase = phase_plan[active_index]
+    phase_started_at = _parse_runtime_datetime(active_phase.get("started_at")) or started_at
+    elapsed_current_phase = max(0.0, (datetime.now(phase_started_at.tzinfo) - phase_started_at).total_seconds())
+
+    phase_start = float(active_phase.get("progress_start") or 0.0)
+    phase_end = float(active_phase.get("progress_end") or 100.0)
+    phase_span = max(1.0, phase_end - phase_start)
+    phase_progress = max(0.0, min(1.0, (percentage - phase_start) / phase_span))
+
+    if phase_progress <= 0.02:
+        current_phase_remaining = float(active_phase.get("baseline_seconds") or 0.0)
+    else:
+        measured_total = elapsed_current_phase / min(max(phase_progress, 0.05), 0.98)
+        baseline_total = float(active_phase.get("baseline_seconds") or 0.0)
+        multiplier = 1.25 if active_phase.get("key") in DISCOVERY_HEAVY_PHASE_KEYS else 1.12
+        calibrated_total = max(baseline_total, measured_total * multiplier)
+        current_phase_remaining = max(0.0, calibrated_total - elapsed_current_phase)
+
+    remaining_after_current = sum(
+        float(item.get("baseline_seconds") or 0.0)
+        for item in phase_plan[active_index + 1:]
+        if item.get("status") == "pending"
+    )
+
+    eta_seconds = current_phase_remaining + remaining_after_current
+    if percentage >= 99.0:
+        eta_seconds = min(eta_seconds, 45.0)
+
+    return round(max(0.0, eta_seconds), 1)
+
+
+def _build_discovery_last_run_outcome(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(snapshot.get("status") or "idle").strip().lower() or "idle"
+    completed_at = snapshot.get("completed_at")
+    result_timestamp = snapshot.get("result_timestamp")
+    report_count = int(snapshot.get("report_count") or 0)
+    phase_title = snapshot.get("current_phase_title") or "Discovery pipeline"
+    error_message = str(snapshot.get("error") or "").strip()
+
+    if status == "completed":
+        title = "Discovery run completed"
+        summary = f"Finished at {completed_at or 'the latest checkpoint'} and produced {report_count} report artifact{'s' if report_count != 1 else ''}."
+    elif status == "interrupted":
+        title = "Discovery run interrupted"
+        summary = f"The app restarted during {phase_title.lower()}. Review the latest checkpoint and rerun when ready."
+    elif status == "aborted":
+        title = "Discovery run stopped"
+        summary = f"Stopped during {phase_title.lower()}. Review the ledger before starting a new run."
+    elif status == "error":
+        title = "Discovery run failed"
+        summary = error_message or f"Failed during {phase_title.lower()}. Review the latest log output for the blocking error."
+    else:
+        title = "Discovery monitor"
+        summary = "No completed discovery outcome is available yet."
+
+    return {
+        "status": status,
+        "title": title,
+        "summary": summary,
+        "completed_at": completed_at,
+        "result_timestamp": result_timestamp,
+        "report_count": report_count,
+        "phase_title": phase_title,
+        "error": error_message or None,
+    }
+
+
+def _advance_discovery_runtime_phase(title: str) -> Dict[str, Any]:
+    snapshot = copy.deepcopy(discovery_runtime_state)
+    pipeline_version = snapshot.get("pipeline_version") or DISCOVERY_PIPELINE_VERSION
+    phase_plan = snapshot.get("phase_plan") or _build_discovery_phase_plan(pipeline_version)
+    definition = _resolve_discovery_phase_definition(title, pipeline_version)
+    if definition is None:
+        return _update_discovery_runtime_state(status="running", current_phase_title=title, phase_plan=phase_plan)
+
+    now_iso = _utcnow_iso()
+    for phase_entry in phase_plan:
+        if phase_entry.get("status") == "active" and phase_entry.get("key") != definition["key"]:
+            phase_entry["status"] = "completed"
+            phase_entry["completed_at"] = phase_entry.get("completed_at") or now_iso
+            phase_entry["progress_percent"] = max(
+                float(phase_entry.get("progress_percent") or 0.0),
+                float(phase_entry.get("progress_end") or 0.0),
+            )
+
+    target_phase = next((item for item in phase_plan if item.get("key") == definition["key"]), None)
+    if target_phase is None:
+        target_phase = {
+            "key": definition["key"],
+            "label": definition["label"],
+            "title": title,
+            "description": definition["description"],
+            "progress_start": float(definition["progress_start"]),
+            "progress_end": float(definition["progress_end"]),
+            "baseline_seconds": float(definition["baseline_seconds"]),
+            "progress_percent": float(definition["progress_start"]),
+            "status": "pending",
+            "started_at": None,
+            "completed_at": None,
+            "last_detail": "",
+        }
+        phase_plan.append(target_phase)
+
+    target_phase["title"] = title
+    target_phase["status"] = "active"
+    target_phase["started_at"] = target_phase.get("started_at") or now_iso
+    target_phase["completed_at"] = None
+    target_phase["progress_percent"] = max(
+        float(target_phase.get("progress_percent") or 0.0),
+        float(target_phase.get("progress_start") or 0.0),
+    )
+
+    return _update_discovery_runtime_state(
+        status="running",
+        phase_plan=phase_plan,
+        current_phase_key=target_phase.get("key"),
+        current_phase_title=title,
+    )
+
+
+def _finalize_discovery_runtime(
+    status: str,
+    *,
+    error: Optional[str] = None,
+    report_count: Optional[int] = None,
+    result_timestamp: Optional[str] = None,
+    completed_at: Optional[str] = None,
+    **fields: Any,
+) -> Dict[str, Any]:
+    snapshot = copy.deepcopy(discovery_runtime_state)
+    phase_plan = snapshot.get("phase_plan") or _build_discovery_phase_plan(snapshot.get("pipeline_version") or DISCOVERY_PIPELINE_VERSION)
+    now_iso = completed_at or _utcnow_iso()
+    normalized_status = str(status or "idle").strip().lower() or "idle"
+
+    for phase_entry in phase_plan:
+        if phase_entry.get("status") == "active":
+            phase_entry["status"] = "completed" if normalized_status == "completed" else normalized_status
+            phase_entry["completed_at"] = phase_entry.get("completed_at") or now_iso
+            if normalized_status == "completed":
+                phase_entry["progress_percent"] = max(
+                    float(phase_entry.get("progress_percent") or 0.0),
+                    float(phase_entry.get("progress_end") or 0.0),
+                )
+            elif error:
+                phase_entry["last_detail"] = error
+
+    completed_snapshot = _update_discovery_runtime_state(
+        status=normalized_status,
+        phase_plan=phase_plan,
+        completed_at=now_iso,
+        error=error,
+        report_count=report_count if report_count is not None else snapshot.get("report_count") or 0,
+        result_timestamp=result_timestamp if result_timestamp is not None else snapshot.get("result_timestamp"),
+        **fields,
+    )
+    outcome = _build_discovery_last_run_outcome(completed_snapshot)
+    return _update_discovery_runtime_state(last_run_outcome=outcome)
+
+
+def _runtime_state_store_path() -> Path:
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+    return output_dir / RUNTIME_STATE_FILENAME
+
+
+def _normalize_summarization_progress_entry(
+    session_id: str,
+    payload: Any = None,
+    *,
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    source_payload = payload if isinstance(payload, dict) else {}
+    current = existing if isinstance(existing, dict) else {}
+
+    stage = str(source_payload.get("stage") or current.get("stage") or "idle").strip().lower() or "idle"
+    try:
+        progress = int(source_payload.get("progress", current.get("progress", 0)) or 0)
+    except (TypeError, ValueError):
+        progress = 0
+
+    message = str(
+        source_payload.get("message")
+        or current.get("message")
+        or _default_summarization_progress_payload()["message"]
+    ).strip() or _default_summarization_progress_payload()["message"]
+    worker_pid = _coerce_process_id(source_payload.get("worker_pid", current.get("worker_pid")))
+    execution_mode = str(
+        source_payload.get("execution_mode")
+        or current.get("execution_mode")
+        or ("worker" if worker_pid else "inline")
+    ).strip().lower() or ("worker" if worker_pid else "inline")
+
+    now_iso = _utcnow_iso()
+    normalized = {
+        **current,
+        **source_payload,
+        "session_id": session_id,
+        "stage": stage,
+        "progress": max(0, min(100, progress)),
+        "message": message,
+        "worker_pid": worker_pid,
+        "execution_mode": execution_mode,
+        "updated_at": now_iso,
+        "started_at": str(current.get("started_at") or source_payload.get("started_at") or now_iso),
+    }
+
+    if stage in SUMMARIZATION_TERMINAL_STAGES:
+        normalized["completed_at"] = str(current.get("completed_at") or source_payload.get("completed_at") or now_iso)
+    else:
+        normalized["completed_at"] = None
+
+    return normalized
+
+
+def _set_summarization_progress(session_id: str, **fields: Any) -> Dict[str, Any]:
+    entry = _normalize_summarization_progress_entry(
+        session_id,
+        fields,
+        existing=summarization_progress.get(session_id),
+    )
+    summarization_progress[session_id] = entry
+    _persist_runtime_state()
+    return copy.deepcopy(entry)
+
+
+def _clear_summarization_progress(session_id: str) -> None:
+    if session_id in summarization_progress:
+        del summarization_progress[session_id]
+        _persist_runtime_state()
+
+
+def _summary_artifact_path(session_id: str) -> Path:
+    return Path("output") / f"v2_ai_summary_{session_id}.json"
+
+
+def _restore_discovery_runtime_state(snapshot: Any) -> Dict[str, Any]:
+    restored = _build_discovery_runtime_state()
+    if not isinstance(snapshot, dict):
+        return restored
+
+    restored.update({
+        "status": str(snapshot.get("status") or restored["status"]).strip().lower() or restored["status"],
+        "session_id": snapshot.get("session_id"),
+        "worker_pid": _coerce_process_id(snapshot.get("worker_pid")),
+        "execution_mode": str(snapshot.get("execution_mode") or "").strip().lower() or None,
+        "pipeline_version": snapshot.get("pipeline_version"),
+        "started_at": snapshot.get("started_at"),
+        "updated_at": snapshot.get("updated_at"),
+        "completed_at": snapshot.get("completed_at"),
+        "result_timestamp": snapshot.get("result_timestamp"),
+        "report_count": int(snapshot.get("report_count") or 0),
+        "error": snapshot.get("error"),
+        "current_phase_key": snapshot.get("current_phase_key"),
+        "current_phase_title": snapshot.get("current_phase_title"),
+        "last_run_outcome": copy.deepcopy(snapshot.get("last_run_outcome")),
+        "progress": _normalize_discovery_progress_payload(snapshot.get("progress")),
+    })
+
+    raw_phase_plan = snapshot.get("phase_plan")
+    restored["phase_plan"] = copy.deepcopy(raw_phase_plan) if isinstance(raw_phase_plan, list) else []
+    restored["activity_log"] = _normalize_discovery_activity_log(snapshot.get("activity_log"))
+
+    if restored["status"] in DISCOVERY_ACTIVE_STATUSES:
+        if _is_runtime_worker_process() or _is_process_running(restored.get("worker_pid")):
+            return restored
+
+        interruption_message = "The app restarted during an active discovery run. Start a new run to continue."
+        restored["status"] = "interrupted"
+        restored["error"] = interruption_message
+        restored["worker_pid"] = None
+        restored["completed_at"] = restored.get("completed_at") or _utcnow_iso()
+        for phase_entry in restored["phase_plan"]:
+            if not isinstance(phase_entry, dict):
+                continue
+            if phase_entry.get("status") == "active":
+                phase_entry["status"] = "interrupted"
+                phase_entry["completed_at"] = phase_entry.get("completed_at") or restored["completed_at"]
+                phase_entry["last_detail"] = str(phase_entry.get("last_detail") or interruption_message)
+        restored["last_run_outcome"] = _build_discovery_last_run_outcome(restored)
+
+    return restored
+
+
+def _restore_summarization_progress(snapshot: Any) -> Dict[str, Dict[str, Any]]:
+    restored: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(snapshot, dict):
+        return restored
+
+    for session_id, payload in snapshot.items():
+        if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+            continue
+
+        entry = _normalize_summarization_progress_entry(session_id, payload)
+        if _summary_artifact_path(session_id).exists():
+            entry = _normalize_summarization_progress_entry(
+                session_id,
+                {
+                    "stage": "complete",
+                    "progress": 100,
+                    "message": "Summary available from saved artifacts after restart.",
+                    "worker_pid": None,
+                },
+                existing=entry,
+            )
+        elif entry["stage"] not in SUMMARIZATION_TERMINAL_STAGES:
+            if _is_runtime_worker_process() or _is_process_running(entry.get("worker_pid")):
+                restored[session_id] = entry
+                continue
+
+            entry = _normalize_summarization_progress_entry(
+                session_id,
+                {
+                    "stage": "interrupted",
+                    "progress": entry.get("progress", 0),
+                    "message": "The app restarted during summary generation. Re-run summarization for this session.",
+                    "worker_pid": None,
+                },
+                existing=entry,
+            )
+
+        restored[session_id] = entry
+
+    return restored
+
+
+def _load_persisted_runtime_state() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    state_path = _runtime_state_store_path()
+    if not state_path.exists():
+        return _build_discovery_runtime_state(), {}
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as runtime_state_file:
+            payload = json.load(runtime_state_file)
+    except Exception as exc:
+        print(f"Error loading runtime state from disk: {exc}")
+        return _build_discovery_runtime_state(), {}
+
+    return (
+        _restore_discovery_runtime_state(payload.get("discovery_runtime_state")),
+        _restore_summarization_progress(payload.get("summarization_progress")),
+    )
+
+
+def _persist_runtime_state() -> None:
+    state_path = _runtime_state_store_path()
+    payload = {
+        "schema_version": RUNTIME_STATE_SCHEMA_VERSION,
+        "saved_at": _utcnow_iso(),
+        "discovery_runtime_state": copy.deepcopy(discovery_runtime_state),
+        "summarization_progress": copy.deepcopy(summarization_progress),
+    }
+    temp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+
+    try:
+        with open(temp_path, "w", encoding="utf-8") as runtime_state_file:
+            json.dump(payload, runtime_state_file, indent=2)
+        os.replace(temp_path, state_path)
+    except Exception as exc:
+        print(f"Error persisting runtime state to disk: {exc}")
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _capture_runtime_state_file_marker() -> Optional[Tuple[int, int]]:
+    state_path = _runtime_state_store_path()
+    try:
+        stat_result = state_path.stat()
+    except OSError:
+        return None
+    return (int(stat_result.st_mtime_ns), int(stat_result.st_size))
+
+
+def _build_discovery_runtime_signature(snapshot: Optional[Dict[str, Any]] = None) -> str:
+    safe_snapshot = snapshot if isinstance(snapshot, dict) else _snapshot_discovery_runtime_state()
+    return json.dumps(safe_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _remember_runtime_state_bridge_snapshot(snapshot: Optional[Dict[str, Any]] = None) -> None:
+    global runtime_state_bridge_last_file_marker, runtime_state_bridge_last_discovery_signature
+
+    runtime_state_bridge_last_file_marker = _capture_runtime_state_file_marker()
+    runtime_state_bridge_last_discovery_signature = _build_discovery_runtime_signature(snapshot)
+
+
+async def _check_for_persisted_runtime_state_rebroadcast(*, force: bool = False) -> bool:
+    global runtime_state_bridge_last_file_marker
+
+    if _is_runtime_worker_process():
+        return False
+
+    if not active_connections and not force:
+        return False
+
+    current_marker = _capture_runtime_state_file_marker()
+    if not force and current_marker == runtime_state_bridge_last_file_marker:
+        return False
+
+    runtime_state_bridge_last_file_marker = current_marker
+    _sync_runtime_state_from_disk()
+    snapshot = _snapshot_discovery_runtime_state()
+    snapshot_signature = _build_discovery_runtime_signature(snapshot)
+    if not force and snapshot_signature == runtime_state_bridge_last_discovery_signature:
+        return False
+
+    await _broadcast_discovery_runtime_state(snapshot)
+    return True
+
+
+async def _runtime_state_bridge_loop() -> None:
+    while True:
+        try:
+            await _check_for_persisted_runtime_state_rebroadcast()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"Runtime state bridge error: {exc}")
+
+        await asyncio.sleep(RUNTIME_STATE_BRIDGE_POLL_INTERVAL_SECONDS)
+
+
+def _sync_runtime_state_from_disk() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    global discovery_runtime_state, summarization_progress
+
+    persisted_discovery, persisted_summarization = _load_persisted_runtime_state()
+    discovery_runtime_state = persisted_discovery
+    summarization_progress = persisted_summarization
+    return copy.deepcopy(discovery_runtime_state), copy.deepcopy(summarization_progress)
+
+
+def _runtime_job_dir() -> Path:
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+    job_dir = output_dir / RUNTIME_JOB_DIRNAME
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
+
+
+def _runtime_job_worker_path() -> Path:
+    return Path(__file__).resolve().with_name("runtime_job_worker.py")
+
+
+def _write_runtime_job_request(job_type: str, payload: Dict[str, Any]) -> Path:
+    request_id = f"{job_type}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{secrets.token_hex(4)}"
+    request_path = _runtime_job_dir() / f"{request_id}.json"
+    with open(request_path, "w", encoding="utf-8") as request_file:
+        json.dump(payload, request_file, indent=2)
+    return request_path
+
+
+def _launch_runtime_job_worker(job_type: str, payload: Dict[str, Any]) -> subprocess.Popen:
+    worker_path = _runtime_job_worker_path()
+    if not worker_path.exists():
+        raise FileNotFoundError(f"Runtime job worker not found: {worker_path}")
+
+    request_path = _write_runtime_job_request(job_type, payload)
+    python_executable = sys.executable or "python"
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(Path(__file__).resolve().parent.parent),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    return subprocess.Popen(
+        [python_executable, str(worker_path), job_type, str(request_path)],
+        **popen_kwargs,
+    )
+
+
+def _terminate_runtime_worker_process(value: Any) -> bool:
+    pid = _coerce_process_id(value)
+    if pid is None:
+        return False
+
+    if not _is_process_running(pid):
+        return True
+
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0 or not _is_process_running(pid)
+
+        if hasattr(os, "getpgid"):
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+
+
+discovery_runtime_state, summarization_progress = _load_persisted_runtime_state()
+_persist_runtime_state()
 
 chat_agent_memory: Dict[str, Dict[str, Any]] = {}
 
@@ -2266,6 +5708,104 @@ def finalize_user_facing_response_text(text: Any, fallback: str) -> str:
     return sanitize_llm_response_text(str(fallback or ""))
 
 
+
+
+def resolve_effective_runtime_config(
+    request: Optional[Request] = None,
+    auth_user: Optional[Dict[str, Any]] = None,
+    base_config: Any = None,
+) -> Any:
+    runtime_config = copy.deepcopy(base_config or config_manager.get())
+    resolved_user = auth_user
+    if resolved_user is None and request is not None:
+        resolved_user = getattr(getattr(request, "state", None), "auth_user", None)
+
+    if not is_auth_enabled() or not isinstance(resolved_user, dict):
+        return runtime_config
+
+    assigned_name = str(resolved_user.get("mcp_config_name") or "").strip()
+    user_role = str(resolved_user.get("role") or "").strip().lower()
+    runtime_role_allows_mcp = user_role in {"admin", "analyst"}
+    if assigned_name and runtime_role_allows_mcp:
+        assigned_config = config_manager.get_mcp_config(assigned_name)
+        if assigned_config is not None:
+            runtime_config.mcp.url = assigned_config.url
+            runtime_config.mcp.token = assigned_config.token
+            runtime_config.mcp.verify_ssl = assigned_config.verify_ssl
+            runtime_config.mcp.ca_bundle_path = assigned_config.ca_bundle_path
+            runtime_config.active_mcp_config_name = assigned_name
+            return runtime_config
+
+        debug_log(
+            f"Assigned MCP configuration '{assigned_name}' for user '{resolved_user.get('username')}' was not found; clearing runtime MCP access.",
+            "warning",
+        )
+    elif assigned_name and not runtime_role_allows_mcp:
+        debug_log(
+            f"Ignoring assigned MCP configuration '{assigned_name}' for user '{resolved_user.get('username')}' because role '{user_role or 'unknown'}' does not allow runtime MCP access.",
+            "info",
+        )
+
+    if user_role != "admin":
+        runtime_config.mcp.url = ""
+        runtime_config.mcp.token = ""
+        runtime_config.mcp.verify_ssl = False
+        runtime_config.mcp.ca_bundle_path = None
+        runtime_config.active_mcp_config_name = None
+    return runtime_config
+
+
+def _build_discovery_runtime_binding(
+    request: Optional[Request] = None,
+    auth_user: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    resolved_user = auth_user
+    if resolved_user is None and request is not None:
+        resolved_user = getattr(getattr(request, "state", None), "auth_user", None)
+
+    binding = {
+        "active_mcp_config_name": None,
+        "clear_runtime_mcp": False,
+    }
+
+    if not is_auth_enabled() or not isinstance(resolved_user, dict):
+        active_name = str(getattr(config_manager.get(), "active_mcp_config_name", "") or "").strip()
+        if active_name:
+            binding["active_mcp_config_name"] = active_name
+        return binding
+
+    assigned_name = str(resolved_user.get("mcp_config_name") or "").strip()
+    user_role = str(resolved_user.get("role") or "").strip().lower()
+    if assigned_name and user_role in {"admin", "analyst"}:
+        binding["active_mcp_config_name"] = assigned_name
+        return binding
+
+    if user_role != "admin":
+        binding["clear_runtime_mcp"] = True
+        return binding
+
+    active_name = str(getattr(config_manager.get(), "active_mcp_config_name", "") or "").strip()
+    if active_name:
+        binding["active_mcp_config_name"] = active_name
+    return binding
+
+
+def _build_mcp_runtime_identity(config: Any) -> Optional[str]:
+    mcp_config = getattr(config, "mcp", None)
+    if mcp_config is None:
+        return None
+
+    current_url = str(getattr(mcp_config, "url", "") or "").strip()
+    if not current_url:
+        return None
+
+    token = str(getattr(mcp_config, "token", "") or "")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+    verify_ssl = bool(getattr(mcp_config, "verify_ssl", False))
+    ca_bundle = str(getattr(mcp_config, "ca_bundle_path", "") or "")
+    return f"{current_url}|{token_hash}|{int(verify_ssl)}|{ca_bundle}"
+
+
 def extract_tool_call_from_text(response_text: str) -> Optional[Dict[str, Any]]:
     """Extract and normalize tool call payload from tagged response text."""
     if not isinstance(response_text, str):
@@ -3380,6 +6920,14 @@ def _resolve_output_artifact_path(filename: str) -> Path:
     raise HTTPException(status_code=404, detail="Report not found")
 
 
+def _resolve_external_catalog_artifact_path(filename: str) -> Path:
+    safe_filename = sanitize_filename(filename)
+    for candidate in _iter_catalog_artifact_paths():
+        if candidate.name == safe_filename:
+            return candidate.resolve()
+    raise HTTPException(status_code=404, detail="Report not found")
+
+
 def _find_existing_summary_infographic(timestamp: str) -> Optional[Path]:
     safe_timestamp = str(timestamp or "").strip()
     if not safe_timestamp:
@@ -4473,32 +8021,7 @@ def build_context_explorer_payload(
     sourcetypes.sort(key=lambda item: item.get("events", 0), reverse=True)
     hosts.sort(key=lambda item: item.get("events", 0), reverse=True)
 
-    normalized_patterns: List[Dict[str, str]] = []
-    seen_pattern_titles = set()
-    for pattern in _parse_v2_notable_patterns(overview.get("notable_patterns", [])):
-        title = str(pattern.get("title") or pattern.get("name") or pattern.get("pattern") or pattern.get("category") or pattern.get("signal") or "").strip()
-        description = str(pattern.get("description") or pattern.get("summary") or pattern.get("insight") or "").strip()
-        evidence = pattern.get("evidence")
-        signal = ""
-        if isinstance(evidence, list):
-            signal = ", ".join([str(item).strip() for item in evidence[:2] if str(item).strip()])
-        elif isinstance(evidence, str):
-            signal = evidence.strip()
-
-        if not title:
-            continue
-
-        lowered_title = title.lower()
-        if lowered_title in seen_pattern_titles:
-            continue
-        seen_pattern_titles.add(lowered_title)
-        normalized_patterns.append({
-            "title": title,
-            "description": description,
-            "signal": signal,
-        })
-        if len(normalized_patterns) >= 6:
-            break
+    normalized_patterns = _normalize_v2_notable_patterns_for_ui(overview.get("notable_patterns", []), limit=6)
 
     safe_unknowns = [item for item in (unknown_questions or []) if isinstance(item, dict)]
     safe_gaps = [item for item in (coverage_gaps or discovery_data.get("coverage_gaps", []) or []) if isinstance(item, dict)]
@@ -4806,7 +8329,8 @@ def build_discovery_compare_payload(
 
 def build_session_runbook_payload(
     timestamp: Optional[str] = None,
-    persona: str = "admin"
+    persona: str = "admin",
+    voice: str = "direct",
 ) -> Dict[str, Any]:
     """Build one-click operational runbook payload for a selected persona and session."""
     sessions = load_discovery_sessions()
@@ -4828,6 +8352,8 @@ def build_session_runbook_payload(
     persona_key = str(persona or "admin").strip().lower()
     if persona_key not in {"admin", "analyst", "executive"}:
         persona_key = "admin"
+    voice_key = _normalize_operator_voice(voice)
+    voice_label = _operator_voice_label(voice_key)
 
     ts = selected.get("timestamp", "unknown")
     personas = selected.get("personas", {}) if isinstance(selected.get("personas", {}), dict) else {}
@@ -4837,6 +8363,7 @@ def build_session_runbook_payload(
         "",
         f"**Session:** {ts}",
         f"**Persona:** {persona_key.title()}",
+        f"**Voice:** {voice_label}",
         f"**Readiness Score:** {_safe_int(selected.get('readiness_score', 0))}/100",
         ""
     ]
@@ -4844,48 +8371,46 @@ def build_session_runbook_payload(
     if persona_key == "admin":
         actions = personas.get("admin", {}).get("actions", []) if isinstance(personas.get("admin", {}), dict) else []
         for idx, action in enumerate(actions[:8], 1):
-            title = action.get("title", f"Admin Action {idx}") if isinstance(action, dict) else f"Admin Action {idx}"
-            why = action.get("why", "") if isinstance(action, dict) else ""
-            effort = action.get("effort", "unknown") if isinstance(action, dict) else "unknown"
-            next_step = action.get("next_step", "") if isinstance(action, dict) else ""
+            action_payload = action if isinstance(action, dict) else {}
+            voice_item = _build_operator_voice_admin_item(action_payload, voice_key)
             steps.append({
                 "step": idx,
-                "title": title,
+                "title": voice_item["title"],
                 "owner": "Splunk Admin",
-                "effort": effort,
-                "details": why,
-                "next_step": next_step
+                "effort": voice_item["badge"],
+                "details": voice_item["summary"],
+                "next_step": voice_item["meta"],
             })
             markdown_lines.extend([
-                f"## {idx}. {title}",
+                f"## {idx}. {voice_item['title']}",
                 f"- Owner: Splunk Admin",
-                f"- Effort: {effort}",
-                f"- Why: {why}",
-                f"- Next Step: {next_step}",
+                f"- {voice_item['badge']}",
+                f"- Summary: {voice_item['summary']}",
+                f"- {voice_item['meta']}",
                 ""
             ])
 
     elif persona_key == "analyst":
         tracks = personas.get("analyst", {}).get("hypotheses", []) if isinstance(personas.get("analyst", {}), dict) else []
         for idx, track in enumerate(tracks[:8], 1):
-            title = track.get("title", f"Investigation Track {idx}") if isinstance(track, dict) else f"Investigation Track {idx}"
-            question = track.get("question", "") if isinstance(track, dict) else ""
-            metric = track.get("success_metric", "") if isinstance(track, dict) else ""
-            sources = track.get("data_sources", []) if isinstance(track, dict) else []
+            track_payload = track if isinstance(track, dict) else {}
+            title = track_payload.get("title", f"Investigation Track {idx}")
+            sources = track_payload.get("data_sources", []) if isinstance(track_payload.get("data_sources", []), list) else []
             source_text = ", ".join([str(s) for s in sources[:6]]) if isinstance(sources, list) else ""
+            voice_item = _build_operator_voice_analyst_item(track_payload, voice_key)
             steps.append({
                 "step": idx,
-                "title": title,
+                "title": voice_item["title"],
                 "owner": "Security Analyst",
                 "effort": "medium",
-                "details": question,
-                "next_step": f"Validate with metric: {metric}"
+                "details": voice_item["summary"],
+                "next_step": voice_item["meta"],
             })
             markdown_lines.extend([
-                f"## {idx}. {title}",
+                f"## {idx}. {voice_item['title']}",
                 f"- Owner: Security Analyst",
-                f"- Question: {question}",
-                f"- Success Metric: {metric}",
+                f"- Summary: {voice_item['summary']}",
+                f"- {voice_item['meta']}",
                 f"- Data Sources: {source_text}",
                 ""
             ])
@@ -4897,13 +8422,14 @@ def build_session_runbook_payload(
         focus_items = executive.get("next_90_day_focus", []) if isinstance(executive.get("next_90_day_focus", []), list) else []
 
         for idx, item in enumerate(focus_items[:8], 1):
+            voice_item = _build_operator_voice_executive_item(item, voice_key, idx, "focus")
             steps.append({
                 "step": idx,
-                "title": f"90-Day Focus {idx}",
+                "title": voice_item["title"],
                 "owner": "Leadership",
                 "effort": "strategic",
-                "details": item,
-                "next_step": "Assign sponsor and KPI"
+                "details": voice_item["summary"],
+                "next_step": voice_item["meta"],
             })
 
         markdown_lines.extend([
@@ -4912,19 +8438,33 @@ def build_session_runbook_payload(
             "",
             "## Business Value Themes"
         ])
-        for theme in themes[:6]:
-            markdown_lines.append(f"- {theme}")
+        for idx, theme in enumerate(themes[:6], 1):
+            theme_item = _build_operator_voice_executive_item(theme, voice_key, idx, "theme")
+            markdown_lines.extend([
+                f"### {theme_item['title']}",
+                f"- Summary: {theme_item['summary']}",
+                f"- {theme_item['meta']}",
+                "",
+            ])
         markdown_lines.extend(["", "## Next 90 Days"])
-        for item in focus_items[:8]:
-            markdown_lines.append(f"- {item}")
+        for idx, item in enumerate(focus_items[:8], 1):
+            focus_item = _build_operator_voice_executive_item(item, voice_key, idx, "focus")
+            markdown_lines.extend([
+                f"### {focus_item['title']}",
+                f"- Summary: {focus_item['summary']}",
+                f"- {focus_item['meta']}",
+                "",
+            ])
         markdown_lines.append("")
 
-    filename = f"runbook_{persona_key}_{ts}.md"
+    filename = f"runbook_{persona_key}_{voice_key}_{ts}.md"
     return {
         "has_data": True,
         "session": selected,
         "persona": persona_key,
-        "title": f"{persona_key.title()} Operational Runbook",
+        "voice": voice_key,
+        "voice_label": voice_label,
+        "title": f"{voice_label} {persona_key.title()} Operational Runbook",
         "filename": filename,
         "markdown": "\n".join(markdown_lines),
         "steps": steps,
@@ -4984,7 +8524,7 @@ def build_discovery_dashboard_payload() -> Dict[str, Any]:
 
 
 def load_latest_v2_blueprint() -> Optional[Dict[str, Any]]:
-    """Load latest v2 intelligence blueprint artifact if available."""
+    """Load the latest intelligence blueprint artifact if available."""
     output_dir = Path("output")
     if not output_dir.exists():
         return None
@@ -5009,7 +8549,7 @@ def load_latest_v2_blueprint() -> Optional[Dict[str, Any]]:
 
 
 def build_v2_artifact_catalog() -> Dict[str, Any]:
-    """Build catalog for V2 artifacts for the Artifacts workspace tab."""
+    """Build the artifact catalog for the Artifacts workspace tab."""
     output_dir = Path("output")
     if not output_dir.exists():
         return {"has_data": False, "artifacts": []}
@@ -5027,18 +8567,20 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
     """Discover and cache available MCP tools from the connected Splunk MCP server."""
     cache_ttl_seconds = 60
     now = time.time()
-    current_url = getattr(config.mcp, "url", None)
+    cache_identity = _build_mcp_runtime_identity(config)
+    cached_tools = _cached_mcp_tools["tools"] if _cached_mcp_tools.get("identity") == cache_identity else set()
 
     if (
         not force_refresh
-        and _cached_mcp_tools["tools"]
-        and _cached_mcp_tools["url"] == current_url
+        and cached_tools
+        and _cached_mcp_tools.get("identity") == cache_identity
         and (now - _cached_mcp_tools["timestamp"]) < cache_ttl_seconds
     ):
-        return _cached_mcp_tools["tools"]
+        return cached_tools
 
-    if not current_url:
-        return _cached_mcp_tools["tools"]
+    current_url = getattr(config.mcp, "url", None)
+    if not current_url or not cache_identity:
+        return set()
 
     headers = {
         "Accept": "application/json",
@@ -5067,7 +8609,7 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
         async with httpx.AsyncClient(verify=ssl_verify, timeout=15.0) as client:
             response = await client.post(current_url, json=payload, headers=headers)
             if response.status_code != 200:
-                return _cached_mcp_tools["tools"]
+                return cached_tools
 
             data = response.json()
             result_obj = data.get("result", {}) if isinstance(data, dict) else {}
@@ -5096,14 +8638,14 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
                                 discovered.add(tool["name"])
 
         if discovered:
-            _cached_mcp_tools["url"] = current_url
+            _cached_mcp_tools["identity"] = cache_identity
             _cached_mcp_tools["tools"] = discovered
             _cached_mcp_tools["timestamp"] = now
 
-        return _cached_mcp_tools["tools"]
+        return discovered or cached_tools
     except Exception as e:
         debug_log(f"MCP tool discovery failed: {str(e)}", "warning")
-        return _cached_mcp_tools["tools"]
+        return cached_tools
 
 def debug_log(message: str, category: str = "info", data: Any = None):
     """
@@ -5181,6 +8723,51 @@ def _sanitize_debug_data(data: Any) -> Any:
         return data
 
 
+@app.middleware("http")
+async def enforce_optional_authentication(request: Request, call_next):
+    """Apply optional auth guards when security mode is enabled."""
+    request.state.auth_user = None
+    request.state.requires_password_reset = False
+    path = request.url.path or "/"
+
+    if _is_external_api_path(path):
+        return await call_next(request)
+
+    if not is_auth_enabled():
+        return await call_next(request)
+
+    auth_provider = get_auth_provider()
+    if auth_provider not in {"local_password", "oidc"}:
+        if _is_public_auth_path(path):
+            return await call_next(request)
+        return JSONResponse(status_code=503, content={"detail": "Configured auth provider is not implemented yet"})
+
+    if auth_provider == "local_password":
+        ensure_local_auth_bootstrap_state()
+
+    session_token = request.cookies.get(AUTH_SESSION_COOKIE_NAME, "")
+    if session_token:
+        session_user = security_manager.resolve_session(session_token)
+        if session_user:
+            request.state.auth_user = session_user
+            request.state.requires_password_reset = bool(session_user.get("require_password_reset")) if auth_provider == "local_password" else False
+
+    if path.startswith("/static/") or _is_public_auth_path(path):
+        return await call_next(request)
+
+    if request.state.auth_user is None:
+        if request.method.upper() == "GET" and not path.startswith("/api/"):
+            return RedirectResponse(url="/", status_code=303)
+        return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+
+    if auth_provider == "local_password" and request.state.requires_password_reset and not _is_password_reset_allowed_path(path):
+        if request.method.upper() == "GET" and not path.startswith("/api/"):
+            return RedirectResponse(url="/", status_code=303)
+        return JSONResponse(status_code=403, content={"detail": "Password reset required", "requires_password_reset": True})
+
+    return await call_next(request)
+
+
 # Security: Add security headers middleware
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -5230,77 +8817,79 @@ class WebSocketDisplayManager:
     
     async def send_to_clients(self, message_type: str, data: Dict[str, Any]):
         """Send message to all connected WebSocket clients."""
-        message = {
-            "type": message_type,
-            "data": data,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        disconnected = []
-        for connection in active_connections:
-            try:
-                await connection.send_text(json.dumps(message))
-            except:
-                disconnected.append(connection)
-        
-        # Remove disconnected clients
-        for conn in disconnected:
-            if conn in active_connections:
-                active_connections.remove(conn)
+        await _broadcast_websocket_message(message_type, data)
     
     async def show_banner(self):
-        await self.send_to_clients("banner", {
+        banner_payload = {
             "title": "Splunk MCP Use Case Discovery Tool",
             "subtitle": "Intelligent Environment Analysis & Recommendation Engine",
             "start_time": self.start_time.strftime('%Y-%m-%d %H:%M:%S')
-        })
+        }
+        _append_discovery_runtime_activity("banner", banner_payload)
+        await self.send_to_clients("banner", banner_payload)
     
     def phase(self, title: str):
+        _advance_discovery_runtime_phase(title)
+        snapshot = _append_discovery_runtime_activity("phase", {"title": title})
+        asyncio.create_task(_broadcast_discovery_runtime_state(snapshot))
         asyncio.create_task(self.send_to_clients("phase", {"title": title}))
     
     def success(self, message: str):
+        _append_discovery_runtime_activity("success", {"message": message})
         asyncio.create_task(self.send_to_clients("success", {"message": message}))
     
     def error(self, message: str):
+        _append_discovery_runtime_activity("error", {"message": message})
         asyncio.create_task(self.send_to_clients("error", {"message": message}))
     
     def warning(self, message: str):
+        _append_discovery_runtime_activity("warning", {"message": message})
         asyncio.create_task(self.send_to_clients("warning", {"message": message}))
     
     def info(self, message: str):
+        _append_discovery_runtime_activity("info", {"message": message})
         asyncio.create_task(self.send_to_clients("info", {"message": message}))
     
     def show_overview_summary(self, overview):
-        asyncio.create_task(self.send_to_clients("overview", {
+        overview_payload = {
             "total_indexes": overview.total_indexes,
             "total_sourcetypes": overview.total_sourcetypes,
             "data_volume_24h": overview.data_volume_24h,
             "active_sources": overview.active_sources,
             "estimated_time": overview.estimated_time,
             "notable_patterns": overview.notable_patterns
-        }))
+        }
+        _append_discovery_runtime_activity("overview", overview_payload)
+        asyncio.create_task(self.send_to_clients("overview", overview_payload))
     
     def show_classification_summary(self, classifications: Dict[str, Any]):
+        _append_discovery_runtime_activity("classification", classifications)
         asyncio.create_task(self.send_to_clients("classification", classifications))
     
     def show_recommendations_preview(self, recommendations: List):
-        asyncio.create_task(self.send_to_clients("recommendations", {
+        recommendation_payload = {
             "count": len(recommendations),
             "top_recommendations": recommendations[:5]  # Show top 5
-        }))
+        }
+        _append_discovery_runtime_activity("recommendations", recommendation_payload)
+        asyncio.create_task(self.send_to_clients("recommendations", recommendation_payload))
     
     def show_suggested_use_cases_preview(self, use_cases: List):
-        asyncio.create_task(self.send_to_clients("use_cases", {
+        use_case_payload = {
             "count": len(use_cases),
             "preview": use_cases[:3]  # Show top 3
-        }))
+        }
+        _append_discovery_runtime_activity("use_cases", use_case_payload)
+        asyncio.create_task(self.send_to_clients("use_cases", use_case_payload))
     
     def show_final_summary(self, report_paths: List[str]):
         elapsed = datetime.now() - self.start_time
-        asyncio.create_task(self.send_to_clients("completion", {
+        completion_payload = {
             "duration": str(elapsed),
             "report_paths": report_paths
-        }))
+        }
+        _append_discovery_runtime_activity("completion", completion_payload)
+        asyncio.create_task(self.send_to_clients("completion", completion_payload))
     
     async def handle_rate_limit_callback(self, event_type: str, data: Dict[str, Any]):
         await self.send_to_clients("rate_limit", {
@@ -5329,31 +8918,17 @@ class ProgressTracker:
         
         if self.total_steps > 0:
             percentage = (step / self.total_steps) * 100
-            elapsed = datetime.now() - self.start_time if self.start_time else None
-            
-            # Calculate ETA
-            eta_seconds = None
-            if elapsed and step > 0:
-                avg_time_per_step = elapsed.total_seconds() / step
-                remaining_steps = self.total_steps - step
-                eta_seconds = remaining_steps * avg_time_per_step
-            
-            # Send WebSocket update
-            for connection in active_connections:
-                try:
-                    await connection.send_text(json.dumps({
-                        "type": "progress",
-                        "data": {
-                            "percentage": percentage,
-                            "current_step": step,
-                            "total_steps": self.total_steps,
-                            "description": description,
-                            "eta_seconds": eta_seconds
-                        },
-                        "timestamp": datetime.now().isoformat()
-                    }))
-                except:
-                    pass
+
+            progress_payload = {
+                "percentage": percentage,
+                "current_step": step,
+                "total_steps": self.total_steps,
+                "description": description,
+                "eta_seconds": None,
+                "eta_method": "stage_calibrated",
+            }
+            snapshot = _update_discovery_runtime_state(status="running", progress=progress_payload)
+            await _broadcast_websocket_message("progress", snapshot.get("progress") or progress_payload)
 
 
 @app.websocket("/ws")
@@ -5361,6 +8936,9 @@ async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time updates."""
     await websocket.accept()
     active_connections.append(websocket)
+
+    _sync_runtime_state_from_disk()
+    await websocket.send_text(json.dumps(_build_websocket_message("discovery_status", _snapshot_discovery_runtime_state())))
     
     try:
         while True:
@@ -5408,58 +8986,140 @@ async def debug_websocket_endpoint(websocket: WebSocket):
 
 
 @app.post("/start-discovery")
-async def start_discovery(background_tasks: BackgroundTasks):
+async def start_discovery(request: Request, background_tasks: BackgroundTasks):
     """Start the discovery process in the background."""
     global current_discovery_session
-    
+
+    _sync_runtime_state_from_disk()
+    active_snapshot = _snapshot_discovery_runtime_state()
+    if active_snapshot.get("status") in DISCOVERY_ACTIVE_STATUSES:
+        return {"error": "Discovery already in progress", "discovery": active_snapshot}
+
     if current_discovery_session and not current_discovery_session.done():
-        return {"error": "Discovery already in progress"}
-    
-    # Start discovery task
-    current_discovery_session = asyncio.create_task(run_discovery())
-    
-    return {"status": "Discovery started", "session_id": id(current_discovery_session)}
+        return {"error": "Discovery already in progress", "discovery": active_snapshot}
+
+    worker_binding = _build_discovery_runtime_binding(request=request)
+
+    try:
+        worker_process = _launch_runtime_job_worker(
+            "discovery",
+            {
+                "runtime_binding": worker_binding,
+                "requested_at": _utcnow_iso(),
+                "pipeline_version": DISCOVERY_PIPELINE_VERSION,
+            },
+        )
+    except Exception as exc:
+        error_message = f"Failed to launch discovery worker: {exc}"
+        discovery_snapshot = _finalize_discovery_runtime(
+            "error",
+            error=error_message,
+            worker_pid=None,
+            execution_mode="worker",
+        )
+        await _broadcast_discovery_runtime_state(discovery_snapshot)
+        raise HTTPException(status_code=500, detail=error_message)
+
+    current_discovery_session = None
+    discovery_snapshot = _update_discovery_runtime_state(
+        reset=True,
+        status="starting",
+        session_id=worker_process.pid,
+        worker_pid=worker_process.pid,
+        execution_mode="worker",
+        pipeline_version=DISCOVERY_PIPELINE_VERSION,
+        started_at=_utcnow_iso(),
+        completed_at=None,
+        result_timestamp=None,
+        report_count=0,
+        error=None,
+        current_phase_key=None,
+        current_phase_title=None,
+        phase_plan=_build_discovery_phase_plan(DISCOVERY_PIPELINE_VERSION),
+        activity_log=[],
+        last_run_outcome=None,
+        progress={
+            "percentage": 0,
+            "current_step": 0,
+            "total_steps": 0,
+            "description": "Preparing discovery pipeline...",
+            "eta_seconds": None,
+            "eta_method": "stage_calibrated",
+        },
+    )
+    discovery_snapshot = _append_discovery_runtime_activity(
+        "info",
+        {
+            "message": "Discovery worker launched. Progress is now backed by durable runtime state.",
+            "worker_pid": worker_process.pid,
+        },
+    )
+    await _broadcast_discovery_runtime_state(discovery_snapshot)
+
+    return {
+        "status": "Discovery started",
+        "session_id": worker_process.pid,
+        "worker_pid": worker_process.pid,
+        "discovery": discovery_snapshot,
+        "runtime_binding": {
+            "active_mcp_config_name": worker_binding.get("active_mcp_config_name"),
+            "clear_runtime_mcp": bool(worker_binding.get("clear_runtime_mcp")),
+        },
+    }
 
 
 @app.post("/abort-discovery")
 async def abort_discovery():
     """Abort the current discovery process."""
     global current_discovery_session
-    
-    if not current_discovery_session or current_discovery_session.done():
+
+    _sync_runtime_state_from_disk()
+    snapshot = _snapshot_discovery_runtime_state()
+    has_in_process_task = bool(current_discovery_session and not current_discovery_session.done())
+    has_worker_process = snapshot.get("status") in DISCOVERY_ACTIVE_STATUSES and _is_process_running(snapshot.get("worker_pid"))
+    if not has_in_process_task and not has_worker_process:
         return {"error": "No discovery in progress"}
-    
-    # Cancel the task
-    current_discovery_session.cancel()
-    
-    # Notify via WebSocket
-    message = {
-        "type": "error",
-        "data": {"message": "⚠️ Discovery aborted by user"},
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    disconnected = []
-    for connection in active_connections:
-        try:
-            await connection.send_text(json.dumps(message))
-        except:
-            disconnected.append(connection)
-    
-    # Remove disconnected clients
-    for conn in disconnected:
-        if conn in active_connections:
-            active_connections.remove(conn)
-    
-    return {"status": "Discovery aborted"}
+
+    if has_in_process_task:
+        current_discovery_session.cancel()
+
+    worker_pid = _coerce_process_id(snapshot.get("worker_pid"))
+    if worker_pid is not None and not _terminate_runtime_worker_process(worker_pid):
+        raise HTTPException(status_code=500, detail="Failed to stop discovery worker")
+
+    _update_discovery_runtime_state(
+        progress={
+            **(discovery_runtime_state.get("progress") or {}),
+            "description": "Discovery stopped by operator.",
+        },
+    )
+    discovery_snapshot = _finalize_discovery_runtime(
+        "aborted",
+        error="Discovery aborted by user",
+        worker_pid=None,
+    )
+    await _broadcast_websocket_message("warning", {"message": "⚠️ Discovery aborted by user"})
+    await _broadcast_discovery_runtime_state(discovery_snapshot)
+
+    return {"status": "Discovery aborted", "discovery": discovery_snapshot}
 
 
-async def run_discovery():
+async def run_discovery(runtime_config: Any = None):
     """Run the complete discovery process with WebSocket updates."""
     display = None
     try:
+        if _is_runtime_worker_process():
+            _sync_runtime_state_from_disk()
+            _update_discovery_runtime_state(
+                status="starting",
+                worker_pid=os.getpid(),
+                execution_mode="worker",
+            )
+        else:
+            _update_discovery_runtime_state(execution_mode="inline")
+
         # Load configuration
-        config = config_manager.get()
+        config = runtime_config or config_manager.get()
         
         # Initialize display manager with WebSocket support
         display = WebSocketDisplayManager()
@@ -5509,7 +9169,7 @@ async def run_discovery():
         progress = ProgressTracker()
 
         if DISCOVERY_PIPELINE_VERSION == "v2":
-            display.phase("🚀 V2 Discovery Pipeline")
+            display.phase("🚀 Discovery Pipeline")
             v2_pipeline = DiscoveryV2Pipeline(discovery_engine)
             v2_result = await v2_pipeline.run(display, progress)
 
@@ -5556,8 +9216,25 @@ async def run_discovery():
                 readiness_score=readiness_score
             )
 
-            display.success("✅ V2 discovery artifact bundle generated")
+            display.success("✅ Discovery artifact bundle generated")
             display.show_final_summary(report_paths)
+
+            _update_discovery_runtime_state(
+                progress={
+                    "percentage": 100,
+                    "current_step": 100,
+                    "total_steps": 100,
+                    "description": "Discovery complete. Outputs are ready for review.",
+                    "eta_seconds": 0,
+                    "eta_method": "stage_calibrated",
+                },
+            )
+            discovery_snapshot = _finalize_discovery_runtime(
+                "completed",
+                report_count=len(report_paths),
+                result_timestamp=timestamp,
+            )
+            await _broadcast_discovery_runtime_state(discovery_snapshot)
 
             return {
                 "status": "success",
@@ -5982,6 +9659,23 @@ async def run_discovery():
             "report_count": len(report_paths),
             "timestamp": timestamp
         })
+
+        _update_discovery_runtime_state(
+            progress={
+                "percentage": 100,
+                "current_step": 100,
+                "total_steps": 100,
+                "description": "Discovery complete. Outputs are ready for review.",
+                "eta_seconds": 0,
+                "eta_method": "stage_calibrated",
+            },
+        )
+        discovery_snapshot = _finalize_discovery_runtime(
+            "completed",
+            report_count=len(report_paths),
+            result_timestamp=timestamp,
+        )
+        await _broadcast_discovery_runtime_state(discovery_snapshot)
         
         # Return completion status
         return {
@@ -6004,11 +9698,19 @@ async def run_discovery():
     except asyncio.CancelledError:
         # User aborted the discovery
         print("Discovery cancelled by user")
+        _update_discovery_runtime_state(
+            progress={
+                **(discovery_runtime_state.get("progress") or {}),
+                "description": "Discovery stopped by operator.",
+            },
+        )
+        discovery_snapshot = _finalize_discovery_runtime("aborted", error="Discovery aborted by user")
         if display:
             await display.send_to_clients("warning", {
                 "message": "⚠️ Discovery aborted by user",
                 "type": "user_abort"
             })
+        await _broadcast_discovery_runtime_state(discovery_snapshot)
         raise  # Re-raise to properly cancel the task
     
     except Exception as e:
@@ -6017,6 +9719,14 @@ async def run_discovery():
         traceback_str = traceback.format_exc()
         print(f"ERROR in run_discovery: {error_message}")
         print(f"Traceback: {traceback_str}")
+
+        _update_discovery_runtime_state(
+            progress={
+                **(discovery_runtime_state.get("progress") or {}),
+                "description": error_message,
+            },
+        )
+        discovery_snapshot = _finalize_discovery_runtime("error", error=str(e))
         
         if display:
             await display.send_to_clients("error", {
@@ -6033,12 +9743,13 @@ async def run_discovery():
                     })
                 except:
                     pass
+        await _broadcast_discovery_runtime_state(discovery_snapshot)
         return {"status": "error", "message": str(e)}
 
 
 @app.get("/reports")
 async def list_reports():
-    """Get list of available V2 reports only."""
+    """Get the list of available discovery reports."""
     output_dir = Path("output")
     if not output_dir.exists():
         return {"reports": [], "sessions": []}
@@ -6097,22 +9808,31 @@ async def get_discovery_dashboard():
     return build_discovery_dashboard_payload()
 
 
+@app.get("/api/discovery/status")
+async def get_discovery_runtime_status():
+    """Return current discovery runtime status for header and workspace hydration."""
+    _sync_runtime_state_from_disk()
+    return _snapshot_discovery_runtime_state()
+
+
 @app.get("/api/v2/intelligence")
 async def get_v2_intelligence():
-    """Return latest V2 intelligence blueprint for V2 workspace UI."""
+    """Return the latest intelligence blueprint for the workspace UI."""
     payload = load_latest_v2_blueprint()
     if not payload:
-        return {"has_data": False, "message": "No V2 intelligence blueprint found."}
+        return {"has_data": False, "message": "No intelligence blueprint found."}
+    overview = payload.get("overview", {}) if isinstance(payload.get("overview", {}), dict) else {}
     return {
         "has_data": True,
         "blueprint": payload,
-        "artifact": payload.get("_artifact", {})
+        "artifact": payload.get("_artifact", {}),
+        "notable_patterns": _normalize_v2_notable_patterns_for_ui(overview.get("notable_patterns", []), limit=6),
     }
 
 
 @app.get("/api/v2/artifacts")
 async def get_v2_artifacts():
-    """Return V2 artifact catalog for artifact workspace view."""
+    """Return the artifact catalog for the workspace view."""
     return build_v2_artifact_catalog()
 
 
@@ -6123,9 +9843,9 @@ async def get_discovery_compare(current: Optional[str] = None, baseline: Optiona
 
 
 @app.get("/api/discovery/runbook")
-async def get_discovery_runbook(timestamp: Optional[str] = None, persona: str = "admin"):
+async def get_discovery_runbook(timestamp: Optional[str] = None, persona: str = "admin", voice: str = "direct"):
     """Return persona-scoped operational runbook for a selected discovery session."""
-    return build_session_runbook_payload(timestamp, persona)
+    return build_session_runbook_payload(timestamp, persona, _normalize_operator_voice(voice))
 
 
 @app.get("/api/discovery/results")
@@ -6136,7 +9856,7 @@ async def get_discovery_results():
     sessions = load_discovery_sessions()
     latest = sessions[0] if sessions else None
     return {
-        "message": "V2 discovery sessions are persisted and available via /api/discovery/sessions.",
+        "message": "Discovery sessions are persisted and available via /api/discovery/sessions.",
         "reports_endpoint": "/reports",
         "sessions_endpoint": "/api/discovery/sessions",
         "latest_session": latest
@@ -6180,10 +9900,10 @@ async def get_report(filename: str):
 
 
 @app.get("/connection-info")
-async def get_connection_info():
+async def get_connection_info(request: Request):
     """Get current LLM and MCP server connection information (DT4SMS version)."""
     try:
-        config = config_manager.get()
+        config = resolve_effective_runtime_config(request=request)
         
         # Get LLM info (no sensitive data)
         llm_provider = normalize_provider_name(config.llm.provider)
@@ -6250,10 +9970,82 @@ class ServerSettings(BaseModel):
     trusted_hosts: List[str]
     debug_mode: Optional[bool] = False
 
+class OIDCSettings(BaseModel):
+    issuer_url: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    audience: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: ["openid", "profile", "email"])
+    username_claim: str = "preferred_username"
+    email_claim: str = "email"
+    role_claim: str = "roles"
+    default_role: str = Field(default="viewer", pattern="^(admin|analyst|viewer)$")
+    mcp_assignment_claim: Optional[str] = None
+
+class SecuritySettings(BaseModel):
+    auth_enabled: bool = False
+    auth_provider: str = Field(default="local_password", pattern="^(local_password|oidc)$")
+    external_api_enabled: bool = False
+    external_mcp_enabled: bool = False
+    external_api_rate_limit_requests: int = Field(default=DEFAULT_EXTERNAL_API_RATE_LIMIT_REQUESTS, ge=1, le=10000)
+    external_api_rate_limit_window_seconds: int = Field(default=DEFAULT_EXTERNAL_API_RATE_LIMIT_WINDOW_SECONDS, ge=1, le=3600)
+    external_mcp_rate_limit_requests: int = Field(default=DEFAULT_EXTERNAL_MCP_RATE_LIMIT_REQUESTS, ge=1, le=10000)
+    external_mcp_rate_limit_window_seconds: int = Field(default=DEFAULT_EXTERNAL_MCP_RATE_LIMIT_WINDOW_SECONDS, ge=1, le=3600)
+    session_timeout_minutes: int = Field(default=480, ge=15, le=10080)
+    password_min_length: int = Field(default=12, ge=8, le=256)
+    require_password_reset_on_first_login: bool = True
+    oidc: OIDCSettings = Field(default_factory=OIDCSettings)
+
 class ConfigUpdate(BaseModel):
     mcp: Optional[MCPSettings] = None
     llm: Optional[LLMSettings] = None
     server: Optional[ServerSettings] = None
+    security: Optional[SecuritySettings] = None
+
+
+class AuthLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordResetRequest(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: str
+
+
+class SecurityUserCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "analyst"
+    is_enabled: bool = True
+    require_password_reset: bool = True
+    mcp_config_name: Optional[str] = None
+
+
+class SecurityUserUpdateRequest(BaseModel):
+    username: Optional[str] = None
+    new_password: Optional[str] = None
+    role: Optional[str] = None
+    is_enabled: Optional[bool] = None
+    require_password_reset: Optional[bool] = None
+    mcp_config_name: Optional[str] = None
+
+
+class SecurityExternalIdentityLinkRequest(BaseModel):
+    auth_provider: str = "oidc"
+    subject: str
+    email: Optional[str] = None
+    claims: Optional[Dict[str, Any]] = None
+
+
+class SecurityTokenCreateRequest(BaseModel):
+    name: str
+    token_type: str = "external_api"
+    scopes: List[str]
+    owner_user_id: Optional[int] = None
+    expires_at: Optional[str] = None
+    expires_in_days: Optional[int] = None
 
 
 class CapabilityConfigUpdate(BaseModel):
@@ -6271,6 +10063,7 @@ class CapabilityDeeplinkBuildRequest(BaseModel):
 class CapabilityExportBuildRequest(BaseModel):
     timestamp: Optional[str] = None
     persona: str = "admin"
+    voice: str = "direct"
     artifact_names: List[str] = []
     title: Optional[str] = None
     runbook_markdown: Optional[str] = None
@@ -6288,6 +10081,11 @@ class RAGKnowledgeAssetImportRequest(BaseModel):
 
 
 class RAGContextPreviewRequest(BaseModel):
+    query: str
+    limit: int = 4
+
+
+class ExternalRAGSearchRequest(BaseModel):
     query: str
     limit: int = 4
 
@@ -6403,7 +10201,6 @@ def build_summary_infographic_brief(timestamp: str, summary_data: Optional[Dict[
         },
     }
 
-
 def build_summary_infographic_prompt(timestamp: str, summary_data: Optional[Dict[str, Any]]) -> str:
     """Build a rich prompt for turning the summary into a single infographic."""
     payload = summary_data if isinstance(summary_data, dict) else {}
@@ -6462,13 +10259,15 @@ Full summary payload (truncated only if needed for API safety):
     return f"{prompt_prefix}{full_payload}"
 
 @app.get("/api/config")
-async def get_config():
+async def get_config(request: Request):
     """Get current configuration (safe export with masked secrets)"""
+    require_admin_user(request)
     return config_manager.export_safe()
 
 @app.post("/api/config")
-async def update_config(config_update: ConfigUpdate):
+async def update_config(request: Request, config_update: ConfigUpdate):
     """Update configuration"""
+    require_admin_user(request)
     try:
         # Update MCP settings
         if config_update.mcp:
@@ -6486,7 +10285,7 @@ async def update_config(config_update: ConfigUpdate):
                 import traceback
                 traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"MCP config error: {str(e)}")
-        
+
         # Update LLM settings
         if config_update.llm:
             try:
@@ -6503,7 +10302,7 @@ async def update_config(config_update: ConfigUpdate):
                 import traceback
                 traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"LLM config error: {str(e)}")
-        
+
         # Update server settings
         if config_update.server:
             try:
@@ -6516,19 +10315,629 @@ async def update_config(config_update: ConfigUpdate):
                 import traceback
                 traceback.print_exc()
                 raise HTTPException(status_code=500, detail=f"Server config error: {str(e)}")
-        
+
+        # Update security settings
+        if config_update.security:
+            try:
+                security_update_data = (
+                    config_update.security.model_dump(exclude_unset=True)
+                    if hasattr(config_update.security, "model_dump")
+                    else config_update.security.dict(exclude_unset=True)
+                )
+                current_security = get_security_config()
+                next_auth_enabled = bool(
+                    security_update_data.get(
+                        "auth_enabled",
+                        getattr(current_security, "auth_enabled", False) if current_security else False,
+                    )
+                )
+                next_auth_provider = str(
+                    security_update_data.get(
+                        "auth_provider",
+                        getattr(current_security, "auth_provider", "local_password") if current_security else "local_password",
+                    )
+                    or "local_password"
+                ).strip().lower()
+
+                next_oidc_settings = _snapshot_oidc_settings(getattr(current_security, "oidc", None) if current_security else None)
+                incoming_oidc_settings = security_update_data.get("oidc") if isinstance(security_update_data.get("oidc"), dict) else {}
+                for field_name, field_value in incoming_oidc_settings.items():
+                    if field_name == "client_secret" and str(field_value or "").strip() in {"", "***"}:
+                        continue
+                    next_oidc_settings[field_name] = field_value
+
+                if next_auth_enabled and next_auth_provider == "oidc":
+                    if not all(
+                        [
+                            str(next_oidc_settings.get("issuer_url") or "").strip(),
+                            str(next_oidc_settings.get("client_id") or "").strip(),
+                            str(next_oidc_settings.get("client_secret") or "").strip(),
+                        ]
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="OIDC authentication requires issuer_url, client_id, and client_secret before it can be enabled",
+                        )
+                success = config_manager.update_security(**security_update_data)
+                if not success:
+                    raise HTTPException(status_code=500, detail="Failed to save security configuration")
+            except HTTPException:
+                raise
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"Security config error: {str(e)}")
+
         # Reload config
         config_manager._config = config_manager.load()
+        if config_update.security:
+            ensure_local_auth_bootstrap_state()
         capability_manager.refresh()
-        
+
         return {"status": "success", "message": "Configuration updated successfully"}
-        
+
     except HTTPException:
         raise
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to update configuration: {str(e)}")
+
+
+@app.get("/api/auth/status")
+async def get_auth_status(request: Request):
+    """Return auth mode and current session state for the active request."""
+    security_config = get_security_config()
+    if is_auth_enabled() and get_auth_provider() == "local_password":
+        ensure_local_auth_bootstrap_state()
+
+    current_user = _serialize_authenticated_user(getattr(request.state, "auth_user", None))
+    auth_provider_status = {
+        "local_password": {
+            "implemented": True,
+            "configured": True,
+            "ready": True,
+            "can_enable_auth": True,
+        },
+        "oidc": _build_oidc_provider_status(),
+    }
+    return {
+        "auth_enabled": is_auth_enabled(),
+        "auth_provider": get_auth_provider(),
+        "authenticated": current_user is not None,
+        "password_reset_required": bool(getattr(request.state, "requires_password_reset", False)),
+        "demo_mode": not is_auth_enabled(),
+        "user": current_user,
+        "session_timeout_minutes": getattr(security_config, "session_timeout_minutes", None) if security_config else None,
+        "auth_provider_status": auth_provider_status,
+    }
+
+
+def _issue_auth_session_response(
+    request: Request,
+    payload: Dict[str, Any],
+    user_id: int,
+    timeout_minutes: int,
+    redirect_to: Optional[str] = None,
+):
+    session = security_manager.create_session(user_id=user_id, timeout_minutes=timeout_minutes)
+    if redirect_to:
+        response = RedirectResponse(url=redirect_to, status_code=303)
+    else:
+        response = JSONResponse(payload)
+
+    response.set_cookie(
+        key=AUTH_SESSION_COOKIE_NAME,
+        value=session["session_token"],
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        max_age=max(60, timeout_minutes * 60),
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/login")
+async def login(request: Request, login_request: AuthLoginRequest):
+    """Authenticate a local user and issue a session cookie."""
+    if not is_auth_enabled():
+        raise HTTPException(status_code=400, detail="Authentication is not enabled")
+    if get_auth_provider() != "local_password":
+        raise HTTPException(status_code=400, detail="Use the configured OIDC sign-in flow instead of local username/password login")
+
+    security_config = get_security_config()
+    ensure_local_auth_bootstrap_state()
+    user = security_manager.authenticate_local_user(login_request.username, login_request.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    timeout_minutes = int(getattr(security_config, "session_timeout_minutes", 480) or 480)
+    response = _issue_auth_session_response(
+        request=request,
+        payload={
+            "status": "success",
+            "message": "Signed in successfully",
+            "password_reset_required": bool(user.get("require_password_reset")),
+            "user": _serialize_authenticated_user(user),
+        },
+        user_id=int(user["id"]),
+        timeout_minutes=timeout_minutes,
+    )
+    return response
+
+
+@app.get("/api/auth/oidc/start")
+async def start_oidc_login(request: Request):
+    """Start the OIDC authorization-code flow for the configured provider."""
+    if not is_auth_enabled() or get_auth_provider() != "oidc":
+        raise HTTPException(status_code=404, detail="OIDC authentication is not enabled")
+
+    provider_status = _build_oidc_provider_status()
+    if not provider_status.get("ready"):
+        raise HTTPException(status_code=503, detail="OIDC configuration is incomplete")
+
+    oidc_settings = _snapshot_oidc_settings()
+    provider_metadata = await load_oidc_provider_metadata(oidc_settings)
+    redirect_uri = str(request.url_for("complete_oidc_login"))
+    nonce = secrets.token_urlsafe(24)
+    state = oidc_login_state_store.issue({"redirect_uri": redirect_uri, "nonce": nonce})
+
+    query = {
+        "client_id": oidc_settings["client_id"],
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(oidc_settings["scopes"] or ["openid", "profile", "email"]),
+        "state": state,
+        "nonce": nonce,
+    }
+    if oidc_settings["audience"]:
+        query["audience"] = oidc_settings["audience"]
+
+    authorization_url = f"{str(provider_metadata.get('authorization_endpoint') or '').strip()}?{urlencode(query)}"
+    return RedirectResponse(url=authorization_url, status_code=303)
+
+
+@app.get("/api/auth/oidc/callback")
+async def complete_oidc_login(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    """Complete the OIDC authorization-code flow and issue a normal DT4SMS session."""
+    if not is_auth_enabled() or get_auth_provider() != "oidc":
+        raise HTTPException(status_code=404, detail="OIDC authentication is not enabled")
+
+    if str(error or "").strip():
+        return HTMLResponse(
+            content=build_auth_error_page("OIDC sign-in failed", f"Identity provider returned an error: {str(error).strip()}"),
+            status_code=400,
+        )
+
+    state_record = oidc_login_state_store.consume(str(state or ""))
+    if state_record is None:
+        return HTMLResponse(
+            content=build_auth_error_page("OIDC sign-in failed", "The sign-in attempt is missing state or has expired. Start the flow again."),
+            status_code=400,
+        )
+
+    if not str(code or "").strip():
+        return HTMLResponse(
+            content=build_auth_error_page("OIDC sign-in failed", "The identity provider did not return an authorization code."),
+            status_code=400,
+        )
+
+    oidc_settings = _snapshot_oidc_settings()
+    try:
+        provider_metadata = await load_oidc_provider_metadata(oidc_settings)
+        redirect_uri = str(state_record.get("redirect_uri") or request.url_for("complete_oidc_login"))
+        token_payload = _validate_oidc_token_payload(
+            await exchange_oidc_authorization_code(oidc_settings, provider_metadata, str(code or "").strip(), redirect_uri)
+        )
+        id_token_claims = await _validate_oidc_id_token_claims(token_payload, provider_metadata, oidc_settings, state_record)
+        claims = await fetch_oidc_userinfo(provider_metadata, str(token_payload.get("access_token") or "").strip())
+        _validate_oidc_subject_coherence(id_token_claims, claims)
+        identity = _resolve_oidc_identity_fields(claims, oidc_settings)
+        user = security_manager.resolve_or_provision_external_user(
+            auth_provider="oidc",
+            subject=identity["subject"],
+            preferred_username=identity["username"],
+            email=identity["email"],
+            role=identity["role"],
+            mcp_config_name=validate_assigned_mcp_config_name(identity["mcp_config_name"]),
+            claims=claims,
+            sync_role=bool(identity.get("sync_role")),
+            sync_mcp_config_name=bool(identity.get("sync_mcp_config_name")),
+        )
+    except ValueError as exc:
+        security_manager.record_audit_event("oidc_login_failed", details={"reason": str(exc)})
+        return HTMLResponse(content=build_auth_error_page("OIDC sign-in failed", str(exc)), status_code=400)
+    except httpx.HTTPError as exc:
+        security_manager.record_audit_event("oidc_login_failed", details={"reason": str(exc)})
+        return HTMLResponse(content=build_auth_error_page("OIDC sign-in failed", "Failed to contact the configured identity provider."), status_code=502)
+
+    if not isinstance(user, dict) or not bool(user.get("is_enabled")):
+        security_manager.record_audit_event(
+            "oidc_login_failed",
+            username=user.get("username") if isinstance(user, dict) else None,
+            user_id=int(user["id"]) if isinstance(user, dict) and user.get("id") is not None else None,
+            details={"reason": "user_disabled_or_missing"},
+        )
+        return HTMLResponse(
+            content=build_auth_error_page("OIDC sign-in denied", "The linked DT4SMS user is disabled or unavailable."),
+            status_code=403,
+        )
+
+    security_config = get_security_config()
+    timeout_minutes = int(getattr(security_config, "session_timeout_minutes", 480) or 480)
+    return _issue_auth_session_response(
+        request=request,
+        payload={
+            "status": "success",
+            "message": "OIDC sign-in completed",
+            "password_reset_required": False,
+            "user": _serialize_authenticated_user(user),
+        },
+        user_id=int(user["id"]),
+        timeout_minutes=timeout_minutes,
+        redirect_to="/",
+    )
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    """Revoke the current session and clear the auth cookie."""
+    auth_provider = get_auth_provider() if is_auth_enabled() else "local_password"
+    session_token = request.cookies.get(AUTH_SESSION_COOKIE_NAME, "")
+    if session_token:
+        security_manager.revoke_session(session_token)
+
+    provider_logout = {
+        "provider": auth_provider,
+        "supported": False,
+        "mode": "local_session_only",
+        "url": None,
+        "post_logout_redirect_uri": None,
+        "reason": "local_session_only",
+    }
+    if is_auth_enabled() and auth_provider == "oidc":
+        provider_logout = await _build_oidc_logout_plan(request)
+
+    response = JSONResponse({"status": "success", "message": "Signed out", "provider_logout": provider_logout})
+    response.delete_cookie(AUTH_SESSION_COOKIE_NAME, path="/")
+    return response
+
+
+@app.post("/api/auth/reset-password")
+async def reset_password(request: Request, reset_request: PasswordResetRequest):
+    """Allow an authenticated local user to reset their password."""
+    if not is_auth_enabled():
+        raise HTTPException(status_code=400, detail="Authentication is not enabled")
+    if get_auth_provider() != "local_password":
+        raise HTTPException(status_code=400, detail="Password resets are only available for local-password authentication")
+    current_user = getattr(request.state, "auth_user", None)
+    if not isinstance(current_user, dict):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    security_config = get_security_config()
+    minimum_length = int(getattr(security_config, "password_min_length", 12) or 12)
+    new_password = str(reset_request.new_password or "")
+    if new_password != str(reset_request.confirm_password or ""):
+        raise HTTPException(status_code=400, detail="New password confirmation does not match")
+    if len(new_password) < minimum_length:
+        raise HTTPException(status_code=400, detail=f"New password must be at least {minimum_length} characters long")
+    if not security_manager.verify_user_password(int(current_user["id"]), reset_request.current_password):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if not security_manager.update_password(int(current_user["id"]), new_password, require_password_reset=False):
+        raise HTTPException(status_code=500, detail="Failed to update password")
+
+    updated_user = security_manager.get_user_by_id(int(current_user["id"]))
+    request.state.auth_user = updated_user
+    request.state.requires_password_reset = False
+    return {
+        "status": "success",
+        "message": "Password updated successfully",
+        "password_reset_required": False,
+        "user": _serialize_authenticated_user(updated_user),
+    }
+
+
+@app.get("/api/security/users")
+async def list_security_users(request: Request):
+    """List local security users for admin management."""
+    require_admin_user(request)
+    users = [_serialize_security_user_record(user) for user in security_manager.list_users()]
+    return {"users": users, "count": len(users)}
+
+
+@app.post("/api/security/users")
+async def create_security_user(request: Request, user_request: SecurityUserCreateRequest):
+    """Create a local user and optionally assign an MCP connection definition."""
+    require_admin_user(request)
+    security_config = get_security_config()
+    minimum_length = int(getattr(security_config, "password_min_length", 12) or 12)
+    if len(str(user_request.password or "")) < minimum_length:
+        raise HTTPException(status_code=400, detail=f"Password must be at least {minimum_length} characters long")
+
+    try:
+        user = security_manager.create_user(
+            username=user_request.username,
+            password=user_request.password,
+            role=user_request.role,
+            is_enabled=user_request.is_enabled,
+            require_password_reset=user_request.require_password_reset,
+            mcp_config_name=validate_assigned_mcp_config_name(user_request.mcp_config_name),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "success",
+        "message": f"User '{user['username']}' created",
+        "user": _serialize_security_user_record(user),
+    }
+
+
+@app.get("/api/security/users/{user_id}")
+async def get_security_user(request: Request, user_id: int):
+    """Load one local security user for admin management."""
+    require_admin_user(request)
+    user = security_manager.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _serialize_security_user_record(user)
+
+
+@app.patch("/api/security/users/{user_id}")
+async def update_security_user(request: Request, user_id: int, user_update: SecurityUserUpdateRequest):
+    """Update a local user, including role, enablement, password reset, and MCP assignment."""
+    require_admin_user(request)
+    update_data = user_update.model_dump(exclude_unset=True) if hasattr(user_update, "model_dump") else user_update.dict(exclude_unset=True)
+
+    if "new_password" in update_data:
+        new_password = str(update_data.get("new_password") or "")
+        security_config = get_security_config()
+        minimum_length = int(getattr(security_config, "password_min_length", 12) or 12)
+        if len(new_password) < minimum_length:
+            raise HTTPException(status_code=400, detail=f"Password must be at least {minimum_length} characters long")
+        if "require_password_reset" not in update_data:
+            update_data["require_password_reset"] = True
+
+    if "mcp_config_name" in update_data:
+        update_data["mcp_config_name"] = validate_assigned_mcp_config_name(update_data.get("mcp_config_name"))
+
+    try:
+        user = security_manager.update_user(user_id, **update_data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "status": "success",
+        "message": f"User '{user['username']}' updated",
+        "user": _serialize_security_user_record(user),
+    }
+
+
+@app.post("/api/security/users/{user_id}/external-identities")
+async def link_security_user_external_identity(
+    request: Request,
+    user_id: int,
+    identity_request: SecurityExternalIdentityLinkRequest,
+):
+    """Explicitly link an external identity to an existing local user for admin-driven migration flows."""
+    require_admin_user(request)
+    target_user = security_manager.get_user_by_id(user_id)
+    if target_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        user = security_manager.link_external_identity(
+            user_id=user_id,
+            auth_provider=identity_request.auth_provider,
+            subject=identity_request.subject,
+            email=identity_request.email,
+            claims=identity_request.claims,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    identity = security_manager.get_external_identity(identity_request.auth_provider, identity_request.subject)
+    return {
+        "status": "success",
+        "message": f"External identity linked to user '{user['username']}'",
+        "user": _serialize_security_user_record(user),
+        "external_identity": _serialize_external_identity_record(identity),
+    }
+
+
+@app.delete("/api/security/users/{user_id}")
+async def delete_security_user(request: Request, user_id: int):
+    """Delete a local user while preserving at least one enabled admin."""
+    require_admin_user(request)
+    try:
+        deleted = security_manager.delete_user(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "success", "message": "User deleted"}
+
+
+@app.get("/api/security/tokens")
+async def list_security_tokens(request: Request):
+    """List inbound access tokens for admin review without re-exposing plaintext secrets."""
+    require_admin_user(request)
+    tokens = [_serialize_security_token_record(token) for token in security_manager.list_access_tokens()]
+    return {"tokens": tokens, "count": len(tokens)}
+
+
+@app.post("/api/security/tokens")
+async def create_security_token(request: Request, token_request: SecurityTokenCreateRequest):
+    """Issue a new inbound access token and reveal the plaintext value exactly once."""
+    current_admin = require_admin_user(request)
+    try:
+        issued = security_manager.issue_access_token(
+            name=token_request.name,
+            token_type=token_request.token_type,
+            scopes=token_request.scopes,
+            owner_user_id=token_request.owner_user_id,
+            created_by_user_id=int(current_admin["id"]) if isinstance(current_admin, dict) else None,
+            expires_at=token_request.expires_at,
+            expires_in_days=token_request.expires_in_days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "success",
+        "message": f"Token '{issued['token']['name']}' created",
+        "access_token": issued["access_token"],
+        "token": _serialize_security_token_record(issued["token"]),
+    }
+
+
+@app.get("/api/security/tokens/{token_id}")
+async def get_security_token(request: Request, token_id: int):
+    """Load one token record for admin inspection without exposing the plaintext token."""
+    require_admin_user(request)
+    token = security_manager.get_access_token(token_id)
+    if token is None:
+        raise HTTPException(status_code=404, detail="Token not found")
+    return _serialize_security_token_record(token)
+
+
+@app.post("/api/security/tokens/{token_id}/revoke")
+async def revoke_security_token(request: Request, token_id: int):
+    """Revoke an inbound access token."""
+    current_admin = require_admin_user(request)
+    try:
+        revoked = security_manager.revoke_access_token(
+            token_id,
+            revoked_by_user_id=int(current_admin["id"]) if isinstance(current_admin, dict) else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Token not found")
+    token = security_manager.get_access_token(token_id)
+    return {
+        "status": "success",
+        "message": "Token revoked",
+        "token": _serialize_security_token_record(token),
+    }
+
+
+@app.delete("/api/security/tokens/{token_id}")
+async def delete_security_token(request: Request, token_id: int):
+    """Remove an inbound access token record permanently."""
+    current_admin = require_admin_user(request)
+    try:
+        deleted = security_manager.delete_access_token(
+            token_id,
+            deleted_by_user_id=int(current_admin["id"]) if isinstance(current_admin, dict) else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Token not found")
+    return {
+        "status": "success",
+        "message": "Token deleted",
+    }
+
+
+@app.get("/api/external/info")
+async def get_external_api_info():
+    """Return a minimal discovery document for the token-authenticated external API."""
+    require_external_api_enabled()
+    security_config = get_security_config()
+    return {
+        "api_name": "dt4sms-external-rag",
+        "status": "available",
+        "version": "v1",
+        "authentication": {
+            "scheme": "bearer",
+            "header": "Authorization: Bearer <token>",
+            "token_type": "external_api",
+        },
+        "supported_scopes": ["rag:search", "rag:assets:read"],
+        "external_mcp_enabled": bool(getattr(security_config, "external_mcp_enabled", False) if security_config else False),
+        "mcp_info_path": "/api/external/mcp/info",
+        "routes": [
+            {"method": "GET", "path": "/api/external/rag/index-summary", "scope": "rag:assets:read"},
+            {"method": "POST", "path": "/api/external/rag/search", "scope": "rag:search"},
+            {"method": "GET", "path": "/api/external/rag/assets", "scope": "rag:assets:read"},
+            {"method": "GET", "path": "/api/external/rag/assets/{asset_id}", "scope": "rag:assets:read"},
+        ],
+    }
+
+
+@app.get("/api/external/mcp/info")
+async def get_external_mcp_info():
+    """Return unauthenticated setup metadata for the inbound read-only MCP surface."""
+    require_external_mcp_enabled()
+    return _build_external_mcp_info_payload()
+
+
+@app.post("/api/external/mcp")
+async def handle_external_mcp(request: Request, payload: Dict[str, Any]):
+    """Serve a minimal inbound read-only MCP surface over JSON-RPC HTTP."""
+    require_external_mcp_token(request, ["mcp:tools:read"])
+
+    if not isinstance(payload, dict):
+        return _build_jsonrpc_error_response(None, -32600, "Invalid JSON-RPC request body")
+
+    request_id = payload.get("id")
+    method = str(payload.get("method") or "").strip()
+    params = payload.get("params")
+    if not method:
+        return _build_jsonrpc_error_response(request_id, -32600, "JSON-RPC method is required")
+
+    if method == "initialize":
+        return _build_jsonrpc_success_response(request_id, _build_external_mcp_initialize_result())
+    if method in {"notifications/initialized", "initialized"}:
+        return _build_jsonrpc_success_response(request_id, {"acknowledged": True})
+    if method == "ping":
+        return _build_jsonrpc_success_response(request_id, {})
+    if method == "tools/list":
+        return _build_jsonrpc_success_response(
+            request_id,
+            {"tools": copy.deepcopy(EXTERNAL_MCP_TOOL_DEFINITIONS)},
+        )
+    if method == "tools/call":
+        return _handle_external_mcp_tool_call(request_id, params)
+
+    return _build_jsonrpc_error_response(request_id, -32601, f"Unsupported MCP method '{method}'")
+
+
+@app.get("/api/external/rag/index-summary")
+async def get_external_rag_index_summary(request: Request):
+    """Return a sanitized RAG index summary for external consumers."""
+    require_external_api_token(request, ["rag:assets:read"])
+    return _build_external_rag_index_summary_payload()
+
+
+@app.post("/api/external/rag/search")
+async def search_external_rag(request: Request, search_request: ExternalRAGSearchRequest):
+    """Search managed RAG assets through the external read-only API."""
+    require_external_api_token(request, ["rag:search"])
+    return _build_external_rag_search_payload(search_request.query, search_request.limit)
+
+
+@app.get("/api/external/rag/assets")
+async def list_external_rag_assets(request: Request):
+    """List sanitized managed RAG assets for external consumers."""
+    require_external_api_token(request, ["rag:assets:read"])
+    return _list_external_rag_assets_payload()
+
+
+@app.get("/api/external/rag/assets/{asset_id}")
+async def get_external_rag_asset_detail(request: Request, asset_id: str):
+    """Return sanitized detail for one managed RAG knowledge asset."""
+    require_external_api_token(request, ["rag:assets:read"])
+    return _get_external_rag_asset_detail_payload(asset_id)
 
 
 def _raise_for_capability_result(result: Dict[str, Any]):
@@ -6714,8 +11123,9 @@ async def update_capability_config(name: str, config_update: CapabilityConfigUpd
 
 
 @app.post("/api/capabilities/deeplinks/build")
-async def build_splunk_deeplink(build_request: CapabilityDeeplinkBuildRequest):
+async def build_splunk_deeplink(request: Request, build_request: CapabilityDeeplinkBuildRequest):
     """Build a Splunk deeplink using the optional deeplink capability pack."""
+    runtime_config = resolve_effective_runtime_config(request=request)
     result = capability_manager.build_deeplink(
         "splunk_deeplink_tools",
         build_request.link_type,
@@ -6724,6 +11134,7 @@ async def build_splunk_deeplink(build_request: CapabilityDeeplinkBuildRequest):
             "earliest": build_request.earliest,
             "latest": build_request.latest,
             "app": build_request.app,
+            "mcp_url_override": runtime_config.mcp.url,
         },
     ).to_dict()
     _raise_for_capability_result(result)
@@ -6738,6 +11149,7 @@ async def build_capability_export(build_request: CapabilityExportBuildRequest):
         {
             "timestamp": build_request.timestamp,
             "persona": build_request.persona,
+            "voice": _normalize_operator_voice(build_request.voice),
             "artifact_names": list(build_request.artifact_names or []),
             "title": build_request.title,
             "runbook_markdown": build_request.runbook_markdown,
@@ -6778,8 +11190,9 @@ class CredentialCreate(BaseModel):
     temperature: float = 0.7
 
 @app.get("/api/credentials")
-async def list_credentials():
+async def list_credentials(request: Request):
     """Get all saved credentials (with masked API keys)"""
+    require_admin_user(request)
     credentials = config_manager.list_credentials()
     return {
         name: {
@@ -6795,8 +11208,9 @@ async def list_credentials():
     }
 
 @app.post("/api/credentials")
-async def save_credential(credential: CredentialCreate):
+async def save_credential(request: Request, credential: CredentialCreate):
     """Save a new credential"""
+    require_admin_user(request)
     try:
         success = config_manager.save_credential(
             name=credential.name,
@@ -6815,8 +11229,9 @@ async def save_credential(credential: CredentialCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/credentials/{name}")
-async def get_credential(name: str):
+async def get_credential(request: Request, name: str):
     """Get a specific credential (with masked API key)"""
+    require_admin_user(request)
     cred = config_manager.get_credential(name)
     if not cred:
         raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
@@ -6832,8 +11247,9 @@ async def get_credential(name: str):
     }
 
 @app.delete("/api/credentials/{name}")
-async def delete_credential(name: str):
+async def delete_credential(request: Request, name: str):
     """Delete a saved credential"""
+    require_admin_user(request)
     success = config_manager.delete_credential(name)
     if success:
         return {"status": "success", "message": f"Credential '{name}' deleted"}
@@ -6841,8 +11257,9 @@ async def delete_credential(name: str):
         raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
 
 @app.post("/api/credentials/{name}/load")
-async def load_credential(name: str):
+async def load_credential(request: Request, name: str):
     """Load a saved credential into active configuration"""
+    require_admin_user(request)
     success = config_manager.load_credential(name)
     if success:
         # Reload config
@@ -6868,8 +11285,9 @@ class MCPConfigCreate(BaseModel):
     description: Optional[str] = None
 
 @app.get("/api/mcp-configs")
-async def list_mcp_configs():
+async def list_mcp_configs(request: Request):
     """Get all saved MCP configurations (with masked tokens)"""
+    require_admin_user(request)
     mcp_configs = config_manager.list_mcp_configs()
     return {
         name: {
@@ -6884,8 +11302,9 @@ async def list_mcp_configs():
     }
 
 @app.post("/api/mcp-configs")
-async def save_mcp_config(mcp_config: MCPConfigCreate):
+async def save_mcp_config(request: Request, mcp_config: MCPConfigCreate):
     """Save a new MCP configuration"""
+    require_admin_user(request)
     try:
         success = config_manager.save_mcp_config(
             name=mcp_config.name,
@@ -6903,8 +11322,9 @@ async def save_mcp_config(mcp_config: MCPConfigCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/mcp-configs/{name}")
-async def get_mcp_config(name: str):
+async def get_mcp_config(request: Request, name: str):
     """Get a specific MCP configuration (with masked token)"""
+    require_admin_user(request)
     mcp_config = config_manager.get_mcp_config(name)
     if not mcp_config:
         raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
@@ -6919,8 +11339,9 @@ async def get_mcp_config(name: str):
     }
 
 @app.delete("/api/mcp-configs/{name}")
-async def delete_mcp_config(name: str):
+async def delete_mcp_config(request: Request, name: str):
     """Delete a saved MCP configuration"""
+    require_admin_user(request)
     success = config_manager.delete_mcp_config(name)
     if success:
         return {"status": "success", "message": f"MCP configuration '{name}' deleted"}
@@ -6928,8 +11349,9 @@ async def delete_mcp_config(name: str):
         raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
 
 @app.post("/api/mcp-configs/{name}/load")
-async def load_mcp_config(name: str):
+async def load_mcp_config(request: Request, name: str):
     """Load a saved MCP configuration into active configuration"""
+    require_admin_user(request)
     success = config_manager.load_mcp_config(name)
     if success:
         # Reload config
@@ -6944,14 +11366,15 @@ async def load_mcp_config(name: str):
         raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
 
 @app.post("/api/mcp-configs/test")
-async def test_mcp_connection(request: dict):
+async def test_mcp_connection(request: Request, request_payload: dict):
     """Test MCP connection with provided credentials"""
+    require_admin_user(request)
     try:
         import httpx
         
-        url = request.get('url')
-        token = request.get('token')
-        verify_ssl = request.get('verify_ssl', False)
+        url = request_payload.get('url')
+        token = request_payload.get('token')
+        verify_ssl = request_payload.get('verify_ssl', False)
         
         if not url:
             raise HTTPException(status_code=400, detail="URL is required")
@@ -7802,15 +12225,229 @@ async def get_summarize_progress(session_id: str):
     try:
         # Security: Validate session ID format
         safe_session_id = validate_session_id(session_id)
-        return summarization_progress.get(safe_session_id, {
-            "stage": "idle",
-            "progress": 0,
-            "message": "Not started"
-        })
+        _sync_runtime_state_from_disk()
+        return copy.deepcopy(summarization_progress.get(safe_session_id, _default_summarization_progress_payload()))
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid session ID")
+
+
+@app.post("/abort-summary")
+async def abort_summary(request: Dict[str, Any]):
+    """Abort an active summary worker for a specific session."""
+    timestamp = request.get("timestamp")
+    if not timestamp:
+        raise HTTPException(status_code=400, detail="timestamp required")
+
+    try:
+        safe_timestamp = validate_session_id(timestamp)
+    except HTTPException:
+        raise HTTPException(status_code=400, detail="Invalid timestamp format")
+
+    _sync_runtime_state_from_disk()
+    progress_entry = copy.deepcopy(summarization_progress.get(safe_timestamp, {}))
+    stage = str(progress_entry.get("stage") or "idle").strip().lower() or "idle"
+    worker_pid = _coerce_process_id(progress_entry.get("worker_pid"))
+
+    if stage in SUMMARIZATION_TERMINAL_STAGES or worker_pid is None:
+        return {
+            "error": "No summary in progress",
+            "progress": copy.deepcopy(progress_entry or _default_summarization_progress_payload()),
+        }
+
+    if not _terminate_runtime_worker_process(worker_pid):
+        raise HTTPException(status_code=500, detail="Failed to stop summary worker")
+
+    updated_progress = _set_summarization_progress(
+        safe_timestamp,
+        stage="aborted",
+        progress=_safe_int(progress_entry.get("progress", 0)),
+        message="Summary aborted by operator.",
+        worker_pid=None,
+        execution_mode="worker",
+    )
+    return {
+        "status": "aborted",
+        "progress": copy.deepcopy(updated_progress),
+    }
+
+
+def _load_cached_summary_if_available(
+    session_id: str,
+    json_file: Optional[Path] = None,
+    *,
+    mark_from_cache: bool,
+    completion_message: str,
+) -> Optional[Dict[str, Any]]:
+    summary_file = _summary_artifact_path(session_id)
+    if not summary_file.exists():
+        return None
+
+    try:
+        with open(summary_file, 'r', encoding='utf-8') as summary_handle:
+            existing_summary = json.load(summary_handle)
+        has_v2_panels = all(
+            key in existing_summary
+            for key in ["schema_version", "trend_signals", "risk_register", "recursive_investigations"]
+        )
+        if not has_v2_panels:
+            print(f"Cached summary {summary_file.name} missing expected fields; regenerating...")
+            return None
+
+        if (
+            (
+                "context_explorer" not in existing_summary
+                or not _context_explorer_has_formal_actions(existing_summary.get("context_explorer"))
+                or not _context_explorer_has_structured_patterns(existing_summary.get("context_explorer"))
+            )
+            and json_file is not None
+            and json_file.exists()
+        ):
+            try:
+                with open(json_file, 'r', encoding='utf-8') as cached_discovery_file:
+                    cached_discovery_data = json.load(cached_discovery_file)
+                existing_summary["context_explorer"] = build_context_explorer_payload(
+                    cached_discovery_data,
+                    unknown_questions=existing_summary.get("unknown_data"),
+                    admin_tasks=existing_summary.get("admin_tasks"),
+                    coverage_gaps=existing_summary.get("coverage_gaps"),
+                    risk_register=existing_summary.get("risk_register"),
+                    readiness_score=existing_summary.get("readiness_score"),
+                    session_id=session_id,
+                )
+                with open(summary_file, 'w', encoding='utf-8') as summary_out:
+                    json.dump(existing_summary, summary_out, indent=2)
+            except Exception as cache_patch_error:
+                print(f"Error backfilling context explorer for cached summary: {cache_patch_error}")
+
+        _set_summarization_progress(
+            session_id,
+            stage="complete",
+            progress=100,
+            message=completion_message,
+            worker_pid=None,
+        )
+        if mark_from_cache:
+            existing_summary['from_cache'] = True
+        return existing_summary
+    except Exception as exc:
+        print(f"Error loading cached summary: {exc}")
+        return None
+
+
+async def _wait_for_summary_result(
+    session_id: str,
+    *,
+    timeout_seconds: float = 900.0,
+    poll_interval_seconds: float = 0.5,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    json_file = Path("output") / f"v2_intelligence_blueprint_{session_id}.json"
+
+    while True:
+        _sync_runtime_state_from_disk()
+        cached_summary = _load_cached_summary_if_available(
+            session_id,
+            json_file,
+            mark_from_cache=False,
+            completion_message="Analysis complete!",
+        )
+        if cached_summary is not None:
+            return cached_summary
+
+        progress_entry = copy.deepcopy(summarization_progress.get(session_id, _default_summarization_progress_payload()))
+        stage = str(progress_entry.get("stage") or "idle").strip().lower() or "idle"
+        if stage == "aborted":
+            raise HTTPException(
+                status_code=409,
+                detail=str(progress_entry.get("message") or "Summary generation was aborted."),
+            )
+        if stage in {"error", "interrupted"}:
+            raise HTTPException(
+                status_code=500,
+                detail=str(progress_entry.get("message") or "Summary generation failed."),
+            )
+
+        worker_pid = _coerce_process_id(progress_entry.get("worker_pid"))
+        if worker_pid is not None and not _is_process_running(worker_pid):
+            failure_message = "Summary worker exited before completing the session."
+            _set_summarization_progress(
+                session_id,
+                stage="error",
+                progress=progress_entry.get("progress", 0),
+                message=failure_message,
+                worker_pid=None,
+            )
+            raise HTTPException(status_code=500, detail=failure_message)
+
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=504,
+                detail="Summary generation is still running. Reopen the summary to continue monitoring progress.",
+            )
+
+        await asyncio.sleep(poll_interval_seconds)
+
+
+async def _handle_summary_background_request(request: Dict[str, Any]) -> Dict[str, Any]:
+    timestamp = request.get("timestamp")
+    if not timestamp:
+        raise HTTPException(status_code=400, detail="timestamp required")
+
+    try:
+        safe_timestamp = validate_session_id(timestamp)
+    except HTTPException:
+        raise HTTPException(status_code=400, detail="Invalid timestamp format")
+
+    json_file = Path("output") / f"v2_intelligence_blueprint_{safe_timestamp}.json"
+    cached_summary = _load_cached_summary_if_available(
+        safe_timestamp,
+        json_file,
+        mark_from_cache=True,
+        completion_message="Summary available from cache.",
+    )
+    if cached_summary is not None:
+        return cached_summary
+
+    _sync_runtime_state_from_disk()
+    existing_progress = copy.deepcopy(summarization_progress.get(safe_timestamp, {}))
+    existing_stage = str(existing_progress.get("stage") or "idle").strip().lower() or "idle"
+    existing_worker_pid = _coerce_process_id(existing_progress.get("worker_pid"))
+    if existing_stage not in SUMMARIZATION_TERMINAL_STAGES and existing_worker_pid is not None and _is_process_running(existing_worker_pid):
+        return await _wait_for_summary_result(safe_timestamp)
+
+    try:
+        worker_process = _launch_runtime_job_worker(
+            "summary",
+            {
+                "timestamp": safe_timestamp,
+                "requested_at": _utcnow_iso(),
+            },
+        )
+    except Exception as exc:
+        failure_message = f"Failed to launch summary worker: {exc}"
+        _set_summarization_progress(
+            safe_timestamp,
+            stage="error",
+            progress=_safe_int(existing_progress.get("progress", 0)),
+            message=failure_message,
+            worker_pid=None,
+            execution_mode="worker",
+        )
+        raise HTTPException(status_code=500, detail=failure_message)
+
+    _set_summarization_progress(
+        safe_timestamp,
+        stage="queued",
+        progress=max(1, _safe_int(existing_progress.get("progress", 0))),
+        message="Summary queued in a durable background worker...",
+        worker_pid=worker_process.pid,
+        execution_mode="worker",
+        started_at=_utcnow_iso(),
+        completed_at=None,
+    )
+    return await _wait_for_summary_result(safe_timestamp)
 
 
 @app.post("/summarize-session")
@@ -7826,6 +12463,9 @@ async def summarize_session(request: Dict[str, Any]):
     5. Creates executive summary with priority actions
     6. Saves the summary for future use
     """
+    if not _is_runtime_worker_process():
+        return await _handle_summary_background_request(request)
+
     from spl.generator import SPLGenerator
     from spl.unknown_identifier import UnknownDataIdentifier
     
@@ -7844,71 +12484,39 @@ async def summarize_session(request: Dict[str, Any]):
 
     output_dir = Path("output")
 
-    # Load V2 session artifacts only (legacy artifacts intentionally ignored)
+    # Load current session artifacts only (legacy artifacts intentionally ignored)
     json_file = output_dir / f"v2_intelligence_blueprint_{timestamp}.json"
     detailed_file = output_dir / f"v2_operator_runbook_{timestamp}.md"
     classification_file = output_dir / f"v2_developer_handoff_{timestamp}.md"
     executive_file = output_dir / f"v2_insights_brief_{timestamp}.md"
-    
-    # Check if summary already exists
+
     summary_file = output_dir / f"v2_ai_summary_{safe_timestamp}.json"
-    
-    if summary_file.exists():
-        # Load and return existing summary
-        try:
-            with open(summary_file, 'r', encoding='utf-8') as f:
-                existing_summary = json.load(f)
-            has_v2_panels = all(
-                key in existing_summary
-                for key in ["schema_version", "trend_signals", "risk_register", "recursive_investigations"]
-            )
-            if has_v2_panels:
-                if (
-                    (
-                        "context_explorer" not in existing_summary
-                        or not _context_explorer_has_formal_actions(existing_summary.get("context_explorer"))
-                        or not _context_explorer_has_structured_patterns(existing_summary.get("context_explorer"))
-                    )
-                    and json_file.exists()
-                ):
-                    try:
-                        with open(json_file, 'r', encoding='utf-8') as cached_discovery_file:
-                            cached_discovery_data = json.load(cached_discovery_file)
-                        existing_summary["context_explorer"] = build_context_explorer_payload(
-                            cached_discovery_data,
-                            unknown_questions=existing_summary.get("unknown_data"),
-                            admin_tasks=existing_summary.get("admin_tasks"),
-                            coverage_gaps=existing_summary.get("coverage_gaps"),
-                            risk_register=existing_summary.get("risk_register"),
-                            readiness_score=existing_summary.get("readiness_score"),
-                            session_id=safe_timestamp,
-                        )
-                        with open(summary_file, 'w', encoding='utf-8') as summary_out:
-                            json.dump(existing_summary, summary_out, indent=2)
-                    except Exception as cache_patch_error:
-                        print(f"Error backfilling context explorer for cached summary: {cache_patch_error}")
-                existing_summary['from_cache'] = True
-                return existing_summary
-            print(f"Cached summary {summary_file.name} missing V2 fields; regenerating...")
-        except Exception as e:
-            print(f"Error loading cached summary: {e}")
-            # Continue to regenerate
+    existing_cached_summary = _load_cached_summary_if_available(
+        safe_timestamp,
+        json_file,
+        mark_from_cache=True,
+        completion_message="Summary available from cache.",
+    )
+    if existing_cached_summary is not None:
+        return existing_cached_summary
 
     if not json_file.exists():
-        return {"error": "V2 session data not found"}
+        _set_summarization_progress(
+            timestamp,
+            stage="error",
+            progress=0,
+            message="Discovery session data not found for this summary run.",
+        )
+        return {"error": "Discovery session data not found"}
     
     # Initialize progress tracking
-    summarization_progress[timestamp] = {
-        "stage": "loading",
-        "progress": 10,
-        "message": "Loading discovery reports..."
-    }
+    _set_summarization_progress(timestamp, stage="loading", progress=10, message="Loading discovery reports...")
     
-    # Load V2 discovery data
+    # Load current discovery data
     with open(json_file, 'r', encoding='utf-8') as f:
         discovery_data = json.load(f)
     
-    # Extract discovery results from V2 finding ledger
+    # Extract discovery results from the finding ledger
     finding_ledger = discovery_data.get('finding_ledger', []) if isinstance(discovery_data, dict) else []
     discovery_results = [entry for entry in finding_ledger if isinstance(entry, dict)]
     discovery_entities = []
@@ -7972,11 +12580,7 @@ async def summarize_session(request: Dict[str, Any]):
     readiness_score = discovery_data.get("readiness_score")
     
     # Update progress
-    summarization_progress[timestamp] = {
-        "stage": "generating_queries",
-        "progress": 25,
-        "message": "Generating SPL queries..."
-    }
+    _set_summarization_progress(timestamp, stage="generating_queries", progress=25, message="Generating SPL queries...")
     
     # Generate template SPL queries (used as fallback if AI generation fails)
     spl_gen = SPLGenerator(discovery_results)
@@ -8017,11 +12621,7 @@ async def summarize_session(request: Dict[str, Any]):
     print(f"Generated {len(template_queries)} template queries as fallback")
     
     # Update progress
-    summarization_progress[timestamp] = {
-        "stage": "identifying_unknowns",
-        "progress": 50,
-        "message": "Identifying unknown data sources..."
-    }
+    _set_summarization_progress(timestamp, stage="identifying_unknowns", progress=50, message="Identifying unknown data sources...")
     
     # Identify unknown data sources
     unknown_id = UnknownDataIdentifier(discovery_entities)
@@ -8029,11 +12629,7 @@ async def summarize_session(request: Dict[str, Any]):
     unknown_questions = unknown_id.generate_contextual_questions(unknown_items)
     
     # Update progress
-    summarization_progress[timestamp] = {
-        "stage": "loading_reports",
-        "progress": 60,
-        "message": "Analyzing discovery reports..."
-    }
+    _set_summarization_progress(timestamp, stage="loading_reports", progress=60, message="Analyzing discovery reports...")
     
     # Load reports for analysis
     executive_summary = ""
@@ -8327,32 +12923,34 @@ async def summarize_session(request: Dict[str, Any]):
             category_raw = "Configuration"
 
         steps_raw = task.get("steps") if isinstance(task.get("steps"), list) else []
-        normalized_steps: List[Dict[str, Any]] = []
-        for step_idx, step in enumerate(steps_raw[:6]):
-            if isinstance(step, str):
-                normalized_steps.append({
-                    "number": step_idx + 1,
-                    "action": _safe_str(step, f"Step {step_idx + 1}"),
-                    "spl": ""
-                })
-                continue
-            if not isinstance(step, dict):
-                continue
-            step_spl = _strip_code_fence(_safe_str(step.get("spl")))
-            if step_spl:
-                step_spl = _anchor_spl_to_environment(step_spl)
+        normalized_steps: List[Dict[str, str]] = []
+        for step_idx, step in enumerate(steps_raw[:5]):
+            if isinstance(step, dict):
+                action_text = _safe_str(
+                    step.get("action") or step.get("step") or step.get("description"),
+                    f"Perform remediation step {step_idx + 1}.",
+                )
+                raw_step_spl = _strip_code_fence(_safe_str(step.get("spl")))
+            else:
+                action_text = _safe_str(step, f"Perform remediation step {step_idx + 1}.")
+                raw_step_spl = ""
+
             normalized_steps.append({
-                "number": int(step.get("number", step_idx + 1)) if str(step.get("number", "")).isdigit() else step_idx + 1,
-                "action": _safe_str(step.get("action"), f"Step {step_idx + 1}"),
-                "spl": step_spl
+                "number": step_idx + 1,
+                "action": action_text,
+                "spl": _anchor_spl_to_environment(raw_step_spl) if raw_step_spl else "",
             })
 
         if not normalized_steps:
-            anchor_index = _preferred_anchor_index()
             normalized_steps = [
-                {"number": 1, "action": "Baseline current state and affected entities.", "spl": f"index={anchor_index} earliest=-24h | stats count by sourcetype host | sort - count"},
-                {"number": 2, "action": "Apply the remediation/update described by the task.", "spl": ""},
-                {"number": 3, "action": "Re-run validation and compare to baseline.", "spl": f"index={anchor_index} earliest=-24h | timechart span=1h count"}
+                {
+                    "number": 1,
+                    "action": _safe_str(
+                        task.get("next_step") or task.get("description"),
+                        "Investigate the highlighted finding and apply the recommended control change.",
+                    ),
+                    "spl": "",
+                }
             ]
 
         verification_spl = _strip_code_fence(_safe_str(task.get("verification_spl")))
@@ -8447,7 +13045,7 @@ async def summarize_session(request: Dict[str, Any]):
             }
         ]
     
-    findings_prompt = f"""Analyze these Splunk V2 discovery artifacts and extract specific, actionable findings.
+    findings_prompt = f"""Analyze these Splunk discovery artifacts and extract specific, actionable findings.
 
 **Executive Summary:**
 {executive_summary[:3000]}
@@ -8496,11 +13094,7 @@ Focus on ACTUAL findings from the reports with SPECIFIC details. If no findings 
 Return ONLY the JSON object."""
 
     # Update progress - starting AI analysis
-    summarization_progress[timestamp] = {
-        "stage": "ai_analysis",
-        "progress": 65,
-        "message": "AI analyzing findings (this may take 1-3 minutes)..."
-    }
+    _set_summarization_progress(timestamp, stage="ai_analysis", progress=65, message="AI analyzing findings (this may take 1-3 minutes)...")
     
     try:
         # Use 25% of configured max_tokens for findings extraction
@@ -8555,11 +13149,7 @@ Return ONLY the JSON object."""
         }
     
     # Update progress - findings extracted
-    summarization_progress[timestamp] = {
-        "stage": "generating_queries",
-        "progress": 75,
-        "message": "AI generating SPL queries (1-2 minutes)..."
-    }
+    _set_summarization_progress(timestamp, stage="generating_queries", progress=75, message="AI generating SPL queries (1-2 minutes)...")
     
     # ===== AI-POWERED QUERY GENERATION =====
     # Generate SPL queries based on actual findings
@@ -8742,11 +13332,7 @@ Return ONLY the JSON array of 8 queries, nothing else."""
     ))
     
     # Update progress - AI summary generation
-    summarization_progress[timestamp] = {
-        "stage": "generating_summary",
-        "progress": 70,
-        "message": "Building executive summary..."
-    }
+    _set_summarization_progress(timestamp, stage="generating_summary", progress=70, message="Building executive summary...")
     
     # Generate AI summary
     config = config_manager.get()
@@ -8756,7 +13342,7 @@ Return ONLY the JSON array of 8 queries, nothing else."""
     from datetime import datetime
     current_date = datetime.now().strftime("%B %d, %Y")
     
-    summary_prompt = f"""You are analyzing a Splunk V2 intelligence report. Create a high-value executive summary.
+    summary_prompt = f"""You are analyzing a Splunk intelligence report. Create a high-value executive summary.
 
 **IMPORTANT CONTEXT:** Today's date is {current_date}. Any timestamps in the reports should be interpreted relative to this date, not as future dates.
 
@@ -8780,11 +13366,7 @@ Please provide:
 Keep it concise and actionable. Focus on business value, risk reduction, and measurable outcomes. Base all statements on actual data from the reports above."""
     
     # Update progress - creating summary
-    summarization_progress[timestamp] = {
-        "stage": "creating_summary",
-        "progress": 82,
-        "message": "AI creating executive summary (30-60 seconds)..."
-    }
+    _set_summarization_progress(timestamp, stage="creating_summary", progress=82, message="AI creating executive summary (30-60 seconds)...")
     
     try:
         # Use 15% of configured max_tokens for executive summary (concise output)
@@ -8798,11 +13380,7 @@ Keep it concise and actionable. Focus on business value, risk reduction, and mea
         ai_summary = f"Could not generate AI summary: {str(e)}"
     
     # Update progress - Admin tasks generation
-    summarization_progress[timestamp] = {
-        "stage": "generating_tasks",
-        "progress": 88,
-        "message": "AI generating admin tasks (1-2 minutes)..."
-    }
+    _set_summarization_progress(timestamp, stage="generating_tasks", progress=88, message="AI generating admin tasks (1-2 minutes)...")
     
     # ===== ADMIN TASK GENERATION =====
     # Generate actionable admin tasks based on findings
@@ -8896,11 +13474,7 @@ Return ONLY the JSON array, no other text."""
         print(f"Generated {len(admin_tasks)} admin tasks")
         
         # Update progress - Tasks generated successfully
-        summarization_progress[timestamp] = {
-            "stage": "finalizing",
-            "progress": 93,
-            "message": "Finalizing summary..."
-        }
+        _set_summarization_progress(timestamp, stage="finalizing", progress=93, message="Finalizing summary...")
         
     except json.JSONDecodeError as e:
         print(f"Error parsing admin tasks JSON: {e}")
@@ -9000,11 +13574,7 @@ Return ONLY the JSON array, no other text."""
     }
     
     # Update progress - Saving results
-    summarization_progress[timestamp] = {
-        "stage": "saving",
-        "progress": 95,
-        "message": "Saving results..."
-    }
+    _set_summarization_progress(timestamp, stage="saving", progress=95, message="Saving results...")
     
     # Save summary for future use
     try:
@@ -9016,20 +13586,7 @@ Return ONLY the JSON array, no other text."""
         # Don't fail the request if save fails
     
     # Update progress - Complete
-    summarization_progress[timestamp] = {
-        "stage": "complete",
-        "progress": 100,
-        "message": "Analysis complete!"
-    }
-    
-    # Clean up progress after a delay (async cleanup)
-    import asyncio
-    async def cleanup_progress():
-        await asyncio.sleep(2)  # Keep visible for 2 seconds
-        if timestamp in summarization_progress:
-            del summarization_progress[timestamp]
-    
-    asyncio.create_task(cleanup_progress())
+    _set_summarization_progress(timestamp, stage="complete", progress=100, message="Analysis complete!")
     
     return response_data
 
@@ -9476,17 +14033,18 @@ async def get_verification_history(session_id: str, task_index: int):
 
 
 @app.post("/chat/stream")
-async def chat_with_splunk_stream(request: dict):
+async def chat_with_splunk_stream(http_request: Request, request: dict):
     """Stream chat responses with real-time status updates via SSE."""
     # Create a queue for status updates
     status_queue = asyncio.Queue()
+    runtime_config = resolve_effective_runtime_config(request=http_request)
     
     async def generate_sse():
         """Generator for Server-Sent Events."""
         try:
             # Process chat in background task
             chat_task = asyncio.create_task(
-                process_chat_with_streaming(request, status_queue)
+                process_chat_with_streaming(request, status_queue, runtime_config=runtime_config)
             )
             
             # Stream status updates as they come in
@@ -9524,7 +14082,7 @@ async def chat_with_splunk_stream(request: dict):
 
 
 def load_latest_discovery_insights():
-    """Load key insights from latest V2 artifacts for agent context."""
+    """Load key insights from the latest discovery artifacts for agent context."""
     knowledge = load_latest_report_knowledge(chat_session_settings.get("discovery_freshness_days", 7))
     if not knowledge:
         return None
@@ -9575,7 +14133,8 @@ def _extract_markdown_section_items(markdown_text: str, heading: str, max_items:
     if not isinstance(markdown_text, str) or not markdown_text.strip():
         return []
 
-    pattern = rf'##\s+{re.escape(heading)}\s*\n(.*?)(?:\n##\s+|\Z)'
+    heading_pattern = re.escape(heading).replace(r'\ ', r'\s+')
+    pattern = rf'##\s+(?:\d+[.)]\s*)?(?:\*\*)?{heading_pattern}(?:\*\*)?\s*\n(.*?)(?:\n##\s+|\Z)'
     match = re.search(pattern, markdown_text, re.DOTALL | re.IGNORECASE)
     if not match:
         return []
@@ -9587,7 +14146,7 @@ def _extract_markdown_section_items(markdown_text: str, heading: str, max_items:
             continue
         cleaned = re.sub(r'^[-*]\s+', '', cleaned)
         cleaned = re.sub(r'^\d+\.\s+', '', cleaned)
-        cleaned = cleaned.strip()
+        cleaned = cleaned.replace('**', '').replace('`', '').strip()
         if cleaned:
             items.append(cleaned)
     return items[:max(1, max_items)]
@@ -9674,6 +14233,122 @@ def _parse_v2_notable_patterns(raw_patterns: Any) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped_patterns.append(pattern)
     return deduped_patterns
+
+
+def _canonicalize_v2_pattern_text(value: Any) -> str:
+    cleaned = str(value or '').strip().lower()
+    if not cleaned:
+        return ''
+    cleaned = cleaned.replace('&', ' and ')
+    cleaned = re.sub(r'[_\-\s]+', ' ', cleaned)
+    cleaned = re.sub(r'[^a-z0-9 ]+', '', cleaned)
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def _normalize_v2_notable_patterns_for_ui(raw_patterns: Any, limit: int = 6) -> List[Dict[str, Any]]:
+    normalized_patterns: List[Dict[str, Any]] = []
+    pattern_lookup: Dict[str, int] = {}
+
+    for pattern in _parse_v2_notable_patterns(raw_patterns):
+        category = str(pattern.get('category') or '').strip()
+        title = str(
+            pattern.get('title')
+            or pattern.get('name')
+            or pattern.get('pattern')
+            or category
+            or pattern.get('signal')
+            or ''
+        ).strip()
+        description = str(pattern.get('description') or pattern.get('summary') or pattern.get('insight') or '').strip()
+
+        evidence: List[str] = []
+        raw_evidence = pattern.get('evidence')
+        if isinstance(raw_evidence, list):
+            for item in raw_evidence:
+                evidence_item = str(item or '').strip()
+                if not evidence_item:
+                    continue
+                evidence.append(evidence_item)
+                if len(evidence) >= 3:
+                    break
+        elif isinstance(raw_evidence, str) and raw_evidence.strip():
+            evidence.append(raw_evidence.strip())
+
+        signal = str(pattern.get('signal') or '').strip()
+        if not signal and evidence:
+            signal = ', '.join(evidence[:2])
+
+        display_title = title or description or 'Pattern'
+        if not (display_title or description or signal):
+            continue
+
+        dedupe_key = _canonicalize_v2_pattern_text(title or category or description or signal or display_title)
+        if not dedupe_key:
+            continue
+
+        normalized_evidence: List[str] = []
+        seen_evidence = set()
+        for item in evidence:
+            item_key = _canonicalize_v2_pattern_text(item)
+            if not item_key or item_key in seen_evidence:
+                continue
+            seen_evidence.add(item_key)
+            normalized_evidence.append(item)
+            if len(normalized_evidence) >= 4:
+                break
+
+        normalized_category = category if category and _canonicalize_v2_pattern_text(category) != _canonicalize_v2_pattern_text(display_title) else ''
+
+        existing_index = pattern_lookup.get(dedupe_key)
+        if existing_index is not None:
+            existing = normalized_patterns[existing_index]
+
+            if normalized_category and not existing.get('category'):
+                existing['category'] = normalized_category
+
+            existing_description = str(existing.get('description') or '').strip()
+            if description:
+                existing_description_key = _canonicalize_v2_pattern_text(existing_description)
+                description_key = _canonicalize_v2_pattern_text(description)
+                if not existing_description or (description_key and description_key != existing_description_key and len(description) > len(existing_description)):
+                    existing['description'] = description
+
+            if title:
+                current_title = str(existing.get('title') or '').strip()
+                current_title_key = _canonicalize_v2_pattern_text(current_title)
+                title_key = _canonicalize_v2_pattern_text(title)
+                category_key = _canonicalize_v2_pattern_text(category)
+                if title_key and (not current_title or (current_title_key == category_key and title_key != category_key)):
+                    existing['title'] = display_title
+
+            if not existing.get('signal') and signal:
+                existing['signal'] = signal
+
+            existing_evidence = existing.get('evidence') if isinstance(existing.get('evidence'), list) else []
+            existing_evidence_keys = {_canonicalize_v2_pattern_text(item) for item in existing_evidence if _canonicalize_v2_pattern_text(item)}
+            for item in normalized_evidence:
+                item_key = _canonicalize_v2_pattern_text(item)
+                if not item_key or item_key in existing_evidence_keys:
+                    continue
+                existing_evidence_keys.add(item_key)
+                existing_evidence.append(item)
+                if len(existing_evidence) >= 4:
+                    break
+            existing['evidence'] = existing_evidence
+            continue
+
+        normalized_patterns.append({
+            'title': display_title,
+            'category': normalized_category,
+            'description': description if description.lower() != title.lower() else '',
+            'signal': signal,
+            'evidence': normalized_evidence,
+        })
+        pattern_lookup[dedupe_key] = len(normalized_patterns) - 1
+        if len(normalized_patterns) >= limit:
+            break
+
+    return normalized_patterns
 
 
 def _dedupe_ranked_entities(items: List[Dict[str, Any]], limit: int = 6) -> List[Dict[str, Any]]:
@@ -9781,7 +14456,7 @@ def _build_report_viability(bundle: Dict[str, Any], staleness_days: int) -> Dict
     if blueprint:
         score += 40
     else:
-        reasons.append('Missing V2 intelligence blueprint')
+        reasons.append('Missing intelligence blueprint')
 
     if insights_text or ai_summary:
         score += 20
@@ -9946,7 +14621,7 @@ def _build_report_knowledge(bundle: Dict[str, Any], viability: Dict[str, Any]) -
 
 
 def load_latest_report_knowledge(staleness_days: int = 7) -> Optional[Dict[str, Any]]:
-    """Load the latest viable V2 report bundle and synthesize a reusable knowledge object."""
+    """Load the latest viable report bundle and synthesize a reusable knowledge object."""
     output_dir = Path('output')
     if not output_dir.exists():
         return None
@@ -10558,7 +15233,7 @@ def format_result_summary_for_llm(summary: Dict[str, Any]) -> str:
     return '\n'.join(lines)
 
 
-async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue):
+async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue, runtime_config: Any = None):
     """Process chat request and push status updates to queue."""
     try:
         # Define callback that pushes to queue
@@ -10571,13 +15246,13 @@ async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue
             })
         
         # Call chat logic with streaming callback
-        result = await chat_with_splunk_logic(request, status_callback)
+        result = await chat_with_splunk_logic(request, status_callback, runtime_config=runtime_config)
         await status_queue.put({'type': 'done', 'data': result})
     except Exception as e:
         await status_queue.put({'type': 'error', 'error': str(e)})
 
 
-async def chat_with_splunk_logic(request: dict, status_callback=None):
+async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_config: Any = None):
     """Core chat logic that can optionally stream status updates.
     
     Args:
@@ -10608,7 +15283,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None):
             return {"error": "Invalid history format"}
         
         # Load configuration
-        config = config_manager.get()
+        config = runtime_config or config_manager.get()
         request_started_at = time.time()
 
         async def push_status(timeline: List[Dict[str, Any]], action: str, iteration: int = 0):
@@ -13004,9 +17679,10 @@ Based on your previous response, provide your next query NOW using the proper fo
 
 
 @app.post("/chat")
-async def chat_with_splunk(request: dict):
+async def chat_with_splunk(http_request: Request, request: dict):
     """Handle chat requests (non-streaming version for backward compatibility)."""
-    return await chat_with_splunk_logic(request, status_callback=None)
+    runtime_config = resolve_effective_runtime_config(request=http_request)
+    return await chat_with_splunk_logic(request, status_callback=None, runtime_config=runtime_config)
 
 
 async def execute_mcp_tool_call(tool_call, config):
@@ -13029,7 +17705,7 @@ async def execute_mcp_tool_call(tool_call, config):
         
         # Use MCP-specific SSL verification setting from config
         verify_ssl = config.mcp.verify_ssl
-        ca_bundle = getattr(config.security, 'ca_bundle_path', None) if hasattr(config, 'security') else None
+        ca_bundle = getattr(config.mcp, 'ca_bundle_path', None) if hasattr(config, 'mcp') else None
         
         # Determine SSL verification setting (match discovery engine behavior)
         if ca_bundle and verify_ssl:
@@ -13235,17 +17911,25 @@ async def execute_mcp_tool_call(tool_call, config):
 @app.get("/status")
 async def get_status():
     """Get current discovery status."""
-    global current_discovery_session
-    
-    if current_discovery_session is None:
-        return {"status": "idle"}
-    elif current_discovery_session.done():
-        if current_discovery_session.exception():
-            return {"status": "error", "error": str(current_discovery_session.exception())}
-        else:
-            return {"status": "completed", "result": current_discovery_session.result()}
-    else:
-        return {"status": "running"}
+    _sync_runtime_state_from_disk()
+    snapshot = _snapshot_discovery_runtime_state()
+    response: Dict[str, Any] = {
+        "status": snapshot.get("status", "idle"),
+        "discovery": snapshot,
+    }
+
+    if snapshot.get("status") == "error" and snapshot.get("error"):
+        response["error"] = snapshot.get("error")
+        return response
+
+    if current_discovery_session and current_discovery_session.done() and not current_discovery_session.cancelled():
+        try:
+            response["result"] = current_discovery_session.result()
+        except Exception as exc:
+            response["status"] = "error"
+            response["error"] = str(exc)
+
+    return response
 
 
 @app.get("/api/llm/health")
@@ -13281,8 +17965,24 @@ async def get_llm_health():
 
 
 @app.get("/")
-async def serve_frontend():
+async def serve_frontend(request: Request):
     """Serve the frontend HTML."""
+    if is_auth_enabled():
+        auth_provider = get_auth_provider()
+        if auth_provider not in {"local_password", "oidc"}:
+            return HTMLResponse(
+                content=build_auth_error_page("Authentication provider unavailable", "The configured authentication provider is not available in this build."),
+                status_code=503,
+            )
+
+        current_user = getattr(request.state, "auth_user", None)
+        if not isinstance(current_user, dict):
+            if auth_provider == "oidc":
+                return HTMLResponse(content=build_oidc_login_page(_build_oidc_provider_status()))
+            return HTMLResponse(content=build_login_page())
+        if auth_provider == "local_password" and bool(current_user.get("require_password_reset")):
+            return HTMLResponse(content=build_password_reset_page(str(current_user.get("username", ""))))
+
     if FRONTEND_INDEX_PATH.exists():
         return FileResponse(FRONTEND_INDEX_PATH)
     return HTMLResponse(content=get_frontend_html())

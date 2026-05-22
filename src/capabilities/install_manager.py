@@ -673,7 +673,11 @@ class CapabilityManager:
         if not config.enabled:
             return self._result(definition.name, "build", False, "Enable the capability before building deeplinks.")
 
-        provider = self._get_deeplink_provider(definition, config)
+        provider = self._get_deeplink_provider(
+            definition,
+            config,
+            mcp_url_override=payload.get("mcp_url_override"),
+        )
         if provider is None:
             return self._result(definition.name, "build", False, "Capability does not expose deeplink generation.")
 
@@ -896,10 +900,15 @@ class CapabilityManager:
             return ChromaRAGProvider(config=config, definition=definition)
         return None
 
-    def _get_deeplink_provider(self, definition: CapabilityDefinition, config: CapabilityConfig):
+    def _get_deeplink_provider(
+        self,
+        definition: CapabilityDefinition,
+        config: CapabilityConfig,
+        mcp_url_override: Optional[str] = None,
+    ):
         if definition.name != "splunk_deeplink_tools":
             return None
-        mcp_url = str(self.config_manager.get().mcp.url or "").strip()
+        mcp_url = str(mcp_url_override or self.config_manager.get().mcp.url or "").strip()
         return SplunkDeepLinkProvider(config=config, definition=definition, mcp_url=mcp_url)
 
     def _get_visualization_provider(self, definition: CapabilityDefinition, config: CapabilityConfig):

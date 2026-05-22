@@ -67,11 +67,52 @@ class ServerConfig:
             self.trusted_hosts = ["*"]
 
 @dataclass
+class OIDCConfig:
+    """OIDC provider settings for DT4SMS external authentication."""
+    issuer_url: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    audience: Optional[str] = None
+    scopes: list = field(default_factory=lambda: ["openid", "profile", "email"])
+    username_claim: str = "preferred_username"
+    email_claim: str = "email"
+    role_claim: str = "roles"
+    default_role: str = "viewer"
+    mcp_assignment_claim: Optional[str] = None
+
+    def __post_init__(self):
+        if self.scopes is None:
+            self.scopes = ["openid", "profile", "email"]
+
+@dataclass
+class SecurityConfig:
+    """Install-wide security feature toggles and defaults."""
+    auth_enabled: bool = False
+    auth_provider: str = "local_password"
+    external_api_enabled: bool = False
+    external_mcp_enabled: bool = False
+    external_api_rate_limit_requests: int = 30
+    external_api_rate_limit_window_seconds: int = 60
+    external_mcp_rate_limit_requests: int = 30
+    external_mcp_rate_limit_window_seconds: int = 60
+    session_timeout_minutes: int = 480
+    password_min_length: int = 12
+    require_password_reset_on_first_login: bool = True
+    oidc: OIDCConfig = field(default_factory=OIDCConfig)
+
+    def __post_init__(self):
+        if isinstance(self.oidc, dict):
+            self.oidc = OIDCConfig(**self.oidc)
+        elif self.oidc is None:
+            self.oidc = OIDCConfig()
+
+@dataclass
 class AppConfig:
     """Complete application configuration"""
     mcp: MCPConfig
     llm: LLMConfig
     server: ServerConfig
+    security: SecurityConfig = field(default_factory=SecurityConfig)
     saved_credentials: Dict[str, LLMCredential] = None  # name -> credential mapping
     saved_mcp_configs: Dict[str, MCPCredential] = None  # name -> MCP config mapping
     capabilities: Dict[str, CapabilityConfig] = field(default_factory=dict)
@@ -80,6 +121,8 @@ class AppConfig:
     version: str = "1.0.0"
     
     def __post_init__(self):
+        if self.security is None:
+            self.security = SecurityConfig()
         if self.saved_credentials is None:
             self.saved_credentials = {}
         if self.saved_mcp_configs is None:
@@ -127,7 +170,8 @@ class ConfigManager:
         return AppConfig(
             mcp=MCPConfig(),
             llm=LLMConfig(),
-            server=ServerConfig()
+            server=ServerConfig(),
+            security=SecurityConfig(),
         )
     
     def _encrypt(self, data: Dict[str, Any]) -> bytes:
@@ -154,6 +198,7 @@ class ConfigManager:
             mcp = MCPConfig(**config_dict.get('mcp', {}))
             llm = LLMConfig(**config_dict.get('llm', {}))
             server = ServerConfig(**config_dict.get('server', {}))
+            security = SecurityConfig(**config_dict.get('security', {}))
             
             # Reconstruct saved credentials
             saved_creds_dict = config_dict.get('saved_credentials', {})
@@ -179,6 +224,7 @@ class ConfigManager:
                 mcp=mcp,
                 llm=llm,
                 server=server,
+                security=security,
                 saved_credentials=saved_credentials,
                 saved_mcp_configs=saved_mcp_configs,
                 capabilities=capabilities,
@@ -213,6 +259,7 @@ class ConfigManager:
                 'mcp': asdict(config.mcp),
                 'llm': asdict(config.llm),
                 'server': asdict(config.server),
+                'security': asdict(config.security),
                 'saved_credentials': saved_creds_dict,
                 'saved_mcp_configs': saved_mcp_dict,
                 'capabilities': saved_capabilities_dict,
@@ -264,6 +311,26 @@ class ConfigManager:
         for key, value in kwargs.items():
             if hasattr(self._config.server, key):
                 setattr(self._config.server, key, value)
+        return self.save(self._config)
+
+    def update_security(self, **kwargs) -> bool:
+        """Update install-wide security configuration."""
+        for key, value in kwargs.items():
+            if key == 'oidc':
+                current_oidc = self._config.security.oidc if isinstance(self._config.security.oidc, OIDCConfig) else OIDCConfig()
+                merged_oidc = asdict(current_oidc)
+                incoming_oidc = asdict(value) if isinstance(value, OIDCConfig) else dict(value or {}) if isinstance(value, dict) else {}
+                allowed_fields = set(OIDCConfig.__dataclass_fields__.keys())
+                for oidc_key, oidc_value in incoming_oidc.items():
+                    if oidc_key not in allowed_fields:
+                        continue
+                    if oidc_key == 'client_secret' and str(oidc_value or '').strip() in {'', '***'}:
+                        continue
+                    merged_oidc[oidc_key] = oidc_value
+                self._config.security.oidc = OIDCConfig(**merged_oidc)
+                continue
+            if hasattr(self._config.security, key):
+                setattr(self._config.security, key, value)
         return self.save(self._config)
 
     def get_capability(self, name: str) -> Optional[CapabilityConfig]:
@@ -402,7 +469,34 @@ class ConfigManager:
                 'port': config.server.port,
                 'host': config.server.host,
                 'cors_origins': config.server.cors_origins,
-                'trusted_hosts': config.server.trusted_hosts
+                'trusted_hosts': config.server.trusted_hosts,
+                'debug_mode': config.server.debug_mode,
+            },
+            'security': {
+                'auth_enabled': config.security.auth_enabled,
+                'auth_provider': config.security.auth_provider,
+                'external_api_enabled': config.security.external_api_enabled,
+                'external_mcp_enabled': config.security.external_mcp_enabled,
+                'external_api_rate_limit_requests': config.security.external_api_rate_limit_requests,
+                'external_api_rate_limit_window_seconds': config.security.external_api_rate_limit_window_seconds,
+                'external_mcp_rate_limit_requests': config.security.external_mcp_rate_limit_requests,
+                'external_mcp_rate_limit_window_seconds': config.security.external_mcp_rate_limit_window_seconds,
+                'session_timeout_minutes': config.security.session_timeout_minutes,
+                'password_min_length': config.security.password_min_length,
+                'require_password_reset_on_first_login': config.security.require_password_reset_on_first_login,
+                'oidc': {
+                    'issuer_url': config.security.oidc.issuer_url,
+                    'client_id': config.security.oidc.client_id,
+                    'client_secret': '***' if config.security.oidc.client_secret else '',
+                    'client_secret_configured': bool(config.security.oidc.client_secret),
+                    'audience': config.security.oidc.audience,
+                    'scopes': list(config.security.oidc.scopes or []),
+                    'username_claim': config.security.oidc.username_claim,
+                    'email_claim': config.security.oidc.email_claim,
+                    'role_claim': config.security.oidc.role_claim,
+                    'default_role': config.security.oidc.default_role,
+                    'mcp_assignment_claim': config.security.oidc.mcp_assignment_claim,
+                },
             },
             'version': config.version
         }

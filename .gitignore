@@ -71,6 +71,21 @@ test_*.sh
 DO NOT SEND TO GIT/
 *.backup*
 *.corrupted*
+.external-test-deps/
+
+# Local scratch artifacts
+capture_screenshot.py
+final_capture.py
+inspect_ui.py
+smoke_test.ps1
+smoke_test.py
+verify_notable_patterns.js
+verify_ui.js
+intelligence_resp.json
+test_output.txt
+external_mcp.token
+external_rag.token
+security.db
 
 # Internal documentation (not public-facing)
 AGENT_INTELLIGENCE_ANALYSIS.md

@@ -68,6 +68,136 @@ def build_simple_docx_bytes(title: str, paragraphs: list[str], table_rows: list[
     return buffer.getvalue()
 
 
+class ConfigManagerSecurityFoundationTests(unittest.TestCase):
+    def test_default_config_exports_demo_mode_security_defaults(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = ConfigManager(str(config_path))
+
+                safe_config = manager.export_safe()
+
+                self.assertIn("security", safe_config)
+                self.assertFalse(safe_config["security"]["auth_enabled"])
+                self.assertEqual(safe_config["security"]["auth_provider"], "local_password")
+                self.assertFalse(safe_config["security"]["external_api_enabled"])
+                self.assertFalse(safe_config["security"]["external_mcp_enabled"])
+                self.assertEqual(safe_config["security"]["external_api_rate_limit_requests"], 30)
+                self.assertEqual(safe_config["security"]["external_api_rate_limit_window_seconds"], 60)
+                self.assertEqual(safe_config["security"]["external_mcp_rate_limit_requests"], 30)
+                self.assertEqual(safe_config["security"]["external_mcp_rate_limit_window_seconds"], 60)
+                self.assertEqual(safe_config["security"]["session_timeout_minutes"], 480)
+                self.assertEqual(safe_config["security"]["password_min_length"], 12)
+                self.assertTrue(safe_config["security"]["require_password_reset_on_first_login"])
+                self.assertIn("oidc", safe_config["security"])
+                self.assertEqual(safe_config["security"]["oidc"]["issuer_url"], "")
+                self.assertEqual(safe_config["security"]["oidc"]["client_id"], "")
+                self.assertFalse(safe_config["security"]["oidc"]["client_secret_configured"])
+                self.assertEqual(safe_config["security"]["oidc"]["scopes"], ["openid", "profile", "email"])
+            finally:
+                os.chdir(original_cwd)
+
+    def test_security_settings_round_trip_without_disturbing_existing_config(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = ConfigManager(str(config_path))
+                manager.save_mcp_config(
+                    name="ops-primary",
+                    url="https://splunk.example.com:8089/services/mcp",
+                    token="secret-token",
+                    verify_ssl=True,
+                    description="Primary Splunk MCP connection",
+                )
+
+                success = manager.update_security(
+                    auth_enabled=True,
+                    external_api_enabled=True,
+                    external_api_rate_limit_requests=12,
+                    external_api_rate_limit_window_seconds=45,
+                    external_mcp_rate_limit_requests=8,
+                    external_mcp_rate_limit_window_seconds=30,
+                    session_timeout_minutes=90,
+                    password_min_length=14,
+                )
+
+                self.assertTrue(success)
+
+                reloaded = ConfigManager(str(config_path))
+                safe_config = reloaded.export_safe()
+
+                self.assertTrue(safe_config["security"]["auth_enabled"])
+                self.assertTrue(safe_config["security"]["external_api_enabled"])
+                self.assertFalse(safe_config["security"]["external_mcp_enabled"])
+                self.assertEqual(safe_config["security"]["external_api_rate_limit_requests"], 12)
+                self.assertEqual(safe_config["security"]["external_api_rate_limit_window_seconds"], 45)
+                self.assertEqual(safe_config["security"]["external_mcp_rate_limit_requests"], 8)
+                self.assertEqual(safe_config["security"]["external_mcp_rate_limit_window_seconds"], 30)
+                self.assertEqual(safe_config["security"]["session_timeout_minutes"], 90)
+                self.assertEqual(safe_config["security"]["password_min_length"], 14)
+                self.assertIn("ops-primary", safe_config["saved_mcp_configs"])
+                self.assertEqual(safe_config["saved_mcp_configs"]["ops-primary"]["token"], "***")
+            finally:
+                os.chdir(original_cwd)
+
+    def test_oidc_settings_round_trip_masks_secret_and_preserves_existing_secret(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = ConfigManager(str(config_path))
+
+                success = manager.update_security(
+                    auth_provider="oidc",
+                    oidc={
+                        "issuer_url": "https://idp.example.com/application/o/dt4sms/",
+                        "client_id": "dt4sms-client",
+                        "client_secret": "super-secret-client-value",
+                        "audience": "dt4sms-api",
+                        "scopes": ["openid", "profile", "email", "groups"],
+                        "username_claim": "preferred_username",
+                        "email_claim": "email",
+                        "role_claim": "roles",
+                        "default_role": "viewer",
+                        "mcp_assignment_claim": "splunk_tenant",
+                    },
+                )
+                self.assertTrue(success)
+
+                secret_preserved = manager.update_security(
+                    oidc={
+                        "issuer_url": "https://idp.example.com/application/o/dt4sms-v2/",
+                        "client_secret": "***",
+                    }
+                )
+                self.assertTrue(secret_preserved)
+
+                reloaded = ConfigManager(str(config_path))
+                safe_config = reloaded.export_safe()
+
+                self.assertEqual(safe_config["security"]["auth_provider"], "oidc")
+                self.assertEqual(safe_config["security"]["oidc"]["issuer_url"], "https://idp.example.com/application/o/dt4sms-v2/")
+                self.assertEqual(safe_config["security"]["oidc"]["client_id"], "dt4sms-client")
+                self.assertEqual(safe_config["security"]["oidc"]["client_secret"], "***")
+                self.assertTrue(safe_config["security"]["oidc"]["client_secret_configured"])
+                self.assertEqual(safe_config["security"]["oidc"]["audience"], "dt4sms-api")
+                self.assertEqual(safe_config["security"]["oidc"]["scopes"], ["openid", "profile", "email", "groups"])
+                self.assertEqual(safe_config["security"]["oidc"]["mcp_assignment_claim"], "splunk_tenant")
+            finally:
+                os.chdir(original_cwd)
+
+
 class CapabilityFrameworkTests(unittest.TestCase):
     def test_bootstrap_persists_known_capabilities(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
@@ -1489,8 +1619,9 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 {
                     "timestamp": timestamp,
                     "persona": "admin",
+                    "voice": "evidence",
                     "runbook_markdown": "# Admin Runbook\n\nValidate queue pressure and ingestion delays.",
-                    "runbook_filename": f"runbook_admin_{timestamp}.md",
+                    "runbook_filename": f"runbook_admin_evidence_{timestamp}.md",
                     "title": "Platform Health Export",
                 }
             )
@@ -1500,14 +1631,23 @@ class CapabilityFrameworkTests(unittest.TestCase):
             self.assertTrue((output_dir / "exports" / export_result["manifest_name"]).exists())
             self.assertTrue((output_dir / "exports" / export_result["summary_name"]).exists())
             self.assertEqual(export_result["artifact_count"], 2)
+            self.assertEqual(export_result["operator_voice"], "evidence")
+            self.assertEqual(export_result["operator_voice_label"], "Evidence-led")
+            self.assertIn("_admin_evidence_", export_result["bundle_name"])
             self.assertIn(f"v2_intelligence_blueprint_{timestamp}.json", export_result["included_files"])
+
+            manifest = json.loads((output_dir / "exports" / export_result["manifest_name"]).read_text(encoding="utf-8"))
+            summary_markdown = (output_dir / "exports" / export_result["summary_name"]).read_text(encoding="utf-8")
+            self.assertEqual(manifest["operator_voice"], "evidence")
+            self.assertEqual(manifest["operator_voice_label"], "Evidence-led")
+            self.assertIn("- Operator Voice: Evidence-led", summary_markdown)
 
             with zipfile.ZipFile(zip_path, "r") as archive:
                 names = set(archive.namelist())
                 self.assertIn("manifest.json", names)
                 self.assertIn("README.md", names)
                 self.assertIn(f"artifacts/v2_intelligence_blueprint_{timestamp}.json", names)
-                self.assertIn(f"generated/runbook_admin_{timestamp}.md", names)
+                self.assertIn(f"generated/runbook_admin_evidence_{timestamp}.md", names)
 
     def test_export_install_enable_test_and_build_flow(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
@@ -1571,14 +1711,18 @@ class CapabilityFrameworkTests(unittest.TestCase):
                     {
                         "timestamp": timestamp,
                         "persona": "executive",
+                        "voice": "executive",
                         "runbook_markdown": "# Executive Runbook\n\nFocus on readiness and business impact.",
-                        "runbook_filename": f"runbook_executive_{timestamp}.md",
+                        "runbook_filename": f"runbook_executive_executive_{timestamp}.md",
                     },
                 )
                 self.assertTrue(build_result.ok)
                 export_payload = build_result.details["export"]
                 self.assertEqual(export_payload["session_timestamp"], timestamp)
                 self.assertEqual(export_payload["persona"], "executive")
+                self.assertEqual(export_payload["operator_voice"], "executive")
+                self.assertEqual(export_payload["operator_voice_label"], "Executive Brief")
+                self.assertIn("_executive_executive", export_payload["bundle_name"])
                 self.assertTrue(Path(export_payload["bundle_path"]).exists())
             finally:
                 os.chdir(original_cwd)

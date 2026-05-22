@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.1.0] - TBD (In Development)
 
-### 🧩 V2 Workspace & Summarization UX Hardening
+### 🧩 Workspace & Summarization UX Hardening
 
 #### Added
 - **Repo Validation Automation**
@@ -22,16 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Installer start warnings when stale frontend assets are detected
 
 #### Added
-- **V2 Workspace Surfaces (UI + API integration)**
+- **Workspace Surfaces (UI + API integration)**
   - Unified static top bar with Mission / Intelligence / Artifacts workflow tabs
   - Intelligence workspace bindings to `/api/discovery/dashboard`, `/api/discovery/compare`, `/api/discovery/runbook`, and `/api/v2/intelligence`
-  - Artifacts workspace bindings to `/api/v2/artifacts` with V2-only artifact handling
+  - Artifacts workspace bindings to `/api/v2/artifacts` with current artifact handling
 
 - **Summarization Context Enrichment** (`/summarize-session`)
-  - Environment extraction for indexes, sourcetypes, and hosts from V2 finding ledger
+  - Environment extraction for indexes, sourcetypes, and hosts from the discovery finding ledger
   - Environment-aware SPL query anchoring and evidence tagging
   - Context-engine fallback generation for both SPL queries and admin tasks
-  - Expanded V2 payload surfaces (`trend_signals`, `risk_register`, `recursive_investigations`, `vulnerability_hypotheses`)
+  - Expanded intelligence payload surfaces (`trend_signals`, `risk_register`, `recursive_investigations`, `vulnerability_hypotheses`)
 
 #### Changed
 - **Header Architecture**

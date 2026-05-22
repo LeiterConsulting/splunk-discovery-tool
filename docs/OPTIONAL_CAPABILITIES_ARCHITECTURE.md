@@ -189,7 +189,7 @@ Add a Chroma-backed provider with:
 
 Suggested indexed content groups:
 
-- V2 intelligence blueprint summaries
+- intelligence blueprint summaries
 - AI summary and insights brief content
 - operator runbooks and developer handoff notes
 - selected raw finding ledger entries
@@ -455,7 +455,7 @@ The current docs already define clean discovery extension points in `docs/DEVELO
 
 Recommended capability-aware discovery hooks:
 
-- after V2 bundle creation, enqueue RAG indexing for eligible artifacts
+- after bundle creation, enqueue RAG indexing for eligible artifacts
 - during summarization, optionally retrieve related historical context
 - during runbook generation, optionally enrich with indexed prior runbooks and uploaded documents
 - write a capability-usage note into the generated summary when optional packs contributed materially
@@ -498,7 +498,7 @@ Suggested response payload addition:
 
 - add evidence display in chat answers
 - add retrieval-aware follow-on action generation
-- add indexing of current V2 artifacts into a normalized source catalog
+- add indexing of current discovery artifacts into a normalized source catalog
 
 ### Phase 3: ChromaDB provider
 

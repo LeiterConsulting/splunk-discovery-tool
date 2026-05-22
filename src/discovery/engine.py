@@ -1148,14 +1148,18 @@ class DiscoveryEngine:
         return base + index_steps + sourcetype_steps + host_steps + source_steps + ko_steps + user_steps + kv_steps + analytics_steps
         
     def _estimate_time(self, steps: int) -> str:
-        """Estimate discovery time based on number of steps."""
-        minutes = max(2, steps // 10)  # Roughly 6 steps per minute
-        if minutes < 60:
-            return f"~{minutes} minutes"
-        else:
-            hours = minutes // 60
-            remaining_minutes = minutes % 60
-            return f"~{hours}h {remaining_minutes}m"
+        """Estimate discovery time as a conservative range before runtime calibration kicks in."""
+        lower_minutes = max(4, int(round(steps / 5.0)))
+        upper_minutes = max(lower_minutes + 2, int(round(lower_minutes * 1.35)))
+
+        def _format_minutes(value: int) -> str:
+            if value < 60:
+                return f"{value}m"
+            hours = value // 60
+            remaining_minutes = value % 60
+            return f"{hours}h {remaining_minutes}m" if remaining_minutes else f"{hours}h"
+
+        return f"~{_format_minutes(lower_minutes)} to {_format_minutes(upper_minutes)}"
     
     async def _mcp_call(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Make MCP call with dynamic tool-name resolution and auto-refresh on unknown-tool errors."""

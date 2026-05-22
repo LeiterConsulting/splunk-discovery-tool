@@ -57,6 +57,57 @@ fatal_statuses = {401, 403, 404}  # HTTP status codes that stop discovery immedi
 # 404: MCP endpoint not found
 ```
 
+### 2.3 External Surface Rate Limits (src/config_manager.py, src/web_app.py)
+```python
+class SecurityConfig:
+    external_api_rate_limit_requests: int = 30          # Requests allowed per window for external REST
+    external_api_rate_limit_window_seconds: int = 60    # Fixed-window size for external REST
+    external_mcp_rate_limit_requests: int = 30          # Requests allowed per window for inbound MCP
+    external_mcp_rate_limit_window_seconds: int = 60    # Fixed-window size for inbound MCP
+```
+
+Behavior notes:
+- limits are enforced per issued token in the current single-process runtime
+- over-budget requests return `429 Too Many Requests`
+- clients should wait for the `Retry-After` header before retrying
+
+### 2.4 Security Feature Defaults (src/config_manager.py)
+```python
+class SecurityConfig:
+    auth_enabled: bool = False
+    auth_provider: str = "local_password"
+    external_api_enabled: bool = False
+    external_mcp_enabled: bool = False
+    session_timeout_minutes: int = 480
+    password_min_length: int = 12
+    require_password_reset_on_first_login: bool = True
+```
+
+Behavior notes:
+- demo mode remains the default install posture
+- auth stays off until explicitly enabled in Settings
+- the external REST and inbound MCP surfaces have separate toggles
+
+### 2.5 OIDC Provider Defaults (src/config_manager.py)
+```python
+class OIDCConfig:
+    issuer_url: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    audience: Optional[str] = None
+    scopes: list = ["openid", "profile", "email"]
+    username_claim: str = "preferred_username"
+    email_claim: str = "email"
+    role_claim: str = "roles"
+    default_role: str = "viewer"
+    mcp_assignment_claim: Optional[str] = None
+```
+
+Behavior notes:
+- the default auth provider is still local-password unless OIDC is configured and enabled
+- role and MCP assignment claim names are configurable so providers do not need identical schemas
+- OIDC claim mapping is install-wide and feeds the same user/session model as local auth
+
 ---
 
 ## 3. Discovery Agent & Chat
@@ -111,7 +162,7 @@ no_data_repetitions: int = 5           # Stop after 5 iterations with no data
 ### 4.1 Discovery Freshness (src/web_app.py)
 ```python
 staleness_threshold: int = 604800      # 7 days in seconds (when to recommend re-discovery)
-discovery_summary_preview: int = 2000  # Characters to read from V2 insights brief
+discovery_summary_preview: int = 2000  # Characters to read from the latest insights brief
 max_key_findings: int = 5              # Maximum findings to inject into context
 max_recommendations: int = 5           # Maximum recommendations to inject
 ```
@@ -166,7 +217,7 @@ api_prefix = "/api"
 websocket_endpoint = "/ws"
 debug_websocket_endpoint = "/ws/debug"
 
-# V2 Workspace Routes
+# Workspace Data Routes
 v2_intelligence_endpoint = "/api/v2/intelligence"
 v2_artifacts_endpoint = "/api/v2/artifacts"
 discovery_dashboard_endpoint = "/api/discovery/dashboard"
@@ -191,7 +242,7 @@ config_key_file = ".config.key"        # Encryption key
 output_directory = "output/"           # Discovery reports output
 log_directory = "logs/"                # Application logs (if enabled)
 
-# V2 Artifact Naming
+# Current Artifact Naming
 v2_blueprint_pattern = "v2_intelligence_blueprint_<timestamp>.json"
 v2_insights_pattern = "v2_insights_brief_<timestamp>.md"
 v2_runbook_pattern = "v2_operator_runbook_<timestamp>.md"
@@ -216,6 +267,9 @@ output/
 DO NOT SEND TO GIT/
 *.backup*
 *.corrupted*
+external_mcp.token
+external_rag.token
+security.db
 test_*.py
 test_*.sh
 ```
@@ -327,6 +381,10 @@ masked_placeholder = "***"             # Placeholder for masked secrets in UI
 | **Discovery** | Max Execution Time | 90 | seconds | Safety timeout |
 | **Discovery** | Max Iterations | 5 | count | Before stopping |
 | **Discovery** | Staleness Threshold | 7 | days | When to recommend re-discovery |
+| **External REST** | Rate Limit Requests | 30 | requests | Per-token fixed-window budget |
+| **External REST** | Rate Limit Window | 60 | seconds | Per-token window size |
+| **Inbound MCP** | Rate Limit Requests | 30 | requests | Per-token fixed-window budget |
+| **Inbound MCP** | Rate Limit Window | 60 | seconds | Per-token window size |
 | **Rate Limiting** | Max Delay | 300 | seconds | 5 minutes max wait |
 | **Rate Limiting** | Max Retries | 5 | count | Retry attempts |
 | **Context** | Max Message Length | 10000 | characters | User input limit |

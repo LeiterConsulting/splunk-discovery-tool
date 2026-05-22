@@ -21,6 +21,20 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _normalize_operator_voice(value: Any, default: str = "direct") -> str:
+    voice = str(value or default).strip().lower()
+    return voice if voice in {"direct", "evidence", "executive"} else default
+
+
+def _operator_voice_label(value: Any) -> str:
+    voice = _normalize_operator_voice(value)
+    if voice == "evidence":
+        return "Evidence-led"
+    if voice == "executive":
+        return "Executive Brief"
+    return "Direct Ops"
+
+
 class DeterministicExportProvider:
     """Build deterministic session export bundles without third-party exporters."""
 
@@ -87,17 +101,19 @@ class DeterministicExportProvider:
             raise ValueError("No discovery session could be resolved for export generation.")
 
         persona = self._normalize_persona(request.get("persona"))
+        voice = _normalize_operator_voice(request.get("voice"))
+        voice_label = _operator_voice_label(voice)
         artifacts = self._resolve_artifacts(output_dir, timestamp, request, sessions)
         if not artifacts:
-            raise ValueError("No V2 artifacts were found for the selected discovery session.")
+            raise ValueError("No discovery artifacts were found for the selected discovery session.")
 
         runbook_markdown = str(request.get("runbook_markdown") or "").strip()
         runbook_filename = self._normalize_generated_filename(
-            request.get("runbook_filename") or f"runbook_{persona}_{timestamp}.md",
-            default_name=f"runbook_{persona}_{timestamp}.md",
+            request.get("runbook_filename") or f"runbook_{persona}_{voice}_{timestamp}.md",
+            default_name=f"runbook_{persona}_{voice}_{timestamp}.md",
         )
 
-        bundle_stem = self._build_bundle_stem(timestamp, persona, request.get("title"))
+        bundle_stem = self._build_bundle_stem(timestamp, persona, voice, request.get("title"))
         manifest_path = export_dir / f"{bundle_stem}_manifest.json"
         summary_path = export_dir / f"{bundle_stem}_summary.md"
         zip_path = export_dir / f"{bundle_stem}.zip"
@@ -105,6 +121,7 @@ class DeterministicExportProvider:
         manifest = self._build_manifest(
             timestamp=timestamp,
             persona=persona,
+            voice=voice,
             title=request.get("title"),
             artifacts=artifacts,
             runbook_filename=runbook_filename if runbook_markdown else None,
@@ -135,6 +152,8 @@ class DeterministicExportProvider:
             "artifact_count": len(artifacts),
             "session_timestamp": timestamp,
             "persona": persona,
+            "operator_voice": voice,
+            "operator_voice_label": voice_label,
             "supported_outputs": self.supported_outputs(),
             "generated_at": manifest["generated_at"],
             "bundle_size_bytes": zip_path.stat().st_size,
@@ -340,6 +359,7 @@ class DeterministicExportProvider:
         self,
         timestamp: str,
         persona: str,
+        voice: str,
         title: Any,
         artifacts: List[Dict[str, Any]],
         runbook_filename: Optional[str],
@@ -356,6 +376,8 @@ class DeterministicExportProvider:
             "title": str(title or f"DT4SMS Report Package {timestamp}").strip(),
             "session_timestamp": timestamp,
             "persona": persona,
+            "operator_voice": voice,
+            "operator_voice_label": _operator_voice_label(voice),
             "source_dir": str(output_dir),
             "artifact_count": len(artifacts),
             "overview": overview,
@@ -395,6 +417,7 @@ class DeterministicExportProvider:
                 f"- Generated: {manifest.get('generated_at', '')}",
                 f"- Session: {manifest.get('session_timestamp', 'unknown')}",
                 f"- Persona: {str(manifest.get('persona', 'admin')).title()}",
+                f"- Operator Voice: {manifest.get('operator_voice_label', _operator_voice_label(manifest.get('operator_voice')))}",
                 f"- Artifact Count: {manifest.get('artifact_count', 0)}",
                 "",
                 "## Environment Snapshot",
@@ -458,10 +481,10 @@ class DeterministicExportProvider:
         return candidate or default_name
 
     @staticmethod
-    def _build_bundle_stem(timestamp: str, persona: str, title: Any) -> str:
+    def _build_bundle_stem(timestamp: str, persona: str, voice: str, title: Any) -> str:
         raw_title = str(title or "").strip().lower()
         safe_title = re.sub(r"[^a-z0-9]+", "_", raw_title).strip("_")[:40]
         safe_title = safe_title.replace("bundle", "package")
         if safe_title:
-            return f"dt4sms_report_package_{timestamp}_{persona}_{safe_title}"
-        return f"dt4sms_report_package_{timestamp}_{persona}"
+            return f"dt4sms_report_package_{timestamp}_{persona}_{voice}_{safe_title}"
+        return f"dt4sms_report_package_{timestamp}_{persona}_{voice}"

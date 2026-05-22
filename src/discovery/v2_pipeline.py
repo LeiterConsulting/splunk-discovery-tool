@@ -1,5 +1,5 @@
 """
-Discovery V2 pipeline for DT4SMS.
+Discovery pipeline for DT4SMS.
 
 This module defines a modern, developer-friendly discovery execution path that:
 - runs purposeful phases with explicit intent,
@@ -24,15 +24,15 @@ class V2PhaseResult:
 
 
 class DiscoveryV2Pipeline:
-    """V2 orchestrator over the existing DiscoveryEngine capabilities."""
+    """Current orchestrator over the existing DiscoveryEngine capabilities."""
 
     def __init__(self, discovery_engine: Any):
         self.discovery_engine = discovery_engine
 
     async def run(self, display: Any, progress: Any) -> Dict[str, Any]:
-        """Execute v2 discovery flow and export a session artifact bundle."""
-        await progress.update_progress(2, "Initializing V2 discovery pipeline...") if hasattr(progress, "update_progress") else None
-        display.phase("🧠 V2 Discovery: Environment Signal Capture")
+        """Execute the current discovery flow and export a session artifact bundle."""
+        await progress.update_progress(2, "Initializing discovery pipeline...") if hasattr(progress, "update_progress") else None
+        display.phase("🧠 Discovery: Environment Signal Capture")
         display.info("Collecting high-level environment topology and platform signals...")
         overview = await self.discovery_engine.get_quick_overview()
         estimated_steps = max(1, int(getattr(overview, "estimated_discovery_steps", 10) or 10))
@@ -40,7 +40,7 @@ class DiscoveryV2Pipeline:
         await progress.update_progress(10, "Signal capture complete. Beginning evidence collection...")
         display.show_overview_summary(overview)
 
-        display.phase("🧭 V2 Discovery: Evidence Collection")
+        display.phase("🧭 Discovery: Evidence Collection")
         display.info("Running iterative discovery tasks across indexes, sourcetypes, hosts, and platform controls...")
         step_count = 0
         async for result in self.discovery_engine.discover_environment():
@@ -51,20 +51,23 @@ class DiscoveryV2Pipeline:
 
         await progress.update_progress(78, f"Evidence collection complete with {step_count} discovery steps.")
 
-        display.phase("🔬 V2 Discovery: Intelligence Synthesis")
+        display.phase("🔬 Discovery: Classification Map")
         display.info("Synthesizing classifications from discovered telemetry...")
         await progress.update_progress(82, "Synthesizing classification map...")
         classifications = await self.discovery_engine.classify_data()
 
+        display.phase("📋 Discovery: Recommendation Queue")
         display.info("Generating prioritized recommendations based on detected patterns...")
         await progress.update_progress(88, "Building recommendation queue...")
         recommendations = await self.discovery_engine.generate_recommendations()
 
+        display.phase("🧪 Discovery: Use Case Generation")
         display.info("Generating cross-functional use cases for admin, analyst, and executive personas...")
         await progress.update_progress(92, "Generating suggested use cases...")
         suggested_use_cases = await self.discovery_engine.generate_suggested_use_cases()
 
         discovery_results = self.discovery_engine.get_all_results()
+        display.phase("🧱 Discovery: Blueprint Assembly")
         await progress.update_progress(95, "Assembling intelligence blueprint payload...")
         artifact_payload = self._build_v2_payload(
             overview=overview,
@@ -74,7 +77,7 @@ class DiscoveryV2Pipeline:
             suggested_use_cases=suggested_use_cases,
         )
 
-        display.phase("📦 V2 Discovery: Artifact Packaging")
+        display.phase("📦 Discovery: Artifact Packaging")
         display.info("Writing blueprint, runbook, insights, and handoff artifacts to output/ ...")
         await progress.update_progress(98, "Packaging artifacts to output directory...")
         export_result = self._export_v2_bundle(artifact_payload)
@@ -265,7 +268,7 @@ class DiscoveryV2Pipeline:
         vulnerabilities = payload.get("vulnerability_hypotheses", []) if isinstance(payload.get("vulnerability_hypotheses", []), list) else []
 
         lines = [
-            "# V2 Intelligence Brief",
+            "# Intelligence Brief",
             "",
             f"Readiness Score: **{payload.get('readiness_score', 'N/A')}**",
             "",
@@ -318,7 +321,7 @@ class DiscoveryV2Pipeline:
         recs = payload.get("recommendations", []) if isinstance(payload.get("recommendations", []), list) else []
         recursive = payload.get("recursive_investigations", []) if isinstance(payload.get("recursive_investigations", []), list) else []
         lines = [
-            "# V2 Operator Runbook",
+            "# Operator Runbook",
             "",
             "## Action Queue",
         ]
@@ -350,7 +353,7 @@ class DiscoveryV2Pipeline:
 
     def _build_handoff_markdown(self, payload: Dict[str, Any]) -> str:
         return "\n".join([
-            "# V2 Developer Handoff",
+            "# Developer Handoff",
             "",
             "## What this bundle contains",
             "- `intelligence_blueprint.json`: machine-readable discovery output schema",
@@ -368,5 +371,5 @@ class DiscoveryV2Pipeline:
             "## Contract notes",
             "- This schema is additive and intended for app-level composition.",
             "- Paths are relative to `output/` for easy archiving and sync.",
-            "- Non-V2 compatibility exports are intentionally removed.",
+            "- Legacy compatibility exports are intentionally removed.",
         ]) + "\n"

@@ -1,4 +1,4 @@
-# DT4SMS Developer Reference (V2)
+# DT4SMS Developer Reference
 
 This reference is for developers repurposing the demo into production or custom projects.
 
@@ -8,13 +8,13 @@ This reference is for developers repurposing the demo into production or custom 
 - Web app + API + embedded frontend: src/web_app.py
 - Discovery orchestration:
   - Legacy: src/discovery/engine.py
-  - V2 primary pipeline: src/discovery/v2_pipeline.py
+   - Current primary pipeline: src/discovery/v2_pipeline.py
 - LLM abstraction: src/llm/factory.py
 - Config and encrypted credentials: src/config_manager.py
 
-## 2) Discovery V2 Flow (Recursive)
+## 2) Discovery Flow (Current)
 
-The V2 pipeline executes in these phases:
+The current discovery pipeline executes in these phases:
 
 1. Signal capture
    - get_quick_overview()
@@ -113,7 +113,7 @@ Every button should communicate purpose:
 - `GET /api/discovery/compare` → Session delta metrics
 - `GET /api/discovery/runbook` → Persona runbook payload
 - `GET /api/v2/intelligence` → Latest blueprint payload
-- `GET /api/v2/artifacts` → V2 artifact catalog
+- `GET /api/v2/artifacts` → Artifact catalog
 - `GET /api/capabilities` → Capability registry with persisted state
 - `GET /api/capabilities/health` → Capability health snapshot
 - `GET /api/capabilities/rag/assets` → Managed RAG knowledge-asset catalog
@@ -129,7 +129,7 @@ Every button should communicate purpose:
 - `POST /api/capabilities/{name}/reindex` → Rebuild indexed retrieval content for capabilities that support it
 - `POST /api/capabilities/{name}/config` → Persist capability-specific config
 - `POST /api/capabilities/deeplinks/build` → Build a Splunk Web search deeplink through the optional deeplink capability
-- `GET /reports` → V2 report/session list
+- `GET /reports` → Report/session list
 
 ### Capability notes
 
@@ -147,16 +147,19 @@ Every button should communicate purpose:
 
 - lightweight repo linting now lives in `ruff.toml` with developer install support in `requirements-dev.txt`
 - current lint baseline is intentionally narrow and correctness-focused: unused imports, undefined names, invalid local scope references, and syntax-level failures
-- the public frontend now ships from checked-in local static assets under `src/static/`; rebuild them with `npm run build:frontend` whenever the legacy inline frontend source in `src/web_app.py` changes
+- the public frontend now ships from checked-in local static assets under `src/static/`; rebuild them with `npm run build:frontend` whenever the source template in `src/frontend_legacy_template.html` changes
 - `src/static/build-manifest.json` now records the expected source and artifact hashes for the shipped frontend bundle so drift can be detected without rebuilding during Python validation
 - `.github/workflows/repo-validation.yml` now mirrors the documented local validation gates on GitHub-hosted Ubuntu and Windows runners for `push`, `pull_request`, and manual dispatch
-- recommended validation commands for hardening work are:
+- recommended validation commands for hardening work, from an activated `.venv` or equivalent, are:
    - `npm run build:frontend`
-   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe tools/check_frontend_sync.py`
-   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -m ruff check src tests`
-   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -W error::SyntaxWarning -m compileall -q src tests`
-   - `c:/Temp/splunk-discovery-tool/.venv/Scripts/python.exe -m unittest discover -v`
-- because the frontend is embedded inside a Python string in `src/web_app.py`, CSS selectors and JavaScript regex literals must keep Python-safe escaping or strict compile validation will fail
+   - `python tools/check_frontend_sync.py`
+   - `npm run test:browser`
+   - `npm run test:auth-browser`
+   - `npm run test:account-functions`
+   - `python -m ruff check src tests`
+   - `python -W error::SyntaxWarning -m compileall -q src tests`
+   - `python -m unittest discover -v`
+- because the frontend source is maintained in `src/frontend_legacy_template.html` and then transpiled into shipped static assets, CSS selectors and JavaScript regex literals must keep build-safe escaping or strict compile validation will fail
 - `tools/render_frontend_template.py` renders the legacy inline template, and `tools/build_frontend.mjs` transpiles its JSX plus vendors pinned local assets so runtime delivery no longer depends on CDN-hosted React, Tailwind, Font Awesome, or in-browser Babel
 - `tools/check_frontend_sync.py` and `tests/test_frontend_delivery.py` now enforce that the shipped static bundle still matches the legacy inline frontend source before release
 
@@ -164,7 +167,7 @@ Every button should communicate purpose:
 
 - Replace discovery recommendation logic with domain controls
 - Add custom deterministic intents for your data model
-- Create role-specific runbooks from V2 blueprint
+- Create role-specific runbooks from the intelligence blueprint
 - Add org-specific KPI cards over capability_graph and finding_ledger
 - Keep settings contract stable for operator familiarity
 
