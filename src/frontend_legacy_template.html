@@ -10,6 +10,9 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
     <style>
         .animated-gradient {
             background: linear-gradient(-45deg, #667eea, #764ba2, #667eea, #764ba2);
@@ -401,6 +404,461 @@
             color: #f3f4f6 !important;
             border-color: #4b5563 !important;
         }
+
+        @keyframes constructSignalDrift {
+            0% {
+                background-position: 0 0, 0 0;
+                opacity: 0.12;
+            }
+            50% {
+                background-position: 0 18px, 180px 54px;
+                opacity: 0.3;
+            }
+            100% {
+                background-position: 0 36px, 360px 108px;
+                opacity: 0.12;
+            }
+        }
+
+        @keyframes constructGlowPulse {
+            0%, 100% {
+                box-shadow: 0 0 0 rgba(77, 255, 136, 0), 0 0 28px rgba(77, 255, 136, 0.1);
+            }
+            50% {
+                box-shadow: 0 0 18px rgba(77, 255, 136, 0.18), 0 0 42px rgba(77, 255, 136, 0.14);
+            }
+        }
+
+        [data-theme='construct'] {
+            color-scheme: dark;
+        }
+
+        [data-theme='construct'] body {
+            background:
+                radial-gradient(circle at top, rgba(79, 255, 136, 0.12), transparent 34%),
+                linear-gradient(180deg, #020403 0%, #08110a 52%, #020403 100%);
+            color: #d8ffe1;
+            font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+
+        [data-theme='construct'] .dt4sms-theme-scope {
+            background:
+                radial-gradient(circle at top, rgba(77, 255, 136, 0.08), transparent 32%),
+                linear-gradient(180deg, rgba(2, 4, 3, 0.98) 0%, rgba(6, 15, 9, 0.99) 100%);
+            color: #d8ffe1;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell {
+            position: relative;
+            overflow: hidden;
+            background:
+                linear-gradient(180deg, rgba(6, 16, 10, 0.96), rgba(2, 8, 5, 0.98)),
+                radial-gradient(circle at top left, rgba(77, 255, 136, 0.12), transparent 30%) !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: 0 18px 40px rgba(0, 0, 0, 0.38), inset 0 -1px 0 rgba(109, 255, 152, 0.1);
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell::before,
+        [data-theme='construct'] .dt4sms-top-shell::after,
+        [data-theme='construct'] .settings-modal-shell::before,
+        [data-theme='construct'] .settings-modal-shell::after {
+            content: '';
+            pointer-events: none;
+            position: absolute;
+            inset: 0;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell::before,
+        [data-theme='construct'] .settings-modal-shell::before {
+            background: repeating-linear-gradient(
+                180deg,
+                rgba(138, 255, 176, 0.025) 0,
+                rgba(138, 255, 176, 0.025) 1px,
+                transparent 1px,
+                transparent 8px
+            );
+            opacity: 0.45;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell::after,
+        [data-theme='construct'] .settings-modal-shell::after {
+            background:
+                linear-gradient(180deg, rgba(3, 12, 6, 0.05), rgba(77, 255, 136, 0.08), rgba(3, 12, 6, 0.05)),
+                linear-gradient(90deg, transparent, rgba(77, 255, 136, 0.12), transparent);
+            background-size: 100% 18px, 240px 100%;
+            opacity: 0;
+            transition: opacity 220ms ease;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell.dt4sms-construct-rain-active::after,
+        [data-theme='construct'] .settings-modal-shell.dt4sms-construct-rain-active::after {
+            opacity: 0.28;
+            animation: constructSignalDrift 9s linear infinite;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell > *,
+        [data-theme='construct'] .settings-modal-shell > * {
+            position: relative;
+            z-index: 1;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-brand-icon {
+            color: #6dff98 !important;
+            filter: drop-shadow(0 0 12px rgba(77, 255, 136, 0.45));
+        }
+
+        [data-theme='construct'] .dt4sms-shell-title {
+            color: #effff3 !important;
+            font-family: 'Space Grotesk', 'IBM Plex Mono', sans-serif;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tabbar {
+            background: rgba(4, 14, 8, 0.86) !important;
+            border-color: rgba(109, 255, 152, 0.2) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist {
+            background: rgba(3, 11, 6, 0.9) !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist [role='tab'] {
+            color: #7df7a9 !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            transition: background-color 180ms ease, color 180ms ease, box-shadow 180ms ease;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist [role='tab'][aria-selected='true'] {
+            background: linear-gradient(180deg, rgba(56, 141, 83, 0.94), rgba(15, 58, 31, 0.96)) !important;
+            color: #effff3 !important;
+            box-shadow: inset 0 0 0 1px rgba(165, 255, 189, 0.18), 0 0 16px rgba(77, 255, 136, 0.12);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist [role='tab'][aria-selected='false']:hover {
+            background: rgba(18, 50, 28, 0.85) !important;
+            color: #dbffe4 !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-quick-actions > button,
+        [data-theme='construct'] .dt4sms-shell-quick-actions > label,
+        [data-theme='construct'] .dt4sms-shell-status-actions > button,
+        [data-theme='construct'] .dt4sms-shell-status-card {
+            background: rgba(6, 18, 11, 0.88) !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            color: #dfffe8 !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.06), 0 0 18px rgba(77, 255, 136, 0.05);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-quick-actions > button:hover,
+        [data-theme='construct'] .dt4sms-shell-quick-actions > label:hover,
+        [data-theme='construct'] .dt4sms-shell-status-actions > button:hover {
+            background: rgba(10, 28, 16, 0.94) !important;
+            color: #f3fff7 !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-voice-control select {
+            background: rgba(2, 9, 5, 0.9) !important;
+            color: #effff4 !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-primary-action {
+            background: linear-gradient(180deg, rgba(56, 141, 83, 0.96), rgba(18, 71, 37, 0.98)) !important;
+            border: 1px solid rgba(140, 255, 176, 0.18) !important;
+            color: #f3fff7 !important;
+            box-shadow: 0 0 18px rgba(77, 255, 136, 0.16);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-primary-action:hover {
+            background: linear-gradient(180deg, rgba(67, 167, 97, 0.98), rgba(26, 87, 46, 1)) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-status-chip {
+            animation: constructGlowPulse 4.4s ease-in-out infinite;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-brand,
+        [data-theme='construct'] .dt4sms-shell-nav,
+        [data-theme='construct'] .dt4sms-shell-status-actions,
+        [data-theme='construct'] .dt4sms-shell-quick-actions {
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+        }
+
+        [data-theme='construct'] .dt4sms-white-rabbit-banner,
+        [data-theme='construct'] .dt4sms-white-rabbit-panel {
+            background: linear-gradient(180deg, rgba(6, 18, 11, 0.95), rgba(3, 9, 5, 0.98));
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            color: #dbffe4;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08), 0 0 18px rgba(77, 255, 136, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-white-rabbit-banner {
+            animation: constructGlowPulse 4.8s ease-in-out infinite;
+        }
+
+        [data-theme='construct'] .dt4sms-white-rabbit-eyebrow {
+            color: #7df7a9;
+            letter-spacing: 0.22em;
+            text-transform: uppercase;
+        }
+
+        [data-theme='construct'] .settings-modal-shell {
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(180deg, rgba(5, 12, 8, 0.99), rgba(2, 6, 4, 0.99)) !important;
+            border: 1px solid rgba(109, 255, 152, 0.18) !important;
+            color: #d8ffe1;
+            box-shadow: 0 28px 80px rgba(0, 0, 0, 0.52), inset 0 0 0 1px rgba(109, 255, 152, 0.06);
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+        }
+
+        [data-theme='construct'] .settings-modal-shell .text-gray-900 { color: #f1fff5 !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-800 { color: #dfffe8 !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-700 { color: #c0f8cf !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-600 { color: #9ddbab !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-500,
+        [data-theme='construct'] .settings-modal-shell .text-gray-400 { color: #7cb58b !important; }
+
+        [data-theme='construct'] .settings-modal-shell .bg-white,
+        [data-theme='construct'] .settings-modal-shell .bg-gray-50,
+        [data-theme='construct'] .settings-modal-shell .bg-gray-100,
+        [data-theme='construct'] .settings-modal-shell .bg-amber-50,
+        [data-theme='construct'] .settings-modal-shell .bg-emerald-50 {
+            background: rgba(7, 18, 11, 0.9) !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell .from-green-50,
+        [data-theme='construct'] .settings-modal-shell .to-emerald-50,
+        [data-theme='construct'] .settings-modal-shell .from-purple-50,
+        [data-theme='construct'] .settings-modal-shell .to-indigo-50,
+        [data-theme='construct'] .settings-modal-shell .from-indigo-50,
+        [data-theme='construct'] .settings-modal-shell .to-violet-50 {
+            background-image: none !important;
+            background-color: rgba(7, 18, 11, 0.92) !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell .border-gray-100,
+        [data-theme='construct'] .settings-modal-shell .border-gray-200,
+        [data-theme='construct'] .settings-modal-shell .border-gray-300,
+        [data-theme='construct'] .settings-modal-shell .border-indigo-200,
+        [data-theme='construct'] .settings-modal-shell .border-emerald-200,
+        [data-theme='construct'] .settings-modal-shell .border-amber-200 {
+            border-color: rgba(109, 255, 152, 0.2) !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell input,
+        [data-theme='construct'] .settings-modal-shell select,
+        [data-theme='construct'] .settings-modal-shell textarea {
+            background: rgba(3, 10, 6, 0.92) !important;
+            color: #f1fff5 !important;
+            border-color: rgba(109, 255, 152, 0.2) !important;
+            box-shadow: inset 0 0 14px rgba(77, 255, 136, 0.05);
+        }
+
+        [data-theme='construct'] .settings-modal-shell input::placeholder,
+        [data-theme='construct'] .settings-modal-shell textarea::placeholder {
+            color: #6f9f7c !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell code {
+            background: rgba(3, 10, 6, 0.9) !important;
+            color: #9cffbc !important;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-trigger {
+            background: transparent;
+            border: 0;
+            padding: 0;
+            margin: 0;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group {
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button {
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button[aria-pressed='true'] {
+            background: linear-gradient(180deg, rgba(56, 141, 83, 0.94), rgba(15, 58, 31, 0.96)) !important;
+            border-color: rgba(109, 255, 152, 0.2) !important;
+            color: #f3fff7 !important;
+            box-shadow: inset 0 0 0 1px rgba(165, 255, 189, 0.16), 0 0 18px rgba(77, 255, 136, 0.14);
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button[aria-pressed='false'] {
+            background: rgba(5, 13, 8, 0.88) !important;
+            color: #bdf8cb !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button[aria-pressed='false']:hover {
+            background: rgba(10, 28, 16, 0.92) !important;
+            color: #effff4 !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace {
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(180deg, rgba(5, 13, 8, 0.96), rgba(2, 8, 5, 0.98)) !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: 0 24px 48px rgba(0, 0, 0, 0.28), inset 0 0 0 1px rgba(109, 255, 152, 0.06);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background:
+                linear-gradient(90deg, rgba(77, 255, 136, 0.08), transparent 22%, transparent 78%, rgba(77, 255, 136, 0.05)),
+                repeating-linear-gradient(180deg, rgba(138, 255, 176, 0.025) 0, rgba(138, 255, 176, 0.025) 1px, transparent 1px, transparent 9px);
+            opacity: 0.38;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace > * {
+            position: relative;
+            z-index: 1;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-sidecard,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-status-band,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-section,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-runbook {
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.06), 0 0 24px rgba(77, 255, 136, 0.06);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-sidecard {
+            background: linear-gradient(180deg, rgba(4, 14, 8, 0.94), rgba(3, 9, 5, 0.98)) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero {
+            position: relative;
+            overflow: hidden;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: radial-gradient(circle at top right, rgba(77, 255, 136, 0.16), transparent 34%);
+            opacity: 0.85;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-status-band {
+            background: linear-gradient(180deg, rgba(8, 24, 13, 0.95), rgba(3, 10, 6, 0.98)) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-section,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-runbook {
+            background: rgba(6, 16, 10, 0.88) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-chip {
+            background: rgba(8, 24, 13, 0.92) !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            color: #dfffe8 !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-metric {
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.05), 0 0 18px rgba(77, 255, 136, 0.05);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-item {
+            background: rgba(5, 13, 8, 0.88) !important;
+            border-color: rgba(109, 255, 152, 0.16) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-rose-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-cyan-700 {
+            color: #76ff9d !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-indigo-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-blue-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-green-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-amber-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-purple-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-white,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-slate-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-800\/40,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-900,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-indigo-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-purple-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-blue-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-amber-950 {
+            background-image: none !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-800,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-indigo-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-indigo-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-indigo-800,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-blue-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-purple-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-purple-800,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-green-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-amber-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-amber-800 {
+            border-color: rgba(109, 255, 152, 0.18) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-900,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-100,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-amber-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-50 {
+            color: #f1fff5 !important;
+            text-shadow: 0 0 14px rgba(77, 255, 136, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-amber-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-200 {
+            color: #9ed9aa !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-500,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-400,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-amber-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-300 {
+            color: #78b487 !important;
+        }
     </style>
 </head>
 <body class="bg-gray-50">
@@ -418,6 +876,29 @@
 
         const CHAT_STATE_STORAGE_KEY = 'dt4sms_chat_state_v1';
         const WELCOME_SPLASH_PREFERENCE_KEY = 'dt4sms_welcome_splash_dismissed_v1';
+        const CONSTRUCT_THEME_SESSION_KEY = 'dt4sms_construct_theme_session_v1';
+        const CONSTRUCT_THEME_KEY_SEQUENCE = 'rabbit';
+
+        const readConstructThemeSessionEnabled = () => {
+            try {
+                return window.sessionStorage.getItem(CONSTRUCT_THEME_SESSION_KEY) === '1';
+            } catch (error) {
+                console.error('Failed to read Construct session theme:', error);
+                return false;
+            }
+        };
+
+        const persistConstructThemeSessionEnabled = (enabled) => {
+            try {
+                if (enabled) {
+                    window.sessionStorage.setItem(CONSTRUCT_THEME_SESSION_KEY, '1');
+                } else {
+                    window.sessionStorage.removeItem(CONSTRUCT_THEME_SESSION_KEY);
+                }
+            } catch (error) {
+                console.error('Failed to persist Construct session theme:', error);
+            }
+        };
 
         const buildAssistantFollowOnLabel = (prompt, limit = 72) => {
             const label = String(prompt || '').trim().replace(/\.+$/, '');
@@ -1612,6 +2093,10 @@
             ];
             const initialChatState = useRef(loadPersistedChatState()).current || {};
             const initialWelcomeSplashDismissed = useRef(loadWelcomeSplashDismissed()).current;
+            const initialConstructThemeSessionEnabled = useRef(readConstructThemeSessionEnabled()).current;
+            const whiteRabbitSequenceRef = useRef('');
+            const whiteRabbitMessageTimeoutRef = useRef(null);
+            const whiteRabbitRainTimeoutRef = useRef(null);
             const [isConnected, setIsConnected] = useState(false);
             const [discoveryStatus, setDiscoveryStatus] = useState('idle');
             const [messages, setMessages] = useState([]);
@@ -1812,6 +2297,10 @@
             const [isWelcomeSplashOpen, setIsWelcomeSplashOpen] = useState(() => !initialWelcomeSplashDismissed);
             const [hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash] = useState(() => initialWelcomeSplashDismissed);
             const [welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain] = useState(() => initialWelcomeSplashDismissed);
+            const [constructThemeSessionEnabled, setConstructThemeSessionEnabled] = useState(() => initialConstructThemeSessionEnabled);
+            const [whiteRabbitMessage, setWhiteRabbitMessage] = useState('');
+            const [constructRainActive, setConstructRainActive] = useState(false);
+            const [appearanceThemeTapCount, setAppearanceThemeTapCount] = useState(0);
             const [themePreference, setThemePreference] = useState(() => {
                 try {
                     const savedTheme = localStorage.getItem(THEME_PREFERENCE_KEY);
@@ -1853,6 +2342,12 @@
             const oidcCanEnableAuth = !!oidcStatus?.can_enable_auth;
             const authProviderSelection = securityConfig.auth_provider || 'local_password';
             const authEnableGateActive = !securityConfig.auth_enabled && !hasReviewedAuthEnableInfo;
+            const currentAuthUser = authStatus?.user || null;
+            const authAccountsEnabled = !!authStatus?.auth_enabled;
+            const headerAuthVisible = authAccountsEnabled && !!currentAuthUser && !!authStatus?.authenticated;
+            const headerAuthProviderLabel = authStatus?.auth_provider === 'oidc' ? 'OpenID Connect' : 'Local account';
+            const headerAuthRoleLabel = currentAuthUser?.role ? `${currentAuthUser.role} access` : 'Authenticated';
+            const headerAuthAssignmentLabel = currentAuthUser?.mcp_config_name ? `MCP ${currentAuthUser.mcp_config_name}` : '';
 
             const isMissionTab = workspaceTab === 'mission';
             const isIntelligenceTab = workspaceTab === 'intelligence';
@@ -1863,7 +2358,8 @@
             const operatorVoiceDefinition = OPERATOR_VOICE_OPTIONS.find((option) => option.value === operatorVoice) || OPERATOR_VOICE_OPTIONS[0];
             const isCapabilitiesOverview = isCapabilitiesTab && capabilitiesView === 'overview';
             const isCapabilitiesRagView = isCapabilitiesTab && capabilitiesView === 'rag';
-            const isDarkTheme = resolvedTheme === 'dark';
+            const isConstructTheme = resolvedTheme === 'construct';
+            const isDarkTheme = resolvedTheme === 'dark' || isConstructTheme;
             const normalizedSelectedModel = (selectedModel || config?.llm?.model || '').trim().toLowerCase();
             const isOpenAIImageModelSelected = selectedProvider === 'openai' && normalizedSelectedModel.startsWith('gpt-image-');
             const panelClass = isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200';
@@ -3127,6 +3623,11 @@
                 const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
                 const updateResolvedTheme = () => {
+                    if (constructThemeSessionEnabled) {
+                        setResolvedTheme('construct');
+                        return;
+                    }
+
                     const nextTheme = themePreference === 'system'
                         ? (mediaQuery.matches ? 'dark' : 'light')
                         : themePreference;
@@ -3135,7 +3636,7 @@
 
                 updateResolvedTheme();
 
-                if (themePreference === 'system') {
+                if (!constructThemeSessionEnabled && themePreference === 'system') {
                     const handleMediaChange = () => updateResolvedTheme();
                     if (mediaQuery.addEventListener) {
                         mediaQuery.addEventListener('change', handleMediaChange);
@@ -3151,16 +3652,119 @@
                         }
                     };
                 }
-            }, [themePreference]);
+            }, [themePreference, constructThemeSessionEnabled]);
 
             useEffect(() => {
                 document.documentElement.setAttribute('data-theme', resolvedTheme);
             }, [resolvedTheme]);
 
+            useEffect(() => {
+                if (appearanceThemeTapCount < 5) {
+                    return;
+                }
+
+                persistConstructThemeSessionEnabled(true);
+                setConstructThemeSessionEnabled(true);
+                setAppearanceThemeTapCount(0);
+                setConstructRainActive(true);
+                setWhiteRabbitMessage('Wake up, Neo... Construct mode armed for this session.');
+                if (whiteRabbitRainTimeoutRef.current) {
+                    window.clearTimeout(whiteRabbitRainTimeoutRef.current);
+                }
+                whiteRabbitRainTimeoutRef.current = window.setTimeout(() => {
+                    setConstructRainActive(false);
+                }, 12000);
+            }, [appearanceThemeTapCount]);
+
+            useEffect(() => {
+                const handleKeyDown = (event) => {
+                    if (event.metaKey || event.ctrlKey || event.altKey) {
+                        return;
+                    }
+
+                    const activeElement = document.activeElement;
+                    const activeTag = String(activeElement?.tagName || '').trim().toLowerCase();
+                    if (['input', 'textarea', 'select'].includes(activeTag) || activeElement?.isContentEditable) {
+                        return;
+                    }
+
+                    const key = String(event.key || '').trim().toLowerCase();
+                    if (!/^[a-z]$/.test(key)) {
+                        if (key === 'escape') {
+                            whiteRabbitSequenceRef.current = '';
+                        }
+                        return;
+                    }
+
+                    whiteRabbitSequenceRef.current = `${whiteRabbitSequenceRef.current}${key}`.slice(-CONSTRUCT_THEME_KEY_SEQUENCE.length);
+                    if (whiteRabbitSequenceRef.current !== CONSTRUCT_THEME_KEY_SEQUENCE) {
+                        return;
+                    }
+
+                    whiteRabbitSequenceRef.current = '';
+                    persistConstructThemeSessionEnabled(true);
+                    setConstructThemeSessionEnabled(true);
+                    if (whiteRabbitRainTimeoutRef.current) {
+                        window.clearTimeout(whiteRabbitRainTimeoutRef.current);
+                    }
+                    setConstructRainActive(true);
+                    setWhiteRabbitMessage('Follow the white rabbit.');
+                    whiteRabbitRainTimeoutRef.current = window.setTimeout(() => {
+                        setConstructRainActive(false);
+                    }, 12000);
+                };
+
+                window.addEventListener('keydown', handleKeyDown);
+                return () => {
+                    window.removeEventListener('keydown', handleKeyDown);
+                };
+            }, []);
+
+            useEffect(() => {
+                if (!whiteRabbitMessage) {
+                    return undefined;
+                }
+
+                if (whiteRabbitMessageTimeoutRef.current) {
+                    window.clearTimeout(whiteRabbitMessageTimeoutRef.current);
+                }
+
+                whiteRabbitMessageTimeoutRef.current = window.setTimeout(() => {
+                    setWhiteRabbitMessage('');
+                }, 6400);
+
+                return () => {
+                    if (whiteRabbitMessageTimeoutRef.current) {
+                        window.clearTimeout(whiteRabbitMessageTimeoutRef.current);
+                    }
+                };
+            }, [whiteRabbitMessage]);
+
+            useEffect(() => {
+                return () => {
+                    if (whiteRabbitMessageTimeoutRef.current) {
+                        window.clearTimeout(whiteRabbitMessageTimeoutRef.current);
+                    }
+                    if (whiteRabbitRainTimeoutRef.current) {
+                        window.clearTimeout(whiteRabbitRainTimeoutRef.current);
+                    }
+                };
+            }, []);
+
             const syncWelcomeSplashPreference = (dismissed) => {
                 const shouldDismiss = !!dismissed;
                 setHasDismissedWelcomeSplash(shouldDismiss);
                 persistWelcomeSplashDismissed(shouldDismiss);
+            };
+
+            const applyThemePreference = (nextTheme) => {
+                persistConstructThemeSessionEnabled(false);
+                setConstructThemeSessionEnabled(false);
+                setThemePreference(nextTheme);
+            };
+
+            const handleAppearanceThemeEasterEgg = () => {
+                setAppearanceThemeTapCount((current) => current + 1);
             };
 
             const closeWelcomeSplash = () => {
@@ -3398,6 +4002,7 @@
                 loadDiscoveryCompare('latest', 'previous');
                 loadRunbookPayload('latest', 'admin');
                 loadConfig(); // Load config to get active LLM connection info
+                loadAuthStatus();
                 loadCapabilities();
 
                 return () => {
@@ -7286,6 +7891,29 @@
             const loadSecurityControlPlane = async () => {
                 await loadAuthStatus();
                 await Promise.all([loadSecurityUsers(), loadSecurityTokens()]);
+            };
+
+            const handleAuthLogout = async () => {
+                try {
+                    const response = await fetch('/api/auth/logout', { method: 'POST' });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result.detail || 'Failed to sign out');
+                    }
+
+                    setAuthStatus((current) => current ? { ...current, authenticated: false, user: null } : null);
+                    closeSettings();
+
+                    const providerLogout = result.provider_logout || {};
+                    if (providerLogout.supported && providerLogout.mode === 'front_channel_redirect' && providerLogout.url) {
+                        window.location.assign(providerLogout.url);
+                        return;
+                    }
+
+                    window.location.assign('/');
+                } catch (error) {
+                    alert(`Failed to sign out: ${error.message}`);
+                }
             };
 
             const updateSecurityUserDraft = (userId, field, value) => {
@@ -11790,20 +12418,48 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
             );
 
             return (
-                <div className={`min-h-screen ${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900'}`}>
+                <div className={`dt4sms-theme-scope min-h-screen ${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-900'}`}>
                     {/* Unified Static Top Bar */}
-                    <header ref={headerRef} className={`${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} sticky top-0 z-50 shadow-sm border-b`}>
+                    <header ref={headerRef} className={`dt4sms-top-shell ${constructRainActive ? 'dt4sms-construct-rain-active' : ''} ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} sticky top-0 z-50 shadow-sm border-b`}>
                         <div className={`${workspaceShellWidthClass} mx-auto px-4 sm:px-6 lg:px-8`}>
                             <div className="flex flex-wrap lg:flex-nowrap justify-between items-center gap-3 py-2 sm:py-3">
-                                <div className="flex items-center">
-                                    <i className="fas fa-search text-xl sm:text-2xl text-indigo-600 mr-2 sm:mr-3"></i>
-                                    <h1 className={`text-lg sm:text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Splunk MCP Discovery Tool</h1>
+                                <div className="dt4sms-shell-brand flex items-center min-w-0">
+                                    <i className="dt4sms-shell-brand-icon fas fa-search text-xl sm:text-2xl text-indigo-600 mr-2 sm:mr-3"></i>
+                                    <div className="min-w-0 flex flex-col justify-center leading-tight sm:-translate-y-px">
+                                        <h1 className={`dt4sms-shell-title text-lg sm:text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Splunk MCP Discovery Tool</h1>
+                                        {headerAuthVisible && (
+                                            <div data-testid="header-auth-indicator" className={`mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] ${mutedTextClass}`}>
+                                                <span className="inline-flex items-center gap-1.5 min-w-0">
+                                                    <i className={`fas fa-user-circle ${isDarkTheme ? 'text-emerald-300' : 'text-indigo-600'}`}></i>
+                                                    <span className={`font-medium truncate ${headingClass}`}>Signed in as {currentAuthUser.username}</span>
+                                                </span>
+                                                <span className="hidden sm:inline">&bull;</span>
+                                                <span>{headerAuthRoleLabel}</span>
+                                                {headerAuthAssignmentLabel && (
+                                                    <>
+                                                        <span className="hidden lg:inline">&bull;</span>
+                                                        <span className="hidden lg:inline">{headerAuthAssignmentLabel}</span>
+                                                    </>
+                                                )}
+                                                <span className="hidden md:inline">&bull;</span>
+                                                <span className="hidden md:inline">{headerAuthProviderLabel}</span>
+                                                <button
+                                                    type="button"
+                                                    data-testid="header-logout-button"
+                                                    onClick={handleAuthLogout}
+                                                    className={`inline-flex items-center rounded border px-2 py-0.5 text-[11px] font-medium transition-colors ${isDarkTheme ? 'border-gray-600 bg-gray-900 text-gray-100 hover:bg-gray-700' : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-100'}`}
+                                                >
+                                                    Sign Out
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
                                 </div>
 
-                                <div className="flex-1 min-w-[320px] flex items-center justify-center">
-                                    <div className={`w-full max-w-3xl rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-indigo-950/70 border border-indigo-700' : 'bg-indigo-50 border border-indigo-200'}`}>
+                                <div className="dt4sms-shell-nav flex-1 min-w-[320px] flex items-center justify-center">
+                                    <div className={`dt4sms-shell-tabbar w-full max-w-3xl rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-indigo-950/70 border border-indigo-700' : 'bg-indigo-50 border border-indigo-200'}`}>
                                         <div className="flex flex-wrap items-center justify-center gap-2">
-                                            <div className="inline-flex rounded-lg border border-indigo-300 overflow-hidden text-[11px] sm:text-xs bg-indigo-900" role="tablist" aria-label="Workspace views">
+                                            <div className="dt4sms-shell-tablist inline-flex rounded-lg border border-indigo-300 overflow-hidden text-[11px] sm:text-xs bg-indigo-900" role="tablist" aria-label="Workspace views">
                                                 <button
                                                     type="button"
                                                     id="workspace-tab-mission"
@@ -11906,7 +12562,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 )}
                                             </div>
 
-                                            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs">
+                                            <div className="dt4sms-shell-quick-actions flex flex-wrap items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs">
                                                 {isArtifactsTab && (
                                                     <button
                                                         onClick={isMissionDiscoveryActive ? abortDiscovery : startDiscovery}
@@ -11958,7 +12614,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 )}
                                                 {(isMissionTab || isIntelligenceTab) && (
                                                     <label
-                                                        className={`inline-flex items-center gap-2 rounded border px-2.5 py-1.5 ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                                        className={`dt4sms-shell-action dt4sms-shell-voice-control inline-flex items-center gap-2 rounded border px-2.5 py-1.5 ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
                                                         title={operatorVoiceDefinition.description}
                                                     >
                                                         <span className={`text-[11px] font-semibold uppercase tracking-wide ${mutedTextClass}`}>Operator Voice</span>
@@ -11977,7 +12633,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 )}
                                                 <button
                                                     onClick={openChatSurface}
-                                                    className="px-2.5 sm:px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white"
+                                                    className="dt4sms-shell-primary-action px-2.5 sm:px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white"
                                                     title={isChatFullscreen ? 'Open the full-screen chat workspace tab' : 'Open chat workspace with deterministic query support'}
                                                 >
                                                     <i className="fas fa-comments mr-1"></i>Open Chat
@@ -11987,12 +12643,12 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                     </div>
                                 </div>
 
-                                <div className="flex items-center flex-wrap justify-end gap-2 sm:gap-3">
+                                <div className="dt4sms-shell-status-actions flex items-center flex-wrap justify-end gap-2 sm:gap-3">
                                     <button
                                         type="button"
                                         data-testid="header-discovery-status-chip"
                                         onClick={openDiscoveryWorkspace}
-                                        className={`flex items-center gap-2 px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border transition-colors ${discoveryStatusMeta.headerChipClass}`}
+                                        className={`dt4sms-shell-status-chip flex items-center gap-2 px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border transition-colors ${discoveryStatusMeta.headerChipClass}`}
                                         title={`${discoveryHeaderChipLabel}. ${discoveryNarrative}`}
                                         aria-label={`${discoveryHeaderChipLabel}. Open the Discovery workspace.`}
                                     >
@@ -12002,7 +12658,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                     </button>
                                     <button
                                         type="button"
-                                        className={`flex items-center cursor-pointer px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg transition-colors ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
+                                        className={`dt4sms-shell-action flex items-center cursor-pointer px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg transition-colors ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
                                         onClick={openConnectionModal}
                                         title="View MCP connection details"
                                         aria-label={isConnected ? 'View MCP connection details. MCP connected.' : 'View MCP connection details. MCP disconnected.'}
@@ -12016,7 +12672,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         </span>
                                     </button>
                                     <div
-                                        className={`flex items-center px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border ${isDarkTheme ? 'bg-gray-800 border-purple-500' : 'bg-white border-purple-200'}`}
+                                        className={`dt4sms-shell-status-card flex items-center px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border ${isDarkTheme ? 'bg-gray-800 border-purple-500' : 'bg-white border-purple-200'}`}
                                         title="Active LLM connection"
                                     >
                                         <i className="fas fa-brain text-purple-600 mr-2"></i>
@@ -12029,7 +12685,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                     </div>
                                     <button
                                         onClick={openSettings}
-                                        className={`px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border font-medium ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100 border-gray-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'}`}
+                                        className={`dt4sms-shell-action px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border font-medium ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100 border-gray-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'}`}
                                         title="Open settings"
                                         aria-label="Open settings"
                                     >
@@ -12037,6 +12693,13 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                     </button>
                                 </div>
                             </div>
+
+                            {whiteRabbitMessage && (
+                                <div className="dt4sms-white-rabbit-banner mb-3 rounded-lg border px-3 py-2 text-xs sm:text-sm flex flex-wrap items-center gap-3">
+                                    <span className="dt4sms-white-rabbit-eyebrow text-[11px] font-semibold">White Rabbit //</span>
+                                    <span>{whiteRabbitMessage}</span>
+                                </div>
+                            )}
                         </div>
                     </header>
 
@@ -12047,7 +12710,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                             <div className={workspaceMainClass}>
                                 {/* Discovery Intelligence Hub */}
                                 {isMissionTab && (
-                                <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
+                                <div className={`dt4sms-construct-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
                                     <div className="flex items-center justify-between mb-4">
                                         <div>
                                             <h2 className={`text-lg font-semibold ${headingClass}`}>Discovery Intelligence Hub</h2>
@@ -12071,12 +12734,12 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                     ) : (
                                         <>
                                             <div className="grid grid-cols-1 xl:grid-cols-5 gap-4 mb-4">
-                                                <div className={`xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
+                                                <div className={`dt4sms-construct-hero xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
                                                     <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                                                         <div className="max-w-3xl">
                                                             <div className={`text-[11px] uppercase tracking-[0.18em] ${mutedTextClass}`}>Mission Status</div>
                                                             <div className="mt-2 flex flex-wrap items-center gap-2">
-                                                                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
+                                                                <span className={`dt4sms-construct-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
                                                                     {missionFreshness.label}
                                                                 </span>
                                                                 <span className={`text-xs ${mutedTextClass}`}>
@@ -12086,7 +12749,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             <h3 className={`mt-3 text-xl font-semibold ${headingClass}`}>{missionExecutiveHeadline}</h3>
                                                             <p className={`mt-2 text-sm leading-6 ${subtextClass}`}>{missionWhyNow}</p>
                                                         </div>
-                                                        <div className={`rounded-xl border px-4 py-3 max-w-sm ${panelMutedClass}`}>
+                                                        <div className={`dt4sms-construct-sidecard rounded-xl border px-4 py-3 max-w-sm ${panelMutedClass}`}>
                                                             <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Immediate Value</div>
                                                             <div className={`mt-2 text-sm leading-6 ${subtextClass}`}>
                                                                 {missionFreshness.summary}
@@ -12096,7 +12759,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
 
                                                     <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
                                                         {missionSummaryCards.map((card) => (
-                                                            <div key={card.label} className={`rounded-xl border px-4 py-4 ${card.shellClass}`}>
+                                                            <div key={card.label} className={`dt4sms-construct-metric rounded-xl border px-4 py-4 ${card.shellClass}`}>
                                                                 <div className={`text-xs uppercase tracking-wide ${card.labelClass}`}>{card.label}</div>
                                                                 <div className={`mt-2 text-2xl font-semibold ${card.valueClass}`}>{card.value}</div>
                                                                 <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{card.detail}</div>
@@ -12105,14 +12768,14 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     </div>
                                                 </div>
 
-                                                <div className={`xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                <div className={`dt4sms-construct-sidecard xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                     <div className="flex items-center gap-2 mb-3">
                                                         <i className="fas fa-chart-line text-indigo-600"></i>
                                                         <h3 className={`text-sm font-semibold ${headingClass}`}>What Changed Since Last Run</h3>
                                                     </div>
                                                     <div className="space-y-3">
                                                         {missionChangeCards.map((card) => (
-                                                            <div key={card.label} className={`rounded-xl border px-4 py-3 ${card.shellClass}`}>
+                                                            <div key={card.label} className={`dt4sms-construct-item rounded-xl border px-4 py-3 ${card.shellClass}`}>
                                                                 <div className="flex items-start justify-between gap-3">
                                                                     <div>
                                                                         <div className={`text-xs uppercase tracking-wide ${card.labelClass}`}>{card.label}</div>
@@ -12126,7 +12789,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 </div>
                                             </div>
 
-                                            <div className={`rounded-xl border p-5 mb-4 ${discoveryStatusMeta.tonePanelClass}`}>
+                                            <div className={`dt4sms-construct-status-band rounded-xl border p-5 mb-4 ${discoveryStatusMeta.tonePanelClass}`}>
                                                 <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                                                     <div className="max-w-3xl">
                                                         <div className={`text-[11px] uppercase tracking-[0.18em] ${discoveryStatusMeta.toneTextClass}`}>Mission Handoff</div>
@@ -12149,19 +12812,19 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     </div>
                                                 </div>
                                                 <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-4">
-                                                    <div className={`rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-item rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
                                                         <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Phase</div>
                                                         <div className={`mt-1 text-sm font-semibold ${headingClass}`}>{discoveryPhaseLeadTitle}</div>
                                                     </div>
-                                                    <div className={`rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-item rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
                                                         <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>{discoveryEtaMethodLabel}</div>
                                                         <div className={`mt-1 text-sm font-semibold ${headingClass}`}>{isMissionDiscoveryActive ? discoveryEtaLabel : missionDiscoveryMonitorCard.detail}</div>
                                                     </div>
-                                                    <div className={`rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-item rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
                                                         <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Outputs</div>
                                                         <div className={`mt-1 text-sm font-semibold ${headingClass}`}>{discoveryReportCount > 0 ? discoveryReportCount : 'No new artifacts'}</div>
                                                     </div>
-                                                    <div className={`rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-item rounded-xl border px-4 py-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-white border-gray-200'}`}>
                                                         <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Monitor</div>
                                                         <div className={`mt-1 text-sm font-semibold ${headingClass}`}>{missionDiscoveryMonitorCard.meta}</div>
                                                     </div>
@@ -12169,7 +12832,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             </div>
 
                                             <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4">
-                                                <div className={`rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                <div className={`dt4sms-construct-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                     <div className="flex items-center gap-2 mb-3">
                                                         <i className="fas fa-clipboard-list text-emerald-600"></i>
                                                         <h3 className={`text-sm font-semibold ${headingClass}`}>Admin Next Actions</h3>
@@ -12179,7 +12842,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     ) : (
                                                         <ul className="space-y-2 text-xs">
                                                             {missionAdminVoiceCards.map((action, idx) => (
-                                                                <li key={`mission-admin-${idx}`} className={`${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                                                <li key={`mission-admin-${idx}`} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                     <div className="flex flex-wrap items-start justify-between gap-2">
                                                                         <div className={`font-medium ${headingClass}`}>{action.title}</div>
                                                                         <span className={`rounded-full px-2 py-0.5 border text-[11px] ${panelMutedClass} ${mutedTextClass}`}>{action.badge}</span>
@@ -12192,7 +12855,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     )}
                                                 </div>
 
-                                                <div className={`rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                <div className={`dt4sms-construct-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                     <div className="flex items-center gap-2 mb-3">
                                                         <i className="fas fa-crosshairs text-indigo-600"></i>
                                                         <h3 className={`text-sm font-semibold ${headingClass}`}>Analyst Investigation Tracks</h3>
@@ -12202,7 +12865,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     ) : (
                                                         <ul className="space-y-2 text-xs">
                                                             {missionAnalystVoiceCards.map((track, idx) => (
-                                                                <li key={`mission-analyst-${idx}`} className={`${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                                                <li key={`mission-analyst-${idx}`} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                     <div className={`font-medium ${headingClass}`}>{track.title}</div>
                                                                     <div className={`mt-1 leading-5 ${subtextClass}`}>{track.summary}</div>
                                                                     <div className={`mt-2 ${mutedTextClass}`}>{track.meta}</div>
@@ -12212,18 +12875,18 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     )}
                                                 </div>
 
-                                                <div className={`rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                <div className={`dt4sms-construct-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                     <div className="flex items-center gap-2 mb-3">
                                                         <i className="fas fa-briefcase text-purple-600"></i>
                                                         <h3 className={`text-sm font-semibold ${headingClass}`}>Executive Readout</h3>
                                                     </div>
-                                                    <div className={`${isDarkTheme ? 'bg-purple-950 border-purple-800' : 'bg-purple-50 border-purple-200'} border rounded-lg px-3 py-3`}>
+                                                    <div className={`dt4sms-construct-item ${isDarkTheme ? 'bg-purple-950 border-purple-800' : 'bg-purple-50 border-purple-200'} border rounded-lg px-3 py-3`}>
                                                         <div className={`text-sm font-medium ${headingClass}`}>{missionExecutiveHeadline}</div>
                                                         <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{missionFreshness.summary}</div>
                                                     </div>
                                                     <div className="mt-3 space-y-2 text-xs">
                                                         {missionExecutiveVoiceCards.map((item, idx) => (
-                                                            <div key={`mission-executive-${idx}`} className={`${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                                            <div key={`mission-executive-${idx}`} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                 <div className={`font-medium ${headingClass}`}>{item.title}</div>
                                                                 <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>
                                                                 <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>
@@ -12338,7 +13001,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             </div>
 
                                             <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
-                                                <div className={`xl:col-span-3 border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800/40' : 'border-gray-200 bg-white'}`}>
+                                                <div className={`dt4sms-construct-runbook xl:col-span-3 border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800/40' : 'border-gray-200 bg-white'}`}>
                                                     <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-3">
                                                         <div>
                                                             <h3 className={`text-sm font-semibold ${headingClass}`}>Persona Runbook</h3>
@@ -12411,7 +13074,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 {workflowTab === 'admin' && (
                                                     <ul id="workflow-panel-admin" role="tabpanel" aria-labelledby="workflow-tab-admin" className={`text-xs space-y-2 ${subtextClass}`}>
                                                         {missionRunbookAdminCards.map((action, idx) => (
-                                                            <li key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
+                                                            <li key={idx} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
                                                                 <div className="flex flex-wrap items-start justify-between gap-2">
                                                                     <div className={`font-medium ${headingClass}`}>{action.title}</div>
                                                                     <span className={`rounded-full px-2 py-0.5 border text-[11px] ${panelMutedClass} ${mutedTextClass}`}>{action.badge}</span>
@@ -12426,7 +13089,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 {workflowTab === 'analyst' && (
                                                     <ul id="workflow-panel-analyst" role="tabpanel" aria-labelledby="workflow-tab-analyst" className={`text-xs space-y-2 ${subtextClass}`}>
                                                         {missionRunbookAnalystCards.map((track, idx) => (
-                                                            <li key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
+                                                            <li key={idx} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
                                                                 <div className={`font-medium ${headingClass}`}>{track.title}</div>
                                                                 <div className={`mt-1 ${subtextClass}`}>{track.summary}</div>
                                                                 <div className={`mt-1 ${mutedTextClass}`}>{track.meta}</div>
@@ -12438,13 +13101,13 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 {workflowTab === 'executive' && (
                                                     <div id="workflow-panel-executive" role="tabpanel" aria-labelledby="workflow-tab-executive" className={`text-xs space-y-2 ${subtextClass}`}>
                                                         {discoveryDashboard.latest?.personas?.executive?.headline && (
-                                                            <div className={`${isDarkTheme ? 'bg-indigo-950 border-indigo-800' : 'bg-indigo-50 border-indigo-200'} border rounded px-3 py-2`}>
+                                                            <div className={`dt4sms-construct-item ${isDarkTheme ? 'bg-indigo-950 border-indigo-800' : 'bg-indigo-50 border-indigo-200'} border rounded px-3 py-2`}>
                                                                 <div className={`font-medium ${headingClass}`}>Headline</div>
                                                                 <div className={`mt-1 ${subtextClass}`}>{discoveryDashboard.latest.personas.executive.headline}</div>
                                                             </div>
                                                         )}
                                                         {missionRunbookExecutiveCards.map((item, idx) => (
-                                                            <div key={`executive-focus-${idx}`} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
+                                                            <div key={`executive-focus-${idx}`} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
                                                                 <div className={`font-medium ${headingClass}`}>{item.title}</div>
                                                                 <div className={`mt-1 ${subtextClass}`}>{item.summary}</div>
                                                                 <div className={`mt-1 ${mutedTextClass}`}>{item.meta}</div>
@@ -12460,7 +13123,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     )}
                                                 </div>
 
-                                                <div className={`xl:col-span-2 border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800/40' : 'border-gray-200 bg-white'}`}>
+                                                <div className={`dt4sms-construct-runbook xl:col-span-2 border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800/40' : 'border-gray-200 bg-white'}`}>
                                                     <div className="flex flex-col gap-3">
                                                         <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
                                                             <div>
@@ -12553,7 +13216,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                 )}
 
                                 {isIntelligenceTab && (
-                                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
+                                    <div className={`dt4sms-construct-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
                                         <div className="flex items-center justify-between mb-4">
                                             <div>
                                                 <h2 className={`text-lg font-semibold ${headingClass}`}>Discovery Intelligence Blueprint</h2>
@@ -12577,15 +13240,15 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         ) : (
                                             <>
                                                 <div className="grid grid-cols-1 xl:grid-cols-5 gap-4 mb-4">
-                                                    <div className={`xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
+                                                    <div className={`dt4sms-construct-hero xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
                                                         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                                                             <div className="max-w-3xl">
                                                                 <div className={`text-[11px] uppercase tracking-[0.18em] ${mutedTextClass}`}>Intelligence Status</div>
                                                                 <div className="mt-2 flex flex-wrap items-center gap-2">
-                                                                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
+                                                                    <span className={`dt4sms-construct-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
                                                                         {missionFreshness.label}
                                                                     </span>
-                                                                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}`}>
+                                                                    <span className={`dt4sms-construct-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}`}>
                                                                         Voice: {operatorVoiceDefinition.label}
                                                                     </span>
                                                                     <span className={`text-xs ${mutedTextClass}`}>
@@ -12595,7 +13258,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                 <h3 className={`mt-3 text-xl font-semibold ${headingClass}`}>{intelligenceHeadline}</h3>
                                                                 <p className={`mt-2 text-sm leading-6 ${subtextClass}`}>{intelligenceWhyNow}</p>
                                                             </div>
-                                                            <div className={`rounded-xl border px-4 py-3 max-w-sm ${panelMutedClass}`}>
+                                                            <div className={`dt4sms-construct-sidecard rounded-xl border px-4 py-3 max-w-sm ${panelMutedClass}`}>
                                                                 <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Immediate Value</div>
                                                                 <div className={`mt-2 text-sm leading-6 ${subtextClass}`}>
                                                                     This view translates the blueprint into {operatorVoiceDefinition.label} language so admins, analysts, and leaders can act without parsing the raw ledger first.
@@ -12605,7 +13268,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
 
                                                         <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
                                                             {intelligenceSummaryCards.map((card) => (
-                                                                <div key={card.label} className={`rounded-xl border px-4 py-4 ${card.shellClass}`}>
+                                                                <div key={card.label} className={`dt4sms-construct-metric rounded-xl border px-4 py-4 ${card.shellClass}`}>
                                                                     <div className={`text-xs uppercase tracking-wide ${card.labelClass}`}>{card.label}</div>
                                                                     <div className={`mt-2 text-2xl font-semibold ${card.valueClass}`}>{card.value}</div>
                                                                     <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{card.detail}</div>
@@ -12614,7 +13277,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         </div>
                                                     </div>
 
-                                                    <div className={`xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-sidecard xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                         <div className="flex items-center gap-2 mb-3">
                                                             <i className="fas fa-layer-group text-rose-600"></i>
                                                             <h3 className={`text-sm font-semibold ${headingClass}`}>Priority Board</h3>
@@ -12622,7 +13285,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         <div className={`text-xs mb-3 ${subtextClass}`}>The top blueprint signals, already translated into the next decisions that matter.</div>
                                                         <div className="space-y-3">
                                                             {intelligencePriorityBoard.map((item) => (
-                                                                <div key={item.label} className={`${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-xl px-4 py-3`}>
+                                                                <div key={item.label} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-xl px-4 py-3`}>
                                                                     <div className="flex items-start justify-between gap-3">
                                                                         <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>{item.label}</div>
                                                                         <span className={`rounded-full px-2 py-0.5 border text-[11px] ${item.badgeClass}`}>{item.badge}</span>
@@ -12635,7 +13298,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 </div>
 
                                                 <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4">
-                                                    <div className={`rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                         <div className="flex items-center gap-2 mb-3">
                                                             <i className="fas fa-clipboard-check text-emerald-600"></i>
                                                             <h3 className={`text-sm font-semibold ${headingClass}`}>Admin Control Brief</h3>
@@ -12645,7 +13308,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         ) : (
                                                             <ul className="space-y-2 text-xs">
                                                                 {intelligenceAdminBriefs.map((item, idx) => (
-                                                                    <li key={`intelligence-admin-${idx}`} className={`${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                                                    <li key={`intelligence-admin-${idx}`} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                         <div className="flex flex-wrap items-start justify-between gap-2">
                                                                             <div className={`font-medium ${headingClass}`}>{item.title}</div>
                                                                             <span className={`rounded-full px-2 py-0.5 border text-[11px] ${panelMutedClass} ${mutedTextClass}`}>{item.badge}</span>
@@ -12658,7 +13321,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         )}
                                                     </div>
 
-                                                    <div className={`rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                         <div className="flex items-center gap-2 mb-3">
                                                             <i className="fas fa-search text-indigo-600"></i>
                                                             <h3 className={`text-sm font-semibold ${headingClass}`}>Analyst Investigation Brief</h3>
@@ -12668,7 +13331,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         ) : (
                                                             <ul className="space-y-2 text-xs">
                                                                 {intelligenceAnalystBriefs.map((item, idx) => (
-                                                                    <li key={`intelligence-analyst-${idx}`} className={`${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                                                    <li key={`intelligence-analyst-${idx}`} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                         <div className={`font-medium ${headingClass}`}>{item.title}</div>
                                                                         <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>
                                                                         <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>
@@ -12678,7 +13341,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         )}
                                                     </div>
 
-                                                    <div className={`rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                    <div className={`dt4sms-construct-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
                                                         <div className="flex items-center gap-2 mb-3">
                                                             <i className="fas fa-briefcase text-purple-600"></i>
                                                             <h3 className={`text-sm font-semibold ${headingClass}`}>Executive Framing</h3>
@@ -12688,7 +13351,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         ) : (
                                                             <div className="space-y-2 text-xs">
                                                                 {intelligenceExecutiveBriefs.map((item, idx) => (
-                                                                    <div key={`intelligence-executive-${idx}`} className={`${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                                                    <div key={`intelligence-executive-${idx}`} className={`dt4sms-construct-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                         <div className={`font-medium ${headingClass}`}>{item.title}</div>
                                                                         <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>
                                                                         <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>
@@ -16941,18 +17604,20 @@ ${query.spl}`,
 
                                 <div className={`px-6 py-4 border-b ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
                                     <div className="flex items-center justify-between mb-3">
-                                        <h3 className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                            <i className="fas fa-adjust mr-2 text-indigo-600"></i>
-                                            Appearance Theme
-                                        </h3>
+                                        <button type="button" onClick={handleAppearanceThemeEasterEgg} className="dt4sms-appearance-theme-trigger text-left">
+                                            <h3 className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
+                                                <i className="fas fa-adjust mr-2 text-indigo-600"></i>
+                                                Appearance Theme
+                                            </h3>
+                                        </button>
                                         <span className={`text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                             Active: {resolvedTheme}
                                         </span>
                                     </div>
-                                    <div className={`inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="group" aria-label="Theme preference">
+                                    <div className={`dt4sms-appearance-theme-group inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="group" aria-label="Theme preference">
                                         <button
                                             type="button"
-                                            onClick={() => setThemePreference('light')}
+                                            onClick={() => applyThemePreference('light')}
                                             className={`px-3 py-2 text-xs font-medium ${themePreference === 'light' ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
                                             aria-pressed={themePreference === 'light'}
                                         >
@@ -16960,7 +17625,7 @@ ${query.spl}`,
                                         </button>
                                         <button
                                             type="button"
-                                            onClick={() => setThemePreference('dark')}
+                                            onClick={() => applyThemePreference('dark')}
                                             className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'dark' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
                                             aria-pressed={themePreference === 'dark'}
                                         >
@@ -16968,7 +17633,7 @@ ${query.spl}`,
                                         </button>
                                         <button
                                             type="button"
-                                            onClick={() => setThemePreference('system')}
+                                            onClick={() => applyThemePreference('system')}
                                             className={`px-3 py-2 text-xs font-medium border-l ${themePreference === 'system' ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
                                             aria-pressed={themePreference === 'system'}
                                         >
@@ -16978,6 +17643,11 @@ ${query.spl}`,
                                     <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
                                         System mode follows your OS appearance preference automatically.
                                     </p>
+                                    {isConstructTheme && (
+                                        <p className={`text-[11px] mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
+                                            Construct session active for this tab. Re-arm it with five taps here or by typing <span className="font-mono">rabbit</span> outside text fields.
+                                        </p>
+                                    )}
 
                                     <div className={`mt-4 pt-4 border-t ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
                                         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">

@@ -9,6 +9,9 @@
     <script src="/static/vendor/react/react-dom.production.min.js"></script>
 <link href="/static/vendor/tailwind/tailwind.min.css" rel="stylesheet">
     <link href="/static/vendor/fontawesome/css/all.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
     <style>
         .animated-gradient {
             background: linear-gradient(-45deg, #667eea, #764ba2, #667eea, #764ba2);
@@ -399,6 +402,461 @@
             background-color: #111827 !important;
             color: #f3f4f6 !important;
             border-color: #4b5563 !important;
+        }
+
+        @keyframes constructSignalDrift {
+            0% {
+                background-position: 0 0, 0 0;
+                opacity: 0.12;
+            }
+            50% {
+                background-position: 0 18px, 180px 54px;
+                opacity: 0.3;
+            }
+            100% {
+                background-position: 0 36px, 360px 108px;
+                opacity: 0.12;
+            }
+        }
+
+        @keyframes constructGlowPulse {
+            0%, 100% {
+                box-shadow: 0 0 0 rgba(77, 255, 136, 0), 0 0 28px rgba(77, 255, 136, 0.1);
+            }
+            50% {
+                box-shadow: 0 0 18px rgba(77, 255, 136, 0.18), 0 0 42px rgba(77, 255, 136, 0.14);
+            }
+        }
+
+        [data-theme='construct'] {
+            color-scheme: dark;
+        }
+
+        [data-theme='construct'] body {
+            background:
+                radial-gradient(circle at top, rgba(79, 255, 136, 0.12), transparent 34%),
+                linear-gradient(180deg, #020403 0%, #08110a 52%, #020403 100%);
+            color: #d8ffe1;
+            font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+
+        [data-theme='construct'] .dt4sms-theme-scope {
+            background:
+                radial-gradient(circle at top, rgba(77, 255, 136, 0.08), transparent 32%),
+                linear-gradient(180deg, rgba(2, 4, 3, 0.98) 0%, rgba(6, 15, 9, 0.99) 100%);
+            color: #d8ffe1;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell {
+            position: relative;
+            overflow: hidden;
+            background:
+                linear-gradient(180deg, rgba(6, 16, 10, 0.96), rgba(2, 8, 5, 0.98)),
+                radial-gradient(circle at top left, rgba(77, 255, 136, 0.12), transparent 30%) !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: 0 18px 40px rgba(0, 0, 0, 0.38), inset 0 -1px 0 rgba(109, 255, 152, 0.1);
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell::before,
+        [data-theme='construct'] .dt4sms-top-shell::after,
+        [data-theme='construct'] .settings-modal-shell::before,
+        [data-theme='construct'] .settings-modal-shell::after {
+            content: '';
+            pointer-events: none;
+            position: absolute;
+            inset: 0;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell::before,
+        [data-theme='construct'] .settings-modal-shell::before {
+            background: repeating-linear-gradient(
+                180deg,
+                rgba(138, 255, 176, 0.025) 0,
+                rgba(138, 255, 176, 0.025) 1px,
+                transparent 1px,
+                transparent 8px
+            );
+            opacity: 0.45;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell::after,
+        [data-theme='construct'] .settings-modal-shell::after {
+            background:
+                linear-gradient(180deg, rgba(3, 12, 6, 0.05), rgba(77, 255, 136, 0.08), rgba(3, 12, 6, 0.05)),
+                linear-gradient(90deg, transparent, rgba(77, 255, 136, 0.12), transparent);
+            background-size: 100% 18px, 240px 100%;
+            opacity: 0;
+            transition: opacity 220ms ease;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell.dt4sms-construct-rain-active::after,
+        [data-theme='construct'] .settings-modal-shell.dt4sms-construct-rain-active::after {
+            opacity: 0.28;
+            animation: constructSignalDrift 9s linear infinite;
+        }
+
+        [data-theme='construct'] .dt4sms-top-shell > *,
+        [data-theme='construct'] .settings-modal-shell > * {
+            position: relative;
+            z-index: 1;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-brand-icon {
+            color: #6dff98 !important;
+            filter: drop-shadow(0 0 12px rgba(77, 255, 136, 0.45));
+        }
+
+        [data-theme='construct'] .dt4sms-shell-title {
+            color: #effff3 !important;
+            font-family: 'Space Grotesk', 'IBM Plex Mono', sans-serif;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tabbar {
+            background: rgba(4, 14, 8, 0.86) !important;
+            border-color: rgba(109, 255, 152, 0.2) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist {
+            background: rgba(3, 11, 6, 0.9) !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist [role='tab'] {
+            color: #7df7a9 !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            transition: background-color 180ms ease, color 180ms ease, box-shadow 180ms ease;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist [role='tab'][aria-selected='true'] {
+            background: linear-gradient(180deg, rgba(56, 141, 83, 0.94), rgba(15, 58, 31, 0.96)) !important;
+            color: #effff3 !important;
+            box-shadow: inset 0 0 0 1px rgba(165, 255, 189, 0.18), 0 0 16px rgba(77, 255, 136, 0.12);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-tablist [role='tab'][aria-selected='false']:hover {
+            background: rgba(18, 50, 28, 0.85) !important;
+            color: #dbffe4 !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-quick-actions > button,
+        [data-theme='construct'] .dt4sms-shell-quick-actions > label,
+        [data-theme='construct'] .dt4sms-shell-status-actions > button,
+        [data-theme='construct'] .dt4sms-shell-status-card {
+            background: rgba(6, 18, 11, 0.88) !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            color: #dfffe8 !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.06), 0 0 18px rgba(77, 255, 136, 0.05);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-quick-actions > button:hover,
+        [data-theme='construct'] .dt4sms-shell-quick-actions > label:hover,
+        [data-theme='construct'] .dt4sms-shell-status-actions > button:hover {
+            background: rgba(10, 28, 16, 0.94) !important;
+            color: #f3fff7 !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-voice-control select {
+            background: rgba(2, 9, 5, 0.9) !important;
+            color: #effff4 !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-primary-action {
+            background: linear-gradient(180deg, rgba(56, 141, 83, 0.96), rgba(18, 71, 37, 0.98)) !important;
+            border: 1px solid rgba(140, 255, 176, 0.18) !important;
+            color: #f3fff7 !important;
+            box-shadow: 0 0 18px rgba(77, 255, 136, 0.16);
+        }
+
+        [data-theme='construct'] .dt4sms-shell-primary-action:hover {
+            background: linear-gradient(180deg, rgba(67, 167, 97, 0.98), rgba(26, 87, 46, 1)) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-status-chip {
+            animation: constructGlowPulse 4.4s ease-in-out infinite;
+        }
+
+        [data-theme='construct'] .dt4sms-shell-brand,
+        [data-theme='construct'] .dt4sms-shell-nav,
+        [data-theme='construct'] .dt4sms-shell-status-actions,
+        [data-theme='construct'] .dt4sms-shell-quick-actions {
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+        }
+
+        [data-theme='construct'] .dt4sms-white-rabbit-banner,
+        [data-theme='construct'] .dt4sms-white-rabbit-panel {
+            background: linear-gradient(180deg, rgba(6, 18, 11, 0.95), rgba(3, 9, 5, 0.98));
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            color: #dbffe4;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08), 0 0 18px rgba(77, 255, 136, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-white-rabbit-banner {
+            animation: constructGlowPulse 4.8s ease-in-out infinite;
+        }
+
+        [data-theme='construct'] .dt4sms-white-rabbit-eyebrow {
+            color: #7df7a9;
+            letter-spacing: 0.22em;
+            text-transform: uppercase;
+        }
+
+        [data-theme='construct'] .settings-modal-shell {
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(180deg, rgba(5, 12, 8, 0.99), rgba(2, 6, 4, 0.99)) !important;
+            border: 1px solid rgba(109, 255, 152, 0.18) !important;
+            color: #d8ffe1;
+            box-shadow: 0 28px 80px rgba(0, 0, 0, 0.52), inset 0 0 0 1px rgba(109, 255, 152, 0.06);
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+        }
+
+        [data-theme='construct'] .settings-modal-shell .text-gray-900 { color: #f1fff5 !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-800 { color: #dfffe8 !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-700 { color: #c0f8cf !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-600 { color: #9ddbab !important; }
+        [data-theme='construct'] .settings-modal-shell .text-gray-500,
+        [data-theme='construct'] .settings-modal-shell .text-gray-400 { color: #7cb58b !important; }
+
+        [data-theme='construct'] .settings-modal-shell .bg-white,
+        [data-theme='construct'] .settings-modal-shell .bg-gray-50,
+        [data-theme='construct'] .settings-modal-shell .bg-gray-100,
+        [data-theme='construct'] .settings-modal-shell .bg-amber-50,
+        [data-theme='construct'] .settings-modal-shell .bg-emerald-50 {
+            background: rgba(7, 18, 11, 0.9) !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell .from-green-50,
+        [data-theme='construct'] .settings-modal-shell .to-emerald-50,
+        [data-theme='construct'] .settings-modal-shell .from-purple-50,
+        [data-theme='construct'] .settings-modal-shell .to-indigo-50,
+        [data-theme='construct'] .settings-modal-shell .from-indigo-50,
+        [data-theme='construct'] .settings-modal-shell .to-violet-50 {
+            background-image: none !important;
+            background-color: rgba(7, 18, 11, 0.92) !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell .border-gray-100,
+        [data-theme='construct'] .settings-modal-shell .border-gray-200,
+        [data-theme='construct'] .settings-modal-shell .border-gray-300,
+        [data-theme='construct'] .settings-modal-shell .border-indigo-200,
+        [data-theme='construct'] .settings-modal-shell .border-emerald-200,
+        [data-theme='construct'] .settings-modal-shell .border-amber-200 {
+            border-color: rgba(109, 255, 152, 0.2) !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell input,
+        [data-theme='construct'] .settings-modal-shell select,
+        [data-theme='construct'] .settings-modal-shell textarea {
+            background: rgba(3, 10, 6, 0.92) !important;
+            color: #f1fff5 !important;
+            border-color: rgba(109, 255, 152, 0.2) !important;
+            box-shadow: inset 0 0 14px rgba(77, 255, 136, 0.05);
+        }
+
+        [data-theme='construct'] .settings-modal-shell input::placeholder,
+        [data-theme='construct'] .settings-modal-shell textarea::placeholder {
+            color: #6f9f7c !important;
+        }
+
+        [data-theme='construct'] .settings-modal-shell code {
+            background: rgba(3, 10, 6, 0.9) !important;
+            color: #9cffbc !important;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-trigger {
+            background: transparent;
+            border: 0;
+            padding: 0;
+            margin: 0;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group {
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button {
+            font-family: 'IBM Plex Mono', ui-monospace, monospace;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button[aria-pressed='true'] {
+            background: linear-gradient(180deg, rgba(56, 141, 83, 0.94), rgba(15, 58, 31, 0.96)) !important;
+            border-color: rgba(109, 255, 152, 0.2) !important;
+            color: #f3fff7 !important;
+            box-shadow: inset 0 0 0 1px rgba(165, 255, 189, 0.16), 0 0 18px rgba(77, 255, 136, 0.14);
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button[aria-pressed='false'] {
+            background: rgba(5, 13, 8, 0.88) !important;
+            color: #bdf8cb !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-appearance-theme-group button[aria-pressed='false']:hover {
+            background: rgba(10, 28, 16, 0.92) !important;
+            color: #effff4 !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace {
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(180deg, rgba(5, 13, 8, 0.96), rgba(2, 8, 5, 0.98)) !important;
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: 0 24px 48px rgba(0, 0, 0, 0.28), inset 0 0 0 1px rgba(109, 255, 152, 0.06);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background:
+                linear-gradient(90deg, rgba(77, 255, 136, 0.08), transparent 22%, transparent 78%, rgba(77, 255, 136, 0.05)),
+                repeating-linear-gradient(180deg, rgba(138, 255, 176, 0.025) 0, rgba(138, 255, 176, 0.025) 1px, transparent 1px, transparent 9px);
+            opacity: 0.38;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace > * {
+            position: relative;
+            z-index: 1;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-sidecard,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-status-band,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-section,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-runbook {
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.06), 0 0 24px rgba(77, 255, 136, 0.06);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-sidecard {
+            background: linear-gradient(180deg, rgba(4, 14, 8, 0.94), rgba(3, 9, 5, 0.98)) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero {
+            position: relative;
+            overflow: hidden;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-hero::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: radial-gradient(circle at top right, rgba(77, 255, 136, 0.16), transparent 34%);
+            opacity: 0.85;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-status-band {
+            background: linear-gradient(180deg, rgba(8, 24, 13, 0.95), rgba(3, 10, 6, 0.98)) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-section,
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-runbook {
+            background: rgba(6, 16, 10, 0.88) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-chip {
+            background: rgba(8, 24, 13, 0.92) !important;
+            border-color: rgba(109, 255, 152, 0.22) !important;
+            color: #dfffe8 !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-metric {
+            border-color: rgba(109, 255, 152, 0.18) !important;
+            box-shadow: inset 0 0 0 1px rgba(109, 255, 152, 0.05), 0 0 18px rgba(77, 255, 136, 0.05);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .dt4sms-construct-item {
+            background: rgba(5, 13, 8, 0.88) !important;
+            border-color: rgba(109, 255, 152, 0.16) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-rose-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-cyan-700 {
+            color: #76ff9d !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-indigo-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-blue-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-green-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-amber-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-purple-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-white,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-slate-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-800\/40,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-900,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-gray-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-indigo-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-purple-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-blue-950,
+        [data-theme='construct'] .dt4sms-construct-workspace .bg-amber-950 {
+            background-image: none !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-gray-800,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-indigo-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-indigo-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-indigo-800,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-blue-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-purple-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-purple-800,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-green-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-amber-700,
+        [data-theme='construct'] .dt4sms-construct-workspace .border-amber-800 {
+            border-color: rgba(109, 255, 152, 0.18) !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-900,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-100,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-amber-50,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-50 {
+            color: #f1fff5 !important;
+            text-shadow: 0 0 14px rgba(77, 255, 136, 0.08);
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-600,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-amber-200,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-200 {
+            color: #9ed9aa !important;
+        }
+
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-500,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-gray-400,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-indigo-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-blue-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-green-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-amber-300,
+        [data-theme='construct'] .dt4sms-construct-workspace .text-purple-300 {
+            color: #78b487 !important;
         }
     </style>
 </head>

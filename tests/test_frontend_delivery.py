@@ -147,6 +147,21 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertNotIn("await loadCredentialIntoSettings(data.active_credential_name);", template_source)
         self.assertNotIn("Credential Loaded!", template_source)
 
+    def test_header_declares_authenticated_user_indicator_and_logout(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const currentAuthUser = authStatus?.user || null;", template_source)
+        self.assertIn("const headerAuthVisible = authAccountsEnabled && !!currentAuthUser && !!authStatus?.authenticated;", template_source)
+        self.assertIn("const headerAuthProviderLabel = authStatus?.auth_provider === 'oidc' ? 'OpenID Connect' : 'Local account';", template_source)
+        self.assertIn("const handleAuthLogout = async () => {", template_source)
+        self.assertIn("window.location.assign(providerLogout.url);", template_source)
+        self.assertIn("window.location.assign('/');", template_source)
+        self.assertIn("loadAuthStatus();", template_source)
+        self.assertIn("data-testid=\"header-auth-indicator\"", template_source)
+        self.assertIn("Signed in as {currentAuthUser.username}", template_source)
+        self.assertIn("data-testid=\"header-logout-button\"", template_source)
+        self.assertIn(">\n                                                    Sign Out\n                                                </button>", template_source)
+
     def test_settings_modal_declares_first_party_ollama_provider(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 
@@ -159,6 +174,31 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("const normalizeProvider = (provider, endpointUrl = '') => {", template_source)
         self.assertIn("if (value === 'custom' && (endpointValue.includes('ollama') || endpointValue.includes(':11434'))) return 'ollama';", template_source)
         self.assertIn("<span><span class=\"font-semibold text-gray-700\">Provider:</span> ${provider}</span>", template_source)
+
+    def test_construct_theme_is_session_gated_and_scoped_to_priority_surfaces(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const CONSTRUCT_THEME_SESSION_KEY = 'dt4sms_construct_theme_session_v1';", template_source)
+        self.assertIn("const CONSTRUCT_THEME_KEY_SEQUENCE = 'rabbit';", template_source)
+        self.assertIn("return window.sessionStorage.getItem(CONSTRUCT_THEME_SESSION_KEY) === '1';", template_source)
+        self.assertIn("window.sessionStorage.setItem(CONSTRUCT_THEME_SESSION_KEY, '1');", template_source)
+        self.assertIn("window.sessionStorage.removeItem(CONSTRUCT_THEME_SESSION_KEY);", template_source)
+        self.assertIn("const isConstructTheme = resolvedTheme === 'construct';", template_source)
+        self.assertIn("const isDarkTheme = resolvedTheme === 'dark' || isConstructTheme;", template_source)
+        self.assertIn("const activeElement = document.activeElement;", template_source)
+        self.assertIn("if (['input', 'textarea', 'select'].includes(activeTag) || activeElement?.isContentEditable)", template_source)
+        self.assertIn("persistConstructThemeSessionEnabled(true);", template_source)
+        self.assertIn("const applyThemePreference = (nextTheme) => {", template_source)
+        self.assertIn("onClick={handleAppearanceThemeEasterEgg}", template_source)
+        self.assertIn("Construct session active for this tab.", template_source)
+        self.assertIn("[data-theme='construct'] .dt4sms-top-shell", template_source)
+        self.assertIn("[data-theme='construct'] .settings-modal-shell", template_source)
+        self.assertIn("[data-theme='construct'] .dt4sms-construct-workspace", template_source)
+        self.assertIn("dt4sms-shell-tabbar", template_source)
+        self.assertIn("dt4sms-white-rabbit-banner", template_source)
+        self.assertIn("dt4sms-construct-hero", template_source)
+        self.assertIn("dt4sms-construct-section", template_source)
+        self.assertIn("dt4sms-construct-runbook", template_source)
 
     def test_discovery_status_declares_passive_polling_fallback(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")

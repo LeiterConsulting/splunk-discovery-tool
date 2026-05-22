@@ -449,6 +449,23 @@ async function openSecuritySettingsAndVerify(page) {
     await page.getByRole('button', { name: 'Close settings' }).click();
 }
 
+async function verifyHeaderAuthIndicator(page, options = {}) {
+    const indicator = page.getByTestId('header-auth-indicator');
+    const logoutButton = page.getByTestId('header-logout-button');
+
+    await indicator.waitFor({ state: 'visible', timeout: 30000 });
+    await logoutButton.waitFor({ state: 'visible', timeout: 30000 });
+
+    const indicatorText = String((await indicator.textContent()) || '');
+    assert(indicatorText.includes(`Signed in as ${options.username}`), `Header auth indicator did not include username '${options.username}'.`);
+    if (options.role) {
+        assert(indicatorText.includes(`${options.role} access`), `Header auth indicator did not include role '${options.role}'.`);
+    }
+    if (options.providerLabel) {
+        assert(indicatorText.includes(options.providerLabel), `Header auth indicator did not include provider label '${options.providerLabel}'.`);
+    }
+}
+
 async function verifyAuthEnableGuideFlow(page) {
     await openSecurityAccessTab(page);
 
@@ -561,19 +578,18 @@ async function runLocalPasswordScenario() {
             await page.getByRole('button', { name: 'Open settings' }).waitFor({ timeout: 30000 });
             await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
             await openSecuritySettingsAndVerify(page);
+            await verifyHeaderAuthIndicator(page, {
+                username: LOCAL_ADMIN_USERNAME,
+                role: 'admin',
+                providerLabel: 'Local account',
+            });
 
             const authStatus = await getAuthStatus(page);
             assert(authStatus.authenticated, 'Local auth flow did not create an authenticated session.');
             assert(authStatus.user?.username === LOCAL_ADMIN_USERNAME, 'Local auth flow did not retain the bootstrap admin user.');
             assert(authStatus.password_reset_required === false, 'Password reset should be cleared after updating the bootstrap password.');
 
-            const logoutPayload = await page.evaluate(async () => {
-                const response = await fetch('/api/auth/logout', { method: 'POST' });
-                return await response.json();
-            });
-            assert(logoutPayload.provider_logout?.provider === 'local_password', 'Local logout should report the local provider.');
-
-            await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
+            await page.getByTestId('header-logout-button').click();
             await page.getByRole('heading', { name: 'DT4SMS Sign In' }).waitFor({ timeout: 30000 });
             const postLogoutStatus = await getAuthStatus(page);
             assert(!postLogoutStatus.authenticated, 'Local logout should clear the session cookie.');
@@ -630,21 +646,18 @@ async function runOidcScenario() {
             await page.getByRole('button', { name: 'Open settings' }).waitFor({ timeout: 30000 });
             await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
             await openSecuritySettingsAndVerify(page);
+            await verifyHeaderAuthIndicator(page, {
+                username: OIDC_TEST_USER.preferred_username,
+                role: 'admin',
+                providerLabel: 'OpenID Connect',
+            });
 
             const authStatus = await getAuthStatus(page);
             assert(authStatus.authenticated, 'OIDC flow did not create an authenticated session.');
             assert(authStatus.user?.username === OIDC_TEST_USER.preferred_username, 'OIDC flow did not provision the expected username.');
             assert(authStatus.user?.role === 'admin', 'OIDC flow did not apply the admin role claim.');
 
-            const logoutPayload = await page.evaluate(async () => {
-                const response = await fetch('/api/auth/logout', { method: 'POST' });
-                return await response.json();
-            });
-            assert(logoutPayload.provider_logout?.provider === 'oidc', 'OIDC logout should report the oidc provider.');
-            assert(logoutPayload.provider_logout?.supported === true, 'OIDC logout should report provider logout guidance when end_session_endpoint is available.');
-            assert(String(logoutPayload.provider_logout?.url || '').includes('/endsession'), 'OIDC logout guidance should point at the provider end_session_endpoint.');
-
-            await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
+            await page.getByTestId('header-logout-button').click();
             await page.getByRole('heading', { name: 'DT4SMS Sign In' }).waitFor({ timeout: 30000 });
             const postLogoutStatus = await getAuthStatus(page);
             assert(!postLogoutStatus.authenticated, 'OIDC logout should clear the DT4SMS session cookie.');
@@ -653,6 +666,7 @@ async function runOidcScenario() {
         assert(provider.requestCounts.authorize >= 1, 'OIDC browser flow never reached the authorize endpoint.');
         assert(provider.requestCounts.token >= 1, 'OIDC browser flow never exchanged an authorization code.');
         assert(provider.requestCounts.userinfo >= 1, 'OIDC browser flow never queried the userinfo endpoint.');
+        assert(provider.requestCounts.endsession >= 1, 'OIDC browser flow never reached the provider end-session endpoint during header sign-out.');
         console.log('[auth-browser] OIDC browser flow passed.');
     } catch (error) {
         const serverLogs = serverHandle?.getLogs ? serverHandle.getLogs() : '';
