@@ -388,13 +388,15 @@
       console.warn("Failed to persist welcome splash preference", error);
     }
   };
-  const normalizeProvider = (provider) => {
+  const normalizeProvider = (provider, endpointUrl = "") => {
     const value = String(provider || "openai").toLowerCase().trim();
+    const endpointValue = String(endpointUrl || "").toLowerCase().trim();
     if (value === "custom endpoint") return "custom";
     if (value === "azure openai") return "azure";
     if (value === "claude") return "anthropic";
     if (value === "google" || value === "google ai") return "gemini";
     if (value === "local ollama" || value === "ollama endpoint") return "ollama";
+    if (value === "custom" && (endpointValue.includes("ollama") || endpointValue.includes(":11434"))) return "ollama";
     return value;
   };
   class ErrorBoundary extends React.Component {
@@ -4810,7 +4812,7 @@
         const response = await fetch("/api/config");
         const data = await response.json();
         setConfig(data);
-        setSelectedProvider(normalizeProvider(data.llm.provider || "openai"));
+        setSelectedProvider(normalizeProvider(data.llm.provider || "openai", data.llm.endpoint_url));
         setSelectedModel(data.llm.model || "");
         setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(data.llm.provider, data.llm.api_key === "***"));
         setMCPTokenPlaceholder(data.mcp.token === "***" ? "(Already Configured)" : "Enter token");
@@ -5094,7 +5096,7 @@ This permanently deletes the token record from DT4SMS.`);
           return 0;
         });
         credList2.innerHTML = credArray.map((cred) => {
-          const provider = normalizeProvider(cred.provider);
+          const provider = normalizeProvider(cred.provider, cred.endpoint_url);
           const providerIcon = provider === "openai" ? "fa-openai" : provider === "azure" ? "fa-cloud" : provider === "anthropic" ? "fa-robot" : provider === "gemini" ? "fa-gem" : provider === "custom" ? "fa-server" : "fa-brain";
           const providerColor = provider === "openai" ? "text-green-600" : provider === "azure" ? "text-blue-600" : provider === "anthropic" ? "text-orange-600" : provider === "gemini" ? "text-indigo-600" : "text-purple-600";
           const isActive = cred.name === activeCredName;
@@ -5110,7 +5112,7 @@ This permanently deletes the token record from DT4SMS.`);
                                         <div class="text-sm text-gray-600 space-y-1.5 pl-1">
                                             <div class="flex items-center gap-2">
                                                 <i class="fas fa-cog w-4 text-gray-400"></i>
-                                                <span><span class="font-semibold text-gray-700">Provider:</span> ${cred.provider}</span>
+                                                <span><span class="font-semibold text-gray-700">Provider:</span> ${provider}</span>
                                             </div>
                                             <div class="flex items-center gap-2">
                                                 <i class="fas fa-brain w-4 text-gray-400"></i>
@@ -5181,14 +5183,14 @@ This permanently deletes the token record from DT4SMS.`);
         if (response.ok) {
           const newConfig = result.config;
           setConfig(newConfig);
-          setSelectedProvider(normalizeProvider(newConfig.llm.provider));
+          setSelectedProvider(normalizeProvider(newConfig.llm.provider, newConfig.llm.endpoint_url));
           setLoadedCredentialName(name);
           setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(newConfig.llm.provider, true));
           setShowConfigForm(true);
           setSelectedModel(newConfig.llm.model);
           setAvailableModels([]);
           setTimeout(() => {
-            const normalizedProvider = normalizeProvider(newConfig.llm.provider);
+            const normalizedProvider = normalizeProvider(newConfig.llm.provider, newConfig.llm.endpoint_url);
             const providerInput = document.getElementById("llm-provider");
             if (providerInput) {
               providerInput.value = normalizedProvider;

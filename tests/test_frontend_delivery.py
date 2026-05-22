@@ -156,6 +156,9 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("Optional for local Ollama", template_source)
         self.assertIn("Ollama uses the native <span className=\"font-mono\">/api/tags</span> model inventory", template_source)
         self.assertIn("endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : null", template_source)
+        self.assertIn("const normalizeProvider = (provider, endpointUrl = '') => {", template_source)
+        self.assertIn("if (value === 'custom' && (endpointValue.includes('ollama') || endpointValue.includes(':11434'))) return 'ollama';", template_source)
+        self.assertIn("<span><span class=\"font-semibold text-gray-700\">Provider:</span> ${provider}</span>", template_source)
 
     def test_discovery_status_declares_passive_polling_fallback(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
