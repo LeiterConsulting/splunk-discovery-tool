@@ -105,6 +105,19 @@ async function stopServer(serverHandle) {
     });
 }
 
+async function runPhase(label, action) {
+    const startedAt = Date.now();
+    console.log(`[browser-regression] starting ${label}`);
+    try {
+        const result = await action();
+        console.log(`[browser-regression] completed ${label} in ${Date.now() - startedAt}ms`);
+        return result;
+    } catch (error) {
+        console.error(`[browser-regression] failed ${label} after ${Date.now() - startedAt}ms`);
+        throw error;
+    }
+}
+
 async function waitForServer(baseUrl, timeoutMs = 30000) {
     const deadline = Date.now() + timeoutMs;
     let lastError = null;
@@ -816,6 +829,7 @@ async function seedOperatorRuntimeState() {
 
     return {
         exportDir: fixtureSession?.exportDir || exportDir,
+        fixtureCreated: !!fixtureSession,
         latestSession,
         async restore() {
             if (originalRuntimeState === null) {
@@ -1547,16 +1561,23 @@ async function main() {
 
     try {
         seededRuntimeState = await seedOperatorRuntimeState();
+        console.log(
+            `[browser-regression] summary session ${seededRuntimeState.latestSession.timestamp} `
+            + `(${seededRuntimeState.fixtureCreated ? 'seeded fixture' : 'existing output'})`,
+        );
         const port = await findFreePort();
         const baseUrl = `http://127.0.0.1:${port}`;
         serverHandle = startServer(port);
         await waitForServer(baseUrl);
 
-        const visualizationResult = await runBrowserRegression(baseUrl);
-        const welcomeSplashResult = await runWelcomeSplashRegression(baseUrl);
-        const workspaceResult = await runWorkspaceSmoke(baseUrl);
-        const operatorResult = await runOperatorWorkflowRegression(baseUrl, seededRuntimeState);
-        const activeSummaryWorkerResult = await runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState);
+        const visualizationResult = await runPhase('visualization regression', () => runBrowserRegression(baseUrl));
+        const welcomeSplashResult = await runPhase('welcome splash regression', () => runWelcomeSplashRegression(baseUrl));
+        const workspaceResult = await runPhase('workspace smoke', () => runWorkspaceSmoke(baseUrl));
+        const operatorResult = await runPhase('operator workflow regression', () => runOperatorWorkflowRegression(baseUrl, seededRuntimeState));
+        const activeSummaryWorkerResult = await runPhase(
+            'active summary worker regression',
+            () => runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState),
+        );
         console.log(`Visualization browser regression passed: ${visualizationResult.barHeights.length} bars, ${visualizationResult.linePoints} line points, ${visualizationResult.truncatedLabels} truncated dense labels.`);
         console.log(`Welcome splash regression passed: persisted dismissal ${welcomeSplashResult.persistedDismissal ? 'verified' : 'not verified'}.`);
         console.log(`Workspace browser smoke passed: ${workspaceResult.reportSplCardCount} report SPL card and ${workspaceResult.libraryCardCount} SPL library card verified.`);

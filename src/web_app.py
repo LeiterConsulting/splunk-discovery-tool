@@ -13,6 +13,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import asyncio
 import base64
 import copy
+import ctypes
 from contextlib import suppress
 from collections import deque
 import hashlib
@@ -2674,13 +2675,17 @@ app.add_middleware(
 
 # Global state management
 active_connections: List[WebSocket] = []
+scoped_active_connections: Dict[str, List[WebSocket]] = {}
 current_discovery_session = None
 summarization_progress: Dict[str, Dict[str, Any]] = {}  # Track progress by session_id
+discovery_runtime_states: Dict[str, Dict[str, Any]] = {}
+DISCOVERY_SCOPE_GLOBAL = "__global__"
+DISCOVERY_SCOPE_NO_MCP = "__no_mcp__"
 DISCOVERY_ACTIVE_STATUSES = {"starting", "running"}
 DISCOVERY_ACTIVITY_LOG_LIMIT = 160
 SUMMARIZATION_TERMINAL_STAGES = {"idle", "complete", "error", "interrupted", "aborted"}
 RUNTIME_STATE_FILENAME = "runtime_state.json"
-RUNTIME_STATE_SCHEMA_VERSION = 1
+RUNTIME_STATE_SCHEMA_VERSION = 2
 RUNTIME_JOB_DIRNAME = "runtime_jobs"
 RUNTIME_JOB_WORKER_ENV = "DT4SMS_RUNTIME_WORKER"
 RUNTIME_STATE_BRIDGE_POLL_INTERVAL_SECONDS = 0.5
@@ -2705,10 +2710,46 @@ def _coerce_process_id(value: Any) -> Optional[int]:
     return pid if pid > 0 else None
 
 
+def _is_process_running_windows(pid: int) -> Optional[bool]:
+    if os.name != "nt":
+        return None
+
+    kernel32 = getattr(ctypes, "windll", None)
+    if kernel32 is None:
+        return None
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+
+    handle = kernel32.kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        error_code = ctypes.GetLastError()
+        if error_code == 5:
+            return True
+        if error_code == 87:
+            return False
+        return None
+
+    exit_code = ctypes.c_ulong()
+    try:
+        if not kernel32.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            error_code = ctypes.GetLastError()
+            if error_code == 5:
+                return True
+            return None
+        return int(exit_code.value) == still_active
+    finally:
+        kernel32.kernel32.CloseHandle(handle)
+
+
 def _is_process_running(value: Any) -> bool:
     pid = _coerce_process_id(value)
     if pid is None:
         return False
+
+    windows_status = _is_process_running_windows(pid)
+    if windows_status is not None:
+        return windows_status
 
     try:
         os.kill(pid, 0)
@@ -2801,6 +2842,9 @@ def _normalize_discovery_progress_payload(payload: Any = None) -> Dict[str, Any]
 
 def _build_discovery_runtime_state() -> Dict[str, Any]:
     return {
+        "scope_key": DISCOVERY_SCOPE_GLOBAL,
+        "scope_label": "Global",
+        "active_mcp_config_name": None,
         "status": "idle",
         "session_id": None,
         "worker_pid": None,
@@ -2821,17 +2865,130 @@ def _build_discovery_runtime_state() -> Dict[str, Any]:
     }
 
 
+def _normalize_discovery_scope_key(value: Any) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return DISCOVERY_SCOPE_GLOBAL
+    return cleaned[:128]
+
+
+def _build_discovery_scope_metadata(
+    request: Optional[Request] = None,
+    auth_user: Optional[Dict[str, Any]] = None,
+    runtime_binding: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    resolved_user = auth_user
+    if resolved_user is None and request is not None:
+        resolved_user = getattr(getattr(request, "state", None), "auth_user", None)
+
+    binding = runtime_binding if isinstance(runtime_binding, dict) else _build_discovery_runtime_binding(
+        request=request,
+        auth_user=resolved_user,
+    )
+    active_mcp_config_name = str(binding.get("active_mcp_config_name") or "").strip() or None
+    clear_runtime_mcp = bool(binding.get("clear_runtime_mcp"))
+
+    if not is_auth_enabled() or not isinstance(resolved_user, dict):
+        return {
+            "scope_key": DISCOVERY_SCOPE_GLOBAL,
+            "scope_label": "Global",
+            "active_mcp_config_name": active_mcp_config_name,
+            "clear_runtime_mcp": clear_runtime_mcp,
+        }
+
+    if active_mcp_config_name:
+        return {
+            "scope_key": f"mcp:{active_mcp_config_name}",
+            "scope_label": active_mcp_config_name,
+            "active_mcp_config_name": active_mcp_config_name,
+            "clear_runtime_mcp": clear_runtime_mcp,
+        }
+
+    if clear_runtime_mcp:
+        return {
+            "scope_key": DISCOVERY_SCOPE_NO_MCP,
+            "scope_label": "No MCP",
+            "active_mcp_config_name": None,
+            "clear_runtime_mcp": True,
+        }
+
+    return {
+        "scope_key": DISCOVERY_SCOPE_GLOBAL,
+        "scope_label": "Global",
+        "active_mcp_config_name": None,
+        "clear_runtime_mcp": False,
+    }
+
+
+def _get_discovery_scope_connections(scope_key: Optional[str] = None) -> List[WebSocket]:
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL:
+        scoped_active_connections[DISCOVERY_SCOPE_GLOBAL] = active_connections
+        return active_connections
+    if normalized_scope_key not in scoped_active_connections:
+        scoped_active_connections[normalized_scope_key] = []
+    return scoped_active_connections[normalized_scope_key]
+
+
+def _has_any_discovery_connections() -> bool:
+    if active_connections:
+        return True
+    return any(
+        connections
+        for scope_key, connections in scoped_active_connections.items()
+        if scope_key != DISCOVERY_SCOPE_GLOBAL
+    )
+
+
+def _iter_active_discovery_scopes() -> List[str]:
+    scopes = set()
+    if active_connections:
+        scopes.add(DISCOVERY_SCOPE_GLOBAL)
+    for scope_key, connections in scoped_active_connections.items():
+        if connections:
+            scopes.add(_normalize_discovery_scope_key(scope_key))
+    return sorted(scopes)
+
+
+def _remove_discovery_scope_connection(websocket: WebSocket, scope_key: Optional[str] = None) -> None:
+    connections = _get_discovery_scope_connections(scope_key)
+    if websocket in connections:
+        connections.remove(websocket)
+
+
+def _get_discovery_runtime_state_for_scope(scope_key: Optional[str] = None) -> Dict[str, Any]:
+    global discovery_runtime_state
+
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL:
+        if not isinstance(discovery_runtime_state, dict):
+            discovery_runtime_state = _build_discovery_runtime_state()
+        discovery_runtime_state.setdefault("scope_key", DISCOVERY_SCOPE_GLOBAL)
+        discovery_runtime_state.setdefault("scope_label", "Global")
+        discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL] = discovery_runtime_state
+        return discovery_runtime_state
+
+    snapshot = discovery_runtime_states.get(normalized_scope_key)
+    if not isinstance(snapshot, dict):
+        snapshot = _build_discovery_runtime_state()
+        snapshot["scope_key"] = normalized_scope_key
+        snapshot["scope_label"] = normalized_scope_key
+        discovery_runtime_states[normalized_scope_key] = snapshot
+    return snapshot
+
+
 discovery_runtime_state: Dict[str, Any] = _build_discovery_runtime_state()
 
 
-def _snapshot_discovery_runtime_state() -> Dict[str, Any]:
-    snapshot = copy.deepcopy(discovery_runtime_state)
+def _snapshot_discovery_runtime_state(scope_key: Optional[str] = None) -> Dict[str, Any]:
+    snapshot = copy.deepcopy(_get_discovery_runtime_state_for_scope(scope_key))
     snapshot["is_active"] = snapshot.get("status") in DISCOVERY_ACTIVE_STATUSES
     return snapshot
 
 
 def _update_discovery_runtime_state(
     *,
+    scope_key: Optional[str] = None,
     reset: bool = False,
     status: Optional[str] = None,
     progress: Any = None,
@@ -2839,7 +2996,12 @@ def _update_discovery_runtime_state(
 ) -> Dict[str, Any]:
     global discovery_runtime_state
 
-    snapshot = _build_discovery_runtime_state() if reset else copy.deepcopy(discovery_runtime_state)
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    current_snapshot = _get_discovery_runtime_state_for_scope(normalized_scope_key)
+    snapshot = _build_discovery_runtime_state() if reset else copy.deepcopy(current_snapshot)
+    snapshot["scope_key"] = normalized_scope_key
+    if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL:
+        snapshot.setdefault("scope_label", "Global")
 
     if status is not None:
         normalized_status = str(status or "idle").strip().lower() or "idle"
@@ -2893,13 +3055,23 @@ def _update_discovery_runtime_state(
             snapshot["progress"]["eta_method"] = "stage_calibrated"
 
     snapshot["updated_at"] = _utcnow_iso()
-    discovery_runtime_state = snapshot
+    if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL:
+        discovery_runtime_state = snapshot
+        discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL] = discovery_runtime_state
+    else:
+        discovery_runtime_states[normalized_scope_key] = snapshot
     _persist_runtime_state()
-    return _snapshot_discovery_runtime_state()
+    return _snapshot_discovery_runtime_state(normalized_scope_key)
 
 
-def _append_discovery_runtime_activity(message_type: str, data: Any) -> Dict[str, Any]:
+def _append_discovery_runtime_activity(
+    message_type: str,
+    data: Any,
+    *,
+    scope_key: Optional[str] = None,
+) -> Dict[str, Any]:
     return _update_discovery_runtime_state(
+        scope_key=scope_key,
         append_activity={
             "type": message_type,
             "data": data,
@@ -2916,25 +3088,33 @@ def _build_websocket_message(message_type: str, data: Any) -> Dict[str, Any]:
     }
 
 
-async def _broadcast_websocket_message(message_type: str, data: Any):
+async def _broadcast_websocket_message(
+    message_type: str,
+    data: Any,
+    scope_key: Optional[str] = None,
+):
     message = _build_websocket_message(message_type, data)
 
     disconnected = []
-    for connection in active_connections:
+    for connection in _get_discovery_scope_connections(scope_key):
         try:
             await connection.send_text(json.dumps(message))
         except Exception:
             disconnected.append(connection)
 
     for conn in disconnected:
-        if conn in active_connections:
-            active_connections.remove(conn)
+        _remove_discovery_scope_connection(conn, scope_key)
 
 
-async def _broadcast_discovery_runtime_state(snapshot: Optional[Dict[str, Any]] = None):
-    discovery_snapshot = snapshot or _snapshot_discovery_runtime_state()
+async def _broadcast_discovery_runtime_state(
+    snapshot: Optional[Dict[str, Any]] = None,
+    *,
+    scope_key: Optional[str] = None,
+):
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key or (snapshot or {}).get("scope_key"))
+    discovery_snapshot = snapshot or _snapshot_discovery_runtime_state(normalized_scope_key)
     _remember_runtime_state_bridge_snapshot(discovery_snapshot)
-    await _broadcast_websocket_message("discovery_status", discovery_snapshot)
+    await _broadcast_websocket_message("discovery_status", discovery_snapshot, normalized_scope_key)
 
 
 @app.on_event("startup")
@@ -3178,6 +3358,27 @@ def _build_discovery_phase_plan(pipeline_version: Optional[str] = None) -> List[
     ]
 
 
+def _prime_discovery_phase_plan_for_start(
+    pipeline_version: Optional[str] = None,
+    *,
+    started_at: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    phase_plan = _build_discovery_phase_plan(pipeline_version)
+    if not phase_plan:
+        return phase_plan
+
+    bootstrap_phase = phase_plan[0]
+    bootstrap_started_at = started_at or _utcnow_iso()
+    bootstrap_phase["status"] = "active"
+    bootstrap_phase["started_at"] = bootstrap_phase.get("started_at") or bootstrap_started_at
+    bootstrap_phase["completed_at"] = None
+    bootstrap_phase["progress_percent"] = max(
+        float(bootstrap_phase.get("progress_percent") or 0.0),
+        float(bootstrap_phase.get("progress_start") or 0.0),
+    )
+    return phase_plan
+
+
 def _resolve_discovery_phase_definition(title: str, pipeline_version: Optional[str] = None) -> Optional[Dict[str, Any]]:
     normalized_title = _normalize_discovery_phase_token(title)
     if not normalized_title:
@@ -3293,13 +3494,18 @@ def _build_discovery_last_run_outcome(snapshot: Dict[str, Any]) -> Dict[str, Any
     }
 
 
-def _advance_discovery_runtime_phase(title: str) -> Dict[str, Any]:
-    snapshot = copy.deepcopy(discovery_runtime_state)
+def _advance_discovery_runtime_phase(title: str, *, scope_key: Optional[str] = None) -> Dict[str, Any]:
+    snapshot = _snapshot_discovery_runtime_state(scope_key)
     pipeline_version = snapshot.get("pipeline_version") or DISCOVERY_PIPELINE_VERSION
     phase_plan = snapshot.get("phase_plan") or _build_discovery_phase_plan(pipeline_version)
     definition = _resolve_discovery_phase_definition(title, pipeline_version)
     if definition is None:
-        return _update_discovery_runtime_state(status="running", current_phase_title=title, phase_plan=phase_plan)
+        return _update_discovery_runtime_state(
+            scope_key=scope_key,
+            status="running",
+            current_phase_title=title,
+            phase_plan=phase_plan,
+        )
 
     now_iso = _utcnow_iso()
     for phase_entry in phase_plan:
@@ -3339,6 +3545,7 @@ def _advance_discovery_runtime_phase(title: str) -> Dict[str, Any]:
     )
 
     return _update_discovery_runtime_state(
+        scope_key=scope_key,
         status="running",
         phase_plan=phase_plan,
         current_phase_key=target_phase.get("key"),
@@ -3349,13 +3556,14 @@ def _advance_discovery_runtime_phase(title: str) -> Dict[str, Any]:
 def _finalize_discovery_runtime(
     status: str,
     *,
+    scope_key: Optional[str] = None,
     error: Optional[str] = None,
     report_count: Optional[int] = None,
     result_timestamp: Optional[str] = None,
     completed_at: Optional[str] = None,
     **fields: Any,
 ) -> Dict[str, Any]:
-    snapshot = copy.deepcopy(discovery_runtime_state)
+    snapshot = _snapshot_discovery_runtime_state(scope_key)
     phase_plan = snapshot.get("phase_plan") or _build_discovery_phase_plan(snapshot.get("pipeline_version") or DISCOVERY_PIPELINE_VERSION)
     now_iso = completed_at or _utcnow_iso()
     normalized_status = str(status or "idle").strip().lower() or "idle"
@@ -3373,6 +3581,7 @@ def _finalize_discovery_runtime(
                 phase_entry["last_detail"] = error
 
     completed_snapshot = _update_discovery_runtime_state(
+        scope_key=scope_key,
         status=normalized_status,
         phase_plan=phase_plan,
         completed_at=now_iso,
@@ -3382,7 +3591,7 @@ def _finalize_discovery_runtime(
         **fields,
     )
     outcome = _build_discovery_last_run_outcome(completed_snapshot)
-    return _update_discovery_runtime_state(last_run_outcome=outcome)
+    return _update_discovery_runtime_state(scope_key=scope_key, last_run_outcome=outcome)
 
 
 def _runtime_state_store_path() -> Path:
@@ -3395,6 +3604,7 @@ def _normalize_summarization_progress_entry(
     session_id: str,
     payload: Any = None,
     *,
+    scope_key: Optional[str] = None,
     existing: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     source_payload = payload if isinstance(payload, dict) else {}
@@ -3423,6 +3633,7 @@ def _normalize_summarization_progress_entry(
         **current,
         **source_payload,
         "session_id": session_id,
+        "scope_key": _normalize_discovery_scope_key(scope_key or current.get("scope_key")),
         "stage": stage,
         "progress": max(0, min(100, progress)),
         "message": message,
@@ -3440,25 +3651,72 @@ def _normalize_summarization_progress_entry(
     return normalized
 
 
-def _set_summarization_progress(session_id: str, **fields: Any) -> Dict[str, Any]:
+def _summary_progress_storage_key(session_id: str, scope_key: Optional[str] = None) -> str:
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL:
+        return session_id
+    return f"{normalized_scope_key}::{session_id}"
+
+
+def _parse_summary_progress_storage_key(value: Any) -> Tuple[str, str]:
+    text = str(value or "").strip()
+    if "::" not in text:
+        return DISCOVERY_SCOPE_GLOBAL, text
+    scope_key, session_id = text.split("::", 1)
+    return _normalize_discovery_scope_key(scope_key), session_id
+
+
+def _get_summarization_progress(session_id: str, scope_key: Optional[str] = None) -> Dict[str, Any]:
+    return copy.deepcopy(
+        summarization_progress.get(
+            _summary_progress_storage_key(session_id, scope_key),
+            _default_summarization_progress_payload(),
+        )
+    )
+
+
+def _set_summarization_progress(session_id: str, *, scope_key: Optional[str] = None, **fields: Any) -> Dict[str, Any]:
+    storage_key = _summary_progress_storage_key(session_id, scope_key)
     entry = _normalize_summarization_progress_entry(
         session_id,
         fields,
-        existing=summarization_progress.get(session_id),
+        scope_key=scope_key,
+        existing=summarization_progress.get(storage_key),
     )
-    summarization_progress[session_id] = entry
+    summarization_progress[storage_key] = entry
     _persist_runtime_state()
     return copy.deepcopy(entry)
 
 
-def _clear_summarization_progress(session_id: str) -> None:
-    if session_id in summarization_progress:
-        del summarization_progress[session_id]
+def _clear_summarization_progress(session_id: str, *, scope_key: Optional[str] = None) -> None:
+    storage_key = _summary_progress_storage_key(session_id, scope_key)
+    if storage_key in summarization_progress:
+        del summarization_progress[storage_key]
         _persist_runtime_state()
 
 
-def _summary_artifact_path(session_id: str) -> Path:
-    return Path("output") / f"v2_ai_summary_{session_id}.json"
+def _resolve_discovery_scope_output_dir(scope_key: Optional[str] = None, *, create: bool = True) -> Path:
+    output_dir = Path("output")
+    if create:
+        output_dir.mkdir(exist_ok=True)
+
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL:
+        return output_dir
+
+    scopes_dir = output_dir / "scopes"
+    if create:
+        scopes_dir.mkdir(parents=True, exist_ok=True)
+
+    encoded_scope = base64.urlsafe_b64encode(normalized_scope_key.encode("utf-8")).decode("ascii").rstrip("=")
+    scope_dir = scopes_dir / encoded_scope
+    if create:
+        scope_dir.mkdir(parents=True, exist_ok=True)
+    return scope_dir
+
+
+def _summary_artifact_path(session_id: str, scope_key: Optional[str] = None) -> Path:
+    return _resolve_discovery_scope_output_dir(scope_key, create=False) / f"v2_ai_summary_{session_id}.json"
 
 
 def _restore_discovery_runtime_state(snapshot: Any) -> Dict[str, Any]:
@@ -3514,12 +3772,14 @@ def _restore_summarization_progress(snapshot: Any) -> Dict[str, Dict[str, Any]]:
     if not isinstance(snapshot, dict):
         return restored
 
-    for session_id, payload in snapshot.items():
+    for progress_key, payload in snapshot.items():
+        scope_key, session_id = _parse_summary_progress_storage_key(progress_key)
         if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
             continue
 
-        entry = _normalize_summarization_progress_entry(session_id, payload)
-        if _summary_artifact_path(session_id).exists():
+        storage_key = _summary_progress_storage_key(session_id, scope_key)
+        entry = _normalize_summarization_progress_entry(session_id, payload, scope_key=scope_key)
+        if _summary_artifact_path(session_id, scope_key).exists():
             entry = _normalize_summarization_progress_entry(
                 session_id,
                 {
@@ -3528,11 +3788,12 @@ def _restore_summarization_progress(snapshot: Any) -> Dict[str, Dict[str, Any]]:
                     "message": "Summary available from saved artifacts after restart.",
                     "worker_pid": None,
                 },
+                scope_key=scope_key,
                 existing=entry,
             )
         elif entry["stage"] not in SUMMARIZATION_TERMINAL_STAGES:
             if _is_runtime_worker_process() or _is_process_running(entry.get("worker_pid")):
-                restored[session_id] = entry
+                restored[storage_key] = entry
                 continue
 
             entry = _normalize_summarization_progress_entry(
@@ -3543,10 +3804,11 @@ def _restore_summarization_progress(snapshot: Any) -> Dict[str, Dict[str, Any]]:
                     "message": "The app restarted during summary generation. Re-run summarization for this session.",
                     "worker_pid": None,
                 },
+                scope_key=scope_key,
                 existing=entry,
             )
 
-        restored[session_id] = entry
+        restored[storage_key] = entry
 
     return restored
 
@@ -3554,27 +3816,49 @@ def _restore_summarization_progress(snapshot: Any) -> Dict[str, Dict[str, Any]]:
 def _load_persisted_runtime_state() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     state_path = _runtime_state_store_path()
     if not state_path.exists():
-        return _build_discovery_runtime_state(), {}
+        return {DISCOVERY_SCOPE_GLOBAL: _build_discovery_runtime_state()}, {}
 
     try:
         with open(state_path, "r", encoding="utf-8") as runtime_state_file:
             payload = json.load(runtime_state_file)
     except Exception as exc:
         print(f"Error loading runtime state from disk: {exc}")
-        return _build_discovery_runtime_state(), {}
+        return {DISCOVERY_SCOPE_GLOBAL: _build_discovery_runtime_state()}, {}
+
+    raw_discovery_payload = payload.get("discovery_runtime_states")
+    if not isinstance(raw_discovery_payload, dict):
+        raw_discovery_payload = {
+            DISCOVERY_SCOPE_GLOBAL: payload.get("discovery_runtime_state")
+        }
+
+    restored_discovery: Dict[str, Dict[str, Any]] = {}
+    for scope_key, discovery_payload in raw_discovery_payload.items():
+        normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+        restored_snapshot = _restore_discovery_runtime_state(discovery_payload)
+        restored_snapshot["scope_key"] = normalized_scope_key
+        restored_snapshot.setdefault(
+            "scope_label",
+            "Global" if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL else normalized_scope_key,
+        )
+        restored_discovery[normalized_scope_key] = restored_snapshot
+
+    if DISCOVERY_SCOPE_GLOBAL not in restored_discovery:
+        restored_discovery[DISCOVERY_SCOPE_GLOBAL] = _build_discovery_runtime_state()
 
     return (
-        _restore_discovery_runtime_state(payload.get("discovery_runtime_state")),
+        restored_discovery,
         _restore_summarization_progress(payload.get("summarization_progress")),
     )
 
 
 def _persist_runtime_state() -> None:
     state_path = _runtime_state_store_path()
+    discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL] = copy.deepcopy(_get_discovery_runtime_state_for_scope())
     payload = {
         "schema_version": RUNTIME_STATE_SCHEMA_VERSION,
         "saved_at": _utcnow_iso(),
-        "discovery_runtime_state": copy.deepcopy(discovery_runtime_state),
+        "discovery_runtime_state": copy.deepcopy(discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL]),
+        "discovery_runtime_states": copy.deepcopy(discovery_runtime_states),
         "summarization_progress": copy.deepcopy(summarization_progress),
     }
     temp_path = state_path.with_suffix(state_path.suffix + ".tmp")
@@ -3602,7 +3886,7 @@ def _capture_runtime_state_file_marker() -> Optional[Tuple[int, int]]:
 
 
 def _build_discovery_runtime_signature(snapshot: Optional[Dict[str, Any]] = None) -> str:
-    safe_snapshot = snapshot if isinstance(snapshot, dict) else _snapshot_discovery_runtime_state()
+    safe_snapshot = snapshot if isinstance(snapshot, dict) else copy.deepcopy(discovery_runtime_states)
     return json.dumps(safe_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -3619,7 +3903,7 @@ async def _check_for_persisted_runtime_state_rebroadcast(*, force: bool = False)
     if _is_runtime_worker_process():
         return False
 
-    if not active_connections and not force:
+    if not _has_any_discovery_connections() and not force:
         return False
 
     current_marker = _capture_runtime_state_file_marker()
@@ -3628,12 +3912,12 @@ async def _check_for_persisted_runtime_state_rebroadcast(*, force: bool = False)
 
     runtime_state_bridge_last_file_marker = current_marker
     _sync_runtime_state_from_disk()
-    snapshot = _snapshot_discovery_runtime_state()
-    snapshot_signature = _build_discovery_runtime_signature(snapshot)
+    snapshot_signature = _build_discovery_runtime_signature()
     if not force and snapshot_signature == runtime_state_bridge_last_discovery_signature:
         return False
 
-    await _broadcast_discovery_runtime_state(snapshot)
+    for active_scope_key in _iter_active_discovery_scopes():
+        await _broadcast_discovery_runtime_state(scope_key=active_scope_key)
     return True
 
 
@@ -3649,13 +3933,15 @@ async def _runtime_state_bridge_loop() -> None:
         await asyncio.sleep(RUNTIME_STATE_BRIDGE_POLL_INTERVAL_SECONDS)
 
 
-def _sync_runtime_state_from_disk() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
-    global discovery_runtime_state, summarization_progress
+def _sync_runtime_state_from_disk() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    global discovery_runtime_state, discovery_runtime_states, summarization_progress
 
     persisted_discovery, persisted_summarization = _load_persisted_runtime_state()
-    discovery_runtime_state = persisted_discovery
+    discovery_runtime_states = persisted_discovery
+    discovery_runtime_state = discovery_runtime_states.get(DISCOVERY_SCOPE_GLOBAL, _build_discovery_runtime_state())
+    discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL] = discovery_runtime_state
     summarization_progress = persisted_summarization
-    return copy.deepcopy(discovery_runtime_state), copy.deepcopy(summarization_progress)
+    return copy.deepcopy(discovery_runtime_states), copy.deepcopy(summarization_progress)
 
 
 def _runtime_job_dir() -> Path:
@@ -3736,7 +4022,9 @@ def _terminate_runtime_worker_process(value: Any) -> bool:
         return False
 
 
-discovery_runtime_state, summarization_progress = _load_persisted_runtime_state()
+discovery_runtime_states, summarization_progress = _load_persisted_runtime_state()
+discovery_runtime_state = discovery_runtime_states.get(DISCOVERY_SCOPE_GLOBAL, _build_discovery_runtime_state())
+discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL] = discovery_runtime_state
 _persist_runtime_state()
 
 chat_agent_memory: Dict[str, Dict[str, Any]] = {}
@@ -6845,8 +7133,62 @@ def _discovery_session_manifest_path() -> Path:
     return output_dir / "discovery_sessions.json"
 
 
-def _summary_infographic_dir() -> Path:
-    return Path("output") / SUMMARY_INFOGRAPHIC_DIRNAME
+def _discovery_scope_output_dir(scope_key: Optional[str] = None, *, create: bool = True) -> Path:
+    output_dir = Path("output")
+    if create:
+        output_dir.mkdir(exist_ok=True)
+
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL:
+        return output_dir
+
+    scopes_dir = output_dir / "scopes"
+    if create:
+        scopes_dir.mkdir(parents=True, exist_ok=True)
+
+    encoded_scope = base64.urlsafe_b64encode(normalized_scope_key.encode("utf-8")).decode("ascii").rstrip("=")
+    scope_dir = scopes_dir / encoded_scope
+    if create:
+        scope_dir.mkdir(parents=True, exist_ok=True)
+    return scope_dir
+
+
+def _summary_infographic_dir(scope_key: Optional[str] = None) -> Path:
+    return _discovery_scope_output_dir(scope_key) / SUMMARY_INFOGRAPHIC_DIRNAME
+
+
+def _get_discovery_session_scope_key(session: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(session, dict):
+        return DISCOVERY_SCOPE_GLOBAL
+    return _normalize_discovery_scope_key(session.get("scope_key"))
+
+
+def _filter_discovery_sessions_by_scope(
+    sessions: List[Dict[str, Any]],
+    scope_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if scope_key is None:
+        return list(sessions)
+
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    return [
+        session
+        for session in sessions
+        if _get_discovery_session_scope_key(session) == normalized_scope_key
+    ]
+
+
+def _find_discovery_session_record(
+    timestamp: str,
+    *,
+    scope_key: Optional[str] = None,
+    sessions: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    session_list = sessions if isinstance(sessions, list) else load_discovery_sessions(scope_key=scope_key)
+    for session in session_list:
+        if str(session.get("timestamp") or "") == str(timestamp or ""):
+            return session
+    return None
 
 
 def _extract_session_timestamp_from_artifact_name(filename: str) -> Optional[str]:
@@ -6886,13 +7228,13 @@ def _build_artifact_metadata(file_path: Path) -> Dict[str, Any]:
     }
 
 
-def _iter_catalog_artifact_paths() -> List[Path]:
-    output_dir = Path("output")
+def _iter_catalog_artifact_paths(scope_key: Optional[str] = None) -> List[Path]:
+    output_dir = _discovery_scope_output_dir(scope_key, create=False)
     artifact_paths: List[Path] = []
     if output_dir.exists():
         artifact_paths.extend(path for path in output_dir.glob("v2_*") if path.is_file())
 
-    infographic_dir = _summary_infographic_dir()
+    infographic_dir = _summary_infographic_dir(scope_key)
     if infographic_dir.exists():
         artifact_paths.extend(
             path
@@ -6905,12 +7247,13 @@ def _iter_catalog_artifact_paths() -> List[Path]:
     return sorted(artifact_paths, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
-def _resolve_output_artifact_path(filename: str) -> Path:
+def _resolve_output_artifact_path(filename: str, scope_key: Optional[str] = None) -> Path:
     safe_filename = sanitize_filename(filename)
     output_dir = Path("output").resolve()
+    scoped_output_dir = _discovery_scope_output_dir(scope_key, create=False)
     candidate_paths = [
-        (Path("output") / safe_filename).resolve(),
-        (_summary_infographic_dir() / safe_filename).resolve(),
+        (scoped_output_dir / safe_filename).resolve(),
+        (_summary_infographic_dir(scope_key) / safe_filename).resolve(),
     ]
     for candidate in candidate_paths:
         if not candidate.is_relative_to(output_dir):
@@ -6928,12 +7271,12 @@ def _resolve_external_catalog_artifact_path(filename: str) -> Path:
     raise HTTPException(status_code=404, detail="Report not found")
 
 
-def _find_existing_summary_infographic(timestamp: str) -> Optional[Path]:
+def _find_existing_summary_infographic(timestamp: str, scope_key: Optional[str] = None) -> Optional[Path]:
     safe_timestamp = str(timestamp or "").strip()
     if not safe_timestamp:
         return None
 
-    infographic_dir = _summary_infographic_dir()
+    infographic_dir = _summary_infographic_dir(scope_key)
     if not infographic_dir.exists():
         return None
 
@@ -6948,7 +7291,12 @@ def _find_existing_summary_infographic(timestamp: str) -> Optional[Path]:
     return None
 
 
-def _ensure_session_artifact_registered(timestamp: str, artifact_name: str) -> None:
+def _ensure_session_artifact_registered(
+    timestamp: str,
+    artifact_name: str,
+    *,
+    scope_key: Optional[str] = None,
+) -> None:
     safe_timestamp = str(timestamp or "").strip()
     safe_artifact_name = Path(str(artifact_name or "")).name
     if not safe_timestamp or not safe_artifact_name:
@@ -6956,12 +7304,24 @@ def _ensure_session_artifact_registered(timestamp: str, artifact_name: str) -> N
     if _extract_session_timestamp_from_artifact_name(safe_artifact_name) != safe_timestamp:
         return
 
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
     sessions = load_discovery_sessions()
     changed = False
-    session_record = next((session for session in sessions if str(session.get("timestamp") or "") == safe_timestamp), None)
+    session_record = next(
+        (
+            session
+            for session in sessions
+            if str(session.get("timestamp") or "") == safe_timestamp
+            and _get_discovery_session_scope_key(session) == normalized_scope_key
+        ),
+        None,
+    )
     if session_record is None:
         session_record = {
             "timestamp": safe_timestamp,
+            "scope_key": normalized_scope_key,
+            "scope_label": "Global" if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL else normalized_scope_key,
+            "active_mcp_config_name": None,
             "created_at": datetime.now().isoformat(),
             "overview": {},
             "report_paths": [],
@@ -7032,6 +7392,8 @@ def _normalize_discovery_sessions(sessions: List[Dict[str, Any]]) -> Tuple[List[
             changed = True
             continue
 
+        scope_key = _get_discovery_session_scope_key(session)
+
         raw_report_paths = session.get("report_paths", [])
         report_paths = raw_report_paths if isinstance(raw_report_paths, list) else []
         clean_report_paths: List[str] = []
@@ -7045,7 +7407,7 @@ def _normalize_discovery_sessions(sessions: List[Dict[str, Any]]) -> Tuple[List[
                 changed = True
                 continue
             try:
-                _resolve_output_artifact_path(safe_report_name)
+                _resolve_output_artifact_path(safe_report_name, scope_key=scope_key)
             except HTTPException:
                 changed = True
                 continue
@@ -7055,6 +7417,14 @@ def _normalize_discovery_sessions(sessions: List[Dict[str, Any]]) -> Tuple[List[
                 changed = True
 
         normalized_session = dict(session)
+        if normalized_session.get("scope_key") != scope_key:
+            normalized_session["scope_key"] = scope_key
+            changed = True
+        normalized_session.setdefault(
+            "scope_label",
+            "Global" if scope_key == DISCOVERY_SCOPE_GLOBAL else scope_key,
+        )
+        normalized_session.setdefault("active_mcp_config_name", None)
         if clean_report_paths != report_paths:
             normalized_session["report_paths"] = clean_report_paths
             changed = True
@@ -7073,45 +7443,60 @@ def _normalize_discovery_sessions(sessions: List[Dict[str, Any]]) -> Tuple[List[
 
 def _augment_sessions_with_catalog_artifacts(sessions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
     sessions, changed = _normalize_discovery_sessions(sessions)
-    sessions_by_timestamp: Dict[str, Dict[str, Any]] = {
-        str(session.get("timestamp") or ""): session
+    sessions_by_identity: Dict[Tuple[str, str], Dict[str, Any]] = {
+        (_get_discovery_session_scope_key(session), str(session.get("timestamp") or "")): session
         for session in sessions
         if isinstance(session, dict) and str(session.get("timestamp") or "").strip()
     }
 
-    for artifact_path in _iter_catalog_artifact_paths():
-        timestamp = _extract_session_timestamp_from_artifact_name(artifact_path.name)
-        if not timestamp:
-            continue
-        session_entry = sessions_by_timestamp.get(timestamp)
-        if session_entry is None:
-            session_entry = {
-                "timestamp": timestamp,
-                "created_at": datetime.fromtimestamp(artifact_path.stat().st_mtime).isoformat(),
-                "overview": {},
-                "report_paths": [],
-                "mcp_capabilities": {},
-                "stats": {
-                    "discovery_steps": 0,
-                    "classification_groups": 0,
-                    "recommendation_count": 0,
-                    "suggested_use_case_count": 0,
-                },
-            }
-            sessions.append(session_entry)
-            sessions_by_timestamp[timestamp] = session_entry
-            changed = True
+    scopes_to_scan = {
+        _get_discovery_session_scope_key(session)
+        for session in sessions
+        if isinstance(session, dict)
+    }
+    scopes_to_scan.add(DISCOVERY_SCOPE_GLOBAL)
 
-        report_paths = session_entry.setdefault("report_paths", [])
-        if artifact_path.name not in report_paths:
-            report_paths.append(artifact_path.name)
-            changed = True
+    for current_scope_key in scopes_to_scan:
+        for artifact_path in _iter_catalog_artifact_paths(current_scope_key):
+            timestamp = _extract_session_timestamp_from_artifact_name(artifact_path.name)
+            if not timestamp:
+                continue
+
+            session_identity = (current_scope_key, timestamp)
+            session_entry = sessions_by_identity.get(session_identity)
+            if session_entry is None:
+                if current_scope_key != DISCOVERY_SCOPE_GLOBAL:
+                    continue
+                session_entry = {
+                    "timestamp": timestamp,
+                    "scope_key": current_scope_key,
+                    "scope_label": "Global",
+                    "active_mcp_config_name": None,
+                    "created_at": datetime.fromtimestamp(artifact_path.stat().st_mtime).isoformat(),
+                    "overview": {},
+                    "report_paths": [],
+                    "mcp_capabilities": {},
+                    "stats": {
+                        "discovery_steps": 0,
+                        "classification_groups": 0,
+                        "recommendation_count": 0,
+                        "suggested_use_case_count": 0,
+                    },
+                }
+                sessions.append(session_entry)
+                sessions_by_identity[session_identity] = session_entry
+                changed = True
+
+            report_paths = session_entry.setdefault("report_paths", [])
+            if artifact_path.name not in report_paths:
+                report_paths.append(artifact_path.name)
+                changed = True
 
     sessions.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
     return sessions[:100], changed
 
 
-def load_discovery_sessions() -> List[Dict[str, Any]]:
+def load_discovery_sessions(scope_key: Optional[str] = None) -> List[Dict[str, Any]]:
     """Load persisted discovery session catalog."""
     manifest_path = _discovery_session_manifest_path()
     if not manifest_path.exists():
@@ -7144,7 +7529,7 @@ def load_discovery_sessions() -> List[Dict[str, Any]]:
         )
         if reconstructed:
             save_discovery_sessions(reconstructed)
-        return reconstructed
+        return _filter_discovery_sessions_by_scope(reconstructed, scope_key)
 
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -7153,7 +7538,7 @@ def load_discovery_sessions() -> List[Dict[str, Any]]:
             augmented_sessions, changed = _augment_sessions_with_catalog_artifacts(data)
             if changed:
                 save_discovery_sessions(augmented_sessions)
-            return augmented_sessions
+            return _filter_discovery_sessions_by_scope(augmented_sessions, scope_key)
     except Exception:
         pass
 
@@ -7180,13 +7565,25 @@ def register_discovery_session(
     suggested_use_cases: List[Dict[str, Any]],
     discovery_step_count: int,
     personas: Optional[Dict[str, Any]] = None,
-    readiness_score: Optional[int] = None
+    readiness_score: Optional[int] = None,
+    discovery_scope: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Register a discovery session in manifest for retrieval and UI history."""
     sessions = load_discovery_sessions()
+    normalized_scope = copy.deepcopy(discovery_scope) if isinstance(discovery_scope, dict) else {}
+    if not normalized_scope:
+        normalized_scope = {
+            "scope_key": DISCOVERY_SCOPE_GLOBAL,
+            "scope_label": "Global",
+            "active_mcp_config_name": None,
+        }
+    scope_key = _normalize_discovery_scope_key(normalized_scope.get("scope_key"))
 
     session_record = {
         "timestamp": timestamp,
+        "scope_key": scope_key,
+        "scope_label": normalized_scope.get("scope_label") or ("Global" if scope_key == DISCOVERY_SCOPE_GLOBAL else scope_key),
+        "active_mcp_config_name": normalized_scope.get("active_mcp_config_name"),
         "created_at": datetime.now().isoformat(),
         "overview": {
             "total_indexes": getattr(overview, "total_indexes", 0),
@@ -7209,11 +7606,62 @@ def register_discovery_session(
     }
 
     # Replace if same timestamp exists
-    sessions = [s for s in sessions if s.get("timestamp") != timestamp]
+    sessions = [
+        s for s in sessions
+        if not (
+            s.get("timestamp") == timestamp
+            and _get_discovery_session_scope_key(s) == scope_key
+        )
+    ]
     sessions.insert(0, session_record)
     sessions = sorted(sessions, key=lambda x: x.get("timestamp", ""), reverse=True)
     save_discovery_sessions(sessions[:100])
     return session_record
+
+
+def _require_accessible_discovery_session(
+    timestamp: str,
+    *,
+    scope_key: Optional[str] = None,
+    sessions: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    session = _find_discovery_session_record(timestamp, scope_key=scope_key, sessions=sessions)
+    if not isinstance(session, dict):
+        raise HTTPException(status_code=404, detail="Discovery session not found")
+    return session
+
+
+def _build_accessible_report_metadata(scope_key: Optional[str] = None) -> List[Dict[str, Any]]:
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    reports: List[Dict[str, Any]] = []
+    seen_names = set()
+
+    for session in sessions:
+        session_scope_key = _get_discovery_session_scope_key(session)
+        for report_name in session.get("report_paths", []):
+            safe_report_name = Path(str(report_name or "")).name
+            if not safe_report_name or safe_report_name in seen_names:
+                continue
+            try:
+                report_path = _resolve_output_artifact_path(safe_report_name, session_scope_key)
+            except HTTPException:
+                continue
+            reports.append(_build_artifact_metadata(report_path))
+            seen_names.add(safe_report_name)
+
+    reports.sort(key=lambda item: str(item.get("modified") or ""), reverse=True)
+    return reports
+
+
+def _resolve_accessible_output_artifact_path(filename: str, scope_key: Optional[str] = None) -> Path:
+    safe_filename = sanitize_filename(filename)
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    for session in sessions:
+        report_paths = session.get("report_paths", []) if isinstance(session.get("report_paths", []), list) else []
+        if safe_filename not in report_paths:
+            continue
+        return _resolve_output_artifact_path(safe_filename, _get_discovery_session_scope_key(session))
+    raise HTTPException(status_code=404, detail="Report not found")
 
 
 def _safe_int(value: Any) -> int:
@@ -8181,7 +8629,7 @@ def hydrate_discovery_session(session: Optional[Dict[str, Any]]) -> Optional[Dic
     if not isinstance(timestamp, str) or not timestamp.strip():
         return hydrated
 
-    export_path = Path("output") / f"discovery_export_{timestamp}.json"
+    export_path = _discovery_scope_output_dir(_get_discovery_session_scope_key(hydrated), create=False) / f"discovery_export_{timestamp}.json"
     if not export_path.exists():
         return hydrated
 
@@ -8242,10 +8690,11 @@ def _resolve_session_selection(
 
 def build_discovery_compare_payload(
     current_selection: Optional[str] = None,
-    baseline_selection: Optional[str] = None
+    baseline_selection: Optional[str] = None,
+    scope_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build compare payload across two discovery sessions."""
-    sessions = load_discovery_sessions()
+    sessions = load_discovery_sessions(scope_key=scope_key)
     if len(sessions) < 2:
         return {
             "has_data": False,
@@ -8331,9 +8780,10 @@ def build_session_runbook_payload(
     timestamp: Optional[str] = None,
     persona: str = "admin",
     voice: str = "direct",
+    scope_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build one-click operational runbook payload for a selected persona and session."""
-    sessions = load_discovery_sessions()
+    sessions = load_discovery_sessions(scope_key=scope_key)
     if not sessions:
         return {
             "has_data": False,
@@ -8472,9 +8922,9 @@ def build_session_runbook_payload(
     }
 
 
-def build_discovery_dashboard_payload() -> Dict[str, Any]:
+def build_discovery_dashboard_payload(scope_key: Optional[str] = None) -> Dict[str, Any]:
     """Build dashboard payload from persisted discovery sessions with simple trend analysis."""
-    sessions = load_discovery_sessions()
+    sessions = load_discovery_sessions(scope_key=scope_key)
     latest = sessions[0] if sessions else None
     previous = sessions[1] if len(sessions) > 1 else None
 
@@ -8523,38 +8973,43 @@ def build_discovery_dashboard_payload() -> Dict[str, Any]:
     }
 
 
-def load_latest_v2_blueprint() -> Optional[Dict[str, Any]]:
+def load_latest_v2_blueprint(scope_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Load the latest intelligence blueprint artifact if available."""
-    output_dir = Path("output")
-    if not output_dir.exists():
-        return None
-
-    candidates = sorted(output_dir.glob("v2_intelligence_blueprint_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        return None
-
-    latest = candidates[0]
-    try:
-        payload = json.loads(latest.read_text(encoding="utf-8"))
-        if isinstance(payload, dict):
-            payload["_artifact"] = {
-                "name": latest.name,
-                "modified": datetime.fromtimestamp(latest.stat().st_mtime).isoformat(),
-                "size": latest.stat().st_size
-            }
-            return payload
-    except Exception:
-        return None
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    for session in sessions:
+        session_scope_key = _get_discovery_session_scope_key(session)
+        report_names = session.get("report_paths", []) if isinstance(session.get("report_paths", []), list) else []
+        blueprint_name = next(
+            (
+                report_name
+                for report_name in report_names
+                if str(report_name).startswith("v2_intelligence_blueprint_") and str(report_name).endswith(".json")
+            ),
+            None,
+        )
+        if blueprint_name is None:
+            blueprint_name = f"v2_intelligence_blueprint_{session.get('timestamp')}.json"
+        try:
+            latest = _resolve_output_artifact_path(blueprint_name, session_scope_key)
+        except HTTPException:
+            continue
+        try:
+            payload = json.loads(latest.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                payload["_artifact"] = {
+                    "name": latest.name,
+                    "modified": datetime.fromtimestamp(latest.stat().st_mtime).isoformat(),
+                    "size": latest.stat().st_size
+                }
+                return payload
+        except Exception:
+            return None
     return None
 
 
-def build_v2_artifact_catalog() -> Dict[str, Any]:
+def build_v2_artifact_catalog(scope_key: Optional[str] = None) -> Dict[str, Any]:
     """Build the artifact catalog for the Artifacts workspace tab."""
-    output_dir = Path("output")
-    if not output_dir.exists():
-        return {"has_data": False, "artifacts": []}
-
-    artifacts = [_build_artifact_metadata(file_path) for file_path in _iter_catalog_artifact_paths()]
+    artifacts = _build_accessible_report_metadata(scope_key)
 
     return {
         "has_data": len(artifacts) > 0,
@@ -8808,16 +9263,26 @@ def validate_session_id(session_id: str) -> str:
     return session_id
 
 
+def _resolve_websocket_authenticated_user(websocket: WebSocket) -> Optional[Dict[str, Any]]:
+    if not is_auth_enabled():
+        return None
+    session_token = websocket.cookies.get(AUTH_SESSION_COOKIE_NAME, "")
+    if not session_token:
+        return None
+    return security_manager.resolve_session(session_token)
+
+
 class WebSocketDisplayManager:
     """Display manager that sends updates via WebSocket."""
     
-    def __init__(self):
+    def __init__(self, scope_key: Optional[str] = None):
         self.verbose = True
         self.start_time = datetime.now()
+        self.scope_key = _normalize_discovery_scope_key(scope_key)
     
     async def send_to_clients(self, message_type: str, data: Dict[str, Any]):
         """Send message to all connected WebSocket clients."""
-        await _broadcast_websocket_message(message_type, data)
+        await _broadcast_websocket_message(message_type, data, self.scope_key)
     
     async def show_banner(self):
         banner_payload = {
@@ -8825,29 +9290,29 @@ class WebSocketDisplayManager:
             "subtitle": "Intelligent Environment Analysis & Recommendation Engine",
             "start_time": self.start_time.strftime('%Y-%m-%d %H:%M:%S')
         }
-        _append_discovery_runtime_activity("banner", banner_payload)
+        _append_discovery_runtime_activity("banner", banner_payload, scope_key=self.scope_key)
         await self.send_to_clients("banner", banner_payload)
     
     def phase(self, title: str):
-        _advance_discovery_runtime_phase(title)
-        snapshot = _append_discovery_runtime_activity("phase", {"title": title})
-        asyncio.create_task(_broadcast_discovery_runtime_state(snapshot))
+        _advance_discovery_runtime_phase(title, scope_key=self.scope_key)
+        snapshot = _append_discovery_runtime_activity("phase", {"title": title}, scope_key=self.scope_key)
+        asyncio.create_task(_broadcast_discovery_runtime_state(snapshot, scope_key=self.scope_key))
         asyncio.create_task(self.send_to_clients("phase", {"title": title}))
     
     def success(self, message: str):
-        _append_discovery_runtime_activity("success", {"message": message})
+        _append_discovery_runtime_activity("success", {"message": message}, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("success", {"message": message}))
     
     def error(self, message: str):
-        _append_discovery_runtime_activity("error", {"message": message})
+        _append_discovery_runtime_activity("error", {"message": message}, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("error", {"message": message}))
     
     def warning(self, message: str):
-        _append_discovery_runtime_activity("warning", {"message": message})
+        _append_discovery_runtime_activity("warning", {"message": message}, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("warning", {"message": message}))
     
     def info(self, message: str):
-        _append_discovery_runtime_activity("info", {"message": message})
+        _append_discovery_runtime_activity("info", {"message": message}, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("info", {"message": message}))
     
     def show_overview_summary(self, overview):
@@ -8859,11 +9324,11 @@ class WebSocketDisplayManager:
             "estimated_time": overview.estimated_time,
             "notable_patterns": overview.notable_patterns
         }
-        _append_discovery_runtime_activity("overview", overview_payload)
+        _append_discovery_runtime_activity("overview", overview_payload, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("overview", overview_payload))
     
     def show_classification_summary(self, classifications: Dict[str, Any]):
-        _append_discovery_runtime_activity("classification", classifications)
+        _append_discovery_runtime_activity("classification", classifications, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("classification", classifications))
     
     def show_recommendations_preview(self, recommendations: List):
@@ -8871,7 +9336,7 @@ class WebSocketDisplayManager:
             "count": len(recommendations),
             "top_recommendations": recommendations[:5]  # Show top 5
         }
-        _append_discovery_runtime_activity("recommendations", recommendation_payload)
+        _append_discovery_runtime_activity("recommendations", recommendation_payload, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("recommendations", recommendation_payload))
     
     def show_suggested_use_cases_preview(self, use_cases: List):
@@ -8879,7 +9344,7 @@ class WebSocketDisplayManager:
             "count": len(use_cases),
             "preview": use_cases[:3]  # Show top 3
         }
-        _append_discovery_runtime_activity("use_cases", use_case_payload)
+        _append_discovery_runtime_activity("use_cases", use_case_payload, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("use_cases", use_case_payload))
     
     def show_final_summary(self, report_paths: List[str]):
@@ -8888,7 +9353,7 @@ class WebSocketDisplayManager:
             "duration": str(elapsed),
             "report_paths": report_paths
         }
-        _append_discovery_runtime_activity("completion", completion_payload)
+        _append_discovery_runtime_activity("completion", completion_payload, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("completion", completion_payload))
     
     async def handle_rate_limit_callback(self, event_type: str, data: Dict[str, Any]):
@@ -8901,12 +9366,13 @@ class WebSocketDisplayManager:
 class ProgressTracker:
     """Enhanced progress tracking with WebSocket updates."""
     
-    def __init__(self):
+    def __init__(self, scope_key: Optional[str] = None):
         self.total_steps = 0
         self.current_step = 0
         self.current_phase = ""
         self.current_description = ""
         self.start_time = None
+        self.scope_key = _normalize_discovery_scope_key(scope_key)
     
     def set_total_steps(self, total: int):
         self.total_steps = total
@@ -8927,26 +9393,48 @@ class ProgressTracker:
                 "eta_seconds": None,
                 "eta_method": "stage_calibrated",
             }
-            snapshot = _update_discovery_runtime_state(status="running", progress=progress_payload)
-            await _broadcast_websocket_message("progress", snapshot.get("progress") or progress_payload)
+            snapshot = _update_discovery_runtime_state(
+                scope_key=self.scope_key,
+                status="running",
+                progress=progress_payload,
+            )
+            await _broadcast_websocket_message(
+                "progress",
+                snapshot.get("progress") or progress_payload,
+                self.scope_key,
+            )
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time updates."""
+    auth_user = _resolve_websocket_authenticated_user(websocket)
+    if is_auth_enabled() and not isinstance(auth_user, dict):
+        await websocket.close(code=4401, reason="Authentication required")
+        return
+
+    scope_info = _build_discovery_scope_metadata(auth_user=auth_user)
+    scope_key = scope_info.get("scope_key")
+
     await websocket.accept()
-    active_connections.append(websocket)
+    _get_discovery_scope_connections(scope_key).append(websocket)
 
     _sync_runtime_state_from_disk()
-    await websocket.send_text(json.dumps(_build_websocket_message("discovery_status", _snapshot_discovery_runtime_state())))
+    await websocket.send_text(
+        json.dumps(
+            _build_websocket_message(
+                "discovery_status",
+                _snapshot_discovery_runtime_state(scope_key),
+            )
+        )
+    )
     
     try:
         while True:
             # Keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
-        if websocket in active_connections:
-            active_connections.remove(websocket)
+        _remove_discovery_scope_connection(websocket, scope_key)
 
 
 @app.websocket("/ws/debug")
@@ -8991,19 +9479,21 @@ async def start_discovery(request: Request, background_tasks: BackgroundTasks):
     global current_discovery_session
 
     _sync_runtime_state_from_disk()
-    active_snapshot = _snapshot_discovery_runtime_state()
+    worker_binding = _build_discovery_runtime_binding(request=request)
+    scope_info = _build_discovery_scope_metadata(request=request, runtime_binding=worker_binding)
+    scope_key = scope_info.get("scope_key")
+    active_snapshot = _snapshot_discovery_runtime_state(scope_key)
     if active_snapshot.get("status") in DISCOVERY_ACTIVE_STATUSES:
         return {"error": "Discovery already in progress", "discovery": active_snapshot}
 
     if current_discovery_session and not current_discovery_session.done():
         return {"error": "Discovery already in progress", "discovery": active_snapshot}
 
-    worker_binding = _build_discovery_runtime_binding(request=request)
-
     try:
         worker_process = _launch_runtime_job_worker(
             "discovery",
             {
+                "scope": scope_info,
                 "runtime_binding": worker_binding,
                 "requested_at": _utcnow_iso(),
                 "pipeline_version": DISCOVERY_PIPELINE_VERSION,
@@ -9013,29 +9503,39 @@ async def start_discovery(request: Request, background_tasks: BackgroundTasks):
         error_message = f"Failed to launch discovery worker: {exc}"
         discovery_snapshot = _finalize_discovery_runtime(
             "error",
+            scope_key=scope_key,
             error=error_message,
             worker_pid=None,
             execution_mode="worker",
         )
-        await _broadcast_discovery_runtime_state(discovery_snapshot)
+        await _broadcast_discovery_runtime_state(discovery_snapshot, scope_key=scope_key)
         raise HTTPException(status_code=500, detail=error_message)
 
     current_discovery_session = None
+    discovery_started_at = _utcnow_iso()
+    phase_plan = _prime_discovery_phase_plan_for_start(
+        DISCOVERY_PIPELINE_VERSION,
+        started_at=discovery_started_at,
+    )
+    bootstrap_phase = phase_plan[0] if phase_plan else None
     discovery_snapshot = _update_discovery_runtime_state(
+        scope_key=scope_key,
         reset=True,
+        scope_label=scope_info.get("scope_label"),
+        active_mcp_config_name=scope_info.get("active_mcp_config_name"),
         status="starting",
         session_id=worker_process.pid,
         worker_pid=worker_process.pid,
         execution_mode="worker",
         pipeline_version=DISCOVERY_PIPELINE_VERSION,
-        started_at=_utcnow_iso(),
+        started_at=discovery_started_at,
         completed_at=None,
         result_timestamp=None,
         report_count=0,
         error=None,
-        current_phase_key=None,
-        current_phase_title=None,
-        phase_plan=_build_discovery_phase_plan(DISCOVERY_PIPELINE_VERSION),
+        current_phase_key=bootstrap_phase.get("key") if bootstrap_phase else None,
+        current_phase_title=(bootstrap_phase.get("title") or bootstrap_phase.get("label")) if bootstrap_phase else None,
+        phase_plan=phase_plan,
         activity_log=[],
         last_run_outcome=None,
         progress={
@@ -9053,8 +9553,9 @@ async def start_discovery(request: Request, background_tasks: BackgroundTasks):
             "message": "Discovery worker launched. Progress is now backed by durable runtime state.",
             "worker_pid": worker_process.pid,
         },
+        scope_key=scope_key,
     )
-    await _broadcast_discovery_runtime_state(discovery_snapshot)
+    await _broadcast_discovery_runtime_state(discovery_snapshot, scope_key=scope_key)
 
     return {
         "status": "Discovery started",
@@ -9065,16 +9566,19 @@ async def start_discovery(request: Request, background_tasks: BackgroundTasks):
             "active_mcp_config_name": worker_binding.get("active_mcp_config_name"),
             "clear_runtime_mcp": bool(worker_binding.get("clear_runtime_mcp")),
         },
+        "scope": scope_info,
     }
 
 
 @app.post("/abort-discovery")
-async def abort_discovery():
+async def abort_discovery(request: Request):
     """Abort the current discovery process."""
     global current_discovery_session
 
     _sync_runtime_state_from_disk()
-    snapshot = _snapshot_discovery_runtime_state()
+    scope_info = _build_discovery_scope_metadata(request=request)
+    scope_key = scope_info.get("scope_key")
+    snapshot = _snapshot_discovery_runtime_state(scope_key)
     has_in_process_task = bool(current_discovery_session and not current_discovery_session.done())
     has_worker_process = snapshot.get("status") in DISCOVERY_ACTIVE_STATUSES and _is_process_running(snapshot.get("worker_pid"))
     if not has_in_process_task and not has_worker_process:
@@ -9088,41 +9592,57 @@ async def abort_discovery():
         raise HTTPException(status_code=500, detail="Failed to stop discovery worker")
 
     _update_discovery_runtime_state(
+        scope_key=scope_key,
         progress={
-            **(discovery_runtime_state.get("progress") or {}),
+            **(snapshot.get("progress") or {}),
             "description": "Discovery stopped by operator.",
         },
     )
     discovery_snapshot = _finalize_discovery_runtime(
         "aborted",
+        scope_key=scope_key,
         error="Discovery aborted by user",
         worker_pid=None,
     )
-    await _broadcast_websocket_message("warning", {"message": "⚠️ Discovery aborted by user"})
-    await _broadcast_discovery_runtime_state(discovery_snapshot)
+    await _broadcast_websocket_message("warning", {"message": "⚠️ Discovery aborted by user"}, scope_key)
+    await _broadcast_discovery_runtime_state(discovery_snapshot, scope_key=scope_key)
 
     return {"status": "Discovery aborted", "discovery": discovery_snapshot}
 
 
-async def run_discovery(runtime_config: Any = None):
+async def run_discovery(
+    runtime_config: Any = None,
+    *,
+    scope_key: Optional[str] = None,
+    scope_info: Optional[Dict[str, Any]] = None,
+):
     """Run the complete discovery process with WebSocket updates."""
     display = None
+    normalized_scope_key = _normalize_discovery_scope_key(scope_key)
+    resolved_scope_info = copy.deepcopy(scope_info or {})
     try:
         if _is_runtime_worker_process():
             _sync_runtime_state_from_disk()
             _update_discovery_runtime_state(
+                scope_key=normalized_scope_key,
                 status="starting",
                 worker_pid=os.getpid(),
                 execution_mode="worker",
             )
         else:
-            _update_discovery_runtime_state(execution_mode="inline")
+            _update_discovery_runtime_state(scope_key=normalized_scope_key, execution_mode="inline")
 
         # Load configuration
         config = runtime_config or config_manager.get()
+        if not resolved_scope_info:
+            resolved_scope_info = {
+                "scope_key": normalized_scope_key,
+                "scope_label": "Global" if normalized_scope_key == DISCOVERY_SCOPE_GLOBAL else normalized_scope_key,
+                "active_mcp_config_name": getattr(config, "active_mcp_config_name", None),
+            }
         
         # Initialize display manager with WebSocket support
-        display = WebSocketDisplayManager()
+        display = WebSocketDisplayManager(normalized_scope_key)
         await display.show_banner()
         
         # Validate MCP configuration
@@ -9166,11 +9686,14 @@ async def run_discovery(runtime_config: Any = None):
         display.success("✅ Discovery engine initialized")
         
         # Initialize progress tracker
-        progress = ProgressTracker()
+        progress = ProgressTracker(normalized_scope_key)
 
         if DISCOVERY_PIPELINE_VERSION == "v2":
             display.phase("🚀 Discovery Pipeline")
-            v2_pipeline = DiscoveryV2Pipeline(discovery_engine)
+            v2_pipeline = DiscoveryV2Pipeline(
+                discovery_engine,
+                output_root=_discovery_scope_output_dir(normalized_scope_key),
+            )
             v2_result = await v2_pipeline.run(display, progress)
 
             overview = v2_result.get("overview")
@@ -9213,13 +9736,15 @@ async def run_discovery(runtime_config: Any = None):
                 suggested_use_cases=suggested_use_cases if isinstance(suggested_use_cases, list) else [],
                 discovery_step_count=discovery_step_count,
                 personas=persona_playbooks,
-                readiness_score=readiness_score
+                readiness_score=readiness_score,
+                discovery_scope=resolved_scope_info,
             )
 
             display.success("✅ Discovery artifact bundle generated")
             display.show_final_summary(report_paths)
 
             _update_discovery_runtime_state(
+                scope_key=normalized_scope_key,
                 progress={
                     "percentage": 100,
                     "current_step": 100,
@@ -9231,10 +9756,11 @@ async def run_discovery(runtime_config: Any = None):
             )
             discovery_snapshot = _finalize_discovery_runtime(
                 "completed",
+                scope_key=normalized_scope_key,
                 report_count=len(report_paths),
                 result_timestamp=timestamp,
             )
-            await _broadcast_discovery_runtime_state(discovery_snapshot)
+            await _broadcast_discovery_runtime_state(discovery_snapshot, scope_key=normalized_scope_key)
 
             return {
                 "status": "success",
@@ -9308,7 +9834,7 @@ async def run_discovery(runtime_config: Any = None):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Create output directory if it doesn't exist
-        output_dir = Path("output")
+        output_dir = _discovery_scope_output_dir(normalized_scope_key)
         output_dir.mkdir(exist_ok=True)
         
         report_paths = []
@@ -9646,7 +10172,8 @@ async def run_discovery(runtime_config: Any = None):
             suggested_use_cases=suggested_use_cases if isinstance(suggested_use_cases, list) else [],
             discovery_step_count=len(discovery_results),
             personas=persona_playbooks,
-            readiness_score=readiness_score
+            readiness_score=readiness_score,
+            discovery_scope=resolved_scope_info,
         )
         
         # Phase 7: Complete Discovery
@@ -9661,6 +10188,7 @@ async def run_discovery(runtime_config: Any = None):
         })
 
         _update_discovery_runtime_state(
+            scope_key=normalized_scope_key,
             progress={
                 "percentage": 100,
                 "current_step": 100,
@@ -9672,10 +10200,11 @@ async def run_discovery(runtime_config: Any = None):
         )
         discovery_snapshot = _finalize_discovery_runtime(
             "completed",
+            scope_key=normalized_scope_key,
             report_count=len(report_paths),
             result_timestamp=timestamp,
         )
-        await _broadcast_discovery_runtime_state(discovery_snapshot)
+        await _broadcast_discovery_runtime_state(discovery_snapshot, scope_key=normalized_scope_key)
         
         # Return completion status
         return {
@@ -9698,19 +10227,25 @@ async def run_discovery(runtime_config: Any = None):
     except asyncio.CancelledError:
         # User aborted the discovery
         print("Discovery cancelled by user")
+        current_snapshot = _snapshot_discovery_runtime_state(normalized_scope_key)
         _update_discovery_runtime_state(
+            scope_key=normalized_scope_key,
             progress={
-                **(discovery_runtime_state.get("progress") or {}),
+                **(current_snapshot.get("progress") or {}),
                 "description": "Discovery stopped by operator.",
             },
         )
-        discovery_snapshot = _finalize_discovery_runtime("aborted", error="Discovery aborted by user")
+        discovery_snapshot = _finalize_discovery_runtime(
+            "aborted",
+            scope_key=normalized_scope_key,
+            error="Discovery aborted by user",
+        )
         if display:
             await display.send_to_clients("warning", {
                 "message": "⚠️ Discovery aborted by user",
                 "type": "user_abort"
             })
-        await _broadcast_discovery_runtime_state(discovery_snapshot)
+        await _broadcast_discovery_runtime_state(discovery_snapshot, scope_key=normalized_scope_key)
         raise  # Re-raise to properly cancel the task
     
     except Exception as e:
@@ -9720,13 +10255,20 @@ async def run_discovery(runtime_config: Any = None):
         print(f"ERROR in run_discovery: {error_message}")
         print(f"Traceback: {traceback_str}")
 
+        current_snapshot = _snapshot_discovery_runtime_state(normalized_scope_key)
+
         _update_discovery_runtime_state(
+            scope_key=normalized_scope_key,
             progress={
-                **(discovery_runtime_state.get("progress") or {}),
+                **(current_snapshot.get("progress") or {}),
                 "description": error_message,
             },
         )
-        discovery_snapshot = _finalize_discovery_runtime("error", error=str(e))
+        discovery_snapshot = _finalize_discovery_runtime(
+            "error",
+            scope_key=normalized_scope_key,
+            error=str(e),
+        )
         
         if display:
             await display.send_to_clients("error", {
@@ -9735,7 +10277,7 @@ async def run_discovery(runtime_config: Any = None):
             })
         else:
             # Fallback if display is not initialized
-            for connection in active_connections:
+            for connection in _get_discovery_scope_connections(normalized_scope_key):
                 try:
                     await connection.send_json({
                         "type": "error",
@@ -9743,30 +10285,27 @@ async def run_discovery(runtime_config: Any = None):
                     })
                 except:
                     pass
-        await _broadcast_discovery_runtime_state(discovery_snapshot)
+        await _broadcast_discovery_runtime_state(discovery_snapshot, scope_key=normalized_scope_key)
         return {"status": "error", "message": str(e)}
 
 
 @app.get("/reports")
-async def list_reports():
+async def list_reports(request: Request):
     """Get the list of available discovery reports."""
-    output_dir = Path("output")
-    if not output_dir.exists():
-        return {"reports": [], "sessions": []}
-    
-    reports = [_build_artifact_metadata(file_path) for file_path in _iter_catalog_artifact_paths()]
-    
-    sessions = load_discovery_sessions()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    reports = _build_accessible_report_metadata(scope_key)
     return {
-        "reports": sorted(reports, key=lambda x: x["modified"], reverse=True),
+        "reports": reports,
         "sessions": sessions
     }
 
 
 @app.get("/api/discovery/sessions")
-async def get_discovery_sessions():
+async def get_discovery_sessions(request: Request):
     """Return persisted discovery sessions for history UI and retrieval."""
-    sessions = load_discovery_sessions()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    sessions = load_discovery_sessions(scope_key=scope_key)
     return {
         "sessions": sessions,
         "count": len(sessions)
@@ -9774,17 +10313,17 @@ async def get_discovery_sessions():
 
 
 @app.get("/api/discovery/sessions/{timestamp}")
-async def get_discovery_session(timestamp: str):
+async def get_discovery_session(timestamp: str, request: Request):
     """Return a specific discovery session and resolved report metadata."""
-    sessions = load_discovery_sessions()
-    session = next((s for s in sessions if s.get("timestamp") == timestamp), None)
-    if not session:
-        raise HTTPException(status_code=404, detail="Discovery session not found")
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    session = _require_accessible_discovery_session(timestamp, scope_key=scope_key, sessions=sessions)
+    session_scope_key = _get_discovery_session_scope_key(session)
 
     files = []
     for report_name in session.get("report_paths", []):
         try:
-            report_path = _resolve_output_artifact_path(report_name)
+            report_path = _resolve_output_artifact_path(report_name, session_scope_key)
         except HTTPException:
             report_path = None
         files.append({
@@ -9803,22 +10342,25 @@ async def get_discovery_session(timestamp: str):
 
 
 @app.get("/api/discovery/dashboard")
-async def get_discovery_dashboard():
+async def get_discovery_dashboard(request: Request):
     """Return latest discovery intelligence dashboard payload for UI hub."""
-    return build_discovery_dashboard_payload()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return build_discovery_dashboard_payload(scope_key=scope_key)
 
 
 @app.get("/api/discovery/status")
-async def get_discovery_runtime_status():
+async def get_discovery_runtime_status(request: Request):
     """Return current discovery runtime status for header and workspace hydration."""
     _sync_runtime_state_from_disk()
-    return _snapshot_discovery_runtime_state()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return _snapshot_discovery_runtime_state(scope_key)
 
 
 @app.get("/api/v2/intelligence")
-async def get_v2_intelligence():
+async def get_v2_intelligence(request: Request):
     """Return the latest intelligence blueprint for the workspace UI."""
-    payload = load_latest_v2_blueprint()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    payload = load_latest_v2_blueprint(scope_key=scope_key)
     if not payload:
         return {"has_data": False, "message": "No intelligence blueprint found."}
     overview = payload.get("overview", {}) if isinstance(payload.get("overview", {}), dict) else {}
@@ -9831,29 +10373,33 @@ async def get_v2_intelligence():
 
 
 @app.get("/api/v2/artifacts")
-async def get_v2_artifacts():
+async def get_v2_artifacts(request: Request):
     """Return the artifact catalog for the workspace view."""
-    return build_v2_artifact_catalog()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return build_v2_artifact_catalog(scope_key=scope_key)
 
 
 @app.get("/api/discovery/compare")
-async def get_discovery_compare(current: Optional[str] = None, baseline: Optional[str] = None):
+async def get_discovery_compare(request: Request, current: Optional[str] = None, baseline: Optional[str] = None):
     """Return comparative metrics between two discovery sessions."""
-    return build_discovery_compare_payload(current, baseline)
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return build_discovery_compare_payload(current, baseline, scope_key=scope_key)
 
 
 @app.get("/api/discovery/runbook")
-async def get_discovery_runbook(timestamp: Optional[str] = None, persona: str = "admin", voice: str = "direct"):
+async def get_discovery_runbook(request: Request, timestamp: Optional[str] = None, persona: str = "admin", voice: str = "direct"):
     """Return persona-scoped operational runbook for a selected discovery session."""
-    return build_session_runbook_payload(timestamp, persona, _normalize_operator_voice(voice))
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return build_session_runbook_payload(timestamp, persona, _normalize_operator_voice(voice), scope_key=scope_key)
 
 
 @app.get("/api/discovery/results")
-async def get_discovery_results():
+async def get_discovery_results(request: Request):
     """
     Discovery results summary endpoint for latest session.
     """
-    sessions = load_discovery_sessions()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    sessions = load_discovery_sessions(scope_key=scope_key)
     latest = sessions[0] if sessions else None
     return {
         "message": "Discovery sessions are persisted and available via /api/discovery/sessions.",
@@ -9864,10 +10410,11 @@ async def get_discovery_results():
 
 
 @app.get("/reports/{filename}")
-async def get_report(filename: str):
+async def get_report(filename: str, request: Request):
     """Get a specific report file with security validation."""
     try:
-        file_path = _resolve_output_artifact_path(filename)
+        scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+        file_path = _resolve_accessible_output_artifact_path(filename, scope_key)
         
         if file_path.suffix.lower() == ".json":
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -11665,9 +12212,14 @@ async def list_models(request: Request):
 
 
 @app.get("/api/summary/infographic-capability")
-async def get_summary_infographic_capability(timestamp: Optional[str] = None):
+async def get_summary_infographic_capability(request: Request, timestamp: Optional[str] = None):
     """Return whether the active OpenAI credential can access gpt-image-2."""
-    existing_artifact = _find_existing_summary_infographic(timestamp) if timestamp else None
+    request_scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    session_scope_key = request_scope_key
+    if timestamp:
+        session = _require_accessible_discovery_session(timestamp, scope_key=request_scope_key)
+        session_scope_key = _get_discovery_session_scope_key(session)
+    existing_artifact = _find_existing_summary_infographic(timestamp, session_scope_key) if timestamp else None
     config = config_manager.get()
     provider = normalize_provider_name(config.llm.provider)
 
@@ -11733,7 +12285,7 @@ async def get_summary_infographic_capability(timestamp: Optional[str] = None):
 
 
 @app.post("/api/summary/generate-infographic")
-async def generate_summary_infographic(request: SummaryInfographicRequest):
+async def generate_summary_infographic(request: SummaryInfographicRequest, http_request: Request):
     """Generate an infographic image from the current summary using gpt-image-2."""
     config = config_manager.get()
     provider = normalize_provider_name(config.llm.provider)
@@ -11747,9 +12299,13 @@ async def generate_summary_infographic(request: SummaryInfographicRequest):
     if not timestamp:
         raise HTTPException(status_code=400, detail="timestamp is required")
 
-    existing_infographic = _find_existing_summary_infographic(timestamp)
+    request_scope_key = _build_discovery_scope_metadata(request=http_request).get("scope_key")
+    session = _require_accessible_discovery_session(timestamp, scope_key=request_scope_key)
+    session_scope_key = _get_discovery_session_scope_key(session)
+
+    existing_infographic = _find_existing_summary_infographic(timestamp, session_scope_key)
     if existing_infographic is not None:
-        _ensure_session_artifact_registered(timestamp, existing_infographic.name)
+        _ensure_session_artifact_registered(timestamp, existing_infographic.name, scope_key=session_scope_key)
         image_format = 'jpeg' if existing_infographic.suffix.lower() == '.jpg' else existing_infographic.suffix[1:].lower()
         return {
             "status": "success",
@@ -11794,13 +12350,13 @@ async def generate_summary_infographic(request: SummaryInfographicRequest):
     image_url = first_image.get("url") if isinstance(first_image.get("url"), str) else ""
 
     if image_base64:
-        output_dir = _summary_infographic_dir()
+        output_dir = _summary_infographic_dir(session_scope_key)
         output_dir.mkdir(parents=True, exist_ok=True)
         safe_timestamp = re.sub(r"[^0-9A-Za-z_-]", "_", timestamp)
         filename = f"summary_infographic_{safe_timestamp}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         artifact_path = output_dir / filename
         artifact_path.write_bytes(base64.b64decode(image_base64))
-        _ensure_session_artifact_registered(timestamp, filename)
+        _ensure_session_artifact_registered(timestamp, filename, scope_key=session_scope_key)
         return {
             "status": "success",
             "model": OPENAI_IMAGE_MODEL,
@@ -11822,14 +12378,14 @@ async def generate_summary_infographic(request: SummaryInfographicRequest):
                 "image/webp": ".webp",
                 "image/gif": ".gif",
             }.get(content_type, ".png")
-            output_dir = _summary_infographic_dir()
+            output_dir = _summary_infographic_dir(session_scope_key)
             output_dir.mkdir(parents=True, exist_ok=True)
             safe_timestamp = re.sub(r"[^0-9A-Za-z_-]", "_", timestamp)
             filename = f"summary_infographic_{safe_timestamp}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{extension}"
             artifact_path = output_dir / filename
             artifact_bytes = image_response.content
             artifact_path.write_bytes(artifact_bytes)
-            _ensure_session_artifact_registered(timestamp, filename)
+            _ensure_session_artifact_registered(timestamp, filename, scope_key=session_scope_key)
             return {
                 "status": "success",
                 "model": OPENAI_IMAGE_MODEL,
@@ -12220,13 +12776,15 @@ async def test_llm_connection(request: Request):
 
 
 @app.get("/summarize-progress/{session_id}")
-async def get_summarize_progress(session_id: str):
+async def get_summarize_progress(session_id: str, request: Request):
     """Get current progress of summarization with input validation."""
     try:
         # Security: Validate session ID format
         safe_session_id = validate_session_id(session_id)
         _sync_runtime_state_from_disk()
-        return copy.deepcopy(summarization_progress.get(safe_session_id, _default_summarization_progress_payload()))
+        scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+        session = _require_accessible_discovery_session(safe_session_id, scope_key=scope_key)
+        return _get_summarization_progress(safe_session_id, _get_discovery_session_scope_key(session))
     except HTTPException:
         raise
     except Exception:
@@ -12234,7 +12792,7 @@ async def get_summarize_progress(session_id: str):
 
 
 @app.post("/abort-summary")
-async def abort_summary(request: Dict[str, Any]):
+async def abort_summary(request: Dict[str, Any], http_request: Request):
     """Abort an active summary worker for a specific session."""
     timestamp = request.get("timestamp")
     if not timestamp:
@@ -12246,7 +12804,10 @@ async def abort_summary(request: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Invalid timestamp format")
 
     _sync_runtime_state_from_disk()
-    progress_entry = copy.deepcopy(summarization_progress.get(safe_timestamp, {}))
+    scope_key = _build_discovery_scope_metadata(request=http_request).get("scope_key")
+    session = _require_accessible_discovery_session(safe_timestamp, scope_key=scope_key)
+    session_scope_key = _get_discovery_session_scope_key(session)
+    progress_entry = _get_summarization_progress(safe_timestamp, session_scope_key)
     stage = str(progress_entry.get("stage") or "idle").strip().lower() or "idle"
     worker_pid = _coerce_process_id(progress_entry.get("worker_pid"))
 
@@ -12261,6 +12822,7 @@ async def abort_summary(request: Dict[str, Any]):
 
     updated_progress = _set_summarization_progress(
         safe_timestamp,
+        scope_key=session_scope_key,
         stage="aborted",
         progress=_safe_int(progress_entry.get("progress", 0)),
         message="Summary aborted by operator.",
@@ -12277,10 +12839,11 @@ def _load_cached_summary_if_available(
     session_id: str,
     json_file: Optional[Path] = None,
     *,
+    scope_key: Optional[str] = None,
     mark_from_cache: bool,
     completion_message: str,
 ) -> Optional[Dict[str, Any]]:
-    summary_file = _summary_artifact_path(session_id)
+    summary_file = _summary_artifact_path(session_id, scope_key)
     if not summary_file.exists():
         return None
 
@@ -12323,6 +12886,7 @@ def _load_cached_summary_if_available(
 
         _set_summarization_progress(
             session_id,
+            scope_key=scope_key,
             stage="complete",
             progress=100,
             message=completion_message,
@@ -12339,24 +12903,26 @@ def _load_cached_summary_if_available(
 async def _wait_for_summary_result(
     session_id: str,
     *,
+    scope_key: Optional[str] = None,
     timeout_seconds: float = 900.0,
     poll_interval_seconds: float = 0.5,
 ) -> Dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
-    json_file = Path("output") / f"v2_intelligence_blueprint_{session_id}.json"
+    json_file = _discovery_scope_output_dir(scope_key, create=False) / f"v2_intelligence_blueprint_{session_id}.json"
 
     while True:
         _sync_runtime_state_from_disk()
         cached_summary = _load_cached_summary_if_available(
             session_id,
             json_file,
+            scope_key=scope_key,
             mark_from_cache=False,
             completion_message="Analysis complete!",
         )
         if cached_summary is not None:
             return cached_summary
 
-        progress_entry = copy.deepcopy(summarization_progress.get(session_id, _default_summarization_progress_payload()))
+        progress_entry = _get_summarization_progress(session_id, scope_key)
         stage = str(progress_entry.get("stage") or "idle").strip().lower() or "idle"
         if stage == "aborted":
             raise HTTPException(
@@ -12374,6 +12940,7 @@ async def _wait_for_summary_result(
             failure_message = "Summary worker exited before completing the session."
             _set_summarization_progress(
                 session_id,
+                scope_key=scope_key,
                 stage="error",
                 progress=progress_entry.get("progress", 0),
                 message=failure_message,
@@ -12390,7 +12957,11 @@ async def _wait_for_summary_result(
         await asyncio.sleep(poll_interval_seconds)
 
 
-async def _handle_summary_background_request(request: Dict[str, Any]) -> Dict[str, Any]:
+async def _handle_summary_background_request(
+    request: Dict[str, Any],
+    *,
+    scope_key: Optional[str] = None,
+) -> Dict[str, Any]:
     timestamp = request.get("timestamp")
     if not timestamp:
         raise HTTPException(status_code=400, detail="timestamp required")
@@ -12400,10 +12971,13 @@ async def _handle_summary_background_request(request: Dict[str, Any]) -> Dict[st
     except HTTPException:
         raise HTTPException(status_code=400, detail="Invalid timestamp format")
 
-    json_file = Path("output") / f"v2_intelligence_blueprint_{safe_timestamp}.json"
+    session = _require_accessible_discovery_session(safe_timestamp, scope_key=scope_key)
+    session_scope_key = _get_discovery_session_scope_key(session)
+    json_file = _discovery_scope_output_dir(session_scope_key, create=False) / f"v2_intelligence_blueprint_{safe_timestamp}.json"
     cached_summary = _load_cached_summary_if_available(
         safe_timestamp,
         json_file,
+        scope_key=session_scope_key,
         mark_from_cache=True,
         completion_message="Summary available from cache.",
     )
@@ -12411,16 +12985,17 @@ async def _handle_summary_background_request(request: Dict[str, Any]) -> Dict[st
         return cached_summary
 
     _sync_runtime_state_from_disk()
-    existing_progress = copy.deepcopy(summarization_progress.get(safe_timestamp, {}))
+    existing_progress = _get_summarization_progress(safe_timestamp, session_scope_key)
     existing_stage = str(existing_progress.get("stage") or "idle").strip().lower() or "idle"
     existing_worker_pid = _coerce_process_id(existing_progress.get("worker_pid"))
     if existing_stage not in SUMMARIZATION_TERMINAL_STAGES and existing_worker_pid is not None and _is_process_running(existing_worker_pid):
-        return await _wait_for_summary_result(safe_timestamp)
+        return await _wait_for_summary_result(safe_timestamp, scope_key=session_scope_key)
 
     try:
         worker_process = _launch_runtime_job_worker(
             "summary",
             {
+                "scope_key": session_scope_key,
                 "timestamp": safe_timestamp,
                 "requested_at": _utcnow_iso(),
             },
@@ -12429,6 +13004,7 @@ async def _handle_summary_background_request(request: Dict[str, Any]) -> Dict[st
         failure_message = f"Failed to launch summary worker: {exc}"
         _set_summarization_progress(
             safe_timestamp,
+            scope_key=session_scope_key,
             stage="error",
             progress=_safe_int(existing_progress.get("progress", 0)),
             message=failure_message,
@@ -12439,6 +13015,7 @@ async def _handle_summary_background_request(request: Dict[str, Any]) -> Dict[st
 
     _set_summarization_progress(
         safe_timestamp,
+        scope_key=session_scope_key,
         stage="queued",
         progress=max(1, _safe_int(existing_progress.get("progress", 0))),
         message="Summary queued in a durable background worker...",
@@ -12447,11 +13024,10 @@ async def _handle_summary_background_request(request: Dict[str, Any]) -> Dict[st
         started_at=_utcnow_iso(),
         completed_at=None,
     )
-    return await _wait_for_summary_result(safe_timestamp)
+    return await _wait_for_summary_result(safe_timestamp, scope_key=session_scope_key)
 
 
-@app.post("/summarize-session")
-async def summarize_session(request: Dict[str, Any]):
+async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key: Optional[str] = None):
     """
     Generate AI-powered summary with SPL queries and contextual questions.
     
@@ -12463,9 +13039,6 @@ async def summarize_session(request: Dict[str, Any]):
     5. Creates executive summary with priority actions
     6. Saves the summary for future use
     """
-    if not _is_runtime_worker_process():
-        return await _handle_summary_background_request(request)
-
     from spl.generator import SPLGenerator
     from spl.unknown_identifier import UnknownDataIdentifier
     
@@ -12482,7 +13055,16 @@ async def summarize_session(request: Dict[str, Any]):
     # Normalize to validated timestamp for all downstream file operations
     timestamp = safe_timestamp
 
-    output_dir = Path("output")
+    if request_scope_key is not None:
+        session = _require_accessible_discovery_session(timestamp, scope_key=request_scope_key)
+        request_scope_key = _get_discovery_session_scope_key(session)
+    else:
+        request_scope_key = _normalize_discovery_scope_key(request.get("scope_key"))
+
+    if not _is_runtime_worker_process():
+        return await _handle_summary_background_request(request, scope_key=request_scope_key)
+
+    output_dir = _discovery_scope_output_dir(request_scope_key, create=False)
 
     # Load current session artifacts only (legacy artifacts intentionally ignored)
     json_file = output_dir / f"v2_intelligence_blueprint_{timestamp}.json"
@@ -12494,6 +13076,7 @@ async def summarize_session(request: Dict[str, Any]):
     existing_cached_summary = _load_cached_summary_if_available(
         safe_timestamp,
         json_file,
+        scope_key=request_scope_key,
         mark_from_cache=True,
         completion_message="Summary available from cache.",
     )
@@ -12503,6 +13086,7 @@ async def summarize_session(request: Dict[str, Any]):
     if not json_file.exists():
         _set_summarization_progress(
             timestamp,
+            scope_key=request_scope_key,
             stage="error",
             progress=0,
             message="Discovery session data not found for this summary run.",
@@ -12510,7 +13094,13 @@ async def summarize_session(request: Dict[str, Any]):
         return {"error": "Discovery session data not found"}
     
     # Initialize progress tracking
-    _set_summarization_progress(timestamp, stage="loading", progress=10, message="Loading discovery reports...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="loading",
+        progress=10,
+        message="Loading discovery reports...",
+    )
     
     # Load current discovery data
     with open(json_file, 'r', encoding='utf-8') as f:
@@ -12580,7 +13170,13 @@ async def summarize_session(request: Dict[str, Any]):
     readiness_score = discovery_data.get("readiness_score")
     
     # Update progress
-    _set_summarization_progress(timestamp, stage="generating_queries", progress=25, message="Generating SPL queries...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="generating_queries",
+        progress=25,
+        message="Generating SPL queries...",
+    )
     
     # Generate template SPL queries (used as fallback if AI generation fails)
     spl_gen = SPLGenerator(discovery_results)
@@ -12621,7 +13217,13 @@ async def summarize_session(request: Dict[str, Any]):
     print(f"Generated {len(template_queries)} template queries as fallback")
     
     # Update progress
-    _set_summarization_progress(timestamp, stage="identifying_unknowns", progress=50, message="Identifying unknown data sources...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="identifying_unknowns",
+        progress=50,
+        message="Identifying unknown data sources...",
+    )
     
     # Identify unknown data sources
     unknown_id = UnknownDataIdentifier(discovery_entities)
@@ -12629,7 +13231,13 @@ async def summarize_session(request: Dict[str, Any]):
     unknown_questions = unknown_id.generate_contextual_questions(unknown_items)
     
     # Update progress
-    _set_summarization_progress(timestamp, stage="loading_reports", progress=60, message="Analyzing discovery reports...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="loading_reports",
+        progress=60,
+        message="Analyzing discovery reports...",
+    )
     
     # Load reports for analysis
     executive_summary = ""
@@ -13094,7 +13702,13 @@ Focus on ACTUAL findings from the reports with SPECIFIC details. If no findings 
 Return ONLY the JSON object."""
 
     # Update progress - starting AI analysis
-    _set_summarization_progress(timestamp, stage="ai_analysis", progress=65, message="AI analyzing findings (this may take 1-3 minutes)...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="ai_analysis",
+        progress=65,
+        message="AI analyzing findings (this may take 1-3 minutes)...",
+    )
     
     try:
         # Use 25% of configured max_tokens for findings extraction
@@ -13149,7 +13763,13 @@ Return ONLY the JSON object."""
         }
     
     # Update progress - findings extracted
-    _set_summarization_progress(timestamp, stage="generating_queries", progress=75, message="AI generating SPL queries (1-2 minutes)...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="generating_queries",
+        progress=75,
+        message="AI generating SPL queries (1-2 minutes)...",
+    )
     
     # ===== AI-POWERED QUERY GENERATION =====
     # Generate SPL queries based on actual findings
@@ -13332,7 +13952,13 @@ Return ONLY the JSON array of 8 queries, nothing else."""
     ))
     
     # Update progress - AI summary generation
-    _set_summarization_progress(timestamp, stage="generating_summary", progress=70, message="Building executive summary...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="generating_summary",
+        progress=70,
+        message="Building executive summary...",
+    )
     
     # Generate AI summary
     config = config_manager.get()
@@ -13366,7 +13992,13 @@ Please provide:
 Keep it concise and actionable. Focus on business value, risk reduction, and measurable outcomes. Base all statements on actual data from the reports above."""
     
     # Update progress - creating summary
-    _set_summarization_progress(timestamp, stage="creating_summary", progress=82, message="AI creating executive summary (30-60 seconds)...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="creating_summary",
+        progress=82,
+        message="AI creating executive summary (30-60 seconds)...",
+    )
     
     try:
         # Use 15% of configured max_tokens for executive summary (concise output)
@@ -13380,7 +14012,13 @@ Keep it concise and actionable. Focus on business value, risk reduction, and mea
         ai_summary = f"Could not generate AI summary: {str(e)}"
     
     # Update progress - Admin tasks generation
-    _set_summarization_progress(timestamp, stage="generating_tasks", progress=88, message="AI generating admin tasks (1-2 minutes)...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="generating_tasks",
+        progress=88,
+        message="AI generating admin tasks (1-2 minutes)...",
+    )
     
     # ===== ADMIN TASK GENERATION =====
     # Generate actionable admin tasks based on findings
@@ -13474,7 +14112,13 @@ Return ONLY the JSON array, no other text."""
         print(f"Generated {len(admin_tasks)} admin tasks")
         
         # Update progress - Tasks generated successfully
-        _set_summarization_progress(timestamp, stage="finalizing", progress=93, message="Finalizing summary...")
+        _set_summarization_progress(
+            timestamp,
+            scope_key=request_scope_key,
+            stage="finalizing",
+            progress=93,
+            message="Finalizing summary...",
+        )
         
     except json.JSONDecodeError as e:
         print(f"Error parsing admin tasks JSON: {e}")
@@ -13574,7 +14218,13 @@ Return ONLY the JSON array, no other text."""
     }
     
     # Update progress - Saving results
-    _set_summarization_progress(timestamp, stage="saving", progress=95, message="Saving results...")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="saving",
+        progress=95,
+        message="Saving results...",
+    )
     
     # Save summary for future use
     try:
@@ -13586,9 +14236,21 @@ Return ONLY the JSON array, no other text."""
         # Don't fail the request if save fails
     
     # Update progress - Complete
-    _set_summarization_progress(timestamp, stage="complete", progress=100, message="Analysis complete!")
+    _set_summarization_progress(
+        timestamp,
+        scope_key=request_scope_key,
+        stage="complete",
+        progress=100,
+        message="Analysis complete!",
+    )
     
     return response_data
+
+
+@app.post("/summarize-session")
+async def summarize_session(request: Dict[str, Any], http_request: Request):
+    request_scope_key = _build_discovery_scope_metadata(request=http_request).get("scope_key")
+    return await _summarize_session_impl(request, request_scope_key=request_scope_key)
 
 
 @app.post("/verify-task")
@@ -17909,10 +18571,11 @@ async def execute_mcp_tool_call(tool_call, config):
 
 
 @app.get("/status")
-async def get_status():
+async def get_status(request: Request):
     """Get current discovery status."""
     _sync_runtime_state_from_disk()
-    snapshot = _snapshot_discovery_runtime_state()
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    snapshot = _snapshot_discovery_runtime_state(scope_key)
     response: Dict[str, Any] = {
         "status": snapshot.get("status", "idle"),
         "discovery": snapshot,

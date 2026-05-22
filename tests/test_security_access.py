@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -440,6 +441,41 @@ class WebAppLocalAuthTests(unittest.TestCase):
         self.assertFalse(reset.json()["password_reset_required"])
         return updated_password
 
+    def _register_discovery_session_fixture(self, timestamp, scope_key=None, active_mcp_config_name=None):
+        report_name = f"v2_intelligence_blueprint_{timestamp}.json"
+        output_dir = web_app._discovery_scope_output_dir(scope_key)
+        (output_dir / report_name).write_text("{}", encoding="utf-8")
+
+        overview = SimpleNamespace(
+            total_indexes=0,
+            total_sourcetypes=0,
+            total_hosts=0,
+            total_users=0,
+            data_volume_24h="unknown",
+            splunk_version="unknown",
+        )
+
+        discovery_scope = None
+        normalized_scope_key = web_app._normalize_discovery_scope_key(scope_key)
+        if normalized_scope_key != web_app.DISCOVERY_SCOPE_GLOBAL:
+            discovery_scope = {
+                "scope_key": normalized_scope_key,
+                "scope_label": active_mcp_config_name or normalized_scope_key,
+                "active_mcp_config_name": active_mcp_config_name,
+            }
+
+        return web_app.register_discovery_session(
+            timestamp=timestamp,
+            overview=overview,
+            report_paths=[report_name],
+            mcp_capabilities={},
+            classifications={},
+            recommendations=[],
+            suggested_use_cases=[],
+            discovery_step_count=0,
+            discovery_scope=discovery_scope,
+        )
+
     def test_demo_mode_leaves_config_access_available(self):
         status = self.client.get("/api/auth/status")
         self.assertEqual(status.status_code, 200)
@@ -499,6 +535,313 @@ class WebAppLocalAuthTests(unittest.TestCase):
             web_app.discovery_runtime_state = original_runtime_state
             web_app.current_discovery_session = original_discovery_session
 
+    def test_is_process_running_prefers_windows_probe_before_os_kill(self):
+        with patch.object(web_app, "_is_process_running_windows", return_value=True) as windows_probe, \
+             patch.object(web_app.os, "kill", side_effect=AssertionError("os.kill should not be used when the Windows probe succeeds")):
+            self.assertTrue(web_app._is_process_running(424242))
+
+        windows_probe.assert_called_once_with(424242)
+
+    def test_start_discovery_primes_bootstrap_phase_as_active(self):
+        original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
+        original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
+        original_discovery_session = web_app.current_discovery_session
+
+        try:
+            fake_worker_pid = 424242
+            web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.summarization_progress = {}
+            web_app.current_discovery_session = None
+
+            with patch.object(web_app, "_launch_runtime_job_worker", return_value=SimpleNamespace(pid=fake_worker_pid)), \
+                 patch.object(web_app, "_build_discovery_runtime_binding", return_value={}), \
+                 patch.object(web_app, "_broadcast_discovery_runtime_state", new=AsyncMock()):
+                response = self.client.post("/start-discovery")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            discovery = payload["discovery"]
+            self.assertEqual(discovery["status"], "starting")
+            self.assertEqual(discovery["worker_pid"], fake_worker_pid)
+            self.assertEqual(discovery["current_phase_key"], "pipeline_boot")
+            self.assertEqual(discovery["current_phase_title"], "Bootstrap")
+            self.assertGreater(len(discovery["phase_plan"]), 0)
+            self.assertEqual(discovery["phase_plan"][0]["key"], "pipeline_boot")
+            self.assertEqual(discovery["phase_plan"][0]["status"], "active")
+            self.assertIsNotNone(discovery["phase_plan"][0]["started_at"])
+        finally:
+            web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
+            web_app.summarization_progress = original_summarization_progress
+            web_app.current_discovery_session = original_discovery_session
+            web_app._persist_runtime_state()
+
+    def test_start_discovery_isolated_by_mcp_scope(self):
+        original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
+        original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
+        original_discovery_session = web_app.current_discovery_session
+
+        try:
+            self._enable_auth_and_complete_admin_reset()
+            self.security_manager.create_user(
+                username="analyst-a",
+                password="AnalystPassword123!",
+                role="analyst",
+                is_enabled=True,
+                require_password_reset=False,
+                mcp_config_name="tenant-a",
+            )
+            self.security_manager.create_user(
+                username="analyst-b",
+                password="AnalystPassword123!",
+                role="analyst",
+                is_enabled=True,
+                require_password_reset=False,
+                mcp_config_name="tenant-a",
+            )
+            self.security_manager.create_user(
+                username="analyst-c",
+                password="AnalystPassword123!",
+                role="analyst",
+                is_enabled=True,
+                require_password_reset=False,
+                mcp_config_name="tenant-b",
+            )
+
+            web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
+            web_app.summarization_progress = {}
+            web_app.current_discovery_session = None
+
+            with patch.object(
+                web_app,
+                "_launch_runtime_job_worker",
+                side_effect=[SimpleNamespace(pid=424242), SimpleNamespace(pid=525252)],
+            ) as launch_worker, patch.object(web_app, "_broadcast_discovery_runtime_state", new=AsyncMock()), patch.object(web_app, "_is_process_running", return_value=True):
+                self.client.cookies.clear()
+                login_a = self.client.post(
+                    "/api/auth/login",
+                    json={"username": "analyst-a", "password": "AnalystPassword123!"},
+                )
+                self.assertEqual(login_a.status_code, 200)
+                first_start = self.client.post("/start-discovery")
+
+                self.client.cookies.clear()
+                login_b = self.client.post(
+                    "/api/auth/login",
+                    json={"username": "analyst-b", "password": "AnalystPassword123!"},
+                )
+                self.assertEqual(login_b.status_code, 200)
+                shared_scope_start = self.client.post("/start-discovery")
+
+                self.client.cookies.clear()
+                login_c = self.client.post(
+                    "/api/auth/login",
+                    json={"username": "analyst-c", "password": "AnalystPassword123!"},
+                )
+                self.assertEqual(login_c.status_code, 200)
+                other_scope_start = self.client.post("/start-discovery")
+
+            self.assertEqual(first_start.status_code, 200)
+            self.assertEqual(first_start.json()["discovery"]["scope_key"], "mcp:tenant-a")
+            self.assertEqual(first_start.json()["worker_pid"], 424242)
+
+            self.assertEqual(shared_scope_start.status_code, 200)
+            self.assertEqual(shared_scope_start.json()["error"], "Discovery already in progress")
+            self.assertEqual(shared_scope_start.json()["discovery"]["scope_key"], "mcp:tenant-a")
+            self.assertEqual(shared_scope_start.json()["discovery"]["worker_pid"], 424242)
+
+            self.assertEqual(other_scope_start.status_code, 200)
+            self.assertEqual(other_scope_start.json()["discovery"]["scope_key"], "mcp:tenant-b")
+            self.assertEqual(other_scope_start.json()["worker_pid"], 525252)
+            self.assertEqual(launch_worker.call_count, 2)
+        finally:
+            web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
+            web_app.summarization_progress = original_summarization_progress
+            web_app.current_discovery_session = original_discovery_session
+            web_app._persist_runtime_state()
+
+    def test_discovery_status_endpoint_isolated_by_mcp_scope(self):
+        original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
+
+        try:
+            self._enable_auth_and_complete_admin_reset()
+            self.security_manager.create_user(
+                username="analyst-a",
+                password="AnalystPassword123!",
+                role="analyst",
+                is_enabled=True,
+                require_password_reset=False,
+                mcp_config_name="tenant-a",
+            )
+            self.security_manager.create_user(
+                username="analyst-b",
+                password="AnalystPassword123!",
+                role="analyst",
+                is_enabled=True,
+                require_password_reset=False,
+                mcp_config_name="tenant-b",
+            )
+
+            web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
+            web_app._update_discovery_runtime_state(
+                scope_key="mcp:tenant-a",
+                scope_label="tenant-a",
+                active_mcp_config_name="tenant-a",
+                status="running",
+                session_id=111,
+                worker_pid=111,
+                execution_mode="worker",
+            )
+            web_app._update_discovery_runtime_state(
+                scope_key="mcp:tenant-b",
+                scope_label="tenant-b",
+                active_mcp_config_name="tenant-b",
+                status="running",
+                session_id=222,
+                worker_pid=222,
+                execution_mode="worker",
+            )
+
+            self.client.cookies.clear()
+            login_a = self.client.post(
+                "/api/auth/login",
+                json={"username": "analyst-a", "password": "AnalystPassword123!"},
+            )
+            self.assertEqual(login_a.status_code, 200)
+            with patch.object(web_app, "_is_process_running", return_value=True):
+                status_a = self.client.get("/api/discovery/status")
+
+            self.client.cookies.clear()
+            login_b = self.client.post(
+                "/api/auth/login",
+                json={"username": "analyst-b", "password": "AnalystPassword123!"},
+            )
+            self.assertEqual(login_b.status_code, 200)
+            with patch.object(web_app, "_is_process_running", return_value=True):
+                status_b = self.client.get("/api/discovery/status")
+
+            self.assertEqual(status_a.status_code, 200)
+            self.assertEqual(status_a.json()["scope_key"], "mcp:tenant-a")
+            self.assertEqual(status_a.json()["worker_pid"], 111)
+
+            self.assertEqual(status_b.status_code, 200)
+            self.assertEqual(status_b.json()["scope_key"], "mcp:tenant-b")
+            self.assertEqual(status_b.json()["worker_pid"], 222)
+        finally:
+            web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
+            web_app._persist_runtime_state()
+
+    def test_reports_and_latest_blueprint_are_filtered_by_mcp_scope(self):
+        self._enable_auth_and_complete_admin_reset()
+        self.security_manager.create_user(
+            username="analyst-a",
+            password="AnalystPassword123!",
+            role="analyst",
+            is_enabled=True,
+            require_password_reset=False,
+            mcp_config_name="tenant-a",
+        )
+        self.security_manager.create_user(
+            username="analyst-b",
+            password="AnalystPassword123!",
+            role="analyst",
+            is_enabled=True,
+            require_password_reset=False,
+            mcp_config_name="tenant-b",
+        )
+
+        timestamp = "20260522_010101"
+        report_name = f"v2_intelligence_blueprint_{timestamp}.json"
+        overview = SimpleNamespace(
+            total_indexes=0,
+            total_sourcetypes=0,
+            total_hosts=0,
+            total_users=0,
+            data_volume_24h="unknown",
+            splunk_version="unknown",
+        )
+
+        tenant_a_dir = web_app._discovery_scope_output_dir("mcp:tenant-a")
+        tenant_b_dir = web_app._discovery_scope_output_dir("mcp:tenant-b")
+        (tenant_a_dir / report_name).write_text(json.dumps({"marker": "tenant-a"}), encoding="utf-8")
+        (tenant_b_dir / report_name).write_text(json.dumps({"marker": "tenant-b"}), encoding="utf-8")
+
+        web_app.register_discovery_session(
+            timestamp=timestamp,
+            overview=overview,
+            report_paths=[report_name],
+            mcp_capabilities={"tool_count": 1, "tools": ["tenant-a"]},
+            classifications={},
+            recommendations=[],
+            suggested_use_cases=[],
+            discovery_step_count=1,
+            discovery_scope={
+                "scope_key": "mcp:tenant-a",
+                "scope_label": "tenant-a",
+                "active_mcp_config_name": "tenant-a",
+            },
+        )
+        web_app.register_discovery_session(
+            timestamp=timestamp,
+            overview=overview,
+            report_paths=[report_name],
+            mcp_capabilities={"tool_count": 1, "tools": ["tenant-b"]},
+            classifications={},
+            recommendations=[],
+            suggested_use_cases=[],
+            discovery_step_count=1,
+            discovery_scope={
+                "scope_key": "mcp:tenant-b",
+                "scope_label": "tenant-b",
+                "active_mcp_config_name": "tenant-b",
+            },
+        )
+
+        self.client.cookies.clear()
+        login_a = self.client.post(
+            "/api/auth/login",
+            json={"username": "analyst-a", "password": "AnalystPassword123!"},
+        )
+        self.assertEqual(login_a.status_code, 200)
+        reports_a = self.client.get("/reports")
+        report_a = self.client.get(f"/reports/{report_name}")
+        latest_a = self.client.get("/api/v2/intelligence")
+
+        self.client.cookies.clear()
+        login_b = self.client.post(
+            "/api/auth/login",
+            json={"username": "analyst-b", "password": "AnalystPassword123!"},
+        )
+        self.assertEqual(login_b.status_code, 200)
+        reports_b = self.client.get("/reports")
+        report_b = self.client.get(f"/reports/{report_name}")
+        latest_b = self.client.get("/api/v2/intelligence")
+
+        self.assertEqual(reports_a.status_code, 200)
+        self.assertEqual(len(reports_a.json()["sessions"]), 1)
+        self.assertEqual(reports_a.json()["sessions"][0]["scope_key"], "mcp:tenant-a")
+        self.assertEqual(reports_a.json()["reports"][0]["name"], report_name)
+        self.assertEqual(report_a.status_code, 200)
+        self.assertEqual(report_a.json()["content"]["marker"], "tenant-a")
+        self.assertEqual(latest_a.status_code, 200)
+        self.assertEqual(latest_a.json()["blueprint"]["marker"], "tenant-a")
+
+        self.assertEqual(reports_b.status_code, 200)
+        self.assertEqual(len(reports_b.json()["sessions"]), 1)
+        self.assertEqual(reports_b.json()["sessions"][0]["scope_key"], "mcp:tenant-b")
+        self.assertEqual(reports_b.json()["reports"][0]["name"], report_name)
+        self.assertEqual(report_b.status_code, 200)
+        self.assertEqual(report_b.json()["content"]["marker"], "tenant-b")
+        self.assertEqual(latest_b.status_code, 200)
+        self.assertEqual(latest_b.json()["blueprint"]["marker"], "tenant-b")
+
     def test_discovery_status_endpoint_hydrates_persisted_worker_snapshot(self):
         original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
         original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
@@ -539,6 +882,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
 
     def test_runtime_state_bridge_rebroadcasts_persisted_discovery_snapshot(self):
         original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
         original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
         original_active_connections = web_app.active_connections
         original_bridge_file_marker = web_app.runtime_state_bridge_last_file_marker
@@ -547,6 +891,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
 
         try:
             web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
             web_app.summarization_progress = {}
             web_app.active_connections = [object()]
             web_app._persist_runtime_state()
@@ -566,13 +911,14 @@ class WebAppLocalAuthTests(unittest.TestCase):
                 },
             )
 
-            with patch.object(web_app, "_is_process_running", return_value=True), \
+            with patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+                 patch.object(web_app, "_is_process_running", return_value=True), \
                  patch.object(web_app, "_broadcast_discovery_runtime_state", new=AsyncMock()) as broadcast_mock:
-                rebroadcasted = asyncio.run(web_app._check_for_persisted_runtime_state_rebroadcast())
+                rebroadcasted = asyncio.run(web_app._check_for_persisted_runtime_state_rebroadcast(force=True))
 
             self.assertTrue(rebroadcasted)
-            broadcast_mock.assert_awaited_once()
-            snapshot = broadcast_mock.await_args.args[0]
+            broadcast_mock.assert_awaited_once_with(scope_key=web_app.DISCOVERY_SCOPE_GLOBAL)
+            snapshot = web_app._snapshot_discovery_runtime_state(web_app.DISCOVERY_SCOPE_GLOBAL)
             self.assertEqual(snapshot["status"], "running")
             self.assertEqual(snapshot["session_id"], 4343)
             self.assertEqual(snapshot["worker_pid"], fake_worker_pid)
@@ -580,6 +926,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
             self.assertEqual(snapshot["progress"]["description"], "Worker-backed discovery is collecting remote evidence.")
         finally:
             web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
             web_app.summarization_progress = original_summarization_progress
             web_app.active_connections = original_active_connections
             web_app.runtime_state_bridge_last_file_marker = original_bridge_file_marker
@@ -588,13 +935,16 @@ class WebAppLocalAuthTests(unittest.TestCase):
 
     def test_summarize_progress_endpoint_hydrates_persisted_worker_snapshot(self):
         original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
         original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
         fake_worker_pid = 424242
 
         try:
             web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
             web_app.summarization_progress = {}
             session_id = "20260518_101500"
+            self._register_discovery_session_fixture(session_id)
             web_app._set_summarization_progress(
                 session_id,
                 stage="ai_analysis",
@@ -616,18 +966,22 @@ class WebAppLocalAuthTests(unittest.TestCase):
             self.assertEqual(payload["execution_mode"], "worker")
         finally:
             web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
             web_app.summarization_progress = original_summarization_progress
             web_app._persist_runtime_state()
 
     def test_abort_summary_endpoint_stops_active_worker(self):
         original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
         original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
         fake_worker_pid = 424242
 
         try:
             web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
             web_app.summarization_progress = {}
             session_id = "20260518_103000"
+            self._register_discovery_session_fixture(session_id)
             web_app._set_summarization_progress(
                 session_id,
                 stage="ai_analysis",
@@ -652,17 +1006,21 @@ class WebAppLocalAuthTests(unittest.TestCase):
             self.assertIsNone(payload["progress"]["worker_pid"])
         finally:
             web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
             web_app.summarization_progress = original_summarization_progress
             web_app._persist_runtime_state()
 
     def test_summarize_session_reuses_active_worker_without_spawning_new_one(self):
         original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
         original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
 
         try:
             web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
             web_app.summarization_progress = {}
             session_id = "20260518_104500"
+            self._register_discovery_session_fixture(session_id)
             expected_payload = {
                 "success": True,
                 "session_id": session_id,
@@ -678,7 +1036,8 @@ class WebAppLocalAuthTests(unittest.TestCase):
                 execution_mode="worker",
             )
 
-            with patch.object(web_app, "_load_cached_summary_if_available", return_value=None), \
+            with patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+                 patch.object(web_app, "_load_cached_summary_if_available", return_value=None), \
                  patch.object(web_app, "_is_process_running", return_value=True), \
                  patch.object(web_app, "_launch_runtime_job_worker") as launch_worker_mock, \
                  patch.object(web_app, "_wait_for_summary_result", new=AsyncMock(return_value=expected_payload)) as wait_mock:
@@ -690,9 +1049,10 @@ class WebAppLocalAuthTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json(), expected_payload)
             launch_worker_mock.assert_not_called()
-            wait_mock.assert_awaited_once_with(session_id)
+            wait_mock.assert_awaited_once_with(session_id, scope_key=web_app.DISCOVERY_SCOPE_GLOBAL)
         finally:
             web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
             web_app.summarization_progress = original_summarization_progress
             web_app._persist_runtime_state()
 
@@ -720,10 +1080,12 @@ Environment summary.
 
     def test_runtime_state_persistence_restores_interrupted_runtime_jobs(self):
         original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)
+        original_runtime_states = copy.deepcopy(getattr(web_app, "discovery_runtime_states", {}))
         original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
 
         try:
             web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
+            web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
             web_app.summarization_progress = {}
 
             phase_plan = web_app._build_discovery_phase_plan("v2")
@@ -754,7 +1116,9 @@ Environment summary.
 
             self.assertTrue(web_app._runtime_state_store_path().exists())
 
-            restored_discovery, restored_summarization = web_app._load_persisted_runtime_state()
+            with patch.object(web_app, "_is_runtime_worker_process", return_value=False):
+                restored_discovery_states, restored_summarization = web_app._load_persisted_runtime_state()
+            restored_discovery = restored_discovery_states[web_app.DISCOVERY_SCOPE_GLOBAL]
 
             self.assertEqual(restored_discovery["status"], "interrupted")
             self.assertEqual(restored_discovery["current_phase_title"], "Evidence Collection")
@@ -767,6 +1131,7 @@ Environment summary.
             self.assertIn("re-run summarization", summary_entry["message"].lower())
         finally:
             web_app.discovery_runtime_state = original_runtime_state
+            web_app.discovery_runtime_states = original_runtime_states
             web_app.summarization_progress = original_summarization_progress
             web_app._persist_runtime_state()
 
@@ -4381,7 +4746,7 @@ Environment summary.
         }
 
         try:
-            web_app.load_discovery_sessions = lambda: [dict(session_payload)]
+            web_app.load_discovery_sessions = lambda scope_key=None: [dict(session_payload)]
             web_app._resolve_session_selection = lambda sessions, selection, default_index: sessions[0]
             web_app.hydrate_discovery_session = lambda session: session
 

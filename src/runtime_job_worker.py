@@ -60,29 +60,36 @@ def _build_discovery_runtime_config(binding: Dict[str, Any]) -> Any:
 
 
 async def _run_discovery_job(payload: Dict[str, Any]) -> None:
+    scope_info = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+    scope_key = scope_info.get("scope_key")
     web_app._sync_runtime_state_from_disk()
     web_app._update_discovery_runtime_state(
+        scope_key=scope_key,
+        scope_label=scope_info.get("scope_label"),
+        active_mcp_config_name=scope_info.get("active_mcp_config_name"),
         status="starting",
         worker_pid=os.getpid(),
         execution_mode="worker",
     )
     runtime_config = _build_discovery_runtime_config(payload.get("runtime_binding") or {})
-    await web_app.run_discovery(runtime_config=runtime_config)
+    await web_app.run_discovery(runtime_config=runtime_config, scope_key=scope_key, scope_info=scope_info)
 
 
 async def _run_summary_job(payload: Dict[str, Any]) -> None:
     session_id = web_app.validate_session_id(payload.get("timestamp") or "")
+    scope_key = payload.get("scope_key")
     web_app._sync_runtime_state_from_disk()
-    existing_progress = web_app.summarization_progress.get(session_id, {})
+    existing_progress = web_app._get_summarization_progress(session_id, scope_key)
     web_app._set_summarization_progress(
         session_id,
+        scope_key=scope_key,
         stage="loading",
         progress=max(5, web_app._safe_int(existing_progress.get("progress", 0))),
         message="Summary worker started...",
         worker_pid=os.getpid(),
         execution_mode="worker",
     )
-    result = await web_app.summarize_session({"timestamp": session_id})
+    result = await web_app._summarize_session_impl({"timestamp": session_id, "scope_key": scope_key})
     if isinstance(result, dict) and result.get("error"):
         raise RuntimeError(str(result.get("error")))
 
@@ -99,15 +106,20 @@ async def _run_job(job_type: str, payload: Dict[str, Any]) -> None:
 
 def _record_worker_failure(job_type: str, payload: Dict[str, Any], exc: Exception) -> None:
     if job_type == "discovery":
+        scope_info = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+        scope_key = scope_info.get("scope_key")
         web_app._sync_runtime_state_from_disk()
+        current_snapshot = web_app._snapshot_discovery_runtime_state(scope_key)
         web_app._update_discovery_runtime_state(
+            scope_key=scope_key,
             progress={
-                **(web_app.discovery_runtime_state.get("progress") or {}),
+                **(current_snapshot.get("progress") or {}),
                 "description": f"Discovery failed: {exc}",
             },
         )
         web_app._finalize_discovery_runtime(
             "error",
+            scope_key=scope_key,
             error=str(exc),
             worker_pid=None,
         )
@@ -115,14 +127,16 @@ def _record_worker_failure(job_type: str, payload: Dict[str, Any], exc: Exceptio
 
     if job_type == "summary":
         session_id_raw = payload.get("timestamp") or ""
+        scope_key = payload.get("scope_key")
         try:
             session_id = web_app.validate_session_id(session_id_raw)
         except Exception:
             return
 
-        existing_progress = web_app.summarization_progress.get(session_id, {})
+        existing_progress = web_app._get_summarization_progress(session_id, scope_key)
         web_app._set_summarization_progress(
             session_id,
+            scope_key=scope_key,
             stage="error",
             progress=existing_progress.get("progress", 0),
             message=f"Summary worker failed: {exc}",

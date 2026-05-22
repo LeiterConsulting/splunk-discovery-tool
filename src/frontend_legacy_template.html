@@ -2154,11 +2154,14 @@
                 && discoveryPhaseEntries.every((phase) => String(phase?.status || 'pending').trim().toLowerCase() === 'completed');
             const discoverySummarySessionTimestamp = discoveryResultTimestamp || discoveryLastRunOutcome?.result_timestamp || null;
             const discoverySummarySession = discoverySummarySessionTimestamp
-                ? (sessionCatalog.find((session) => session?.timestamp === discoverySummarySessionTimestamp) || null)
+                ? (sessionCatalog.find((session) => session?.timestamp === discoverySummarySessionTimestamp) || {
+                    timestamp: discoverySummarySessionTimestamp,
+                    hasSummary: false,
+                })
                 : null;
             const isDiscoverySummaryReady = discoveryStatusNormalized === 'completed'
                 && discoveryAllStagesComplete
-                && !!discoverySummarySession;
+                && !!discoverySummarySessionTimestamp;
             const discoveryPhaseLeadTitle = discoveryActivePhase?.title || discoveryCurrentPhaseTitle || discoveryLastRunOutcome?.phase_title || 'Awaiting next run';
             const discoveryStatusMeta = (() => {
                 switch (discoveryStatusNormalized) {
@@ -14024,7 +14027,9 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                                     <span>{discoverySummarySession.hasSummary ? 'View Summary' : 'Summarize'}</span>
                                                                                 </button>
                                                                                 <span className={`text-[11px] ${mutedTextClass}`}>
-                                                                                    Summary is ready for {formatMissionSessionSelectionLabel(discoverySummarySession.timestamp)}.
+                                                                                    {discoverySummarySession.hasSummary
+                                                                                        ? `Summary is ready for ${formatMissionSessionSelectionLabel(discoverySummarySession.timestamp)}.`
+                                                                                        : `Generate a summary for ${formatMissionSessionSelectionLabel(discoverySummarySession.timestamp)}.`}
                                                                                 </span>
                                                                             </div>
                                                                         )}

@@ -1366,8 +1366,11 @@
     const discoveryCompletedPhaseCount = discoveryPhaseEntries.filter((phase) => phase.status === "completed").length;
     const discoveryAllStagesComplete = discoveryPhaseEntries.length > 0 && discoveryPhaseEntries.every((phase) => String((phase == null ? void 0 : phase.status) || "pending").trim().toLowerCase() === "completed");
     const discoverySummarySessionTimestamp = discoveryResultTimestamp || (discoveryLastRunOutcome == null ? void 0 : discoveryLastRunOutcome.result_timestamp) || null;
-    const discoverySummarySession = discoverySummarySessionTimestamp ? sessionCatalog.find((session) => (session == null ? void 0 : session.timestamp) === discoverySummarySessionTimestamp) || null : null;
-    const isDiscoverySummaryReady = discoveryStatusNormalized === "completed" && discoveryAllStagesComplete && !!discoverySummarySession;
+    const discoverySummarySession = discoverySummarySessionTimestamp ? sessionCatalog.find((session) => (session == null ? void 0 : session.timestamp) === discoverySummarySessionTimestamp) || {
+      timestamp: discoverySummarySessionTimestamp,
+      hasSummary: false
+    } : null;
+    const isDiscoverySummaryReady = discoveryStatusNormalized === "completed" && discoveryAllStagesComplete && !!discoverySummarySessionTimestamp;
     const discoveryPhaseLeadTitle = (discoveryActivePhase == null ? void 0 : discoveryActivePhase.title) || discoveryCurrentPhaseTitle || (discoveryLastRunOutcome == null ? void 0 : discoveryLastRunOutcome.phase_title) || "Awaiting next run";
     const discoveryStatusMeta = (() => {
       switch (discoveryStatusNormalized) {
@@ -8805,7 +8808,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         },
         /* @__PURE__ */ React.createElement("i", { className: `fas ${discoverySummarySession.hasSummary ? "fa-eye" : "fa-magic"} mr-2` }),
         /* @__PURE__ */ React.createElement("span", null, discoverySummarySession.hasSummary ? "View Summary" : "Summarize")
-      ), /* @__PURE__ */ React.createElement("span", { className: `text-[11px] ${mutedTextClass}` }, "Summary is ready for ", formatMissionSessionSelectionLabel(discoverySummarySession.timestamp), ".")));
+      ), /* @__PURE__ */ React.createElement("span", { className: `text-[11px] ${mutedTextClass}` }, discoverySummarySession.hasSummary ? `Summary is ready for ${formatMissionSessionSelectionLabel(discoverySummarySession.timestamp)}.` : `Generate a summary for ${formatMissionSessionSelectionLabel(discoverySummarySession.timestamp)}.`)));
     })))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-[11px] uppercase tracking-[0.18em] ${mutedTextClass}` }, "Discovery Activity"), /* @__PURE__ */ React.createElement("h2", { className: `mt-1 text-lg font-medium ${headingClass}` }, "Discovery Log")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 border ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, isMissionDiscoveryActive ? "Live discovery" : discoveryStatusNormalized === "completed" ? "Last run complete" : discoveryStatusNormalized === "error" ? "Last run needs attention" : discoveryStatusNormalized === "aborted" ? "Last run stopped" : "Awaiting next run"), discoveryHasFocusedReport && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 border ${isDarkTheme ? "bg-indigo-950 border-indigo-800 text-indigo-100" : "bg-indigo-50 border-indigo-200 text-indigo-700"}` }, "Focused artifact selected")))), /* @__PURE__ */ React.createElement(
       "div",
       {

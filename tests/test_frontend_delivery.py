@@ -295,7 +295,9 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("const executeDiscoveryAbort = async () => {", template_source)
         self.assertIn("const confirmDiscoveryAction = async () => {", template_source)
         self.assertIn("const discoverySummarySession = discoverySummarySessionTimestamp", template_source)
+        self.assertIn("timestamp: discoverySummarySessionTimestamp,", template_source)
         self.assertIn("const isDiscoverySummaryReady = discoveryStatusNormalized === 'completed'", template_source)
+        self.assertIn("&& !!discoverySummarySessionTimestamp;", template_source)
         self.assertIn("case 'discovery_status':", template_source)
         self.assertIn("const isMissionDiscoveryActive = discoveryStatus === 'starting' || discoveryStatus === 'running';", template_source)
         self.assertIn("data-testid=\"header-discovery-status-chip\"", template_source)
@@ -328,6 +330,8 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("Cached View Summary paths skip this prompt because no new LLM work is required.", template_source)
         self.assertIn("openSummaryModal(session.timestamp, { hasSummary: session.hasSummary });", template_source)
         self.assertIn("openSummaryModal(discoverySummarySession.timestamp, { hasSummary: discoverySummarySession.hasSummary })", template_source)
+        self.assertIn("? `Summary is ready for ${formatMissionSessionSelectionLabel(discoverySummarySession.timestamp)}.`", template_source)
+        self.assertIn(": `Generate a summary for ${formatMissionSessionSelectionLabel(discoverySummarySession.timestamp)}.`", template_source)
         self.assertNotIn("Continue with summarization?", template_source)
 
     def test_summary_surface_declares_worker_resume_and_abort_controls(self):

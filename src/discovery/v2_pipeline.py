@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -26,8 +26,9 @@ class V2PhaseResult:
 class DiscoveryV2Pipeline:
     """Current orchestrator over the existing DiscoveryEngine capabilities."""
 
-    def __init__(self, discovery_engine: Any):
+    def __init__(self, discovery_engine: Any, output_root: Optional[Path] = None):
         self.discovery_engine = discovery_engine
+        self.output_root = Path(output_root) if output_root is not None else Path("output")
 
     async def run(self, display: Any, progress: Any) -> Dict[str, Any]:
         """Execute the current discovery flow and export a session artifact bundle."""
@@ -237,7 +238,7 @@ class DiscoveryV2Pipeline:
 
     def _export_v2_bundle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = Path("output")
+        output_root = self.output_root
         output_root.mkdir(exist_ok=True)
 
         report_paths: List[str] = []
