@@ -162,6 +162,34 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("data-testid=\"header-logout-button\"", template_source)
         self.assertIn(">\n                                                    Sign Out\n                                                </button>", template_source)
 
+    def test_rag_install_notice_declares_progress_and_remediation_ui(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const [capabilityActionStartedAt, setCapabilityActionStartedAt] = useState({});", template_source)
+        self.assertIn("const formatCapabilityActionElapsed = (totalSeconds) => {", template_source)
+        self.assertIn("const getRagInstallProgressMeta = (elapsedSeconds, installGuidance = null) => {", template_source)
+        self.assertIn("const expectedDurationLabel = installGuidance?.expected_duration_label || 'This install can take a few minutes while pip resolves the full dependency tree.';", template_source)
+        self.assertIn("Installing ChromaDB runtime", template_source)
+        self.assertIn("Install Commands", template_source)
+        self.assertIn("Diagnostic Excerpt", template_source)
+        self.assertIn("{renderCapabilityNotice()}", template_source)
+        self.assertIn("Installing... ${formatCapabilityActionElapsed(ragInstallElapsedSeconds)}", template_source)
+
+    def test_rag_install_preflight_warning_declares_alternate_install_methods(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const ragInstallPreflightWarning = typeof ragInstallGuidance?.preflight_warning === 'string'", template_source)
+        self.assertIn("const ragInstallAlternativeMethods = Array.isArray(ragInstallGuidance?.alternative_methods)", template_source)
+        self.assertIn("const ragPreferredInstallAlternativeMethod = ragInstallAlternativeMethods.find((method) => method?.app_action_supported && typeof method?.strategy === 'string') || null;", template_source)
+        self.assertIn("data-testid=\"rag-install-preflight-warning\"", template_source)
+        self.assertIn("data-testid=\"rag-install-alternate-method-button\"", template_source)
+        self.assertIn("Likely to fail with the current pip source", template_source)
+        self.assertIn("Try This First", template_source)
+        self.assertIn("{method?.label || 'Alternate install method'}", template_source)
+        self.assertIn("rag-install-alt-method-", template_source)
+        self.assertIn("runCapabilityAction('rag_chromadb', 'install', { strategy: ragPreferredInstallAlternativeMethod.strategy })", template_source)
+        self.assertIn("Please try alternate method", template_source)
+
     def test_settings_modal_declares_first_party_ollama_provider(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 

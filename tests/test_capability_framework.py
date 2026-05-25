@@ -2,10 +2,12 @@ import importlib.util
 from io import BytesIO
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 import zipfile
 
@@ -66,6 +68,129 @@ def build_simple_docx_bytes(title: str, paragraphs: list[str], table_rows: list[
                     row_cells[index].text = row_values[index] if index < len(row_values) else ""
     document.save(buffer)
     return buffer.getvalue()
+
+
+class CapabilityInstallGuidanceTests(unittest.TestCase):
+    def test_rag_chromadb_public_pypi_strategy_uses_isolated_public_index(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            manager = ConfigManager(str(config_path))
+            capability_manager = CapabilityManager(config_manager=manager, registry=CapabilityRegistry())
+
+            with patch.object(capability_manager, "_dependencies_available", return_value=False):
+                with patch.object(capability_manager, "_load_pip_config_values", return_value={}):
+                    with patch.object(capability_manager, "_resolve_version", return_value="test-version"):
+                        with patch("capabilities.install_manager.subprocess.run") as mock_run:
+                            mock_run.return_value = subprocess.CompletedProcess(
+                                args=[sys.executable, "-m", "pip", "install", "chromadb"],
+                                returncode=0,
+                                stdout="Installed from public PyPI\n",
+                                stderr="",
+                            )
+
+                            result = capability_manager.install_capability("rag_chromadb", strategy="public_pypi")
+
+            self.assertTrue(result.ok)
+            self.assertIn("alternate public PyPI method", result.message)
+            self.assertEqual(result.details.get("strategy"), "public_pypi")
+            call_kwargs = mock_run.call_args.kwargs
+            command = mock_run.call_args.args[0]
+            self.assertIn("--index-url", command)
+            self.assertIn("https://pypi.org/simple", command)
+            self.assertIn("--no-cache-dir", command)
+            self.assertEqual(call_kwargs["env"].get("PIP_CONFIG_FILE"), os.devnull)
+            self.assertNotIn("PIP_INDEX_URL", call_kwargs["env"])
+            self.assertNotIn("PIP_EXTRA_INDEX_URL", call_kwargs["env"])
+            self.assertNotIn("PIP_NO_INDEX", call_kwargs["env"])
+
+    def test_rag_chromadb_install_guidance_surfaces_preflight_warning_for_custom_index(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            manager = ConfigManager(str(config_path))
+            capability_manager = CapabilityManager(config_manager=manager, registry=CapabilityRegistry())
+
+            with patch.dict(os.environ, {"PIP_INDEX_URL": "https://repo.example.invalid/simple"}, clear=False):
+                with patch("capabilities.install_manager.subprocess.run") as mock_run:
+                    mock_run.return_value = subprocess.CompletedProcess(
+                        args=[sys.executable, "-m", "pip", "config", "list"],
+                        returncode=0,
+                        stdout="",
+                        stderr="",
+                    )
+
+                    state = capability_manager.get_capability_state("rag_chromadb")
+
+            guidance = state.get("install_guidance")
+            self.assertIsInstance(guidance, dict)
+            self.assertEqual(guidance.get("preflight_status"), "warning")
+            self.assertIn("likely to fail", guidance.get("preflight_warning", "").lower())
+            self.assertIn("repo.example.invalid/simple", guidance.get("preflight_warning", ""))
+            self.assertIn("dev-space mirror or filtered repository", guidance.get("preflight_reason", ""))
+            self.assertEqual(guidance.get("package_indexes"), ["https://repo.example.invalid/simple"])
+            self.assertTrue(any(method.get("label") == "Force public PyPI for the active environment" for method in guidance.get("alternative_methods", [])))
+            self.assertTrue(any(method.get("app_action_supported") and method.get("strategy") == "public_pypi" for method in guidance.get("alternative_methods", [])))
+
+    def test_rag_chromadb_install_failure_returns_actionable_guidance(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            manager = ConfigManager(str(config_path))
+            capability_manager = CapabilityManager(config_manager=manager, registry=CapabilityRegistry())
+
+            with patch.object(capability_manager, "_dependencies_available", return_value=False):
+                with patch("capabilities.install_manager.subprocess.run") as mock_run:
+                    mock_run.return_value = subprocess.CompletedProcess(
+                        args=[sys.executable, "-m", "pip", "install", "chromadb"],
+                        returncode=1,
+                        stdout="Collecting chromadb\n",
+                        stderr="ERROR: Could not build wheels for chromadb which use PEP 517 and cannot be installed directly\n",
+                    )
+
+                    result = capability_manager.install_capability("rag_chromadb")
+
+            self.assertFalse(result.ok)
+            self.assertIn("Review the next steps below", result.message)
+            self.assertIsInstance(result.details, dict)
+            guidance = result.details.get("install_guidance")
+            self.assertIsInstance(guidance, dict)
+            self.assertIn("pip appears to be missing a required wheel or native build toolchain", guidance.get("likely_issue", ""))
+            self.assertIn("Upgrade pip, setuptools, and wheel", " ".join(guidance.get("next_steps", [])))
+            self.assertTrue(any("chromadb" in command for command in guidance.get("install_commands", [])))
+            self.assertIn("Could not build wheels for chromadb", guidance.get("diagnostic_excerpt", ""))
+            self.assertIn("install_guidance", result.state)
+            self.assertIn("last install attempt failed", result.state.get("health_message", "").lower())
+
+    def test_rag_chromadb_install_guidance_surfaces_active_package_index_for_no_match_errors(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            manager = ConfigManager(str(config_path))
+            capability_manager = CapabilityManager(config_manager=manager, registry=CapabilityRegistry())
+
+            with patch.object(capability_manager, "_dependencies_available", return_value=False):
+                with patch("capabilities.install_manager.subprocess.run") as mock_run:
+                    mock_run.return_value = subprocess.CompletedProcess(
+                        args=[sys.executable, "-m", "pip", "install", "chromadb"],
+                        returncode=1,
+                        stdout="Looking in indexes: http://127.0.0.1:9/simple\n",
+                        stderr=(
+                            "ERROR: Could not find a version that satisfies the requirement chromadb (from versions: none)\n"
+                            "ERROR: No matching distribution found for chromadb\n"
+                        ),
+                    )
+
+                    result = capability_manager.install_capability("rag_chromadb")
+
+            self.assertFalse(result.ok)
+            guidance = result.details.get("install_guidance")
+            self.assertEqual(guidance.get("package_indexes"), ["http://127.0.0.1:9/simple"])
+            self.assertIn("http://127.0.0.1:9/simple", guidance.get("summary", ""))
+            self.assertIn("http://127.0.0.1:9/simple", guidance.get("likely_issue", ""))
+            self.assertIn("private mirror or offline repository", " ".join(guidance.get("next_steps", [])))
+            self.assertTrue(any("pip config list" in command for command in guidance.get("install_commands", [])))
+            self.assertIn("Looking in indexes: http://127.0.0.1:9/simple", guidance.get("diagnostic_excerpt", ""))
 
 
 class ConfigManagerSecurityFoundationTests(unittest.TestCase):

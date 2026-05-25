@@ -1,5 +1,6 @@
 """Capability install, state, and health orchestration."""
 
+import os
 import re
 import subprocess
 import sys
@@ -32,6 +33,27 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 class CapabilityManager:
     """Coordinate registry definitions with persisted config and health."""
+
+    _supported_install_strategies = {None, "public_pypi"}
+
+    _pip_install_failure_patterns = [
+        (
+            re.compile(r"no matching distribution found|could not find a version", re.IGNORECASE),
+            "The active Python environment could not resolve a compatible package from the configured package index.",
+        ),
+        (
+            re.compile(r"temporary failure in name resolution|connection timed out|connection reset|proxyerror|ssl", re.IGNORECASE),
+            "The install attempt looks blocked by package-index connectivity, SSL inspection, or proxy policy.",
+        ),
+        (
+            re.compile(r"failed building wheel|could not build wheels|microsoft visual c\+\+|build tools|rust compiler", re.IGNORECASE),
+            "pip appears to be missing a required wheel or native build toolchain for one of the ChromaDB dependencies.",
+        ),
+        (
+            re.compile(r"permission denied|access is denied|not permitted|winerror 5", re.IGNORECASE),
+            "The install failed because the current Python environment does not have permission to modify packages.",
+        ),
+    ]
 
     def __init__(self, config_manager, registry: Optional[CapabilityRegistry] = None, health_service: Optional[CapabilityHealthService] = None):
         self.config_manager = config_manager
@@ -122,11 +144,21 @@ class CapabilityManager:
         payload.update(self._extra_capability_state(definition, config))
         return payload
 
-    def install_capability(self, name: str) -> CapabilityActionResult:
+    def install_capability(self, name: str, strategy: Optional[str] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "install", "Unknown capability.")
         config = self._get_or_create_config(definition)
+
+        if strategy not in self._supported_install_strategies:
+            return CapabilityActionResult(
+                ok=False,
+                capability=name,
+                action="install",
+                message="Unknown install strategy.",
+                state=self.get_capability_state(name),
+                details={"strategy": strategy},
+            )
 
         if not definition.runtime_available and definition.install_method == "internal":
             return self._result(definition.name, "install", False, "Capability runtime is not implemented yet.")
@@ -148,7 +180,7 @@ class CapabilityManager:
         if not definition.runtime_available:
             return self._result(definition.name, "install", False, "Capability runtime is not implemented yet.")
 
-        return self._install_python_capability(definition, config)
+        return self._install_python_capability(definition, config, strategy=strategy)
 
     def enable_capability(self, name: str) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
@@ -811,7 +843,12 @@ class CapabilityManager:
             "chunks": [],
         }
 
-    def _install_python_capability(self, definition: CapabilityDefinition, config: CapabilityConfig) -> CapabilityActionResult:
+    def _install_python_capability(
+        self,
+        definition: CapabilityDefinition,
+        config: CapabilityConfig,
+        strategy: Optional[str] = None,
+    ) -> CapabilityActionResult:
         if self._dependencies_available(definition):
             config.installed = True
             config.version = self._resolve_version(definition)
@@ -821,34 +858,50 @@ class CapabilityManager:
             self.config_manager.save_capability(config)
             return self._result(definition.name, "install", True, "Capability dependencies already available.")
 
+        command, install_env = self._build_python_install_command(definition, strategy=strategy)
+        strategy_label = " using the alternate public PyPI method" if strategy == "public_pypi" else ""
+
         try:
-            command = [sys.executable, "-m", "pip", "install", *definition.dependency_packages]
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=600, check=False)
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=600, check=False, env=install_env)
         except Exception as exc:
             config.last_error = str(exc)
+            config.health_message = "Capability is not installed. The last install attempt failed; review the install guidance and retry."
             self.config_manager.save_capability(config)
             return CapabilityActionResult(
                 ok=False,
                 capability=definition.name,
                 action="install",
-                message="Capability installation failed.",
+                message=f"Capability installation failed{strategy_label}. Review the next steps below and retry once the environment issue is resolved.",
                 state=self.get_capability_state(definition.name),
-                details={"error": str(exc)},
+                details={
+                    "error": str(exc),
+                    "strategy": strategy,
+                    "install_guidance": self._build_install_guidance(definition, config, failure_text=str(exc)),
+                },
             )
 
         if completed.returncode != 0:
             config.last_error = (completed.stderr or completed.stdout or "pip install failed").strip()[-4000:]
+            config.health_message = "Capability is not installed. The last install attempt failed; review the install guidance and retry."
             self.config_manager.save_capability(config)
             return CapabilityActionResult(
                 ok=False,
                 capability=definition.name,
                 action="install",
-                message="Capability installation failed.",
+                message=f"Capability installation failed{strategy_label}. Review the next steps below and retry once the environment issue is resolved.",
                 state=self.get_capability_state(definition.name),
                 details={
                     "return_code": completed.returncode,
                     "stderr": completed.stderr[-4000:],
                     "stdout": completed.stdout[-4000:],
+                    "strategy": strategy,
+                    "install_guidance": self._build_install_guidance(
+                        definition,
+                        config,
+                        return_code=completed.returncode,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                    ),
                 },
             )
 
@@ -862,19 +915,318 @@ class CapabilityManager:
             ok=True,
             capability=definition.name,
             action="install",
-            message="Capability installed successfully.",
+            message=f"Capability installed successfully{strategy_label}.",
             state=self.get_capability_state(definition.name),
             details={
                 "restart_required": config.restart_required,
                 "stdout": completed.stdout[-4000:],
+                "strategy": strategy,
             },
         )
+
+    def _build_python_install_command(self, definition: CapabilityDefinition, strategy: Optional[str] = None) -> tuple[list[str], Optional[Dict[str, str]]]:
+        command = [sys.executable, "-m", "pip", "install", *definition.dependency_packages]
+        install_env: Optional[Dict[str, str]] = None
+
+        if strategy == "public_pypi":
+            command = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--index-url",
+                "https://pypi.org/simple",
+                "--no-cache-dir",
+                *definition.dependency_packages,
+            ]
+            install_env = os.environ.copy()
+            install_env.pop("PIP_INDEX_URL", None)
+            install_env.pop("PIP_EXTRA_INDEX_URL", None)
+            install_env.pop("PIP_NO_INDEX", None)
+            install_env["PIP_CONFIG_FILE"] = os.devnull
+
+        return command, install_env
+
+    def _build_install_guidance(
+        self,
+        definition: CapabilityDefinition,
+        config: CapabilityConfig,
+        failure_text: str = "",
+        return_code: Optional[int] = None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> Dict[str, Any]:
+        if definition.install_method != "pip":
+            return {}
+
+        install_target = " ".join(definition.dependency_packages) or definition.name
+        runtime_profile = self._build_pip_install_preflight(definition)
+        combined_output = "\n".join(
+            part.strip()
+            for part in (stdout, stderr, failure_text, config.last_error or "")
+            if part and part.strip()
+        )
+        failure_excerpt = (stderr or stdout or failure_text or config.last_error or "").strip()
+        package_indexes = self._merge_package_indexes(
+            runtime_profile.get("package_indexes"),
+            self._extract_pip_indexes(combined_output),
+        )
+        guidance = {
+            "summary": (
+                "Indexed Artifact Search installs ChromaDB into the active DT4SMS Python environment. "
+                "First-time installs can take a few minutes while pip resolves transitive packages and unpacks wheels."
+            ),
+            "dependency_packages": list(definition.dependency_packages),
+            "expected_duration_label": "This first-time install can take a few minutes on Windows while pip resolves and unpacks ChromaDB dependencies.",
+            "operator_notes": [
+                "DT4SMS runs this install with the same Python interpreter that is currently hosting the app.",
+                "If the install succeeds, restart the app, then enable Indexed Artifact Search and run a reindex before using it in chat.",
+                "If the install keeps failing, run the commands below in the active DT4SMS environment so pip output stays visible.",
+            ],
+            "next_steps": [
+                "Confirm DT4SMS is using the intended virtual environment or Python installation before retrying.",
+                "Verify the host can reach the configured Python package index and that SSL or proxy policy is not blocking pip.",
+                "Upgrade pip, setuptools, and wheel in the active environment, then retry the ChromaDB install command directly.",
+                "After a successful install, restart DT4SMS, enable Indexed Artifact Search, and run Reindex to build the retrieval store.",
+            ],
+            "install_commands": [
+                f'"{sys.executable}" -m pip install --upgrade pip setuptools wheel',
+                f'"{sys.executable}" -m pip install {install_target}',
+            ],
+            "documentation": [
+                "README.md",
+                "docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md",
+            ],
+        }
+
+        if runtime_profile:
+            guidance["preflight_status"] = runtime_profile.get("status") or "ready"
+            if runtime_profile.get("preflight_warning"):
+                guidance["preflight_warning"] = runtime_profile["preflight_warning"]
+            if runtime_profile.get("preflight_reason"):
+                guidance["preflight_reason"] = runtime_profile["preflight_reason"]
+            if runtime_profile.get("active_config_source"):
+                guidance["active_config_source"] = runtime_profile["active_config_source"]
+            if runtime_profile.get("alternative_methods"):
+                guidance["alternative_methods"] = runtime_profile["alternative_methods"]
+
+        if package_indexes:
+            primary_index = package_indexes[0]
+            guidance["package_indexes"] = package_indexes
+            guidance["summary"] = f'{guidance["summary"]} pip reported the active package index as {primary_index}.'
+
+        no_matching_distribution = self._is_no_matching_distribution_error(failure_excerpt)
+        if no_matching_distribution and package_indexes:
+            primary_index = package_indexes[0]
+            guidance["next_steps"] = [
+                f"Review the active pip index configuration ({primary_index}) and confirm it is the intended package source for DT4SMS.",
+                "If this host uses a private mirror or offline repository, verify that chromadb and its transitive dependencies are published there.",
+                *guidance["next_steps"],
+            ]
+            guidance["install_commands"] = [
+                f'"{sys.executable}" -m pip config list',
+                *guidance["install_commands"],
+            ]
+
+        likely_issue = self._classify_pip_install_failure(failure_excerpt, package_indexes=package_indexes)
+        if likely_issue:
+            guidance["likely_issue"] = likely_issue
+            guidance["next_steps"] = [likely_issue, *guidance["next_steps"]]
+
+        diagnostic_excerpt = combined_output[-1600:] if combined_output else ""
+        if diagnostic_excerpt:
+            guidance["diagnostic_excerpt"] = diagnostic_excerpt
+        if return_code is not None:
+            guidance["return_code"] = return_code
+
+        return guidance
+
+    def _classify_pip_install_failure(self, failure_excerpt: str, package_indexes: Optional[list[str]] = None) -> str:
+        if not failure_excerpt:
+            return ""
+
+        if self._is_no_matching_distribution_error(failure_excerpt):
+            if package_indexes:
+                visible_indexes = ", ".join(package_indexes[:2])
+                if len(package_indexes) > 2:
+                    visible_indexes = f"{visible_indexes}, +{len(package_indexes) - 2} more"
+                return (
+                    f"pip did not find any chromadb distributions on the active package index ({visible_indexes}). "
+                    "If DT4SMS is using a private mirror or filtered repository, verify that chromadb and its dependencies are published there before retrying."
+                )
+            return (
+                "The active Python environment could not resolve a compatible chromadb package from the current package index. "
+                "Verify Python and pip compatibility and, if this host uses a private mirror, confirm that chromadb is available there."
+            )
+
+        for pattern, message in self._pip_install_failure_patterns:
+            if pattern.search(failure_excerpt):
+                return message
+        return ""
+
+    def _extract_pip_indexes(self, pip_output: str) -> list[str]:
+        indexes: list[str] = []
+        for raw_line in str(pip_output or "").splitlines():
+            match = re.search(r"Looking in indexes:\s*(.+)", raw_line, re.IGNORECASE)
+            if not match:
+                continue
+            for candidate in match.group(1).split(","):
+                normalized = candidate.strip()
+                if normalized and normalized not in indexes:
+                    indexes.append(normalized)
+        return indexes
+
+    def _is_no_matching_distribution_error(self, failure_excerpt: str) -> bool:
+        normalized_excerpt = str(failure_excerpt or "").lower()
+        return "no matching distribution found" in normalized_excerpt or "could not find a version" in normalized_excerpt
+
+    def _build_pip_install_preflight(self, definition: CapabilityDefinition) -> Dict[str, Any]:
+        install_target = " ".join(definition.dependency_packages) or definition.name
+        env_index = str(os.environ.get("PIP_INDEX_URL") or "").strip()
+        env_extra_indexes = self._split_pip_index_value(os.environ.get("PIP_EXTRA_INDEX_URL") or "")
+        env_no_index = _coerce_bool(os.environ.get("PIP_NO_INDEX"), False)
+        pip_config = self._load_pip_config_values()
+        config_index = pip_config.get("global.index-url") or pip_config.get("install.index-url") or ""
+        config_extra_indexes = self._split_pip_index_value(
+            pip_config.get("global.extra-index-url") or pip_config.get("install.extra-index-url") or ""
+        )
+        package_indexes = self._merge_package_indexes(
+            [env_index] if env_index else [],
+            env_extra_indexes,
+            [config_index] if config_index else [],
+            config_extra_indexes,
+        )
+        active_config_source = "default"
+        if env_no_index or env_index or env_extra_indexes:
+            active_config_source = "environment"
+        elif config_index or config_extra_indexes:
+            active_config_source = "pip_config"
+
+        if env_no_index:
+            return {
+                "status": "warning",
+                "active_config_source": active_config_source,
+                "package_indexes": package_indexes,
+                "preflight_warning": "This install is likely to fail because pip is currently configured with no package index.",
+                "preflight_reason": (
+                    "Optional capability installs inherit the host Python environment, and PIP_NO_INDEX is active for this DT4SMS process. "
+                    "Clear that override or use a direct public-PyPI install path before retrying in the UI."
+                ),
+                "alternative_methods": self._build_pip_alternative_methods(install_target, requires_clearing_no_index=True),
+            }
+
+        primary_index = package_indexes[0] if package_indexes else ""
+        if primary_index and not self._is_public_pypi_index(primary_index):
+            return {
+                "status": "warning",
+                "active_config_source": active_config_source,
+                "package_indexes": package_indexes,
+                "preflight_warning": f"This install is likely to fail because the active pip index ({primary_index}) is not public PyPI.",
+                "preflight_reason": (
+                    "Optional capability installs inherit the current Python environment. "
+                    "If this dev-space mirror or filtered repository does not publish chromadb and its dependencies, the runtime install will fail before DT4SMS can recover."
+                ),
+                "alternative_methods": self._build_pip_alternative_methods(install_target),
+            }
+
+        return {
+            "status": "ready",
+            "active_config_source": active_config_source,
+            "package_indexes": package_indexes,
+            "alternative_methods": [],
+        }
+
+    def _load_pip_config_values(self) -> Dict[str, str]:
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-m", "pip", "config", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return {}
+
+        if completed.returncode != 0:
+            return {}
+
+        config_values: Dict[str, str] = {}
+        for raw_line in str(completed.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            key = key.strip()
+            value = raw_value.strip().strip("\"'")
+            if key:
+                config_values[key] = value
+        return config_values
+
+    def _split_pip_index_value(self, value: str) -> list[str]:
+        indexes: list[str] = []
+        for candidate in re.split(r"[\s,]+", str(value or "").strip()):
+            normalized = candidate.strip()
+            if normalized and normalized not in indexes:
+                indexes.append(normalized)
+        return indexes
+
+    def _merge_package_indexes(self, *collections: Optional[list[str]]) -> list[str]:
+        merged: list[str] = []
+        for collection in collections:
+            for candidate in collection or []:
+                normalized = str(candidate or "").strip()
+                if normalized and normalized not in merged:
+                    merged.append(normalized)
+        return merged
+
+    def _is_public_pypi_index(self, value: str) -> bool:
+        normalized = str(value or "").strip().rstrip("/").lower()
+        return normalized in {
+            "https://pypi.org/simple",
+            "http://pypi.org/simple",
+            "https://pypi.python.org/simple",
+            "http://pypi.python.org/simple",
+        }
+
+    def _build_pip_alternative_methods(self, install_target: str, requires_clearing_no_index: bool = False) -> list[Dict[str, Any]]:
+        direct_commands: list[str] = []
+        installer_commands: list[str] = []
+
+        if sys.platform.startswith("win"):
+            if requires_clearing_no_index:
+                direct_commands.append("Remove-Item Env:PIP_NO_INDEX -ErrorAction SilentlyContinue")
+            direct_commands.append(f'"{sys.executable}" -m pip install --index-url https://pypi.org/simple --no-cache-dir {install_target}')
+            installer_commands.append(".\\install.ps1 -PublicOnly")
+        else:
+            if requires_clearing_no_index:
+                direct_commands.append("unset PIP_NO_INDEX")
+            direct_commands.append(f'"{sys.executable}" -m pip install --index-url https://pypi.org/simple --no-cache-dir {install_target}')
+            installer_commands.append("./install.sh --public_only")
+
+        return [
+            {
+                "label": "Force public PyPI for the active environment",
+                "description": "Bypass the inherited pip source and install the capability dependency directly from public PyPI before retrying in the app.",
+                "commands": direct_commands,
+                "strategy": "public_pypi",
+                "app_action_supported": True,
+                "app_action_label": "Please try alternate method",
+            },
+            {
+                "label": "Re-run the installer in public-only mode",
+                "description": "Use the installer fallback path that skips private or local package indexes before trying the in-app capability install again.",
+                "commands": installer_commands,
+                "app_action_supported": False,
+            },
+        ]
 
     def _extra_capability_state(self, definition: CapabilityDefinition, config: CapabilityConfig) -> Dict[str, Any]:
         if definition.name == "rag_chromadb":
             provider = ChromaRAGProvider(config=config, definition=definition)
             asset_summary = provider.get_knowledge_asset_summary()
             return {
+                "install_guidance": self._build_install_guidance(definition, config),
                 "index_summary": provider.get_index_summary(),
                 "knowledge_asset_summary": {
                     key: value

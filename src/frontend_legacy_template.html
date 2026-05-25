@@ -2246,6 +2246,8 @@
             });
             const [capabilityDrafts, setCapabilityDrafts] = useState({});
             const [capabilityActionState, setCapabilityActionState] = useState({});
+            const [capabilityActionStartedAt, setCapabilityActionStartedAt] = useState({});
+            const [capabilityActionTick, setCapabilityActionTick] = useState(() => Date.now());
             const [capabilityNotice, setCapabilityNotice] = useState(null);
             const [selectedCapabilityDetailName, setSelectedCapabilityDetailName] = useState(null);
             const [deeplinkDrafts, setDeeplinkDrafts] = useState({
@@ -2483,6 +2485,26 @@
             const canDisableRag = !!ragCapability?.installed && !!ragCapability?.enabled;
             const canTestRag = !!ragCapability?.installed;
             const canReindexRag = !!ragCapability?.installed && !ragCapability?.restart_required;
+            const ragInstallGuidance = ragCapability?.install_guidance && typeof ragCapability.install_guidance === 'object'
+                ? ragCapability.install_guidance
+                : null;
+            const ragInstallPreflightWarning = typeof ragInstallGuidance?.preflight_warning === 'string'
+                ? ragInstallGuidance.preflight_warning.trim()
+                : '';
+            const ragInstallPreflightReason = typeof ragInstallGuidance?.preflight_reason === 'string'
+                ? ragInstallGuidance.preflight_reason.trim()
+                : '';
+            const ragInstallAlternativeMethods = Array.isArray(ragInstallGuidance?.alternative_methods)
+                ? ragInstallGuidance.alternative_methods
+                : [];
+            const ragPreferredInstallAlternativeMethod = ragInstallAlternativeMethods.find((method) => method?.app_action_supported && typeof method?.strategy === 'string') || null;
+            const ragInstallPackageIndexes = Array.isArray(ragInstallGuidance?.package_indexes)
+                ? ragInstallGuidance.package_indexes
+                : [];
+            const ragInstallStartedAt = capabilityActionStartedAt?.rag_chromadb || 0;
+            const ragInstallElapsedSeconds = ragActionInProgress === 'install' && ragInstallStartedAt
+                ? Math.max(0, Math.floor((capabilityActionTick - ragInstallStartedAt) / 1000))
+                : 0;
             const canUseSplunkDeeplinks = !!deeplinkCapability?.installed
                 && !!deeplinkCapability?.enabled
                 && !deeplinkCapability?.restart_required
@@ -2491,6 +2513,78 @@
                 && !!exportCapability?.enabled
                 && !exportCapability?.restart_required
                 && String(exportCapability?.health_status || '').toLowerCase() === 'ready';
+            useEffect(() => {
+                if (ragActionInProgress !== 'install') {
+                    return undefined;
+                }
+
+                setCapabilityActionTick(Date.now());
+                const intervalId = window.setInterval(() => {
+                    setCapabilityActionTick(Date.now());
+                }, 1000);
+
+                return () => window.clearInterval(intervalId);
+            }, [ragActionInProgress]);
+
+            const formatCapabilityActionElapsed = (totalSeconds) => {
+                const safeSeconds = Math.max(0, Number(totalSeconds) || 0);
+                const minutes = Math.floor(safeSeconds / 60);
+                const seconds = safeSeconds % 60;
+                if (minutes > 0) {
+                    return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+                }
+                return `${seconds}s`;
+            };
+
+            const getRagInstallProgressMeta = (elapsedSeconds, installGuidance = null) => {
+                const expectedDurationLabel = installGuidance?.expected_duration_label || 'This install can take a few minutes while pip resolves the full dependency tree.';
+                if (elapsedSeconds < 12) {
+                    return {
+                        title: 'Preparing the DT4SMS Python environment',
+                        detail: 'Checking the active interpreter and starting the pip install command for ChromaDB.',
+                        stageLabel: 'Preparing install',
+                        notes: Array.isArray(installGuidance?.operator_notes) ? installGuidance.operator_notes.slice(0, 2) : [],
+                        expectedDurationLabel,
+                    };
+                }
+                if (elapsedSeconds < 45) {
+                    return {
+                        title: 'Downloading ChromaDB dependencies',
+                        detail: 'pip is resolving packages and fetching the first dependency set for indexed retrieval.',
+                        stageLabel: 'Downloading packages',
+                        notes: Array.isArray(installGuidance?.operator_notes) ? installGuidance.operator_notes.slice(0, 2) : [],
+                        expectedDurationLabel,
+                    };
+                }
+                if (elapsedSeconds < 120) {
+                    return {
+                        title: 'Installing and verifying packages',
+                        detail: 'The install is still active. First-time Windows installs often spend extra time unpacking wheels and validating dependencies.',
+                        stageLabel: 'Installing packages',
+                        notes: Array.isArray(installGuidance?.operator_notes) ? installGuidance.operator_notes.slice(0, 3) : [],
+                        expectedDurationLabel,
+                    };
+                }
+                return {
+                    title: 'Still working on the first-time install',
+                    detail: 'The installer is still running in the active DT4SMS Python environment. This usually means pip is still building or unpacking a larger dependency chain.',
+                    stageLabel: 'Still installing',
+                    notes: Array.isArray(installGuidance?.next_steps) ? installGuidance.next_steps.slice(0, 3) : [],
+                    expectedDurationLabel,
+                };
+            };
+
+            const getCapabilityActionError = (result, fallbackMessage) => {
+                const detailPayload = result?.detail && typeof result.detail === 'object' ? result.detail : null;
+                const details = result?.details || detailPayload?.details || null;
+                const message = detailPayload?.message || result?.message || result?.detail || fallbackMessage;
+                return {
+                    message,
+                    details,
+                    result: detailPayload || result || null,
+                };
+            };
+
             const parseMissionSessionDate = (value) => {
                 if (!value) {
                     return null;
@@ -4822,9 +4916,14 @@
             };
 
             const runCapabilityAction = async (name, action, payload = null) => {
+                setCapabilityNotice(null);
                 setCapabilityActionState(prev => ({
                     ...prev,
                     [name]: action
+                }));
+                setCapabilityActionStartedAt(prev => ({
+                    ...prev,
+                    [name]: Date.now(),
                 }));
 
                 try {
@@ -4835,27 +4934,45 @@
                     });
                     const result = await response.json();
                     if (!response.ok) {
-                        throw new Error(result?.detail || result?.message || `${action} failed`);
+                        const capabilityError = getCapabilityActionError(result, `${action} failed`);
+                        const requestError = new Error(capabilityError.message || `${action} failed`);
+                        requestError.details = capabilityError.details;
+                        requestError.result = capabilityError.result;
+                        throw requestError;
                     }
 
                     setCapabilityNotice({
                         type: 'success',
-                        message: result?.message || `${name} ${action} completed successfully.`
+                        capability: name,
+                        action,
+                        message: result?.message || `${name} ${action} completed successfully.`,
+                        details: result?.details || null,
                     });
                     await loadCapabilities();
                 } catch (error) {
                     console.error(`Capability action failed (${name}/${action}):`, error);
                     setCapabilityNotice({
                         type: 'error',
-                        message: `${name}: ${error.message || `${action} failed`}`
+                        capability: name,
+                        action,
+                        message: `${name}: ${error.message || `${action} failed`}`,
+                        details: error?.details || error?.result?.details || null,
                     });
+                    await loadCapabilities();
                 } finally {
                     setCapabilityActionState(prev => {
                         const next = { ...prev };
                         delete next[name];
                         return next;
                     });
-                    setTimeout(() => setCapabilityNotice(null), 3500);
+                    setCapabilityActionStartedAt(prev => {
+                        const next = { ...prev };
+                        delete next[name];
+                        return next;
+                    });
+                    if (action !== 'install') {
+                        setTimeout(() => setCapabilityNotice(null), 3500);
+                    }
                 }
             };
 
@@ -6781,6 +6898,158 @@
                 );
             };
 
+            const renderCapabilityNotice = () => {
+                const showRagInstallProgress = ragActionInProgress === 'install';
+                const progressMeta = showRagInstallProgress ? getRagInstallProgressMeta(ragInstallElapsedSeconds, ragInstallGuidance) : null;
+                const activeNotice = capabilityNotice;
+
+                if (!activeNotice && !showRagInstallProgress) {
+                    return null;
+                }
+
+                if (!activeNotice && showRagInstallProgress) {
+                    return (
+                        <div className={`mt-4 rounded-xl border p-4 ${isDarkTheme ? 'bg-sky-950 border-sky-800 text-sky-100' : 'bg-sky-50 border-sky-200 text-sky-900'}`}>
+                            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                                <div className="min-w-0 flex-1">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${isDarkTheme ? 'bg-sky-900 text-sky-100 border border-sky-700' : 'bg-white text-sky-800 border border-sky-200'}`}>
+                                            Installing ChromaDB runtime
+                                        </span>
+                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium ${isDarkTheme ? 'bg-slate-900 text-slate-100 border border-slate-700' : 'bg-white text-slate-700 border border-slate-200'}`}>
+                                            {progressMeta?.stageLabel || 'In progress'}
+                                        </span>
+                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium ${isDarkTheme ? 'bg-indigo-950 text-indigo-100 border border-indigo-800' : 'bg-indigo-50 text-indigo-700 border border-indigo-200'}`}>
+                                            Elapsed {formatCapabilityActionElapsed(ragInstallElapsedSeconds)}
+                                        </span>
+                                    </div>
+                                    <div className={`mt-3 text-sm font-semibold ${headingClass}`}>{progressMeta?.title || 'Installing Indexed Artifact Search'}</div>
+                                    <div className={`mt-1 text-sm ${subtextClass}`}>{progressMeta?.detail}</div>
+                                    <div className={`mt-2 text-xs ${mutedTextClass}`}>{progressMeta?.expectedDurationLabel}</div>
+                                    {Array.isArray(progressMeta?.notes) && progressMeta.notes.length > 0 && (
+                                        <ul className={`mt-3 space-y-2 text-xs ${subtextClass}`}>
+                                            {progressMeta.notes.map((item, index) => (
+                                                <li key={`rag-install-progress-note-${index}`} className="flex items-start gap-2">
+                                                    <span className={`mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? 'bg-sky-300' : 'bg-sky-600'}`}></span>
+                                                    <span>{item}</span>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    )}
+                                </div>
+                                <div className={`min-w-[240px] rounded-xl border p-3 ${isDarkTheme ? 'bg-slate-950 border-sky-900' : 'bg-white border-sky-200'}`}>
+                                    <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Dependency Set</div>
+                                    <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                                        {(Array.isArray(ragCapability?.dependency_packages) ? ragCapability.dependency_packages : ['chromadb']).map((pkg) => (
+                                            <span key={pkg} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-900 text-gray-200 border-gray-700' : 'bg-sky-50 text-sky-800 border-sky-200'}`}>
+                                                {pkg}
+                                            </span>
+                                        ))}
+                                    </div>
+                                    <div className={`mt-3 text-xs ${subtextClass}`}>When the install finishes, restart DT4SMS, then enable the capability and run Reindex.</div>
+                                </div>
+                            </div>
+                            <div className={`mt-4 h-2 overflow-hidden rounded-full ${isDarkTheme ? 'bg-slate-900' : 'bg-sky-100'}`}>
+                                <div className={`h-full w-1/3 rounded-full ${isDarkTheme ? 'bg-sky-400' : 'bg-sky-500'} animate-pulse`}></div>
+                            </div>
+                        </div>
+                    );
+                }
+
+                const noticeToneClass = activeNotice.type === 'error'
+                    ? (isDarkTheme ? 'bg-red-950 border-red-800 text-red-100' : 'bg-red-50 border-red-200 text-red-900')
+                    : (isDarkTheme ? 'bg-emerald-950 border-emerald-800 text-emerald-100' : 'bg-emerald-50 border-emerald-200 text-emerald-900');
+                const noticeDetails = activeNotice?.details && typeof activeNotice.details === 'object'
+                    ? activeNotice.details
+                    : null;
+                const installGuidance = noticeDetails?.install_guidance && typeof noticeDetails.install_guidance === 'object'
+                    ? noticeDetails.install_guidance
+                    : null;
+                const nextSteps = Array.isArray(installGuidance?.next_steps) ? installGuidance.next_steps : [];
+                const installCommands = Array.isArray(installGuidance?.install_commands) ? installGuidance.install_commands : [];
+                const diagnosticExcerpt = installGuidance?.diagnostic_excerpt || noticeDetails?.stderr || noticeDetails?.error || '';
+                const likelyIssue = installGuidance?.likely_issue || '';
+
+                return (
+                    <div className={`mt-4 rounded-xl border p-4 ${noticeToneClass}`}>
+                        <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    {activeNotice.capability && (
+                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${activeNotice.type === 'error'
+                                            ? (isDarkTheme ? 'bg-red-900 text-red-100 border border-red-700' : 'bg-white text-red-700 border border-red-200')
+                                            : (isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-white text-emerald-700 border border-emerald-200')}`}>
+                                            {activeNotice.capability}
+                                        </span>
+                                    )}
+                                    {activeNotice.action && (
+                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium ${isDarkTheme ? 'bg-slate-950 text-slate-100 border border-slate-700' : 'bg-white text-slate-700 border border-slate-200'}`}>
+                                            {activeNotice.action}
+                                        </span>
+                                    )}
+                                </div>
+                                <div className={`mt-3 text-sm font-semibold ${headingClass}`}>{activeNotice.message}</div>
+                                {installGuidance?.summary && (
+                                    <div className={`mt-1 text-sm ${subtextClass}`}>{installGuidance.summary}</div>
+                                )}
+                                {likelyIssue && (
+                                    <div className={`mt-3 rounded-lg border px-3 py-2 text-xs ${activeNotice.type === 'error'
+                                        ? (isDarkTheme ? 'bg-red-900/60 border-red-800 text-red-100' : 'bg-white border-red-200 text-red-800')
+                                        : (isDarkTheme ? 'bg-emerald-900/60 border-emerald-800 text-emerald-100' : 'bg-white border-emerald-200 text-emerald-800')}`}>
+                                        {likelyIssue}
+                                    </div>
+                                )}
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setCapabilityNotice(null)}
+                                className={`inline-flex items-center rounded-lg border px-2 py-1 text-xs font-medium ${isDarkTheme ? 'border-gray-700 bg-slate-950 text-gray-100 hover:bg-slate-900' : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'}`}
+                            >
+                                Dismiss
+                            </button>
+                        </div>
+
+                        {nextSteps.length > 0 && (
+                            <div className="mt-4">
+                                <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Next Steps</div>
+                                <ul className={`mt-2 space-y-2 text-sm ${subtextClass}`}>
+                                    {nextSteps.map((step, index) => (
+                                        <li key={`capability-notice-step-${index}`} className="flex items-start gap-2">
+                                            <span className={`mt-1 h-1.5 w-1.5 rounded-full ${activeNotice.type === 'error'
+                                                ? (isDarkTheme ? 'bg-red-300' : 'bg-red-600')
+                                                : (isDarkTheme ? 'bg-emerald-300' : 'bg-emerald-600')}`}></span>
+                                            <span>{step}</span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+
+                        {installCommands.length > 0 && (
+                            <div className="mt-4">
+                                <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Install Commands</div>
+                                <div className="mt-2 space-y-2">
+                                    {installCommands.map((command, index) => (
+                                        <pre key={`capability-notice-command-${index}`} className={`overflow-x-auto rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'bg-slate-950 border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-800'}`}>
+{command}
+                                        </pre>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {diagnosticExcerpt && (
+                            <div className="mt-4">
+                                <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Diagnostic Excerpt</div>
+                                <pre className={`mt-2 max-h-56 overflow-auto rounded-lg border px-3 py-2 text-xs whitespace-pre-wrap break-words ${isDarkTheme ? 'bg-slate-950 border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-800'}`}>
+{diagnosticExcerpt}
+                                </pre>
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+
             const renderRagOverviewCard = () => {
                 const lastIndexedLabel = ragIndexSummary?.last_indexed_at
                     ? new Date(ragIndexSummary.last_indexed_at).toLocaleString()
@@ -6951,6 +7220,78 @@
                                 </div>
                             </div>
 
+                            {canInstallRag && ragInstallPreflightWarning && (
+                                <div data-testid="rag-install-preflight-warning" className={`mt-4 rounded-xl border p-4 ${isDarkTheme ? 'bg-amber-950 border-amber-800 text-amber-100' : 'bg-amber-50 border-amber-200 text-amber-900'}`}>
+                                    <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-white text-amber-800 border border-amber-200'}`}>
+                                                    Install Preflight
+                                                </span>
+                                                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium ${isDarkTheme ? 'bg-rose-950 text-rose-100 border border-rose-800' : 'bg-rose-50 text-rose-700 border border-rose-200'}`}>
+                                                    Likely to fail with the current pip source
+                                                </span>
+                                            </div>
+                                            <div className={`mt-3 text-sm font-semibold ${headingClass}`}>{ragInstallPreflightWarning}</div>
+                                            {ragInstallPreflightReason && (
+                                                <div className={`mt-1 text-sm ${subtextClass}`}>{ragInstallPreflightReason}</div>
+                                            )}
+                                            {ragInstallPackageIndexes.length > 0 && (
+                                                <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
+                                                    {ragInstallPackageIndexes.map((pkgIndex) => (
+                                                        <span key={pkgIndex} className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-gray-900 text-gray-200 border-gray-700' : 'bg-white text-gray-700 border-gray-300'}`}>
+                                                            {pkgIndex}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <div className={`min-w-[240px] rounded-xl border p-3 ${isDarkTheme ? 'bg-slate-950 border-amber-900' : 'bg-white border-amber-200'}`}>
+                                            <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Try This First</div>
+                                            <div className={`mt-2 text-xs ${subtextClass}`}>Use an alternate install path before clicking Install if this environment is pinned to a filtered or private package source.</div>
+                                            {ragPreferredInstallAlternativeMethod && (
+                                                <>
+                                                    <button
+                                                        type="button"
+                                                        data-testid="rag-install-alternate-method-button"
+                                                        onClick={() => runCapabilityAction('rag_chromadb', 'install', { strategy: ragPreferredInstallAlternativeMethod.strategy })}
+                                                        disabled={isRagBusy}
+                                                        className={`mt-3 w-full px-3 py-2 rounded text-sm font-semibold ${!isRagBusy ? 'bg-amber-500 hover:bg-amber-600 text-gray-950' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                    >
+                                                        {ragActionInProgress === 'install'
+                                                            ? `Trying alternate method... ${formatCapabilityActionElapsed(ragInstallElapsedSeconds)}`
+                                                            : (ragPreferredInstallAlternativeMethod.app_action_label || 'Please try alternate method')}
+                                                    </button>
+                                                    <div className={`mt-2 text-[11px] ${mutedTextClass}`}>{ragPreferredInstallAlternativeMethod.label || 'Force public PyPI for the active environment'}</div>
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    {ragInstallAlternativeMethods.length > 0 && (
+                                        <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-3">
+                                            {ragInstallAlternativeMethods.map((method, index) => (
+                                                <div key={`rag-install-alt-method-${index}`} className={`rounded-xl border p-3 ${panelMutedClass}`}>
+                                                    <div className={`text-sm font-semibold ${headingClass}`}>{method?.label || 'Alternate install method'}</div>
+                                                    {method?.description && (
+                                                        <div className={`mt-1 text-xs ${subtextClass}`}>{method.description}</div>
+                                                    )}
+                                                    {Array.isArray(method?.commands) && method.commands.length > 0 && (
+                                                        <div className="mt-3 space-y-2">
+                                                            {method.commands.map((command, commandIndex) => (
+                                                                <pre key={`rag-install-alt-command-${index}-${commandIndex}`} className={`overflow-x-auto rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'bg-slate-950 border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-800'}`}>
+{command}
+                                                                </pre>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
                             <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4">
                                 <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
                                     <div className={`text-xs font-medium mb-1 ${headingClass}`}>Index Status</div>
@@ -7026,7 +7367,7 @@
                                     disabled={!canInstallRag || isRagBusy}
                                     className={`px-3 py-1.5 rounded text-sm font-medium ${canInstallRag && !isRagBusy ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
                                 >
-                                    {ragActionInProgress === 'install' ? 'Installing...' : (ragCapability.installed ? 'Installed' : (ragCapability.runtime_available ? 'Install' : 'Planned'))}
+                                    {ragActionInProgress === 'install' ? `Installing... ${formatCapabilityActionElapsed(ragInstallElapsedSeconds)}` : (ragCapability.installed ? 'Installed' : (ragCapability.runtime_available ? 'Install' : 'Planned'))}
                                 </button>
                                 <button
                                     type="button"
@@ -13598,13 +13939,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 </div>
                                             </div>
 
-                                            {capabilityNotice && (
-                                                <div className={`mt-4 rounded-lg border px-3 py-2 text-sm ${capabilityNotice.type === 'error'
-                                                    ? (isDarkTheme ? 'bg-red-950 border-red-800 text-red-100' : 'bg-red-50 border-red-200 text-red-800')
-                                                    : (isDarkTheme ? 'bg-emerald-950 border-emerald-800 text-emerald-100' : 'bg-emerald-50 border-emerald-200 text-emerald-800')}`}>
-                                                    {capabilityNotice.message}
-                                                </div>
-                                            )}
+                                            {renderCapabilityNotice()}
                                         </div>
 
                                         {capabilitiesData.status === 'error' ? (
@@ -14446,7 +14781,9 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                         disabled={!canInstall || isBusy}
                                                                         className={`px-3 py-1.5 rounded text-sm font-medium ${canInstall && !isBusy ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
                                                                     >
-                                                                        {actionInProgress === 'install' ? 'Installing...' : (capability.installed ? 'Installed' : (capability.runtime_available ? 'Install' : 'Planned'))}
+                                                                        {actionInProgress === 'install'
+                                                                            ? (capability.name === 'rag_chromadb' ? `Installing... ${formatCapabilityActionElapsed(ragInstallElapsedSeconds)}` : 'Installing...')
+                                                                            : (capability.installed ? 'Installed' : (capability.runtime_available ? 'Install' : 'Planned'))}
                                                                     </button>
                                                                     <button
                                                                         onClick={() => runCapabilityAction(capability.name, 'enable')}

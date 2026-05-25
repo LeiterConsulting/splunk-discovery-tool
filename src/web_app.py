@@ -10601,6 +10601,10 @@ class CapabilityConfigUpdate(BaseModel):
     config: Dict[str, Any]
 
 
+class CapabilityInstallRequest(BaseModel):
+    strategy: Optional[str] = None
+
+
 class CapabilityDeeplinkBuildRequest(BaseModel):
     query: str
     earliest: Optional[str] = None
@@ -11624,10 +11628,11 @@ async def build_rag_context_preview(build_request: RAGContextPreviewRequest):
 
 
 @app.post("/api/capabilities/{name}/install")
-async def install_capability(name: str):
+async def install_capability(name: str, install_request: Optional[CapabilityInstallRequest] = None):
     """Install or prepare an optional capability."""
-    result = capability_manager.install_capability(name).to_dict()
-    _raise_for_capability_result(result)
+    result = capability_manager.install_capability(name, strategy=install_request.strategy if install_request else None).to_dict()
+    if not result.get("ok"):
+        return JSONResponse(status_code=400, content=result)
     return result
 
 
