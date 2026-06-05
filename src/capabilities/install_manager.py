@@ -225,7 +225,11 @@ class CapabilityManager:
         if definition is None:
             return CapabilityActionResult(False, name, action, "Unknown capability.")
         config = self._get_or_create_config(definition)
-        report = self._sync_health_state(definition, config)
+        report = self._sync_health_state(
+            definition,
+            config,
+            network_probe=definition.name == "splunk_deeplink_tools",
+        )
 
         ok = report.status in {"ready", "disabled"}
         details = report.to_dict()
@@ -250,6 +254,8 @@ class CapabilityManager:
         merged = dict(config.config)
         merged.update(updates or {})
         config.config = self._normalize_capability_config(definition, merged)
+        if definition.name == "splunk_deeplink_tools" and "web_base_url" in (updates or {}):
+            config.runtime_state = {}
         self.config_manager.save_capability(config)
         return self._result(definition.name, "update-config", True, "Capability configuration updated.")
 
@@ -1280,14 +1286,65 @@ class CapabilityManager:
             return None
         return DeterministicExportProvider(config=config, definition=definition)
 
-    def _sync_health_state(self, definition: CapabilityDefinition, config: CapabilityConfig):
-        report = self.health_service.check(definition, config)
+    def _sync_health_state(
+        self,
+        definition: CapabilityDefinition,
+        config: CapabilityConfig,
+        network_probe: bool = False,
+    ):
+        report = self.health_service.check(definition, config, network_probe=network_probe)
+        self._update_runtime_state_from_health(definition, config, report)
         config.last_tested_at = report.checked_at
         config.health_status = report.status
         config.health_message = report.message
         config.last_error = report.message if report.status in {"degraded", "unavailable"} else None
         self.config_manager.save_capability(config)
         return report
+
+    def _update_runtime_state_from_health(
+        self,
+        definition: CapabilityDefinition,
+        config: CapabilityConfig,
+        report,
+    ) -> None:
+        if definition.name != "splunk_deeplink_tools":
+            return
+
+        details = report.details if isinstance(report.details, dict) else {}
+        probe = details.get("web_probe") if isinstance(details.get("web_probe"), dict) else None
+        if probe is None:
+            return
+
+        runtime_state = dict(getattr(config, "runtime_state", {}) or {})
+        runtime_state["last_probe"] = {
+            "checked_at": report.checked_at,
+            "reachable": bool(probe.get("reachable")),
+            "resolved_web_base_url": probe.get("resolved_web_base_url"),
+            "status_code": probe.get("status_code"),
+            "probe_url": probe.get("probe_url"),
+            "error": probe.get("message") or probe.get("error"),
+            "used_alternate_scheme": bool(probe.get("used_alternate_scheme")),
+        }
+
+        if probe.get("reachable") and str(probe.get("resolved_web_base_url") or "").strip():
+            probe_source = str(probe.get("resolved_web_base_url_source") or "").strip()
+            if probe_source.startswith("mcp.url"):
+                runtime_state["verified_web_base_url"] = str(probe.get("resolved_web_base_url") or "").strip()
+                runtime_state["verified_from_mcp_url"] = str(self.config_manager.get().mcp.url or "").strip()
+                runtime_state["verified_from_source"] = probe_source
+                runtime_state["verified_at"] = report.checked_at
+            else:
+                runtime_state.pop("verified_web_base_url", None)
+                runtime_state.pop("verified_from_mcp_url", None)
+                runtime_state.pop("verified_from_source", None)
+                runtime_state.pop("verified_at", None)
+        else:
+            runtime_state.pop("verified_web_base_url", None)
+            runtime_state.pop("verified_from_mcp_url", None)
+            runtime_state.pop("verified_from_source", None)
+            runtime_state.pop("verified_at", None)
+
+        config.runtime_state = runtime_state
 
     def _result(self, name: str, action: str, ok: bool, message: str) -> CapabilityActionResult:
         return CapabilityActionResult(

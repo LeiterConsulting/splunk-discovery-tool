@@ -38,6 +38,7 @@ class CapabilityConfig:
     health_status: str = "not_installed"
     health_message: str = "Capability is not installed."
     config: Dict[str, Any] = field(default_factory=dict)
+    runtime_state: Dict[str, Any] = field(default_factory=dict)
     last_tested_at: Optional[str] = None
     last_error: Optional[str] = None
     restart_required: bool = False

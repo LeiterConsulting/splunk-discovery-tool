@@ -1525,7 +1525,7 @@ class CapabilityFrameworkTests(unittest.TestCase):
             enabled=True,
             config={
                 **definition.default_config,
-                "web_base_url": "https://splunkweb.example.local/splunk",
+                "web_base_url": "http://splunkweb.example.local/splunk",
                 "default_app": "search",
             },
         )
@@ -1543,11 +1543,46 @@ class CapabilityFrameworkTests(unittest.TestCase):
         parsed = urlsplit(deeplink["url"])
         params = parse_qs(parsed.query)
 
-        self.assertEqual(f"{parsed.scheme}://{parsed.netloc}{parsed.path.rsplit('/en-US/', 1)[0]}", "https://splunkweb.example.local/splunk")
+        self.assertEqual(f"{parsed.scheme}://{parsed.netloc}{parsed.path.rsplit('/en-US/', 1)[0]}", "http://splunkweb.example.local/splunk")
         self.assertEqual(params["q"][0], "search index=_internal error | stats count by host")
         self.assertEqual(params["earliest"][0], "-2h")
         self.assertEqual(params["latest"][0], "now")
         self.assertEqual(deeplink["base_url_source"], "capability_config.web_base_url")
+
+    def test_deeplink_provider_probe_falls_back_to_http_candidate(self):
+        definition = CapabilityRegistry().get_definition("splunk_deeplink_tools")
+        config = CapabilityConfig(
+            name="splunk_deeplink_tools",
+            installed=True,
+            enabled=True,
+            config=dict(definition.default_config),
+        )
+        provider = SplunkDeepLinkProvider(
+            config=config,
+            definition=definition,
+            mcp_url="https://splunk.example.local:8089/services/mcp",
+        )
+
+        def fake_probe(_provider, probe_url, timeout_seconds=1.5, verify_ssl=True):
+            if probe_url.startswith("https://splunk.example.local:8000/"):
+                return {"reachable": False, "error": "timed out"}
+            if probe_url.startswith("http://splunk.example.local:8000/"):
+                return {"reachable": True, "status_code": 200, "final_url": probe_url}
+            raise AssertionError(f"Unexpected probe URL: {probe_url}")
+
+        with patch.object(SplunkDeepLinkProvider, "_probe_url", autospec=True, side_effect=fake_probe):
+            probe = provider.probe_web_base_url(verify_ssl=False)
+
+        self.assertTrue(probe["reachable"])
+        self.assertEqual(probe["resolved_web_base_url"], "http://splunk.example.local:8000")
+        self.assertEqual(
+            [attempt["base_url"] for attempt in probe["attempts"]],
+            [
+                "https://splunk.example.local:8000",
+                "http://splunk.example.local:8000",
+            ],
+        )
+        self.assertTrue(probe["used_alternate_scheme"])
 
     def test_deeplink_install_enable_test_and_build_flow(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1560,34 +1595,83 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
                 manager.config_manager.update_mcp(url="https://splunk.example.local:8089/services/mcp")
 
-                install_result = manager.install_capability("splunk_deeplink_tools")
-                self.assertTrue(install_result.ok)
+                def fake_probe(_provider, probe_url, timeout_seconds=1.5, verify_ssl=True):
+                    if probe_url.startswith("https://splunk.example.local:8000/"):
+                        return {"reachable": False, "error": "connection refused"}
+                    if probe_url.startswith("http://splunk.example.local:8000/"):
+                        return {"reachable": True, "status_code": 200, "final_url": probe_url}
+                    raise AssertionError(f"Unexpected probe URL: {probe_url}")
 
-                enable_result = manager.enable_capability("splunk_deeplink_tools")
-                self.assertTrue(enable_result.ok)
-                self.assertEqual(enable_result.state["health_status"], "ready")
+                with patch.object(SplunkDeepLinkProvider, "_probe_url", autospec=True, side_effect=fake_probe):
+                    install_result = manager.install_capability("splunk_deeplink_tools")
+                    self.assertTrue(install_result.ok)
 
-                test_result = manager.test_capability("splunk_deeplink_tools")
-                self.assertTrue(test_result.ok)
-                self.assertIn("sample_deeplink", test_result.details)
+                    enable_result = manager.enable_capability("splunk_deeplink_tools")
+                    self.assertTrue(enable_result.ok)
+                    self.assertEqual(enable_result.state["health_status"], "ready")
 
-                build_result = manager.build_deeplink(
-                    "splunk_deeplink_tools",
-                    "search",
-                    {
-                        "query": "index=_internal | stats count by sourcetype",
-                        "earliest": "-7d",
-                        "latest": "now",
-                    },
-                )
-                self.assertTrue(build_result.ok)
-                deeplink = build_result.details["deeplink"]
-                params = parse_qs(urlsplit(deeplink["url"]).query)
+                    test_result = manager.test_capability("splunk_deeplink_tools")
+                    self.assertTrue(test_result.ok)
+                    self.assertIn("sample_deeplink", test_result.details)
+                    self.assertTrue(test_result.details["details"]["web_probe"]["reachable"])
+                    self.assertEqual(
+                        test_result.details["sample_deeplink"]["base_url"],
+                        "http://splunk.example.local:8000",
+                    )
 
-                self.assertEqual(deeplink["base_url"], "https://splunk.example.local:8000")
-                self.assertEqual(params["q"][0], "search index=_internal | stats count by sourcetype")
-                self.assertEqual(params["earliest"][0], "-7d")
-                self.assertEqual(params["latest"][0], "now")
+                    capability_state = manager.get_capability_state("splunk_deeplink_tools")
+                    self.assertEqual(capability_state["resolved_web_base_url"], "http://splunk.example.local:8000")
+                    self.assertEqual(capability_state["base_url_source"], "runtime_state.verified_web_base_url")
+
+                    build_result = manager.build_deeplink(
+                        "splunk_deeplink_tools",
+                        "search",
+                        {
+                            "query": "index=_internal | stats count by sourcetype",
+                            "earliest": "-7d",
+                            "latest": "now",
+                        },
+                    )
+                    self.assertTrue(build_result.ok)
+                    deeplink = build_result.details["deeplink"]
+                    params = parse_qs(urlsplit(deeplink["url"]).query)
+
+                    self.assertEqual(deeplink["base_url"], "http://splunk.example.local:8000")
+                    self.assertEqual(params["q"][0], "search index=_internal | stats count by sourcetype")
+                    self.assertEqual(params["earliest"][0], "-7d")
+                    self.assertEqual(params["latest"][0], "now")
+            finally:
+                os.chdir(original_cwd)
+
+    def test_deeplink_test_action_reports_unreachable_web_base_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                manager.config_manager.update_mcp(url="https://splunk.example.local:8089/services/mcp")
+
+                def fake_probe(_provider, probe_url, timeout_seconds=1.5, verify_ssl=True):
+                    return {"reachable": False, "error": f"unreachable: {probe_url}"}
+
+                with patch.object(SplunkDeepLinkProvider, "_probe_url", autospec=True, side_effect=fake_probe):
+                    install_result = manager.install_capability("splunk_deeplink_tools")
+                    self.assertTrue(install_result.ok)
+
+                    enable_result = manager.enable_capability("splunk_deeplink_tools")
+                    self.assertTrue(enable_result.ok)
+
+                    test_result = manager.test_capability("splunk_deeplink_tools")
+                    self.assertFalse(test_result.ok)
+                    self.assertIn("not reachable", test_result.message.lower())
+                    self.assertFalse(test_result.details["details"]["web_probe"]["reachable"])
+
+                    capability_state = manager.get_capability_state("splunk_deeplink_tools")
+                    self.assertEqual(capability_state["health_status"], "degraded")
+                    self.assertEqual(capability_state["resolved_web_base_url"], "https://splunk.example.local:8000")
             finally:
                 os.chdir(original_cwd)
 

@@ -21,7 +21,12 @@ class CapabilityHealthService:
     def __init__(self, config_manager=None):
         self.config_manager = config_manager
 
-    def check(self, definition: CapabilityDefinition, config: CapabilityConfig) -> CapabilityHealthReport:
+    def check(
+        self,
+        definition: CapabilityDefinition,
+        config: CapabilityConfig,
+        network_probe: bool = False,
+    ) -> CapabilityHealthReport:
         checked_at = _utc_now_iso()
 
         if not definition.runtime_available:
@@ -74,7 +79,7 @@ class CapabilityHealthService:
             return self._check_rag_chromadb(definition, config, checked_at)
 
         if definition.name == "splunk_deeplink_tools":
-            return self._check_splunk_deeplink_tools(definition, config, checked_at)
+            return self._check_splunk_deeplink_tools(definition, config, checked_at, network_probe=network_probe)
 
         if definition.name == "m26_14_advisor":
             return self._check_m26_14_advisor(definition, config, checked_at)
@@ -199,13 +204,18 @@ class CapabilityHealthService:
         definition: CapabilityDefinition,
         config: CapabilityConfig,
         checked_at: str,
+        network_probe: bool = False,
     ) -> CapabilityHealthReport:
         mcp_url = ""
+        verify_ssl = True
         if self.config_manager is not None:
             try:
-                mcp_url = str(self.config_manager.get().mcp.url or "").strip()
+                resolved_config = self.config_manager.get()
+                mcp_url = str(resolved_config.mcp.url or "").strip()
+                verify_ssl = bool(resolved_config.mcp.verify_ssl)
             except Exception:
                 mcp_url = ""
+                verify_ssl = True
 
         provider = SplunkDeepLinkProvider(config=config, definition=definition, mcp_url=mcp_url)
         base_url = provider.resolve_web_base_url()
@@ -219,6 +229,34 @@ class CapabilityHealthService:
             )
 
         summary = provider.get_runtime_summary()
+        if network_probe:
+            probe = provider.probe_web_base_url(verify_ssl=verify_ssl)
+            summary["web_probe"] = probe
+            if not probe.get("reachable"):
+                return CapabilityHealthReport(
+                    name=definition.name,
+                    status="degraded",
+                    message="Resolved Splunk Web URL is not reachable. Set web_base_url to the correct http:// or https:// base URL and retry Test.",
+                    checked_at=checked_at,
+                    details=summary,
+                )
+
+            resolved_web_base_url = str(probe.get("resolved_web_base_url") or "").strip() or summary.get("resolved_web_base_url")
+            summary["resolved_web_base_url"] = resolved_web_base_url
+            summary["base_url_source"] = probe.get("resolved_web_base_url_source") or summary.get("base_url_source")
+            try:
+                summary["sample_search_url"] = provider.build_sample_search_link(base_url_override=resolved_web_base_url)["url"]
+            except Exception:
+                summary["sample_search_url"] = None
+
+            return CapabilityHealthReport(
+                name=definition.name,
+                status="ready",
+                message=f"Splunk deeplink generation is ready. Verified Splunk Web at {resolved_web_base_url}.",
+                checked_at=checked_at,
+                details=summary,
+            )
+
         return CapabilityHealthReport(
             name=definition.name,
             status="ready",

@@ -15564,7 +15564,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                         )}
                                                                         {capability.name === 'splunk_deeplink_tools' && (
                                                                             <div className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                                                Set web_base_url to override automatic derivation from the MCP URL. Once installed and enabled, assistant SPL cards expose an Open in Splunk action.
+                                                                                Set web_base_url to the full Splunk Web base URL, including http:// or https://, to override MCP-derived guesses. Use Test to verify the resolved URL is reachable before relying on Open in Splunk actions.
                                                                             </div>
                                                                         )}
                                                                         {capability.name === 'visualization_tools' && (
