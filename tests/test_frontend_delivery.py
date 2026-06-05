@@ -139,6 +139,36 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("onClick={() => openRagCapabilitiesWorkspace({ libraryFilter: 'spl_library' })}", template_source)
         self.assertIn("Refresh Context", template_source)
 
+    def test_m26_14_workspace_wiring_is_declared(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const [m2614Profile, setM2614Profile] = useState({ has_data: false", template_source)
+        self.assertIn("const [m2614ValidationCatalog, setM2614ValidationCatalog] = useState({", template_source)
+        self.assertIn("const showM2614WorkspaceTab = !!(m2614AdvisorCapability?.installed && m2614AdvisorCapability?.enabled);", template_source)
+        self.assertIn("id=\"workspace-tab-m26-14\"", template_source)
+        self.assertIn("data-testid=\"workspace-tab-m26-14\"", template_source)
+        self.assertIn("const openM2614Workspace = () => {", template_source)
+        self.assertIn("const loadM2614Profile = async (timestamp = compareSelection.current || 'latest') => {", template_source)
+        self.assertIn("const loadM2614ValidationPacks = async () => {", template_source)
+        self.assertIn("const runM2614Validation = async () => {", template_source)
+        self.assertIn("/api/discovery/m26-14/profile?${params.toString()}", template_source)
+        self.assertIn("/api/discovery/m26-14/validation-packs", template_source)
+        self.assertIn("/api/discovery/m26-14/validate", template_source)
+        self.assertIn("data-testid=\"m2614-compare-current-select\"", template_source)
+        self.assertIn("data-testid=\"m2614-compare-baseline-select\"", template_source)
+        self.assertIn("data-testid=\"m2614-compare-submit\"", template_source)
+        self.assertIn("data-testid=\"m2614-compare-readiness-delta\"", template_source)
+        self.assertIn("data-testid=\"m2614-validation-pack-select\"", template_source)
+        self.assertIn("data-testid=\"m2614-run-validation-button\"", template_source)
+        self.assertIn("data-testid=\"m2614-validation-result\"", template_source)
+        self.assertIn("data-testid=\"m2614-validation-summary-headline\"", template_source)
+        self.assertIn("const m2614ValidationAdvisory = m2614ValidationResult?.advisory", template_source)
+        self.assertIn("data-testid=\"m2614-validation-grounding-panel\"", template_source)
+        self.assertIn("data-testid=\"m2614-validation-rag-panel\"", template_source)
+        self.assertIn("data-testid=\"m2614-validation-reusable-query-card\"", template_source)
+        self.assertIn("data-testid=\"m2614-validation-advisory-panel\"", template_source)
+        self.assertIn("renderM2614WorkspaceView()", template_source)
+
     def test_header_llm_status_is_config_driven_without_credential_load_toast(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 

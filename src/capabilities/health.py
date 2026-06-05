@@ -8,6 +8,7 @@ from typing import List, Tuple
 from capabilities.models import CapabilityConfig, CapabilityDefinition, CapabilityHealthReport
 from capabilities.rag.indexer import ArtifactSourceIndexer
 from capabilities.tools import DeterministicExportProvider, SplunkDeepLinkProvider, VisualizationPreviewProvider
+from discovery.m26_14_advisor import build_capability_state_snapshot
 
 
 def _utc_now_iso() -> str:
@@ -74,6 +75,9 @@ class CapabilityHealthService:
 
         if definition.name == "splunk_deeplink_tools":
             return self._check_splunk_deeplink_tools(definition, config, checked_at)
+
+        if definition.name == "m26_14_advisor":
+            return self._check_m26_14_advisor(definition, config, checked_at)
 
         if definition.name == "visualization_tools":
             return self._check_visualization_tools(definition, config, checked_at)
@@ -244,6 +248,44 @@ class CapabilityHealthService:
             name=definition.name,
             status="ready",
             message="Visualization preview generation is ready.",
+            checked_at=checked_at,
+            details=summary,
+        )
+
+    def _check_m26_14_advisor(
+        self,
+        definition: CapabilityDefinition,
+        config: CapabilityConfig,
+        checked_at: str,
+    ) -> CapabilityHealthReport:
+        summary = build_capability_state_snapshot(config.config)
+        if self.config_manager is not None:
+            summary["active_mcp_config_name"] = str(
+                getattr(self.config_manager.get(), "active_mcp_config_name", "") or ""
+            ).strip() or None
+
+        if self._safe_positive_int(summary.get("validation_pack_count"), 0) <= 0:
+            return CapabilityHealthReport(
+                name=definition.name,
+                status="degraded",
+                message="M-26-14 advisor has no curated validation packs configured.",
+                checked_at=checked_at,
+                details=summary,
+            )
+
+        if not summary.get("has_discovery_blueprint"):
+            return CapabilityHealthReport(
+                name=definition.name,
+                status="degraded",
+                message="M-26-14 advisor is enabled, but no discovery blueprint is available yet.",
+                checked_at=checked_at,
+                details=summary,
+            )
+
+        return CapabilityHealthReport(
+            name=definition.name,
+            status="ready",
+            message="M-26-14 advisor is ready with discovery evidence and curated validation packs.",
             checked_at=checked_at,
             details=summary,
         )

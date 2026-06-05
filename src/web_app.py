@@ -43,6 +43,12 @@ from pydantic import BaseModel, Field
 from config_manager import ConfigManager
 from capabilities import CapabilityManager, CapabilityRegistry
 from discovery.engine import DiscoveryEngine
+from discovery.m26_14_advisor import (
+    build_profile_from_blueprint as build_m26_14_profile_from_blueprint,
+    get_validation_pack as get_m26_14_validation_pack,
+    list_validation_packs as list_m26_14_validation_packs,
+    summarize_validation_results as summarize_m26_14_validation_results,
+)
 from discovery.v2_pipeline import DiscoveryV2Pipeline
 from llm.factory import (
     DEFAULT_OLLAMA_ENDPOINT_URL,
@@ -85,6 +91,8 @@ DEFAULT_EXTERNAL_MCP_RATE_LIMIT_WINDOW_SECONDS = 60
 _cached_llm_client = None
 _cached_config_hash = None
 _cached_oidc_provider_jwks: Dict[str, Dict[str, Any]] = {}
+M2614_VALIDATION_CACHE_LIMIT = 64
+_cached_m2614_validation_results: Dict[str, Dict[str, Any]] = {}
 
 
 class ExternalSurfaceRateLimiter:
@@ -930,6 +938,16 @@ def require_admin_user(request: Request) -> Optional[Dict[str, Any]]:
         return None
     if str(current_user.get("role") or "").strip().lower() != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+def require_analyst_or_admin_user(request: Request) -> Optional[Dict[str, Any]]:
+    current_user = require_authenticated_user(request)
+    if current_user is None:
+        return None
+    normalized_role = str(current_user.get("role") or "").strip().lower()
+    if normalized_role not in {"admin", "analyst"}:
+        raise HTTPException(status_code=403, detail="Analyst or admin access required")
     return current_user
 
 
@@ -8778,6 +8796,569 @@ def build_discovery_compare_payload(
     }
 
 
+def _get_m26_14_capability_state(refresh_health: bool = False) -> Dict[str, Any]:
+    try:
+        return capability_manager.get_capability_state("m26_14_advisor", refresh_health=refresh_health)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="M-26-14 advisor capability is not registered") from exc
+
+
+def _require_m26_14_enabled(refresh_health: bool = False) -> Dict[str, Any]:
+    capability_state = _get_m26_14_capability_state(refresh_health=refresh_health)
+    if not capability_state.get("installed") or not capability_state.get("enabled"):
+        raise HTTPException(status_code=404, detail="M-26-14 advisor is not enabled")
+    return capability_state
+
+
+def _resolve_m26_14_validation_cache_session_timestamp(selection: Optional[str], scope_key: Optional[str] = None) -> str:
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    selected_session = _resolve_session_selection(sessions, selection, 0)
+    if isinstance(selected_session, dict) and str(selected_session.get("timestamp") or "").strip():
+        return str(selected_session.get("timestamp") or "").strip()
+    return str(selection or "latest").strip() or "latest"
+
+
+def _build_m26_14_validation_cache_key(
+    validation_pack: Dict[str, Any],
+    validation_request: "M2614ValidationRequest",
+    runtime_config: Any,
+    *,
+    scope_key: Optional[str] = None,
+) -> str:
+    resolved_timestamp = _resolve_m26_14_validation_cache_session_timestamp(validation_request.timestamp, scope_key=scope_key)
+    runtime_url = str(getattr(getattr(runtime_config, "mcp", None), "url", "") or "").strip()
+    runtime_name = str(getattr(runtime_config, "active_mcp_config_name", "") or "").strip()
+    cache_payload = {
+        "pack_id": str(validation_pack.get("id") or "").strip(),
+        "query": str(validation_pack.get("query") or "").strip(),
+        "timestamp": resolved_timestamp,
+        "earliest": str(validation_request.earliest or "").strip() or "-30d",
+        "latest": str(validation_request.latest or "").strip() or "now",
+        "scope_key": str(scope_key or "").strip(),
+        "runtime_url": runtime_url,
+        "runtime_name": runtime_name,
+    }
+    return hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _get_cached_m26_14_validation_result(cache_key: str) -> Optional[Dict[str, Any]]:
+    cached_payload = _cached_m2614_validation_results.get(str(cache_key or "").strip())
+    if not isinstance(cached_payload, dict):
+        return None
+    return copy.deepcopy(cached_payload)
+
+
+def _store_cached_m26_14_validation_result(cache_key: str, payload: Dict[str, Any]) -> None:
+    normalized_key = str(cache_key or "").strip()
+    if not normalized_key or not isinstance(payload, dict):
+        return
+
+    if normalized_key in _cached_m2614_validation_results:
+        _cached_m2614_validation_results.pop(normalized_key, None)
+
+    _cached_m2614_validation_results[normalized_key] = copy.deepcopy(payload)
+    while len(_cached_m2614_validation_results) > M2614_VALIDATION_CACHE_LIMIT:
+        oldest_key = next(iter(_cached_m2614_validation_results), None)
+        if oldest_key is None:
+            break
+        _cached_m2614_validation_results.pop(oldest_key, None)
+
+
+def clear_m26_14_validation_cache() -> None:
+    _cached_m2614_validation_results.clear()
+
+
+def _normalize_m26_14_advisory_list(value: Any, limit: int = 5) -> List[str]:
+    if isinstance(value, str):
+        candidates = [value]
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        candidates = []
+
+    normalized: List[str] = []
+    for item in candidates:
+        cleaned = str(item or "").strip()
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+        if len(normalized) >= limit:
+            break
+    return normalized
+
+
+def _sample_m26_14_validation_rows(rows: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    sampled_rows: List[Dict[str, Any]] = []
+    for row in rows[:max(1, limit)]:
+        if isinstance(row, dict):
+            sampled_rows.append(copy.deepcopy(row))
+    return sampled_rows
+
+
+def _build_m26_14_profile_advisory_snapshot(profile_payload: Dict[str, Any], validation_pack: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(profile_payload, dict) or not profile_payload.get("has_data"):
+        return {
+            "has_data": False,
+            "message": str((profile_payload or {}).get("message") or "No M-26-14 discovery-backed profile is available for grounding.").strip(),
+        }
+
+    priority_key = str(validation_pack.get("priority_objective") or "").strip().lower()
+    control_area = str(validation_pack.get("control_area") or "").strip().lower()
+    priority_signal = None
+    if isinstance(profile_payload.get("priority_objectives"), dict):
+        priority_signal = profile_payload.get("priority_objectives", {}).get(priority_key)
+    maturity_element = None
+    if isinstance(profile_payload.get("maturity_elements"), list):
+        maturity_element = next(
+            (
+                element
+                for element in profile_payload.get("maturity_elements", [])
+                if isinstance(element, dict) and str(element.get("id") or "").strip().lower() == control_area
+            ),
+            None,
+        )
+
+    return {
+        "has_data": True,
+        "timestamp": profile_payload.get("timestamp"),
+        "readiness_estimate": profile_payload.get("readiness_estimate"),
+        "confidence": profile_payload.get("confidence"),
+        "maturity_floor": copy.deepcopy(profile_payload.get("maturity_floor") or {}),
+        "priority_objective": copy.deepcopy(priority_signal or {}),
+        "maturity_element": copy.deepcopy(maturity_element or {}),
+        "source_summary": copy.deepcopy(profile_payload.get("source_summary") or {}),
+        "recommended_pack_ids": list((profile_payload.get("live_validation") or {}).get("recommended_pack_ids") or []),
+    }
+
+
+def _build_m26_14_rag_context_query(
+    validation_pack: Dict[str, Any],
+    validation_summary: Dict[str, Any],
+    profile_snapshot: Dict[str, Any],
+) -> str:
+    query_parts: List[str] = [
+        "M-26-14 advisory",
+        str(validation_pack.get("title") or "").strip(),
+        str(validation_pack.get("control_area") or "").replace("_", " ").strip(),
+        str(validation_pack.get("priority_objective") or "").upper().strip(),
+        str(validation_pack.get("description") or "").strip(),
+        str(validation_summary.get("headline") or "").strip(),
+    ]
+
+    if isinstance(profile_snapshot.get("priority_objective"), dict):
+        query_parts.append(str(profile_snapshot.get("priority_objective", {}).get("objective") or "").strip())
+        query_parts.extend(_normalize_m26_14_advisory_list(profile_snapshot.get("priority_objective", {}).get("notes"), limit=2))
+
+    if isinstance(profile_snapshot.get("maturity_element"), dict):
+        query_parts.append(str(profile_snapshot.get("maturity_element", {}).get("label") or "").strip())
+        query_parts.extend(_normalize_m26_14_advisory_list(profile_snapshot.get("maturity_element", {}).get("gaps"), limit=2))
+        query_parts.extend(_normalize_m26_14_advisory_list(profile_snapshot.get("maturity_element", {}).get("remediation"), limit=1))
+
+    query_parts.extend(_normalize_m26_14_advisory_list(validation_summary.get("findings"), limit=2))
+    return " ".join(part for part in query_parts if part)
+
+
+def _build_m26_14_lightweight_rag_context_payload(query: str, details: Dict[str, Any]) -> Dict[str, Any]:
+    chunks = [
+        _sanitize_external_rag_chunk(chunk)
+        for chunk in (details.get("chunks") or [])
+        if isinstance(chunk, dict)
+    ]
+    context_text = str(details.get("context_text") or "").strip()
+    message = str(details.get("message") or "").strip()
+    if not message:
+        message = "Built context from recent local artifacts." if context_text else "No local artifact context matched this advisory query."
+    return {
+        "status": "ready" if context_text else "unavailable",
+        "provider": str(details.get("provider") or details.get("capability") or "rag_local").strip() or "rag_local",
+        "query": str(query or "").strip(),
+        "message": message,
+        "context_text": context_text,
+        "operator_brief": context_text,
+        "chunks": chunks,
+        "matched_assets": [],
+        "reusable_spl_queries": [],
+        "retrieved_key_points": [],
+        "recommended_uses": [],
+        "coverage_gaps": [],
+        "coverage_summary": {
+            "asset_count": 0,
+            "asset_types": [],
+            "source_labels": [],
+            "focus_terms": [],
+        },
+        "index_summary": {},
+        "asset_summary": {},
+    }
+
+
+def _build_m26_14_rag_context_payload(query: str) -> Dict[str, Any]:
+    normalized_query = str(query or "").strip()
+    for capability_name in ("rag_chromadb", "rag_local"):
+        try:
+            capability_state = capability_manager.get_capability_state(capability_name, refresh_health=False)
+        except KeyError:
+            continue
+
+        if not capability_state.get("installed") or not capability_state.get("enabled"):
+            continue
+
+        if capability_name == "rag_chromadb":
+            preview_result = capability_manager.build_rag_context_preview(capability_name, normalized_query, max_chunks=4).to_dict()
+            if preview_result.get("ok"):
+                sanitized = _sanitize_external_rag_search_result(preview_result.get("details") or {})
+                sanitized["status"] = "ready" if sanitized.get("context_text") else "unavailable"
+                sanitized["provider"] = capability_name
+                if not sanitized.get("message"):
+                    sanitized["message"] = str(preview_result.get("message") or "").strip()
+                return sanitized
+            return {
+                "status": "error",
+                "provider": capability_name,
+                "query": normalized_query,
+                "message": str(preview_result.get("message") or "Failed to build indexed artifact context preview.").strip(),
+                "context_text": "",
+                "operator_brief": "",
+                "chunks": [],
+                "matched_assets": [],
+                "reusable_spl_queries": [],
+                "retrieved_key_points": [],
+                "recommended_uses": [],
+                "coverage_gaps": [],
+                "coverage_summary": {},
+                "index_summary": {},
+                "asset_summary": {},
+            }
+
+        definition = capability_manager.registry.get_definition(capability_name)
+        if definition is None:
+            continue
+        config = capability_manager._get_or_create_config(definition)
+        provider = capability_manager._get_rag_provider(definition, config)
+        if provider is None or not hasattr(provider, "get_context"):
+            continue
+
+        try:
+            details = provider.get_context(normalized_query, max_chunks=4)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "provider": capability_name,
+                "query": normalized_query,
+                "message": f"Local artifact context lookup failed: {exc}",
+                "context_text": "",
+                "operator_brief": "",
+                "chunks": [],
+                "matched_assets": [],
+                "reusable_spl_queries": [],
+                "retrieved_key_points": [],
+                "recommended_uses": [],
+                "coverage_gaps": [],
+                "coverage_summary": {},
+                "index_summary": {},
+                "asset_summary": {},
+            }
+
+        return _build_m26_14_lightweight_rag_context_payload(normalized_query, details if isinstance(details, dict) else {})
+
+    return {
+        "status": "unavailable",
+        "provider": None,
+        "query": normalized_query,
+        "message": "Indexed artifact or local artifact context is not enabled.",
+        "context_text": "",
+        "operator_brief": "",
+        "chunks": [],
+        "matched_assets": [],
+        "reusable_spl_queries": [],
+        "retrieved_key_points": [],
+        "recommended_uses": [],
+        "coverage_gaps": [],
+        "coverage_summary": {},
+        "index_summary": {},
+        "asset_summary": {},
+    }
+
+
+def _extract_json_object_from_llm_text(text: Any) -> Optional[Dict[str, Any]]:
+    cleaned = sanitize_llm_response_text(str(text or ""))
+    if not cleaned:
+        return None
+
+    candidates = [cleaned]
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", cleaned, re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        candidates.insert(0, fenced_match.group(1).strip())
+    object_match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
+    if object_match:
+        candidates.append(object_match.group(1).strip())
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _is_llm_available_for_m26_14_advisory(config: Any) -> Tuple[bool, str]:
+    provider = normalize_provider_name(getattr(getattr(config, "llm", None), "provider", "") or "")
+    model = str(getattr(getattr(config, "llm", None), "model", "") or "").strip()
+    endpoint_url = str(getattr(getattr(config, "llm", None), "endpoint_url", "") or "").strip()
+    api_key = str(getattr(getattr(config, "llm", None), "api_key", "") or "").strip()
+
+    if not provider or not model:
+        return False, "Configured LLM provider or model is missing."
+    if provider in {"azure", "custom"} and not endpoint_url:
+        return False, f"Provider '{provider}' requires an endpoint URL."
+    if provider in {"openai", "azure", "anthropic", "gemini"} and not api_key:
+        return False, f"Provider '{provider}' requires an API key."
+    return True, ""
+
+
+async def _build_m26_14_llm_analysis_payload(
+    validation_pack: Dict[str, Any],
+    validation_summary: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    profile_snapshot: Dict[str, Any],
+    rag_context: Dict[str, Any],
+    capability_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    capability_config = capability_state.get("config") if isinstance(capability_state.get("config"), dict) else {}
+    if not bool(capability_config.get("allow_bespoke_follow_up", True)):
+        return {
+            "status": "disabled",
+            "message": "LLM-grounded bespoke follow-up is disabled for the M-26-14 advisor capability.",
+        }
+
+    config = config_manager.get()
+    llm_available, reason = _is_llm_available_for_m26_14_advisory(config)
+    if not llm_available:
+        return {
+            "status": "unavailable",
+            "message": reason,
+        }
+
+    try:
+        llm_client = get_or_create_llm_client(config)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Failed to initialize the configured LLM client: {exc}",
+        }
+
+    pack_payload = {
+        "id": validation_pack.get("id"),
+        "title": validation_pack.get("title"),
+        "control_area": validation_pack.get("control_area"),
+        "priority_objective": validation_pack.get("priority_objective"),
+        "description": validation_pack.get("description"),
+        "expected_evidence": _normalize_m26_14_advisory_list(validation_pack.get("expected_evidence"), limit=4),
+        "limitations": _normalize_m26_14_advisory_list(validation_pack.get("limitations"), limit=4),
+    }
+    rag_payload = {
+        "provider": rag_context.get("provider"),
+        "status": rag_context.get("status"),
+        "operator_brief": str(rag_context.get("operator_brief") or "").strip(),
+        "recommended_uses": _normalize_m26_14_advisory_list(rag_context.get("recommended_uses"), limit=4),
+        "coverage_gaps": _normalize_m26_14_advisory_list(rag_context.get("coverage_gaps"), limit=4),
+        "reusable_spl_queries": [
+            {
+                "title": item.get("title"),
+                "why_reuse": item.get("why_reuse"),
+                "environment_fit_status": item.get("environment_fit_status"),
+                "validation_status": item.get("validation_status"),
+                "reuse_tier": item.get("reuse_tier"),
+                "known_good": bool(item.get("known_good")),
+            }
+            for item in (rag_context.get("reusable_spl_queries") or [])[:3]
+            if isinstance(item, dict)
+        ],
+    }
+    validation_payload = {
+        "status": validation_summary.get("status"),
+        "headline": validation_summary.get("headline"),
+        "findings": _normalize_m26_14_advisory_list(validation_summary.get("findings"), limit=5),
+        "row_count": validation_summary.get("row_count"),
+        "sample_fields": validation_summary.get("sample_fields") or [],
+        "sample_rows": _sample_m26_14_validation_rows(rows, limit=5),
+    }
+
+    prompt_payload = {
+        "pack": pack_payload,
+        "profile_snapshot": profile_snapshot,
+        "validation": validation_payload,
+        "rag_context": rag_payload,
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are producing grounded M-26-14 advisor guidance for a Splunk discovery tool. "
+                "Use only the provided evidence. Do not claim formal compliance. Do not invent SPL, logs, hosts, sourcetypes, or policies. "
+                "Return strict JSON with keys: summary, environment_relevance, recommended_adjustments, suggested_follow_ups, evidence_gaps, confidence_notes. "
+                "Each list should contain short strings."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(prompt_payload, indent=2),
+        },
+    ]
+
+    try:
+        raw_response = await llm_client.generate_response(
+            messages=messages,
+            max_tokens=max(400, min(int(getattr(getattr(config, "llm", None), "max_tokens", 1200) or 1200), 1200)),
+            temperature=0.2,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Configured LLM follow-up failed: {exc}",
+        }
+
+    parsed = _extract_json_object_from_llm_text(raw_response)
+    if parsed is None:
+        fallback_summary = finalize_user_facing_response_text(raw_response, "")
+        return {
+            "status": "partial",
+            "message": "Configured LLM returned unstructured output; using a plain-text advisory summary.",
+            "summary": fallback_summary,
+            "environment_relevance": "",
+            "recommended_adjustments": [],
+            "suggested_follow_ups": [],
+            "evidence_gaps": [],
+            "confidence_notes": [],
+        }
+
+    return {
+        "status": "ready",
+        "summary": str(parsed.get("summary") or "").strip(),
+        "environment_relevance": str(parsed.get("environment_relevance") or "").strip(),
+        "recommended_adjustments": _normalize_m26_14_advisory_list(parsed.get("recommended_adjustments"), limit=5),
+        "suggested_follow_ups": _normalize_m26_14_advisory_list(parsed.get("suggested_follow_ups"), limit=5),
+        "evidence_gaps": _normalize_m26_14_advisory_list(parsed.get("evidence_gaps"), limit=5),
+        "confidence_notes": _normalize_m26_14_advisory_list(parsed.get("confidence_notes"), limit=4),
+    }
+
+
+async def _build_m26_14_validation_advisory_payload(
+    validation_pack: Dict[str, Any],
+    validation_request: "M2614ValidationRequest",
+    validation_summary: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    capability_state: Dict[str, Any],
+    *,
+    scope_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    profile_payload = build_m26_14_profile_payload(timestamp=validation_request.timestamp, scope_key=scope_key)
+    profile_snapshot = _build_m26_14_profile_advisory_snapshot(profile_payload, validation_pack)
+    rag_query = _build_m26_14_rag_context_query(validation_pack, validation_summary, profile_snapshot)
+    rag_context = _build_m26_14_rag_context_payload(rag_query)
+    llm_analysis = await _build_m26_14_llm_analysis_payload(
+        validation_pack,
+        validation_summary,
+        rows,
+        profile_snapshot,
+        rag_context,
+        capability_state,
+    )
+
+    status_parts = [profile_snapshot.get("has_data"), rag_context.get("status") == "ready", llm_analysis.get("status") in {"ready", "partial"}]
+    overall_status = "ready" if any(status_parts) else "unavailable"
+    if rag_context.get("status") == "error" or llm_analysis.get("status") == "error":
+        overall_status = "partial"
+
+    return {
+        "status": overall_status,
+        "profile_snapshot": profile_snapshot,
+        "rag_context": rag_context,
+        "llm_analysis": llm_analysis,
+    }
+
+
+def build_m26_14_profile_payload(
+    timestamp: Optional[str] = None,
+    scope_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build an M-26-14 profile payload from a selected discovery session."""
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    if not sessions:
+        return {
+            "has_data": False,
+            "message": "No discovery sessions are available yet.",
+            "validation_packs": list_m26_14_validation_packs(),
+            "sessions": [],
+        }
+
+    blueprint = load_selected_v2_blueprint(timestamp, scope_key=scope_key)
+    if not blueprint:
+        return {
+            "has_data": False,
+            "message": "No M-26-14 profile could be built because the selected V2 blueprint is unavailable.",
+            "validation_packs": list_m26_14_validation_packs(),
+            "sessions": sessions[:20],
+        }
+
+    profile = build_m26_14_profile_from_blueprint(blueprint)
+    profile["timestamp"] = blueprint.get("_session", {}).get("timestamp")
+    profile["artifact"] = blueprint.get("_artifact", {})
+    profile["validation_packs"] = list_m26_14_validation_packs()
+    profile["sessions"] = sessions[:20]
+    return profile
+
+
+def build_m26_14_compare_payload(
+    current_selection: Optional[str] = None,
+    baseline_selection: Optional[str] = None,
+    scope_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build compare payload across two M-26-14 profiles."""
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    if len(sessions) < 2:
+        return {
+            "has_data": False,
+            "message": "At least two discovery sessions are required for M-26-14 compare.",
+            "sessions": sessions[:20],
+        }
+
+    current = build_m26_14_profile_payload(current_selection, scope_key=scope_key)
+    baseline = build_m26_14_profile_payload(baseline_selection or "previous", scope_key=scope_key)
+    if not current.get("has_data") or not baseline.get("has_data"):
+        return {
+            "has_data": False,
+            "message": "Unable to build both M-26-14 profiles for compare.",
+            "current": current,
+            "baseline": baseline,
+            "sessions": sessions[:20],
+        }
+
+    current_level = current.get("maturity_floor", {}).get("level")
+    baseline_level = baseline.get("maturity_floor", {}).get("level")
+    recommended_pack_ids: List[str] = []
+    for pack_id in list(current.get("live_validation", {}).get("recommended_pack_ids", []) or []) + list(
+        baseline.get("live_validation", {}).get("recommended_pack_ids", []) or []
+    ):
+        if pack_id not in recommended_pack_ids:
+            recommended_pack_ids.append(pack_id)
+
+    return {
+        "has_data": True,
+        "current": current,
+        "baseline": baseline,
+        "comparison": {
+            "readiness_delta": int(current.get("readiness_estimate", 0) or 0) - int(baseline.get("readiness_estimate", 0) or 0),
+            "maturity_floor_delta": (current_level - baseline_level) if current_level is not None and baseline_level is not None else None,
+            "recommended_pack_ids": recommended_pack_ids[:8],
+        },
+        "sessions": sessions[:20],
+    }
+
+
 def build_session_runbook_payload(
     timestamp: Optional[str] = None,
     persona: str = "admin",
@@ -9007,6 +9588,57 @@ def load_latest_v2_blueprint(scope_key: Optional[str] = None) -> Optional[Dict[s
         except Exception:
             return None
     return None
+
+
+def load_selected_v2_blueprint(
+    timestamp: Optional[str] = None,
+    scope_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Load a selected intelligence blueprint artifact by discovery session timestamp."""
+    sessions = load_discovery_sessions(scope_key=scope_key)
+    if not sessions:
+        return None
+
+    selected_session = hydrate_discovery_session(_resolve_session_selection(sessions, timestamp, 0))
+    if not selected_session:
+        return None
+
+    session_scope_key = _get_discovery_session_scope_key(selected_session)
+    report_names = selected_session.get("report_paths", []) if isinstance(selected_session.get("report_paths", []), list) else []
+    blueprint_name = next(
+        (
+            report_name
+            for report_name in report_names
+            if str(report_name).startswith("v2_intelligence_blueprint_") and str(report_name).endswith(".json")
+        ),
+        None,
+    )
+    if blueprint_name is None:
+        blueprint_name = f"v2_intelligence_blueprint_{selected_session.get('timestamp')}.json"
+
+    try:
+        blueprint_path = _resolve_output_artifact_path(blueprint_name, session_scope_key)
+    except HTTPException:
+        return None
+
+    try:
+        payload = json.loads(blueprint_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    payload["_artifact"] = {
+        "name": blueprint_path.name,
+        "modified": datetime.fromtimestamp(blueprint_path.stat().st_mtime).isoformat(),
+        "size": blueprint_path.stat().st_size,
+    }
+    payload["_session"] = {
+        "timestamp": selected_session.get("timestamp"),
+        "scope_key": session_scope_key,
+    }
+    return payload
 
 
 def build_v2_artifact_catalog(scope_key: Optional[str] = None) -> Dict[str, Any]:
@@ -10374,6 +11006,13 @@ async def get_v2_intelligence(request: Request):
     }
 
 
+class M2614ValidationRequest(BaseModel):
+    pack_id: str
+    timestamp: Optional[str] = None
+    earliest: str = "-30d"
+    latest: str = "now"
+
+
 @app.get("/api/v2/artifacts")
 async def get_v2_artifacts(request: Request):
     """Return the artifact catalog for the workspace view."""
@@ -10386,6 +11025,126 @@ async def get_discovery_compare(request: Request, current: Optional[str] = None,
     """Return comparative metrics between two discovery sessions."""
     scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
     return build_discovery_compare_payload(current, baseline, scope_key=scope_key)
+
+
+@app.get("/api/discovery/m26-14/profile")
+async def get_m26_14_profile(request: Request, timestamp: Optional[str] = None):
+    """Return the latest or selected M-26-14 advisor profile."""
+    require_authenticated_user(request)
+    _require_m26_14_enabled(refresh_health=True)
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return build_m26_14_profile_payload(timestamp=timestamp, scope_key=scope_key)
+
+
+@app.get("/api/discovery/m26-14/compare")
+async def get_m26_14_compare(request: Request, current: Optional[str] = None, baseline: Optional[str] = None):
+    """Return comparative metrics between two M-26-14 advisor profiles."""
+    require_authenticated_user(request)
+    _require_m26_14_enabled(refresh_health=False)
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return build_m26_14_compare_payload(current_selection=current, baseline_selection=baseline, scope_key=scope_key)
+
+
+@app.get("/api/discovery/m26-14/validation-packs")
+async def get_m26_14_validation_packs(request: Request):
+    """Return the curated live-validation pack catalog for the M-26-14 advisor."""
+    require_authenticated_user(request)
+    capability_state = _require_m26_14_enabled(refresh_health=False)
+    return {
+        "status": "success",
+        "capability": {
+            "health_status": capability_state.get("health_status"),
+            "health_message": capability_state.get("health_message"),
+        },
+        "packs": list_m26_14_validation_packs(),
+    }
+
+
+@app.post("/api/discovery/m26-14/validate")
+async def run_m26_14_validation(request: Request, validation_request: M2614ValidationRequest):
+    """Execute one curated M-26-14 validation SPL pack against the active runtime MCP connection."""
+    require_analyst_or_admin_user(request)
+    capability_state = _require_m26_14_enabled(refresh_health=False)
+
+    validation_pack = get_m26_14_validation_pack(validation_request.pack_id)
+    if validation_pack is None:
+        raise HTTPException(status_code=404, detail=f"Unknown M-26-14 validation pack '{validation_request.pack_id}'")
+
+    runtime_config = resolve_effective_runtime_config(request=request)
+    if not str(getattr(runtime_config.mcp, "url", "") or "").strip():
+        raise HTTPException(status_code=503, detail="Live validation requires an active runtime MCP connection")
+
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    cache_key = _build_m26_14_validation_cache_key(
+        validation_pack,
+        validation_request,
+        runtime_config,
+        scope_key=scope_key,
+    )
+    cached_response = _get_cached_m26_14_validation_result(cache_key)
+    if cached_response is not None:
+        cached_response["from_cache"] = True
+        cached_response["cache_key"] = cache_key
+        return cached_response
+
+    tool_result = await execute_mcp_tool_call(
+        {
+            "method": "tools/call",
+            "params": {
+                "name": "splunk_run_query",
+                "arguments": {
+                    "query": validation_pack.get("query"),
+                    "earliest_time": validation_request.earliest,
+                    "latest_time": validation_request.latest,
+                },
+            },
+        },
+        runtime_config,
+    )
+
+    if isinstance(tool_result, dict) and tool_result.get("error"):
+        return JSONResponse(
+            status_code=int(tool_result.get("status_code") or 502),
+            content={
+                "status": "error",
+                "pack": validation_pack,
+                "message": str(tool_result.get("error") or "M-26-14 live validation failed"),
+                "detail": tool_result.get("detail"),
+            },
+        )
+
+    normalized_result = extract_results_from_mcp_response(tool_result)
+    rows = normalized_result.get("results", []) if isinstance(normalized_result.get("results", []), list) else []
+    validation_summary = summarize_m26_14_validation_results(validation_pack, rows)
+    advisory_payload = await _build_m26_14_validation_advisory_payload(
+        validation_pack,
+        validation_request,
+        validation_summary,
+        rows,
+        capability_state,
+        scope_key=scope_key,
+    )
+    response_payload = {
+        "status": "success",
+        "pack": validation_pack,
+        "query": validation_pack.get("query"),
+        "time_range": {
+            "earliest": validation_request.earliest,
+            "latest": validation_request.latest,
+        },
+        "cache_key": cache_key,
+        "cached_at": datetime.now().isoformat(),
+        "from_cache": False,
+        "result": {
+            "status_code": normalized_result.get("status_code"),
+            "error_message": normalized_result.get("error_message"),
+            "rows": rows,
+            "summary": validation_summary,
+        },
+        "advisory": advisory_payload,
+    }
+    _store_cached_m26_14_validation_result(cache_key, response_payload)
+    return response_payload
 
 
 @app.get("/api/discovery/runbook")

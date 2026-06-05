@@ -15,6 +15,7 @@ from capabilities.rag.chromadb_provider import ChromaRAGProvider
 from capabilities.rag.lightweight import LightweightRAGProvider
 from capabilities.registry import CapabilityRegistry
 from capabilities.tools import DeterministicExportProvider, SplunkDeepLinkProvider, VisualizationPreviewProvider
+from discovery.m26_14_advisor import build_capability_state_snapshot
 
 
 def _utc_now_iso() -> str:
@@ -1222,6 +1223,12 @@ class CapabilityManager:
         ]
 
     def _extra_capability_state(self, definition: CapabilityDefinition, config: CapabilityConfig) -> Dict[str, Any]:
+        if definition.name == "m26_14_advisor":
+            summary = build_capability_state_snapshot(config.config)
+            summary["enabled_validation_pack_ids"] = list(
+                config.config.get("default_validation_pack_ids", []) or []
+            )
+            return summary
         if definition.name == "rag_chromadb":
             provider = ChromaRAGProvider(config=config, definition=definition)
             asset_summary = provider.get_knowledge_asset_summary()

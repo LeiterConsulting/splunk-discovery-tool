@@ -6,6 +6,38 @@ from capabilities.models import CapabilityDefinition
 
 
 KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
+    "m26_14_advisor": CapabilityDefinition(
+        name="m26_14_advisor",
+        title="M-26-14 Advisor",
+        category="advisor",
+        description="Non-authoritative readiness advisor for OMB M-26-14 logging and network visibility posture.",
+        purpose="Turn discovery evidence and curated live validations into an explainable M-26-14 readiness estimate.",
+        intent="Help operators understand how current Splunk evidence aligns with M-26-14, where confidence is weak, and which validations to run next.",
+        capability_set=[
+            "Build an evidence-backed M-26-14 posture profile from persisted discovery blueprints.",
+            "Offer curated day-one validation SPL packs for retention, audit coverage, network visibility, privilege changes, and detection posture.",
+            "Separate discovery-derived posture from explicit live validations and bespoke follow-up analysis.",
+        ],
+        install_method="internal",
+        default_config={
+            "output_dir": "output",
+            "profile_cache_dir": "output/m26_14",
+            "live_validation_limit": 6,
+            "allow_bespoke_follow_up": True,
+            "require_live_validation_confirmation": True,
+            "default_validation_pack_ids": [
+                "retention_and_searchability",
+                "audit_and_admin_activity",
+                "network_visibility_coverage",
+                "privileged_change_monitoring",
+            ],
+        },
+        runtime_available=True,
+        requires_restart_on_install=False,
+        enabled_by_default=False,
+        priority=25,
+        maturity="phase6",
+    ),
     "rag_local": CapabilityDefinition(
         name="rag_local",
         title="Local Artifact Search",

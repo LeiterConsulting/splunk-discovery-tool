@@ -407,6 +407,8 @@ class WebAppLocalAuthTests(unittest.TestCase):
         web_app.oidc_login_state_store = web_app.OIDCLoginStateStore()
         if hasattr(web_app, "clear_oidc_provider_jwks_cache"):
             web_app.clear_oidc_provider_jwks_cache()
+        if hasattr(web_app, "clear_m26_14_validation_cache"):
+            web_app.clear_m26_14_validation_cache()
 
         self.client = TestClient(web_app.app)
 
@@ -419,6 +421,8 @@ class WebAppLocalAuthTests(unittest.TestCase):
         web_app.oidc_login_state_store = self.original_oidc_login_state_store
         if hasattr(web_app, "clear_oidc_provider_jwks_cache"):
             web_app.clear_oidc_provider_jwks_cache()
+        if hasattr(web_app, "clear_m26_14_validation_cache"):
+            web_app.clear_m26_14_validation_cache()
         os.chdir(self.original_cwd)
         self.temp_dir.cleanup()
 
@@ -476,6 +480,13 @@ class WebAppLocalAuthTests(unittest.TestCase):
             discovery_scope=discovery_scope,
         )
 
+    def _enable_m26_14_advisor(self):
+        install_result = web_app.capability_manager.install_capability("m26_14_advisor")
+        self.assertTrue(install_result.ok, install_result.message)
+
+        enable_result = web_app.capability_manager.enable_capability("m26_14_advisor")
+        self.assertTrue(enable_result.ok, enable_result.message)
+
     def test_demo_mode_leaves_config_access_available(self):
         status = self.client.get("/api/auth/status")
         self.assertEqual(status.status_code, 200)
@@ -485,6 +496,463 @@ class WebAppLocalAuthTests(unittest.TestCase):
         config_response = self.client.get("/api/config")
         self.assertEqual(config_response.status_code, 200)
         self.assertIn("security", config_response.json())
+
+    def test_m26_14_profile_and_validation_catalog_endpoints_return_advisor_data(self):
+        self._enable_m26_14_advisor()
+        session_id = "20260526_120000"
+        self._register_discovery_session_fixture(session_id)
+
+        profile_response = self.client.get("/api/discovery/m26-14/profile")
+        self.assertEqual(profile_response.status_code, 200)
+        profile_payload = profile_response.json()
+        self.assertTrue(profile_payload["has_data"])
+        self.assertEqual(profile_payload["timestamp"], session_id)
+        self.assertTrue(any(pack.get("id") == "retention_and_searchability" for pack in profile_payload["validation_packs"]))
+        self.assertTrue(any(session.get("timestamp") == session_id for session in profile_payload["sessions"]))
+
+        catalog_response = self.client.get("/api/discovery/m26-14/validation-packs")
+        self.assertEqual(catalog_response.status_code, 200)
+        catalog_payload = catalog_response.json()
+        self.assertEqual(catalog_payload["status"], "success")
+        self.assertTrue(any(pack.get("id") == "audit_and_admin_activity" for pack in catalog_payload["packs"]))
+        self.assertEqual(catalog_payload["capability"]["health_status"], "ready")
+
+    def test_m26_14_compare_endpoint_uses_session_history_and_deduplicates_recommended_packs(self):
+        self._enable_m26_14_advisor()
+        previous_session_id = "20260525_120000"
+        latest_session_id = "20260526_120000"
+        self._register_discovery_session_fixture(previous_session_id)
+        self._register_discovery_session_fixture(latest_session_id)
+
+        profile_by_timestamp = {
+            latest_session_id: {
+                "has_data": True,
+                "framework": "OMB M-26-14",
+                "readiness_estimate": 82,
+                "confidence": "medium",
+                "maturity_floor": {"level": 3, "explanation": "Latest session shows broader evidence coverage."},
+                "priority_objectives": {},
+                "maturity_elements": [],
+                "live_validation": {
+                    "curated_pack_count": 2,
+                    "recommended_pack_ids": [
+                        "network_visibility_coverage",
+                        "audit_and_admin_activity",
+                    ],
+                },
+                "source_summary": {},
+            },
+            previous_session_id: {
+                "has_data": True,
+                "framework": "OMB M-26-14",
+                "readiness_estimate": 64,
+                "confidence": "low",
+                "maturity_floor": {"level": 2, "explanation": "Previous session had narrower evidence coverage."},
+                "priority_objectives": {},
+                "maturity_elements": [],
+                "live_validation": {
+                    "curated_pack_count": 2,
+                    "recommended_pack_ids": [
+                        "audit_and_admin_activity",
+                        "timestamp_freshness_sanity",
+                    ],
+                },
+                "source_summary": {},
+            },
+        }
+
+        def stub_build_profile_from_blueprint(blueprint):
+            timestamp = blueprint.get("_session", {}).get("timestamp")
+            return copy.deepcopy(profile_by_timestamp[timestamp])
+
+        with patch.object(web_app, "build_m26_14_profile_from_blueprint", side_effect=stub_build_profile_from_blueprint):
+            compare_response = self.client.get("/api/discovery/m26-14/compare?current=latest&baseline=previous")
+
+        self.assertEqual(compare_response.status_code, 200)
+        compare_payload = compare_response.json()
+        self.assertTrue(compare_payload["has_data"])
+        self.assertEqual(compare_payload["current"]["timestamp"], latest_session_id)
+        self.assertEqual(compare_payload["baseline"]["timestamp"], previous_session_id)
+        self.assertEqual(compare_payload["comparison"]["readiness_delta"], 18)
+        self.assertEqual(compare_payload["comparison"]["maturity_floor_delta"], 1)
+        self.assertEqual(
+            compare_payload["comparison"]["recommended_pack_ids"],
+            [
+                "network_visibility_coverage",
+                "audit_and_admin_activity",
+                "timestamp_freshness_sanity",
+            ],
+        )
+        self.assertEqual(
+            [session.get("timestamp") for session in compare_payload["sessions"][:2]],
+            [latest_session_id, previous_session_id],
+        )
+
+    def test_m26_14_validation_endpoint_rejects_viewer_role(self):
+        self._enable_m26_14_advisor()
+        self._enable_auth_and_complete_admin_reset()
+
+        create_viewer = self.client.post(
+            "/api/security/users",
+            json={
+                "username": "viewer-m2614",
+                "password": "ViewerPassword123!",
+                "role": "viewer",
+                "require_password_reset": False,
+            },
+        )
+        self.assertEqual(create_viewer.status_code, 200)
+
+        logout_response = self.client.post("/api/auth/logout")
+        self.assertEqual(logout_response.status_code, 200)
+
+        viewer_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "viewer-m2614", "password": "ViewerPassword123!"},
+        )
+        self.assertEqual(viewer_login.status_code, 200)
+
+        validation_response = self.client.post(
+            "/api/discovery/m26-14/validate",
+            json={"pack_id": "retention_and_searchability"},
+        )
+        self.assertEqual(validation_response.status_code, 403)
+        self.assertIn("analyst or admin", validation_response.json()["detail"].lower())
+
+    def test_m26_14_validation_endpoint_allows_admin_and_analyst_execution(self):
+        admin_password = self._enable_auth_and_complete_admin_reset()
+        self._enable_m26_14_advisor()
+
+        create_analyst = self.client.post(
+            "/api/security/users",
+            json={
+                "username": "analyst-m2614",
+                "password": "AnalystPassword123!",
+                "role": "analyst",
+                "require_password_reset": False,
+            },
+        )
+        self.assertEqual(create_analyst.status_code, 200)
+
+        captured_calls = []
+
+        def build_runtime_config(request=None):
+            return SimpleNamespace(
+                mcp=SimpleNamespace(url="https://mcp.example.com"),
+                active_mcp_config_name="global",
+            )
+
+        async def stub_execute_mcp_tool_call(payload, runtime_config):
+            captured_calls.append(
+                {
+                    "payload": copy.deepcopy(payload),
+                    "runtime_url": getattr(runtime_config.mcp, "url", None),
+                    "runtime_name": getattr(runtime_config, "active_mcp_config_name", None),
+                }
+            )
+            return {
+                "result": {
+                    "structuredContent": {
+                        "status_code": 200,
+                        "results": [
+                            {
+                                "index": "main",
+                                "retention_days": 400,
+                                "retention_status": "meets_floor",
+                            }
+                        ],
+                    }
+                }
+            }
+
+        with patch.object(web_app, "resolve_effective_runtime_config", side_effect=build_runtime_config), patch.object(
+            web_app,
+            "execute_mcp_tool_call",
+            new=AsyncMock(side_effect=stub_execute_mcp_tool_call),
+        ):
+            admin_response = self.client.post(
+                "/api/discovery/m26-14/validate",
+                json={
+                    "pack_id": "retention_and_searchability",
+                    "earliest": "-14d",
+                    "latest": "now",
+                },
+            )
+
+            self.assertEqual(admin_response.status_code, 200)
+            admin_payload = admin_response.json()
+            self.assertEqual(admin_payload["status"], "success")
+            self.assertEqual(admin_payload["result"]["status_code"], 200)
+            self.assertEqual(admin_payload["result"]["summary"]["status"], "observed")
+            self.assertEqual(admin_payload["result"]["summary"]["row_count"], 1)
+            self.assertEqual(admin_payload["time_range"], {"earliest": "-14d", "latest": "now"})
+
+            admin_logout = self.client.post("/api/auth/logout")
+            self.assertEqual(admin_logout.status_code, 200)
+
+            analyst_login = self.client.post(
+                "/api/auth/login",
+                json={"username": "analyst-m2614", "password": "AnalystPassword123!"},
+            )
+            self.assertEqual(analyst_login.status_code, 200)
+
+            analyst_response = self.client.post(
+                "/api/discovery/m26-14/validate",
+                json={
+                    "pack_id": "retention_and_searchability",
+                    "earliest": "-7d",
+                    "latest": "now",
+                },
+            )
+
+        self.assertEqual(analyst_response.status_code, 200)
+        analyst_payload = analyst_response.json()
+        self.assertEqual(analyst_payload["status"], "success")
+        self.assertEqual(analyst_payload["pack"]["id"], "retention_and_searchability")
+        self.assertEqual(analyst_payload["result"]["rows"][0]["index"], "main")
+        self.assertEqual(analyst_payload["result"]["summary"]["sample_fields"], ["index", "retention_days", "retention_status"])
+
+        self.assertEqual(len(captured_calls), 2)
+        self.assertEqual(captured_calls[0]["runtime_url"], "https://mcp.example.com")
+        self.assertEqual(captured_calls[1]["runtime_name"], "global")
+        self.assertEqual(captured_calls[0]["payload"]["params"]["name"], "splunk_run_query")
+        self.assertEqual(captured_calls[0]["payload"]["params"]["arguments"]["earliest_time"], "-14d")
+        self.assertEqual(captured_calls[1]["payload"]["params"]["arguments"]["earliest_time"], "-7d")
+        self.assertIn("| rest /services/data/indexes", captured_calls[0]["payload"]["params"]["arguments"]["query"])
+
+        admin_relogin = self.client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": admin_password},
+        )
+        self.assertEqual(admin_relogin.status_code, 200)
+
+    def test_m26_14_validation_endpoint_reuses_cached_result_for_repeated_requests(self):
+        self._enable_auth_and_complete_admin_reset()
+        self._enable_m26_14_advisor()
+        session_id = "20260526_120000"
+        self._register_discovery_session_fixture(session_id)
+
+        captured_calls = []
+
+        def build_runtime_config(request=None):
+            return SimpleNamespace(
+                mcp=SimpleNamespace(url="https://mcp.example.com"),
+                active_mcp_config_name="global",
+            )
+
+        async def stub_execute_mcp_tool_call(payload, runtime_config):
+            captured_calls.append(
+                {
+                    "payload": copy.deepcopy(payload),
+                    "runtime_url": getattr(runtime_config.mcp, "url", None),
+                    "runtime_name": getattr(runtime_config, "active_mcp_config_name", None),
+                }
+            )
+            return {
+                "result": {
+                    "structuredContent": {
+                        "status_code": 200,
+                        "results": [
+                            {
+                                "index": "main",
+                                "retention_days": 400,
+                                "retention_status": "meets_floor",
+                            }
+                        ],
+                    }
+                }
+            }
+
+        request_payload = {
+            "pack_id": "retention_and_searchability",
+            "timestamp": "latest",
+            "earliest": "-14d",
+            "latest": "now",
+        }
+
+        with patch.object(web_app, "resolve_effective_runtime_config", side_effect=build_runtime_config), patch.object(
+            web_app,
+            "execute_mcp_tool_call",
+            new=AsyncMock(side_effect=stub_execute_mcp_tool_call),
+        ):
+            first_response = self.client.post("/api/discovery/m26-14/validate", json=request_payload)
+            second_response = self.client.post("/api/discovery/m26-14/validate", json=request_payload)
+            changed_range_response = self.client.post(
+                "/api/discovery/m26-14/validate",
+                json={**request_payload, "earliest": "-7d"},
+            )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(changed_range_response.status_code, 200)
+
+        first_payload = first_response.json()
+        second_payload = second_response.json()
+        changed_range_payload = changed_range_response.json()
+
+        self.assertFalse(first_payload["from_cache"])
+        self.assertFalse(changed_range_payload["from_cache"])
+        self.assertTrue(second_payload["from_cache"])
+        self.assertEqual(first_payload["cache_key"], second_payload["cache_key"])
+        self.assertNotEqual(first_payload["cache_key"], changed_range_payload["cache_key"])
+        self.assertEqual(first_payload["cached_at"], second_payload["cached_at"])
+        self.assertEqual(second_payload["result"], first_payload["result"])
+        self.assertEqual(len(captured_calls), 2)
+        self.assertEqual(captured_calls[0]["payload"]["params"]["arguments"]["earliest_time"], "-14d")
+        self.assertEqual(captured_calls[1]["payload"]["params"]["arguments"]["earliest_time"], "-7d")
+
+    def test_m26_14_validation_endpoint_returns_grounded_advisory_context(self):
+        self._enable_auth_and_complete_admin_reset()
+        self._enable_m26_14_advisor()
+        session_id = "20260526_120000"
+        self._register_discovery_session_fixture(session_id)
+
+        def build_runtime_config(request=None):
+            return SimpleNamespace(
+                mcp=SimpleNamespace(url="https://mcp.example.com"),
+                active_mcp_config_name="global",
+            )
+
+        async def stub_execute_mcp_tool_call(payload, runtime_config):
+            return {
+                "result": {
+                    "structuredContent": {
+                        "status_code": 200,
+                        "results": [
+                            {
+                                "index": "main",
+                                "retention_days": 400,
+                                "retention_status": "meets_floor",
+                            }
+                        ],
+                    }
+                }
+            }
+
+        fake_profile_payload = {
+            "has_data": True,
+            "timestamp": session_id,
+            "readiness_estimate": 78,
+            "confidence": "medium",
+            "maturity_floor": {"level": 3, "explanation": "Fixture floor"},
+            "priority_objectives": {
+                "thirf": {
+                    "objective": "Threat Hunting, Investigation, and Response Findings",
+                    "notes": ["Retention evidence is the current focus."],
+                },
+            },
+            "maturity_elements": [
+                {
+                    "id": "data_retention",
+                    "label": "Data Retention",
+                    "gaps": ["Searchable retention needs confirmation for critical indexes."],
+                    "remediation": ["Validate the highest-value indexes first."],
+                },
+            ],
+            "source_summary": {
+                "total_indexes": 4,
+                "total_hosts": 12,
+                "security_source_count": 3,
+                "compliance_source_count": 1,
+            },
+            "live_validation": {
+                "recommended_pack_ids": ["retention_and_searchability"],
+            },
+        }
+        fake_rag_context = {
+            "status": "ready",
+            "provider": "rag_chromadb",
+            "query": "M-26-14 advisory Retention and Searchability",
+            "message": "Built context preview from indexed assets.",
+            "context_text": "Knowledge asset context preview for retention review.",
+            "operator_brief": "Use the retention runbook to compare frozen buckets against one-year expectations.",
+            "chunks": [],
+            "matched_assets": [],
+            "reusable_spl_queries": [
+                {
+                    "title": "Known-good retention review",
+                    "query": "| rest /services/data/indexes | table title frozenTimePeriodInSecs",
+                    "why_reuse": "Previously validated against similar Splunk layouts.",
+                    "environment_fit_status": "aligned",
+                    "validation_status": "known_good",
+                    "reuse_tier": "known_good",
+                    "known_good": True,
+                },
+            ],
+            "recommended_uses": ["Cross-check curated retention findings against the runbook baseline."],
+            "coverage_gaps": ["No archived storage policy note was matched in indexed context."],
+            "coverage_summary": {"asset_count": 1},
+            "index_summary": {},
+            "asset_summary": {},
+        }
+        fake_llm_client = SimpleNamespace(
+            generate_response=AsyncMock(
+                return_value=json.dumps(
+                    {
+                        "summary": "Retention settings currently look favorable for the sampled indexes, but searchable retention still needs confirmation.",
+                        "environment_relevance": "This environment already shows enough indexed context to compare retention intent against prior operator guidance.",
+                        "recommended_adjustments": [
+                            "Confirm that the highest-value indexes preserve at least six months of immediately searchable history.",
+                        ],
+                        "suggested_follow_ups": [
+                            "Review archived storage and thaw procedures for the affected indexes.",
+                        ],
+                        "evidence_gaps": [
+                            "The result does not prove searchable retention duration for each critical data set.",
+                        ],
+                        "confidence_notes": [
+                            "The advisory is grounded in one validation result and one retrieved knowledge asset.",
+                        ],
+                    }
+                )
+            )
+        )
+
+        with patch.object(web_app, "resolve_effective_runtime_config", side_effect=build_runtime_config), patch.object(
+            web_app,
+            "execute_mcp_tool_call",
+            new=AsyncMock(side_effect=stub_execute_mcp_tool_call),
+        ), patch.object(
+            web_app,
+            "build_m26_14_profile_payload",
+            return_value=fake_profile_payload,
+        ), patch.object(
+            web_app,
+            "_build_m26_14_rag_context_payload",
+            return_value=fake_rag_context,
+        ), patch.object(
+            web_app,
+            "_is_llm_available_for_m26_14_advisory",
+            return_value=(True, ""),
+        ), patch.object(
+            web_app,
+            "get_or_create_llm_client",
+            return_value=fake_llm_client,
+        ):
+            response = self.client.post(
+                "/api/discovery/m26-14/validate",
+                json={
+                    "pack_id": "retention_and_searchability",
+                    "timestamp": "latest",
+                    "earliest": "-14d",
+                    "latest": "now",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("advisory", payload)
+        self.assertEqual(payload["advisory"]["status"], "ready")
+        self.assertTrue(payload["advisory"]["profile_snapshot"]["has_data"])
+        self.assertEqual(payload["advisory"]["profile_snapshot"]["timestamp"], session_id)
+        self.assertEqual(payload["advisory"]["rag_context"]["provider"], "rag_chromadb")
+        self.assertEqual(payload["advisory"]["rag_context"]["reusable_spl_queries"][0]["title"], "Known-good retention review")
+        self.assertEqual(payload["advisory"]["llm_analysis"]["status"], "ready")
+        self.assertIn("Retention settings currently look favorable", payload["advisory"]["llm_analysis"]["summary"])
+        self.assertEqual(
+            payload["advisory"]["llm_analysis"]["recommended_adjustments"],
+            ["Confirm that the highest-value indexes preserve at least six months of immediately searchable history."],
+        )
 
     def test_discovery_status_endpoint_returns_runtime_snapshot(self):
         original_runtime_state = copy.deepcopy(web_app.discovery_runtime_state)

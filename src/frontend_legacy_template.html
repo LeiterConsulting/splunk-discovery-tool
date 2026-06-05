@@ -2123,6 +2123,21 @@
             const [workflowTab, setWorkflowTab] = useState('admin');
             const [compareSelection, setCompareSelection] = useState({ current: 'latest', baseline: 'previous' });
             const [discoveryCompare, setDiscoveryCompare] = useState(null);
+            const [m2614Profile, setM2614Profile] = useState({ has_data: false, message: 'M-26-14 advisor has not been loaded yet.' });
+            const [m2614Compare, setM2614Compare] = useState({ has_data: false, message: 'M-26-14 compare has not been loaded yet.' });
+            const [m2614ValidationCatalog, setM2614ValidationCatalog] = useState({
+                status: 'idle',
+                capability: null,
+                packs: [],
+                error: ''
+            });
+            const [m2614ValidationSelection, setM2614ValidationSelection] = useState({
+                packId: '',
+                earliest: '-30d',
+                latest: 'now'
+            });
+            const [m2614ValidationState, setM2614ValidationState] = useState({ status: 'idle', error: '' });
+            const [m2614ValidationResult, setM2614ValidationResult] = useState(null);
             const [runbookPayload, setRunbookPayload] = useState(null);
             const [selectedReport, setSelectedReport] = useState(null);
             const [reportContent, setReportContent] = useState(null);
@@ -2353,6 +2368,7 @@
 
             const isMissionTab = workspaceTab === 'mission';
             const isIntelligenceTab = workspaceTab === 'intelligence';
+            const isM2614Tab = workspaceTab === 'm26-14';
             const isArtifactsTab = workspaceTab === 'artifacts';
             const isCapabilitiesTab = workspaceTab === 'capabilities';
             const isChatTab = isChatFullscreen && workspaceTab === 'chat';
@@ -2452,6 +2468,40 @@
             const ragDisplayedAssetCount = ragAssetWorkspace.summary?.asset_count ?? ragKnowledgeAssetSummary?.asset_count ?? 0;
             const ragDisplayedAssetDir = ragAssetWorkspace.summary?.asset_dir || ragKnowledgeAssetSummary?.asset_dir || 'output/rag/assets';
             const ragSplLibraryAssetCount = ragDisplayedAssets.filter((asset) => String(asset?.asset_type || '').toLowerCase() === SPL_LIBRARY_ASSET_TYPE).length;
+            const m2614AdvisorCapability = capabilitiesData?.capabilities?.m26_14_advisor || null;
+            const showM2614WorkspaceTab = !!(m2614AdvisorCapability?.installed && m2614AdvisorCapability?.enabled);
+            const m2614PriorityObjectives = Object.values(m2614Profile?.priority_objectives || {}).filter((item) => item && typeof item === 'object');
+            const m2614MaturityElements = Array.isArray(m2614Profile?.maturity_elements)
+                ? m2614Profile.maturity_elements.filter((item) => item && typeof item === 'object')
+                : [];
+            const m2614ValidationPacks = Array.isArray(m2614ValidationCatalog?.packs) && m2614ValidationCatalog.packs.length > 0
+                ? m2614ValidationCatalog.packs
+                : (Array.isArray(m2614Profile?.validation_packs) ? m2614Profile.validation_packs : []);
+            const selectedM2614ValidationPack = m2614ValidationPacks.find((pack) => pack?.id === m2614ValidationSelection.packId) || m2614ValidationPacks[0] || null;
+            const m2614RecommendedPackIds = Array.isArray(m2614Profile?.live_validation?.recommended_pack_ids)
+                ? m2614Profile.live_validation.recommended_pack_ids
+                : [];
+            const m2614RecommendedPacks = m2614ValidationPacks.filter((pack) => m2614RecommendedPackIds.includes(pack?.id));
+            const canRunM2614Validation = !authAccountsEnabled || ['admin', 'analyst'].includes(String(currentAuthUser?.role || '').trim().toLowerCase());
+            const m2614ValidationSummary = m2614ValidationResult?.result?.summary && typeof m2614ValidationResult.result.summary === 'object'
+                ? m2614ValidationResult.result.summary
+                : null;
+            const m2614ValidationRows = Array.isArray(m2614ValidationResult?.result?.rows) ? m2614ValidationResult.result.rows : [];
+            const m2614ValidationAdvisory = m2614ValidationResult?.advisory && typeof m2614ValidationResult.advisory === 'object'
+                ? m2614ValidationResult.advisory
+                : null;
+            const m2614ValidationProfileSnapshot = m2614ValidationAdvisory?.profile_snapshot && typeof m2614ValidationAdvisory.profile_snapshot === 'object'
+                ? m2614ValidationAdvisory.profile_snapshot
+                : null;
+            const m2614ValidationRagContext = m2614ValidationAdvisory?.rag_context && typeof m2614ValidationAdvisory.rag_context === 'object'
+                ? m2614ValidationAdvisory.rag_context
+                : null;
+            const m2614ValidationReusableQueries = Array.isArray(m2614ValidationRagContext?.reusable_spl_queries)
+                ? m2614ValidationRagContext.reusable_spl_queries.filter((candidate) => typeof candidate?.query === 'string' && candidate.query.trim()).slice(0, 3)
+                : [];
+            const m2614ValidationLlmAnalysis = m2614ValidationAdvisory?.llm_analysis && typeof m2614ValidationAdvisory.llm_analysis === 'object'
+                ? m2614ValidationAdvisory.llm_analysis
+                : null;
             const ragLibraryStatusCounts = ragAssetWorkspace.summary?.library_status_counts && typeof ragAssetWorkspace.summary.library_status_counts === 'object'
                 ? ragAssetWorkspace.summary.library_status_counts
                 : (ragKnowledgeAssetSummary?.library_status_counts && typeof ragKnowledgeAssetSummary.library_status_counts === 'object'
@@ -4116,6 +4166,9 @@
                 if (isIntelligenceTab) {
                     loadV2Intelligence();
                 }
+                if (isM2614Tab) {
+                    refreshM2614Workspace();
+                }
                 if (isArtifactsTab) {
                     loadDiscoveryStatus();
                     loadReports();
@@ -4125,6 +4178,26 @@
                     loadCapabilities();
                 }
             }, [workspaceTab]);
+
+            useEffect(() => {
+                if (!showM2614WorkspaceTab && workspaceTab === 'm26-14') {
+                    setWorkspaceTab('mission');
+                }
+            }, [showM2614WorkspaceTab, workspaceTab]);
+
+            useEffect(() => {
+                if (m2614ValidationPacks.length === 0) {
+                    return;
+                }
+
+                const hasSelectedPack = m2614ValidationPacks.some((pack) => pack?.id === m2614ValidationSelection.packId);
+                if (!hasSelectedPack) {
+                    setM2614ValidationSelection((prev) => ({
+                        ...prev,
+                        packId: m2614ValidationPacks[0]?.id || ''
+                    }));
+                }
+            }, [m2614ValidationPacks, m2614ValidationSelection.packId]);
 
             useEffect(() => {
                 if (!isCapabilitiesTab) {
@@ -4585,6 +4658,11 @@
                 refreshArtifactsWorkspace();
             };
 
+            const openM2614Workspace = () => {
+                setWorkspaceTab('m26-14');
+                refreshM2614Workspace();
+            };
+
             const loadCapabilities = async () => {
                 try {
                     const response = await fetch('/api/capabilities');
@@ -4693,6 +4771,23 @@
                 }
             };
 
+            const getM2614StatusClasses = (status) => {
+                switch (String(status || '').toLowerCase()) {
+                    case 'ready':
+                    case 'observed':
+                        return isDarkTheme ? 'bg-emerald-900 text-emerald-100 border border-emerald-700' : 'bg-emerald-100 text-emerald-800 border border-emerald-300';
+                    case 'partial':
+                    case 'warn':
+                    case 'degraded':
+                        return isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-100 text-amber-900 border border-amber-300';
+                    case 'gap':
+                        return isDarkTheme ? 'bg-rose-900 text-rose-100 border border-rose-700' : 'bg-rose-100 text-rose-900 border border-rose-300';
+                    case 'unknown':
+                    default:
+                        return isDarkTheme ? 'bg-slate-800 text-slate-100 border border-slate-600' : 'bg-slate-100 text-slate-800 border border-slate-300';
+                }
+            };
+
             const formatTokenLabel = (value) => {
                 const cleaned = String(value || '').trim();
                 if (!cleaned) {
@@ -4720,6 +4815,15 @@
                         return 'Restart required';
                     case 'unavailable':
                         return 'Planned';
+                    default:
+                        return formatTokenLabel(status) || 'Unknown';
+                }
+            };
+
+            const formatM2614StatusLabel = (status) => {
+                switch (String(status || '').toLowerCase()) {
+                    case 'very_low':
+                        return 'Very low';
                     default:
                         return formatTokenLabel(status) || 'Unknown';
                 }
@@ -5652,6 +5756,109 @@
                 }
             };
 
+            const loadM2614Profile = async (timestamp = compareSelection.current || 'latest') => {
+                try {
+                    const params = new URLSearchParams();
+                    if (timestamp) params.set('timestamp', timestamp);
+                    const response = await fetch(`/api/discovery/m26-14/profile?${params.toString()}`);
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
+                    }
+                    setM2614Profile(result);
+                    return result;
+                } catch (error) {
+                    console.error('Failed to load M-26-14 profile:', error);
+                    const fallbackResult = { has_data: false, message: error.message || 'Failed to load M-26-14 profile.' };
+                    setM2614Profile(fallbackResult);
+                    return fallbackResult;
+                }
+            };
+
+            const loadM2614Compare = async (current = compareSelection.current || 'latest', baseline = compareSelection.baseline || 'previous') => {
+                try {
+                    const params = new URLSearchParams();
+                    if (current) params.set('current', current);
+                    if (baseline) params.set('baseline', baseline);
+                    const response = await fetch(`/api/discovery/m26-14/compare?${params.toString()}`);
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
+                    }
+                    setM2614Compare(result);
+                    return result;
+                } catch (error) {
+                    console.error('Failed to load M-26-14 compare:', error);
+                    const fallbackResult = { has_data: false, message: error.message || 'Failed to load M-26-14 compare.' };
+                    setM2614Compare(fallbackResult);
+                    return fallbackResult;
+                }
+            };
+
+            const loadM2614ValidationPacks = async () => {
+                try {
+                    const response = await fetch('/api/discovery/m26-14/validation-packs');
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
+                    }
+                    setM2614ValidationCatalog({
+                        status: 'success',
+                        capability: result?.capability || null,
+                        packs: Array.isArray(result?.packs) ? result.packs : [],
+                        error: ''
+                    });
+                    return result;
+                } catch (error) {
+                    console.error('Failed to load M-26-14 validation packs:', error);
+                    setM2614ValidationCatalog({
+                        status: 'error',
+                        capability: null,
+                        packs: [],
+                        error: error.message || 'Failed to load M-26-14 validation packs.'
+                    });
+                    return { status: 'error', packs: [], message: error.message || 'Failed to load M-26-14 validation packs.' };
+                }
+            };
+
+            const refreshM2614Workspace = (options = {}) => {
+                const current = options.current || compareSelection.current || 'latest';
+                const baseline = options.baseline || compareSelection.baseline || 'previous';
+                loadM2614Profile(current);
+                loadM2614Compare(current, baseline);
+                loadM2614ValidationPacks();
+            };
+
+            const runM2614Validation = async () => {
+                if (!selectedM2614ValidationPack?.id) {
+                    setM2614ValidationState({ status: 'error', error: 'Select a curated validation pack before running live validation.' });
+                    return;
+                }
+
+                setM2614ValidationState({ status: 'loading', error: '' });
+                try {
+                    const response = await fetch('/api/discovery/m26-14/validate', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            pack_id: selectedM2614ValidationPack.id,
+                            timestamp: compareSelection.current || 'latest',
+                            earliest: m2614ValidationSelection.earliest,
+                            latest: m2614ValidationSelection.latest,
+                        }),
+                    });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result?.detail || result?.message || `HTTP ${response.status}`);
+                    }
+                    setM2614ValidationResult(result);
+                    setM2614ValidationState({ status: 'success', error: '' });
+                } catch (error) {
+                    console.error('Failed to run M-26-14 validation:', error);
+                    setM2614ValidationState({ status: 'error', error: error.message || 'Failed to run M-26-14 validation.' });
+                }
+            };
+
             const loadRunbookPayload = async (timestamp = 'latest', persona = workflowTab, voice = operatorVoice) => {
                 try {
                     const params = new URLSearchParams();
@@ -5689,6 +5896,10 @@
 
             const refreshCompareSelection = () => {
                 loadDiscoveryCompare(compareSelection.current, compareSelection.baseline);
+            };
+
+            const refreshM2614CompareSelection = () => {
+                refreshM2614Workspace({ current: compareSelection.current, baseline: compareSelection.baseline });
             };
 
             const refreshRunbook = () => {
@@ -7154,6 +7365,576 @@
                                     </div>
                                 </div>
                             </div>
+                        )}
+                    </div>
+                );
+            };
+
+            const renderM2614WorkspaceView = () => {
+                return (
+                    <div className={`rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
+                        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                            <div className="max-w-3xl">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${isDarkTheme ? 'bg-rose-950 text-rose-100 border border-rose-800' : 'bg-rose-50 text-rose-900 border border-rose-200'}`}>
+                                        Non-authoritative advisory surface
+                                    </span>
+                                    <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${getCapabilityStatusClasses(m2614AdvisorCapability?.health_status || 'unknown')}`}>
+                                        {formatCapabilityStatusLabel(m2614AdvisorCapability?.health_status || 'unknown')}
+                                    </span>
+                                    {headerAuthVisible && (
+                                        <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}`}>
+                                            {headerAuthRoleLabel}
+                                        </span>
+                                    )}
+                                </div>
+                                <div className={`mt-4 text-[11px] uppercase tracking-[0.18em] ${mutedTextClass}`}>Optional Compliance Workspace</div>
+                                <h2 className={`mt-1 text-xl font-semibold ${headingClass}`}>M-26-14 Readiness Advisor</h2>
+                                <p className={`mt-2 text-sm leading-6 ${subtextClass}`}>
+                                    Discovery-backed posture estimate, explicit evidence boundaries, and curated live validation for CEM, THIRF, retention, and log-management readiness.
+                                </p>
+                                <div className={`mt-3 text-xs ${mutedTextClass}`}>
+                                    {canRunM2614Validation
+                                        ? 'Curated live validation is available from this workspace for analysts and admins when MCP runtime access is healthy.'
+                                        : 'This account can review posture, but live validation remains restricted to analysts and admins.'}
+                                </div>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                                <button
+                                    type="button"
+                                    onClick={() => refreshM2614Workspace()}
+                                    className="inline-flex items-center rounded-lg bg-indigo-600 px-3 py-2 font-medium text-white transition-colors hover:bg-indigo-700"
+                                >
+                                    <i className="fas fa-sync mr-2"></i>
+                                    Refresh Advisor
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={openCapabilitiesOverview}
+                                    className={`inline-flex items-center rounded-lg border px-3 py-2 font-medium ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700' : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'}`}
+                                >
+                                    <i className="fas fa-sliders-h mr-2"></i>
+                                    Capability Settings
+                                </button>
+                            </div>
+                        </div>
+
+                        {!m2614Profile || !m2614Profile.has_data ? (
+                            <div className={`mt-6 rounded-xl border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}`}>
+                                {m2614Profile?.message || 'No M-26-14 advisory profile is available yet. Run Discovery to generate a current blueprint.'}
+                            </div>
+                        ) : (
+                            <>
+                                <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                                    <div className={`rounded-xl border px-4 py-4 ${isDarkTheme ? 'bg-indigo-950 border-indigo-800' : 'bg-indigo-50 border-indigo-200'}`}>
+                                        <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-900'}`}>Readiness Estimate</div>
+                                        <div className={`mt-2 text-2xl font-semibold ${isDarkTheme ? 'text-indigo-50' : 'text-indigo-950'}`}>{formatMissionMetricValue(m2614Profile?.readiness_estimate)}/100</div>
+                                        <div className={`mt-2 text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-900'}`}>Session {formatMissionSessionSelectionLabel(m2614Profile?.timestamp || compareSelection.current)}</div>
+                                    </div>
+                                    <div className={`rounded-xl border px-4 py-4 ${panelMutedClass}`}>
+                                        <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>Evidence Confidence</div>
+                                        <div className={`mt-2 text-2xl font-semibold ${headingClass}`}>{formatM2614StatusLabel(m2614Profile?.confidence)}</div>
+                                        <div className={`mt-2 text-xs ${subtextClass}`}>Confidence stays intentionally conservative until curated validation replaces discovery-only heuristics.</div>
+                                    </div>
+                                    <div className={`rounded-xl border px-4 py-4 ${panelMutedClass}`}>
+                                        <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>Maturity Floor</div>
+                                        <div className={`mt-2 text-2xl font-semibold ${headingClass}`}>{m2614Profile?.maturity_floor?.level == null ? 'Unknown' : `Level ${m2614Profile.maturity_floor.level}`}</div>
+                                        <div className={`mt-2 text-xs ${subtextClass}`}>{m2614Profile?.maturity_floor?.explanation || 'No defensible floor is available yet.'}</div>
+                                    </div>
+                                    <div className={`rounded-xl border px-4 py-4 ${panelMutedClass}`}>
+                                        <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>Observed Footprint</div>
+                                        <div className={`mt-2 text-sm font-semibold ${headingClass}`}>
+                                            {formatMissionMetricValue(m2614Profile?.source_summary?.total_indexes)} indexes • {formatMissionMetricValue(m2614Profile?.source_summary?.total_hosts)} hosts
+                                        </div>
+                                        <div className={`mt-2 text-xs ${subtextClass}`}>
+                                            Security sources {formatMissionMetricValue(m2614Profile?.source_summary?.security_source_count)} • Compliance sources {formatMissionMetricValue(m2614Profile?.source_summary?.compliance_source_count)}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-5">
+                                    <div className={`xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <i className="fas fa-bullseye text-indigo-600"></i>
+                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Priority Objectives</h3>
+                                        </div>
+                                        <div className={`text-xs mb-3 ${subtextClass}`}>CEM and THIRF status is derived from the blueprint first, then strengthened with curated validation evidence.</div>
+                                        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                            {m2614PriorityObjectives.length > 0 ? m2614PriorityObjectives.map((objective) => (
+                                                <div key={objective.objective || objective.status} className={`rounded-xl border px-4 py-4 ${panelMutedClass}`}>
+                                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                                        <div className={`text-sm font-semibold ${headingClass}`}>{objective.objective || 'Objective'}</div>
+                                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${getM2614StatusClasses(objective.status)}`}>
+                                                            {formatM2614StatusLabel(objective.status)}
+                                                        </span>
+                                                    </div>
+                                                    <div className={`mt-2 text-xs ${subtextClass}`}>{Array.isArray(objective.notes) && objective.notes.length > 0 ? objective.notes[0] : 'No notes recorded for this objective yet.'}</div>
+                                                    {Array.isArray(objective.evidence) && objective.evidence.length > 0 && (
+                                                        <div className={`mt-3 text-xs ${mutedTextClass}`}>Evidence: {objective.evidence[0]}</div>
+                                                    )}
+                                                </div>
+                                            )) : (
+                                                <div className={`rounded-xl border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}`}>
+                                                    Priority-objective posture is not available for the selected session.
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    <div className={`xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <i className="fas fa-code-compare text-emerald-600"></i>
+                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Session Compare</h3>
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-2 text-xs mb-3">
+                                            <select
+                                                value={compareSelection.current}
+                                                onChange={(e) => setCompareSelection((prev) => ({ ...prev, current: e.target.value }))}
+                                                data-testid="m2614-compare-current-select"
+                                                className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                            >
+                                                <option value="latest">Latest Session</option>
+                                                {sessionCatalog.map((session) => (
+                                                    <option key={`m2614-current-${session.timestamp}`} value={session.timestamp}>
+                                                        {formatMissionSessionSelectionLabel(session.timestamp)}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <span className={mutedTextClass}>vs</span>
+                                            <select
+                                                value={compareSelection.baseline}
+                                                onChange={(e) => setCompareSelection((prev) => ({ ...prev, baseline: e.target.value }))}
+                                                data-testid="m2614-compare-baseline-select"
+                                                className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                            >
+                                                <option value="previous">Previous Session</option>
+                                                {sessionCatalog.map((session) => (
+                                                    <option key={`m2614-baseline-${session.timestamp}`} value={session.timestamp}>
+                                                        {formatMissionSessionSelectionLabel(session.timestamp)}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                type="button"
+                                                onClick={refreshM2614CompareSelection}
+                                                data-testid="m2614-compare-submit"
+                                                className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
+                                            >
+                                                Compare
+                                            </button>
+                                        </div>
+
+                                        {!m2614Compare || !m2614Compare.has_data ? (
+                                            <div className={`rounded-xl border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}`}>
+                                                {m2614Compare?.message || 'Compare data will appear once at least two discovery sessions exist.'}
+                                            </div>
+                                        ) : (
+                                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                                                <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
+                                                    <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Readiness Δ</div>
+                                                    <div data-testid="m2614-compare-readiness-delta" className={`mt-1 text-sm font-semibold ${headingClass}`}>{m2614Compare?.comparison?.readiness_delta ?? 0}</div>
+                                                </div>
+                                                <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
+                                                    <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Floor Δ</div>
+                                                    <div className={`mt-1 text-sm font-semibold ${headingClass}`}>{m2614Compare?.comparison?.maturity_floor_delta == null ? 'Unknown' : m2614Compare.comparison.maturity_floor_delta}</div>
+                                                </div>
+                                                <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
+                                                    <div className={`text-[11px] uppercase tracking-wide ${mutedTextClass}`}>Recommended Packs</div>
+                                                    <div className={`mt-1 text-sm font-semibold ${headingClass}`}>{Array.isArray(m2614Compare?.comparison?.recommended_pack_ids) ? m2614Compare.comparison.recommended_pack_ids.length : 0}</div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="mt-4 grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(0,1.12fr)_minmax(380px,0.88fr)]">
+                                    <div className={`rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <i className="fas fa-layer-group text-rose-600"></i>
+                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Maturity Elements</h3>
+                                        </div>
+                                        <div className={`text-xs mb-3 ${subtextClass}`}>Each element records discovery evidence, explicit gaps, and the next validation or remediation step.</div>
+                                        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+                                            {m2614MaturityElements.map((element) => (
+                                                <div key={element.id || element.label} className={`rounded-xl border px-4 py-4 ${panelMutedClass}`}>
+                                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                                        <div className={`text-sm font-semibold ${headingClass}`}>{element.label || element.id || 'Element'}</div>
+                                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${getM2614StatusClasses(element.status)}`}>
+                                                            {formatM2614StatusLabel(element.status)}
+                                                        </span>
+                                                    </div>
+                                                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                            Confidence: {formatM2614StatusLabel(element.confidence)}
+                                                        </span>
+                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                            Floor: {element.estimated_level_floor == null ? 'Unknown' : `Level ${element.estimated_level_floor}`}
+                                                        </span>
+                                                    </div>
+                                                    {Array.isArray(element.evidence) && element.evidence.length > 0 && (
+                                                        <div className={`mt-3 text-xs ${subtextClass}`}>
+                                                            <span className="font-semibold">Evidence:</span> {element.evidence[0]}
+                                                        </div>
+                                                    )}
+                                                    {Array.isArray(element.gaps) && element.gaps.length > 0 && (
+                                                        <div className={`mt-2 text-xs ${subtextClass}`}>
+                                                            <span className="font-semibold">Gap:</span> {element.gaps[0]}
+                                                        </div>
+                                                    )}
+                                                    {Array.isArray(element.unknowns) && element.unknowns.length > 0 && (
+                                                        <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                            <span className="font-semibold">Unknown:</span> {element.unknowns[0]}
+                                                        </div>
+                                                    )}
+                                                    {Array.isArray(element.remediation) && element.remediation.length > 0 && (
+                                                        <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                            <span className="font-semibold">Next step:</span> {element.remediation[0]}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-4">
+                                        <div className={`rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                            <div className="flex items-center gap-2 mb-3">
+                                                <i className="fas fa-vial text-emerald-600"></i>
+                                                <h3 className={`text-sm font-semibold ${headingClass}`}>Curated Live Validation</h3>
+                                            </div>
+                                            <div className={`text-xs mb-3 ${subtextClass}`}>
+                                                The advisor prefers pre-authored SPL and shows the exact query before execution.
+                                            </div>
+                                            {m2614ValidationCatalog.status === 'error' && (
+                                                <div className={`rounded-lg border px-3 py-2 text-xs mb-3 ${isDarkTheme ? 'border-rose-800 bg-rose-950 text-rose-100' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
+                                                    {m2614ValidationCatalog.error}
+                                                </div>
+                                            )}
+                                            <div className="grid grid-cols-1 gap-3">
+                                                <div>
+                                                    <label className={`block text-[11px] font-semibold uppercase tracking-wide mb-1 ${mutedTextClass}`}>Validation Pack</label>
+                                                    <select
+                                                        value={m2614ValidationSelection.packId || selectedM2614ValidationPack?.id || ''}
+                                                        onChange={(e) => {
+                                                            const nextPackId = e.target.value;
+                                                            setM2614ValidationSelection((prev) => ({ ...prev, packId: nextPackId }));
+                                                            setM2614ValidationResult(null);
+                                                            setM2614ValidationState({ status: 'idle', error: '' });
+                                                        }}
+                                                        data-testid="m2614-validation-pack-select"
+                                                        className={`w-full border rounded px-3 py-2 text-sm ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                                    >
+                                                        {m2614ValidationPacks.map((pack) => (
+                                                            <option key={pack.id} value={pack.id}>{pack.title}</option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                                    <div>
+                                                        <label className={`block text-[11px] font-semibold uppercase tracking-wide mb-1 ${mutedTextClass}`}>Earliest</label>
+                                                        <input
+                                                            type="text"
+                                                            value={m2614ValidationSelection.earliest}
+                                                            onChange={(e) => setM2614ValidationSelection((prev) => ({ ...prev, earliest: e.target.value }))}
+                                                            className={`w-full border rounded px-3 py-2 text-sm ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                                        />
+                                                    </div>
+                                                    <div>
+                                                        <label className={`block text-[11px] font-semibold uppercase tracking-wide mb-1 ${mutedTextClass}`}>Latest</label>
+                                                        <input
+                                                            type="text"
+                                                            value={m2614ValidationSelection.latest}
+                                                            onChange={(e) => setM2614ValidationSelection((prev) => ({ ...prev, latest: e.target.value }))}
+                                                            className={`w-full border rounded px-3 py-2 text-sm ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                                        />
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {selectedM2614ValidationPack && (
+                                                <div className={`mt-4 rounded-xl border p-4 ${panelMutedClass}`}>
+                                                    <div className="flex flex-wrap items-center gap-2 mb-2">
+                                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${panelMutedClass} ${mutedTextClass}`}>
+                                                            {formatTokenLabel(selectedM2614ValidationPack.control_area)}
+                                                        </span>
+                                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${panelMutedClass} ${mutedTextClass}`}>
+                                                            {String(selectedM2614ValidationPack.priority_objective || '').toUpperCase() || 'Objective'}
+                                                        </span>
+                                                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${panelMutedClass} ${mutedTextClass}`}>
+                                                            {formatTokenLabel(selectedM2614ValidationPack.required_role)}
+                                                        </span>
+                                                    </div>
+                                                    <div className={`text-sm font-semibold ${headingClass}`}>{selectedM2614ValidationPack.title}</div>
+                                                    <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{selectedM2614ValidationPack.description}</div>
+                                                    <details className="mt-3" open>
+                                                        <summary className={`cursor-pointer text-xs font-semibold ${headingClass}`}>Curated SPL</summary>
+                                                        <pre className={`mt-2 overflow-x-auto rounded-lg p-3 text-[11px] ${isDarkTheme ? 'bg-gray-900 text-emerald-200' : 'bg-gray-950 text-emerald-100'}`}>{selectedM2614ValidationPack.query}</pre>
+                                                    </details>
+                                                </div>
+                                            )}
+
+                                            {m2614RecommendedPacks.length > 0 && (
+                                                <div className="mt-4">
+                                                    <div className={`text-[11px] font-semibold uppercase tracking-wide mb-2 ${mutedTextClass}`}>Recommended Next</div>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {m2614RecommendedPacks.map((pack) => (
+                                                            <button
+                                                                key={`m2614-recommended-${pack.id}`}
+                                                                type="button"
+                                                                onClick={() => setM2614ValidationSelection((prev) => ({ ...prev, packId: pack.id }))}
+                                                                className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${selectedM2614ValidationPack?.id === pack.id ? 'bg-indigo-600 text-white border-indigo-600' : (isDarkTheme ? 'bg-gray-900 text-gray-200 border-gray-700 hover:bg-gray-800' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50')}`}
+                                                            >
+                                                                {pack.title}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {!canRunM2614Validation && (
+                                                <div className={`mt-4 rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'border-amber-700 bg-amber-950 text-amber-100' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>
+                                                    Live validation is role-gated. Use an analyst or admin account to run curated SPL from this workspace.
+                                                </div>
+                                            )}
+
+                                            <div className="mt-4 flex flex-wrap items-center gap-2">
+                                                <button
+                                                    type="button"
+                                                    onClick={runM2614Validation}
+                                                    disabled={!selectedM2614ValidationPack || !canRunM2614Validation || m2614ValidationState.status === 'loading'}
+                                                    data-testid="m2614-run-validation-button"
+                                                    className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-medium ${selectedM2614ValidationPack && canRunM2614Validation && m2614ValidationState.status !== 'loading' ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : (isDarkTheme ? 'bg-gray-800 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed')}`}
+                                                >
+                                                    <i className="fas fa-play mr-2"></i>
+                                                    {m2614ValidationState.status === 'loading' ? 'Running Validation...' : 'Run Curated Validation'}
+                                                </button>
+                                                <span className={`text-xs ${mutedTextClass}`}>Time range {m2614ValidationSelection.earliest} to {m2614ValidationSelection.latest}</span>
+                                            </div>
+                                        </div>
+
+                                        {(m2614ValidationState.status === 'error' || m2614ValidationResult) && (
+                                            <div data-testid="m2614-validation-result" className={`rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                <div className="flex items-center gap-2 mb-3">
+                                                    <i className="fas fa-clipboard-check text-indigo-600"></i>
+                                                    <h3 className={`text-sm font-semibold ${headingClass}`}>Validation Result</h3>
+                                                </div>
+
+                                                {m2614ValidationState.status === 'error' ? (
+                                                    <div className={`rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'border-rose-800 bg-rose-950 text-rose-100' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
+                                                        {m2614ValidationState.error}
+                                                    </div>
+                                                ) : (
+                                                    <>
+                                                        <div className="flex flex-wrap items-center gap-2 mb-3">
+                                                            <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${getM2614StatusClasses(m2614ValidationSummary?.status || 'unknown')}`}>
+                                                                {formatM2614StatusLabel(m2614ValidationSummary?.status || 'unknown')}
+                                                            </span>
+                                                            <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${panelMutedClass} ${mutedTextClass}`}>
+                                                                {formatMissionMetricValue(m2614ValidationSummary?.row_count || m2614ValidationRows.length)} row(s)
+                                                            </span>
+                                                        </div>
+                                                        <div data-testid="m2614-validation-summary-headline" className={`text-sm font-semibold ${headingClass}`}>{m2614ValidationSummary?.headline || 'Validation completed.'}</div>
+                                                        {Array.isArray(m2614ValidationSummary?.findings) && m2614ValidationSummary.findings.length > 0 && (
+                                                            <ul className={`mt-3 space-y-2 text-xs ${subtextClass}`}>
+                                                                {m2614ValidationSummary.findings.map((finding, findingIdx) => (
+                                                                    <li key={`m2614-finding-${findingIdx}`} className="flex items-start gap-2">
+                                                                        <span className={`mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? 'bg-emerald-300' : 'bg-emerald-600'}`}></span>
+                                                                        <span>{finding}</span>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                        {Array.isArray(m2614ValidationSummary?.sample_rows) && m2614ValidationSummary.sample_rows.length > 0 && (
+                                                            <details className="mt-3">
+                                                                <summary className={`cursor-pointer text-xs font-semibold ${headingClass}`}>Sample Rows</summary>
+                                                                <pre className={`mt-2 overflow-x-auto rounded-lg p-3 text-[11px] ${isDarkTheme ? 'bg-gray-900 text-gray-200' : 'bg-gray-50 text-gray-800'}`}>{JSON.stringify(m2614ValidationSummary.sample_rows, null, 2)}</pre>
+                                                            </details>
+                                                        )}
+                                                        {m2614ValidationProfileSnapshot && (
+                                                            <div data-testid="m2614-validation-grounding-panel" className={`mt-4 rounded-xl border p-4 ${panelMutedClass}`}>
+                                                                <div className="flex items-center gap-2 mb-2">
+                                                                    <i className="fas fa-map-signs text-sky-600"></i>
+                                                                    <div className={`text-sm font-semibold ${headingClass}`}>Discovery Grounding</div>
+                                                                </div>
+                                                                {m2614ValidationProfileSnapshot.has_data ? (
+                                                                    <>
+                                                                        <div className="flex flex-wrap gap-2 text-[11px] mb-2">
+                                                                            <span className={`rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                                                Readiness {formatMissionMetricValue(m2614ValidationProfileSnapshot.readiness_estimate)}/100
+                                                                            </span>
+                                                                            <span className={`rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                                                Confidence {formatM2614StatusLabel(m2614ValidationProfileSnapshot.confidence || 'unknown')}
+                                                                            </span>
+                                                                            <span className={`rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}`}>
+                                                                                Session {formatMissionSessionSelectionLabel(m2614ValidationProfileSnapshot.timestamp || compareSelection.current)}
+                                                                            </span>
+                                                                        </div>
+                                                                        {m2614ValidationProfileSnapshot.priority_objective?.objective && (
+                                                                            <div className={`text-xs ${subtextClass}`}>
+                                                                                <span className="font-semibold">Priority objective:</span> {m2614ValidationProfileSnapshot.priority_objective.objective}
+                                                                            </div>
+                                                                        )}
+                                                                        {Array.isArray(m2614ValidationProfileSnapshot.priority_objective?.notes) && m2614ValidationProfileSnapshot.priority_objective.notes.length > 0 && (
+                                                                            <div className={`mt-2 text-xs ${subtextClass}`}>
+                                                                                <span className="font-semibold">Current posture:</span> {m2614ValidationProfileSnapshot.priority_objective.notes[0]}
+                                                                            </div>
+                                                                        )}
+                                                                        {Array.isArray(m2614ValidationProfileSnapshot.maturity_element?.gaps) && m2614ValidationProfileSnapshot.maturity_element.gaps.length > 0 && (
+                                                                            <div className={`mt-2 text-xs ${subtextClass}`}>
+                                                                                <span className="font-semibold">Gap to keep in view:</span> {m2614ValidationProfileSnapshot.maturity_element.gaps[0]}
+                                                                            </div>
+                                                                        )}
+                                                                        {Array.isArray(m2614ValidationProfileSnapshot.maturity_element?.remediation) && m2614ValidationProfileSnapshot.maturity_element.remediation.length > 0 && (
+                                                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                                <span className="font-semibold">Suggested next step:</span> {m2614ValidationProfileSnapshot.maturity_element.remediation[0]}
+                                                                            </div>
+                                                                        )}
+                                                                    </>
+                                                                ) : (
+                                                                    <div className={`text-xs ${mutedTextClass}`}>
+                                                                        {m2614ValidationProfileSnapshot.message || 'No discovery-grounded profile is available for this validation yet.'}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                        {m2614ValidationRagContext && (
+                                                            <div data-testid="m2614-validation-rag-panel" className={`mt-4 rounded-xl border p-4 ${panelMutedClass}`}>
+                                                                <div className="flex items-center gap-2 mb-2">
+                                                                    <i className="fas fa-compass text-emerald-600"></i>
+                                                                    <div className={`text-sm font-semibold ${headingClass}`}>Environment Context</div>
+                                                                </div>
+                                                                {m2614ValidationRagContext.operator_brief && (
+                                                                    <div className={`text-xs ${subtextClass}`}>{m2614ValidationRagContext.operator_brief}</div>
+                                                                )}
+                                                                {Array.isArray(m2614ValidationRagContext.recommended_uses) && m2614ValidationRagContext.recommended_uses.length > 0 && (
+                                                                    <ul className={`mt-3 space-y-2 text-xs ${subtextClass}`}>
+                                                                        {m2614ValidationRagContext.recommended_uses.slice(0, 3).map((item, itemIdx) => (
+                                                                            <li key={`m2614-rag-use-${itemIdx}`} className="flex items-start gap-2">
+                                                                                <span className={`mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? 'bg-sky-300' : 'bg-sky-600'}`}></span>
+                                                                                <span>{item}</span>
+                                                                            </li>
+                                                                        ))}
+                                                                    </ul>
+                                                                )}
+                                                                {Array.isArray(m2614ValidationRagContext.coverage_gaps) && m2614ValidationRagContext.coverage_gaps.length > 0 && (
+                                                                    <div className={`mt-3 text-xs ${mutedTextClass}`}>
+                                                                        <span className="font-semibold">Context gaps:</span> {m2614ValidationRagContext.coverage_gaps[0]}
+                                                                    </div>
+                                                                )}
+                                                                {m2614ValidationReusableQueries.length > 0 && (
+                                                                    <div className="mt-4 space-y-3">
+                                                                        <div className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${mutedTextClass}`}>
+                                                                            Reusable SPL Candidates
+                                                                        </div>
+                                                                        {m2614ValidationReusableQueries.map((candidate, candidateIdx) => {
+                                                                            const query = String(candidate.query || '').trim();
+                                                                            const reuseTier = String(candidate.reuse_tier || '').trim().toLowerCase();
+                                                                            const fitStatus = String(candidate.environment_fit_status || '').trim().toLowerCase();
+                                                                            const validationStatus = String(candidate.validation_status || '').trim().toLowerCase();
+                                                                            const knownGood = Boolean(candidate.known_good) || validationStatus === 'known_good';
+
+                                                                            return (
+                                                                                <div key={`m2614-validation-reuse-${candidateIdx}`} data-testid="m2614-validation-reusable-query-card" className={`rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-emerald-200'}`}>
+                                                                                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                                                                        <div>
+                                                                                            <div className={`text-sm font-medium ${headingClass}`}>{candidate.title || 'Reusable SPL candidate'}</div>
+                                                                                            {candidate.why_reuse && (
+                                                                                                <div className={`mt-1 text-xs ${subtextClass}`}>{candidate.why_reuse}</div>
+                                                                                            )}
+                                                                                        </div>
+                                                                                        {renderSplQueryActionButtons(query, {
+                                                                                            allowSave: false,
+                                                                                            originKind: 'm2614_validation_reuse',
+                                                                                            originLabel: candidate.title || selectedM2614ValidationPack?.title || 'M-26-14 reusable SPL candidate',
+                                                                                            sourceLabel: 'M-26-14 Advisory',
+                                                                                            contextExcerpt: candidate.why_reuse || m2614ValidationRagContext.operator_brief || '',
+                                                                                            className: 'sm:justify-end',
+                                                                                        })}
+                                                                                    </div>
+                                                                                    <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                                                                                        {(reuseTier || knownGood) && (
+                                                                                            <span className={`rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}`}>
+                                                                                                Reuse: {knownGood ? 'Known Good' : formatSplIntelligenceLabel(reuseTier, 'Candidate')}
+                                                                                            </span>
+                                                                                        )}
+                                                                                        {fitStatus && (
+                                                                                            <span className={`rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}`}>
+                                                                                                Environment Fit: {formatSplIntelligenceLabel(fitStatus, 'Unknown')}
+                                                                                            </span>
+                                                                                        )}
+                                                                                        {validationStatus && (
+                                                                                            <span className={`rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}`}>
+                                                                                                Validation: {formatSplIntelligenceLabel(validationStatus, 'Unknown')}
+                                                                                            </span>
+                                                                                        )}
+                                                                                    </div>
+                                                                                    <pre className={`mt-2 max-h-32 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-950 border-gray-700 text-gray-100' : 'bg-gray-50 border-gray-200 text-gray-900'}`}>
+{query}
+                                                                                    </pre>
+                                                                                </div>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                        {m2614ValidationLlmAnalysis && (
+                                                            <div data-testid="m2614-validation-advisory-panel" className={`mt-4 rounded-xl border p-4 ${panelMutedClass}`}>
+                                                                <div className="flex items-center gap-2 mb-2">
+                                                                    <i className="fas fa-brain text-violet-600"></i>
+                                                                    <div className={`text-sm font-semibold ${headingClass}`}>Grounded Advisory</div>
+                                                                </div>
+                                                                {m2614ValidationLlmAnalysis.message && m2614ValidationLlmAnalysis.status !== 'ready' && (
+                                                                    <div className={`rounded-lg border px-3 py-2 text-xs mb-3 ${isDarkTheme ? 'border-gray-700 bg-gray-900 text-gray-200' : 'border-gray-200 bg-gray-50 text-gray-700'}`}>
+                                                                        {m2614ValidationLlmAnalysis.message}
+                                                                    </div>
+                                                                )}
+                                                                {m2614ValidationLlmAnalysis.summary && (
+                                                                    <div className={`text-xs leading-6 ${subtextClass}`}>{m2614ValidationLlmAnalysis.summary}</div>
+                                                                )}
+                                                                {m2614ValidationLlmAnalysis.environment_relevance && (
+                                                                    <div className={`mt-2 text-xs ${subtextClass}`}>
+                                                                        <span className="font-semibold">Why this matters here:</span> {m2614ValidationLlmAnalysis.environment_relevance}
+                                                                    </div>
+                                                                )}
+                                                                {Array.isArray(m2614ValidationLlmAnalysis.recommended_adjustments) && m2614ValidationLlmAnalysis.recommended_adjustments.length > 0 && (
+                                                                    <div className="mt-3">
+                                                                        <div className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${mutedTextClass}`}>Recommended Adjustments</div>
+                                                                        <ul className={`mt-2 space-y-2 text-xs ${subtextClass}`}>
+                                                                            {m2614ValidationLlmAnalysis.recommended_adjustments.slice(0, 4).map((item, itemIdx) => (
+                                                                                <li key={`m2614-adjustment-${itemIdx}`} className="flex items-start gap-2">
+                                                                                    <span className={`mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? 'bg-violet-300' : 'bg-violet-600'}`}></span>
+                                                                                    <span>{item}</span>
+                                                                                </li>
+                                                                            ))}
+                                                                        </ul>
+                                                                    </div>
+                                                                )}
+                                                                {Array.isArray(m2614ValidationLlmAnalysis.suggested_follow_ups) && m2614ValidationLlmAnalysis.suggested_follow_ups.length > 0 && (
+                                                                    <div className={`mt-3 text-xs ${subtextClass}`}>
+                                                                        <span className="font-semibold">Follow-up:</span> {m2614ValidationLlmAnalysis.suggested_follow_ups[0]}
+                                                                    </div>
+                                                                )}
+                                                                {Array.isArray(m2614ValidationLlmAnalysis.evidence_gaps) && m2614ValidationLlmAnalysis.evidence_gaps.length > 0 && (
+                                                                    <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                        <span className="font-semibold">Evidence gap:</span> {m2614ValidationLlmAnalysis.evidence_gaps[0]}
+                                                                    </div>
+                                                                )}
+                                                                {Array.isArray(m2614ValidationLlmAnalysis.confidence_notes) && m2614ValidationLlmAnalysis.confidence_notes.length > 0 && (
+                                                                    <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                        <span className="font-semibold">Confidence note:</span> {m2614ValidationLlmAnalysis.confidence_notes[0]}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </>
                         )}
                     </div>
                 );
@@ -12828,6 +13609,21 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 >
                                                     Intelligence
                                                 </button>
+                                                {showM2614WorkspaceTab && (
+                                                    <button
+                                                        type="button"
+                                                        id="workspace-tab-m26-14"
+                                                        data-testid="workspace-tab-m26-14"
+                                                        role="tab"
+                                                        aria-selected={isM2614Tab}
+                                                        tabIndex={isM2614Tab ? 0 : -1}
+                                                        onClick={openM2614Workspace}
+                                                        className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isM2614Tab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
+                                                        title="M-26-14 advisor: readiness posture, compare, and curated validation"
+                                                    >
+                                                        M-26-14
+                                                    </button>
+                                                )}
                                                 <button
                                                     type="button"
                                                     id="workspace-tab-discovery"
@@ -12924,6 +13720,15 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         title="Refresh intelligence KPIs and trends"
                                                     >
                                                         <i className="fas fa-brain mr-1"></i>Refresh Intelligence
+                                                    </button>
+                                                )}
+                                                {isM2614Tab && (
+                                                    <button
+                                                        onClick={refreshM2614Workspace}
+                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
+                                                        title="Refresh M-26-14 posture and curated validation catalog"
+                                                    >
+                                                        <i className="fas fa-shield-halved mr-1"></i>Refresh M-26-14
                                                     </button>
                                                 )}
                                                 {isArtifactsTab && (
@@ -14832,6 +15637,12 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         ) : (
                                             renderRagWorkspaceView()
                                         )}
+                                    </div>
+                                )}
+
+                                {isM2614Tab && (
+                                    <div className="mb-6 space-y-6">
+                                        {renderM2614WorkspaceView()}
                                     </div>
                                 )}
 
