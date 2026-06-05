@@ -222,6 +222,10 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("rag-install-alt-method-", template_source)
         self.assertIn("runCapabilityAction('rag_chromadb', 'install', { strategy: ragPreferredInstallAlternativeMethod.strategy })", template_source)
         self.assertIn("Please try alternate method", template_source)
+        self.assertIn("text-sm font-semibold break-words", template_source)
+        self.assertIn("text-sm break-words", template_source)
+        self.assertIn("max-w-full break-all rounded-full", template_source)
+        self.assertIn("max-w-full overflow-x-auto whitespace-pre-wrap break-all rounded-lg border", template_source)
 
     def test_settings_modal_declares_first_party_ollama_provider(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
