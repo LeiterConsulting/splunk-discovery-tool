@@ -497,6 +497,19 @@ class WebAppLocalAuthTests(unittest.TestCase):
         self.assertEqual(config_response.status_code, 200)
         self.assertIn("security", config_response.json())
 
+    def test_connection_info_hides_unconfigured_default_placeholders(self):
+        connection_response = self.client.get("/connection-info")
+        self.assertEqual(connection_response.status_code, 200)
+
+        payload = connection_response.json()
+        self.assertEqual(payload["status"], "disconnected")
+        self.assertFalse(payload["llm"]["configured"])
+        self.assertEqual(payload["llm"]["display_label"], "")
+        self.assertEqual(payload["llm"]["model"], "")
+        self.assertEqual(payload["llm"]["endpoint"], "")
+        self.assertFalse(payload["mcp"]["configured"])
+        self.assertEqual(payload["mcp"]["endpoint"], "")
+
     def test_m26_14_profile_and_validation_catalog_endpoints_return_advisor_data(self):
         self._enable_m26_14_advisor()
         session_id = "20260526_120000"

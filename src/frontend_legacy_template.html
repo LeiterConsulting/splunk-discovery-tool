@@ -2555,6 +2555,29 @@
             const ragInstallElapsedSeconds = ragActionInProgress === 'install' && ragInstallStartedAt
                 ? Math.max(0, Math.floor((capabilityActionTick - ragInstallStartedAt) / 1000))
                 : 0;
+            const headerMcpConnected = !!connectionInfo?.mcp?.configured;
+            const headerLlmDisplayLabel = String(connectionInfo?.llm?.display_label || '').trim() || 'Not configured';
+            const connectionInfoStatus = String(connectionInfo?.status || 'disconnected').toLowerCase();
+            const connectionStatusMeta = connectionInfoStatus === 'connected'
+                ? {
+                    icon: 'fa-check-circle',
+                    panelClass: 'bg-green-50 border-green-200',
+                    textClass: 'text-green-800',
+                    message: 'Connection settings are configured for both MCP and LLM.',
+                }
+                : connectionInfoStatus === 'partial'
+                    ? {
+                        icon: 'fa-exclamation-triangle',
+                        panelClass: 'bg-amber-50 border-amber-200',
+                        textClass: 'text-amber-800',
+                        message: 'Some connection settings are still missing.',
+                    }
+                    : {
+                        icon: 'fa-circle-xmark',
+                        panelClass: 'bg-gray-100 border-gray-200',
+                        textClass: 'text-gray-700',
+                        message: 'No connection settings are configured yet.',
+                    };
             const canUseSplunkDeeplinks = !!deeplinkCapability?.installed
                 && !!deeplinkCapability?.enabled
                 && !deeplinkCapability?.restart_required
@@ -4145,7 +4168,7 @@
                 loadCapabilities();
                 loadDiscoveryCompare('latest', 'previous');
                 loadRunbookPayload('latest', 'admin');
-                loadConfig(); // Load config to get active LLM connection info
+                loadConfig();
                 loadAuthStatus();
                 loadCapabilities();
 
@@ -8952,6 +8975,8 @@
                     }
                 } catch (error) {
                     console.error('Failed to load config:', error);
+                } finally {
+                    await loadConnectionInfo();
                 }
             };
 
@@ -13807,25 +13832,25 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         className={`dt4sms-shell-action flex items-center cursor-pointer px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg transition-colors ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
                                         onClick={openConnectionModal}
                                         title="View MCP connection details"
-                                        aria-label={isConnected ? 'View MCP connection details. MCP connected.' : 'View MCP connection details. MCP disconnected.'}
+                                        aria-label={headerMcpConnected ? 'View MCP connection details. MCP connected.' : 'View MCP connection details. MCP disconnected.'}
                                         aria-haspopup="dialog"
                                         aria-expanded={isConnectionModalOpen}
                                         aria-controls="connection-details-popover"
                                     >
-                                        <span aria-hidden="true" className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></span>
+                                        <span aria-hidden="true" className={`w-3 h-3 rounded-full mr-2 ${headerMcpConnected ? 'bg-green-500' : 'bg-red-500'}`}></span>
                                         <span className={`text-xs sm:text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            {isConnected ? 'MCP Connected' : 'MCP Disconnected'}
+                                            {headerMcpConnected ? 'MCP Connected' : 'MCP Disconnected'}
                                         </span>
                                     </button>
                                     <div
                                         className={`dt4sms-shell-status-card flex items-center px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border ${isDarkTheme ? 'bg-gray-800 border-purple-500' : 'bg-white border-purple-200'}`}
-                                        title="Active LLM connection"
+                                        title="Configured LLM connection"
                                     >
                                         <i className="fas fa-brain text-purple-600 mr-2"></i>
                                         <div className="flex flex-col">
                                             <span className={`text-xs leading-tight ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>LLM:</span>
                                             <span className={`text-xs sm:text-sm font-medium leading-tight ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                {config?.active_credential_name || config?.llm?.model || 'Not configured'}
+                                                {headerLlmDisplayLabel}
                                             </span>
                                         </div>
                                     </div>
@@ -16131,15 +16156,15 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     <div className="space-y-1.5">
                                                         <div className="flex items-start">
                                                             <span className="text-xs font-medium text-gray-500 w-16">Provider:</span>
-                                                            <span className="text-xs text-gray-900 font-semibold">{connectionInfo.llm?.provider || 'Unknown'}</span>
+                                                            <span className="text-xs text-gray-900 font-semibold">{connectionInfo.llm?.provider || 'Not configured'}</span>
                                                         </div>
                                                         <div className="flex items-start">
                                                             <span className="text-xs font-medium text-gray-500 w-16">Model:</span>
-                                                            <span className="text-xs text-gray-900 font-mono bg-white px-1.5 py-0.5 rounded border border-indigo-200">{connectionInfo.llm?.model || 'Unknown'}</span>
+                                                            <span className="text-xs text-gray-900 font-mono bg-white px-1.5 py-0.5 rounded border border-indigo-200">{connectionInfo.llm?.display_label || connectionInfo.llm?.model || 'Not configured'}</span>
                                                         </div>
                                                         <div className="flex items-start">
                                                             <span className="text-xs font-medium text-gray-500 w-16">Endpoint:</span>
-                                                            <span className="text-xs text-gray-700 break-all flex-1">{connectionInfo.llm?.endpoint || 'Unknown'}</span>
+                                                            <span className="text-xs text-gray-700 break-all flex-1">{connectionInfo.llm?.endpoint || 'Not configured'}</span>
                                                         </div>
                                                     </div>
                                                 </div>
@@ -16152,14 +16177,14 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     </h3>
                                                     <div className="flex items-start">
                                                         <span className="text-xs font-medium text-gray-500 w-16">Endpoint:</span>
-                                                        <span className="text-xs text-gray-700 font-mono bg-white px-1.5 py-0.5 rounded border border-green-200 break-all flex-1">{connectionInfo.mcp?.endpoint || 'Unknown'}</span>
+                                                        <span className="text-xs text-gray-700 font-mono bg-white px-1.5 py-0.5 rounded border border-green-200 break-all flex-1">{connectionInfo.mcp?.endpoint || 'Not configured'}</span>
                                                     </div>
                                                 </div>
 
                                                 {/* Status */}
-                                                <div className="flex items-center justify-center p-2.5 bg-green-50 rounded-lg border border-green-200">
-                                                    <i className="fas fa-check-circle text-green-600 mr-2"></i>
-                                                    <span className="text-xs font-medium text-green-800">All connections active</span>
+                                                <div className={`flex items-center justify-center p-2.5 rounded-lg border ${connectionStatusMeta.panelClass}`}>
+                                                    <i className={`fas ${connectionStatusMeta.icon} mr-2 ${connectionStatusMeta.textClass}`}></i>
+                                                    <span className={`text-xs font-medium ${connectionStatusMeta.textClass}`}>{connectionStatusMeta.message}</span>
                                                 </div>
                                             </>
                                         )

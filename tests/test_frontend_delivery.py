@@ -173,7 +173,10 @@ class FrontendDeliveryTests(unittest.TestCase):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 
         self.assertIn("setSelectedModel(data.llm.model || '');", template_source)
-        self.assertIn("{config?.active_credential_name || config?.llm?.model || 'Not configured'}", template_source)
+        self.assertIn("const headerMcpConnected = !!connectionInfo?.mcp?.configured;", template_source)
+        self.assertIn("const headerLlmDisplayLabel = String(connectionInfo?.llm?.display_label || '').trim() || 'Not configured';", template_source)
+        self.assertIn("await loadConnectionInfo();", template_source)
+        self.assertIn("{headerLlmDisplayLabel}", template_source)
         self.assertNotIn("await loadCredentialIntoSettings(data.active_credential_name);", template_source)
         self.assertNotIn("Credential Loaded!", template_source)
 

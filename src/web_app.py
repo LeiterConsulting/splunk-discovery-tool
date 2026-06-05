@@ -11212,12 +11212,19 @@ async def get_connection_info(request: Request):
     """Get current LLM and MCP server connection information (DT4SMS version)."""
     try:
         config = resolve_effective_runtime_config(request=request)
+        llm_configured, _ = _is_llm_available_for_m26_14_advisory(config)
+        active_credential_name = str(getattr(config, "active_credential_name", "") or "").strip()
+        llm_display_label = active_credential_name or (str(config.llm.model or "").strip() if llm_configured else "")
+        mcp_endpoint = str(config.mcp.url or "").strip()
+        mcp_configured = bool(mcp_endpoint and str(config.mcp.token or "").strip())
         
         # Get LLM info (no sensitive data)
         llm_provider = normalize_provider_name(config.llm.provider)
         
         # Determine endpoint display based on provider
-        if llm_provider == "openai":
+        if not llm_configured:
+            llm_endpoint = ""
+        elif llm_provider == "openai":
             llm_endpoint = "OpenAI API (api.openai.com)"
         elif llm_provider == "anthropic":
             llm_endpoint = config.llm.endpoint_url or "Anthropic API (api.anthropic.com)"
@@ -11232,19 +11239,24 @@ async def get_connection_info(request: Request):
         
         llm_info = {
             "provider": llm_provider.upper(),
-            "model": config.llm.model,
-            "endpoint": llm_endpoint
+            "model": str(config.llm.model or "").strip() if llm_configured else "",
+            "endpoint": llm_endpoint,
+            "display_label": llm_display_label,
+            "configured": llm_configured,
         }
         
         # Get MCP server info (no sensitive data)
         mcp_info = {
-            "endpoint": config.mcp.url
+            "endpoint": mcp_endpoint if mcp_configured else "",
+            "configured": mcp_configured,
         }
+
+        status = "connected" if llm_configured and mcp_configured else "partial" if llm_configured or mcp_configured else "disconnected"
         
         return {
             "llm": llm_info,
             "mcp": mcp_info,
-            "status": "connected"
+            "status": status,
         }
     except Exception as e:
         print(f"Error loading connection info: {e}")
