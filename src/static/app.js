@@ -3582,9 +3582,23 @@
       };
       const directUrl = buildSplunkSearchUrl(deeplinkPayload.query, deeplinkPayload);
       if (directUrl) {
-        const launchedWindow = window.open(directUrl, "_blank", "noopener,noreferrer");
-        if (!launchedWindow) {
-          window.location.assign(directUrl);
+        const launchedWindow = window.open("", "_blank");
+        if (launchedWindow && !launchedWindow.closed) {
+          try {
+            launchedWindow.opener = null;
+          } catch (error) {
+            console.debug("Unable to clear opener for Splunk window:", error);
+          }
+          launchedWindow.location.href = directUrl;
+        } else {
+          const fallbackWindow = window.open(directUrl, "_blank", "noopener,noreferrer");
+          if (!fallbackWindow) {
+            setCapabilityNotice({
+              type: "error",
+              message: "Unable to open Splunk in a new tab. Allow pop-ups for this site and retry."
+            });
+            setTimeout(() => setCapabilityNotice(null), 3500);
+          }
         }
         return;
       }

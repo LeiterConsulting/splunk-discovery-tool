@@ -180,6 +180,14 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertNotIn("await loadCredentialIntoSettings(data.active_credential_name);", template_source)
         self.assertNotIn("Credential Loaded!", template_source)
 
+    def test_open_in_splunk_avoids_current_tab_redirect(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("const launchedWindow = window.open('', '_blank');", template_source)
+        self.assertIn("launchedWindow.location.href = directUrl;", template_source)
+        self.assertIn("Unable to open Splunk in a new tab. Allow pop-ups for this site and retry.", template_source)
+        self.assertNotIn("window.location.assign(directUrl);", template_source)
+
     def test_header_declares_authenticated_user_indicator_and_logout(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 
