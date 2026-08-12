@@ -8573,12 +8573,14 @@ def build_persona_playbooks(
     mcp_capabilities: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Build persona-specific outputs for admins, analysts, and executives."""
-    recs = recommendations if isinstance(recommendations, list) else []
-    use_cases = suggested_use_cases if isinstance(suggested_use_cases, list) else []
+    # LLM analysis is an untrusted schema boundary. A text fallback must not
+    # crash a completed discovery run during persona assembly.
+    recs = [item for item in recommendations if isinstance(item, dict)] if isinstance(recommendations, list) else []
+    use_cases = [item for item in suggested_use_cases if isinstance(item, dict)] if isinstance(suggested_use_cases, list) else []
 
     high_priority = [r for r in recs if isinstance(r, dict) and str(r.get("priority", "")).lower() == "high"]
     top_recs = (high_priority or recs)[:5]
-    top_use_cases = [u for u in use_cases if isinstance(u, dict)][:4]
+    top_use_cases = use_cases[:4]
 
     admin_actions = []
     for rec in top_recs:
@@ -12771,14 +12773,14 @@ async def test_mcp_connection(request: Request, request_payload: dict):
         }
 
 @app.post("/api/mcp-configs/{name}/test")
-async def test_saved_mcp_connection(name: str):
+async def test_saved_mcp_connection(request: Request, name: str):
     """Test a saved MCP configuration"""
     mcp_config = config_manager.get_mcp_config(name)
     if not mcp_config:
         raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
     
     # Use the test endpoint with saved credentials
-    return await test_mcp_connection({
+    return await test_mcp_connection(request, {
         'url': mcp_config.url,
         'token': mcp_config.token,
         'verify_ssl': mcp_config.verify_ssl
@@ -15567,8 +15569,31 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
                     # No new updates, send keepalive
                     yield ": keepalive\n\n"
                     
-                    # Check if chat task is done
+                    # The task can enqueue its terminal update and finish in
+                    # the small window between wait_for timing out and this
+                    # check. Always drain that update before closing the SSE
+                    # stream or the UI remains stuck without a final answer.
                     if chat_task.done():
+                        terminal_sent = False
+                        while True:
+                            try:
+                                queued_update = status_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+
+                            if queued_update.get("type") == "done":
+                                yield f"data: {json.dumps({'type': 'response', 'data': queued_update['data']})}\n\n"
+                                terminal_sent = True
+                                break
+                            if queued_update.get("type") == "error":
+                                yield f"data: {json.dumps({'type': 'error', 'error': queued_update['error']})}\n\n"
+                                terminal_sent = True
+                                break
+
+                            yield f"data: {json.dumps(queued_update)}\n\n"
+
+                        if not terminal_sent:
+                            yield f"data: {json.dumps({'type': 'error', 'error': 'Chat processing ended without a final response.'})}\n\n"
                         break
                         
         except Exception as e:
@@ -19626,4 +19651,3 @@ if __name__ == "__main__":
         log_level="info",
         reload=False  # Set to True for development
     )
-

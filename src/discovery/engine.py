@@ -743,17 +743,20 @@ class DiscoveryEngine:
             print(f"DEBUG: LLM recommendations type: {type(recommendations_result)}")
             print(f"DEBUG: LLM recommendations content (first 500 chars): {str(recommendations_result)[:500]}")
             
-            # If we get a list directly, return it
+            # Keep the public contract stable even when the LLM returns a
+            # placeholder string (for example, ["Analysis completed"]).
+            # Downstream discovery/report builders expect mapping objects.
             if isinstance(recommendations_result, list):
-                return recommendations_result
+                return [item for item in recommendations_result if isinstance(item, dict)]
             elif isinstance(recommendations_result, dict) and "recommendations" in recommendations_result:
-                return recommendations_result["recommendations"]
+                recommendations = recommendations_result["recommendations"]
+                return [item for item in recommendations if isinstance(item, dict)] if isinstance(recommendations, list) else []
             elif isinstance(recommendations_result, dict):
                 # Try to extract any list from the dict
                 for key, value in recommendations_result.items():
                     if isinstance(value, list) and len(value) > 0:
                         print(f"DEBUG: Found list under key '{key}'")
-                        return value
+                        return [item for item in value if isinstance(item, dict)]
                 # If we found a dict but no useful list, return empty
                 print("DEBUG: Dict received but no list found, returning empty")
                 return []

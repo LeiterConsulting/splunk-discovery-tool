@@ -16,6 +16,7 @@ if str(SRC_DIR) not in sys.path:
 from llm.factory import CustomLLMClient, filter_openai_generation_models, get_openai_model_capabilities, is_openai_image_generation_model
 from capabilities.models import CapabilityActionResult, CapabilityConfig
 from discovery.context_manager import DiscoveryContextManager
+from discovery.engine import DiscoveryEngine
 import web_app
 
 
@@ -48,6 +49,13 @@ class OpenAIModelHelperTests(unittest.TestCase):
         self.assertTrue(capabilities["prefers_responses_api"])
         self.assertFalse(capabilities["supports_temperature"])
         self.assertIn("max_completion_tokens", capabilities["chat_token_keys"])
+
+    def test_gpt_5_6_family_uses_responses_api(self):
+        for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"):
+            with self.subTest(model=model):
+                capabilities = get_openai_model_capabilities(model)
+                self.assertTrue(capabilities["supports_generation"])
+                self.assertTrue(capabilities["prefers_responses_api"])
 
     def test_image_model_capabilities_report_image_generation(self):
         capabilities = get_openai_model_capabilities("gpt-image-2")
@@ -936,6 +944,83 @@ class ChatSettingsTests(unittest.TestCase):
 
 
 class ChatHelperTests(unittest.TestCase):
+    def test_generate_recommendations_filters_text_placeholders(self):
+        class StubAnalyzer:
+            def summarize_discovery(self, _results):
+                return {}
+
+        class StubLLMClient:
+            async def analyze_data(self, _data, _analysis_type):
+                return {
+                    "recommendations": [
+                        "Analysis completed",
+                        {"title": "Keep this recommendation", "priority": "high"},
+                    ]
+                }
+
+        engine = object.__new__(DiscoveryEngine)
+        engine.local_analyzer = StubAnalyzer()
+        engine.llm_client = StubLLMClient()
+        engine.environment_overview = None
+        engine.discovery_results = []
+
+        recommendations = asyncio.run(engine.generate_recommendations())
+
+        self.assertEqual(recommendations, [{"title": "Keep this recommendation", "priority": "high"}])
+
+    def test_persona_playbooks_ignore_non_mapping_recommendations(self):
+        overview = type(
+            "OverviewStub",
+            (),
+            {"total_indexes": 3, "total_sourcetypes": 4, "total_hosts": 2},
+        )()
+
+        playbooks = web_app.build_persona_playbooks(
+            overview,
+            ["Analysis completed", {"title": "Tune ingestion", "priority": "high"}],
+            [{"title": "Monitor latency", "success_metrics": ["Lower latency"]}],
+            {"tool_count": 2},
+        )
+
+        self.assertEqual(playbooks["admin"]["actions"][0]["title"], "Tune ingestion")
+        self.assertEqual(playbooks["analyst"]["hypotheses"][0]["title"], "Monitor latency")
+
+    def test_chat_stream_drains_terminal_update_when_task_finishes_at_timeout(self):
+        original_process_chat = web_app.process_chat_with_streaming
+        original_wait_for = web_app.asyncio.wait_for
+
+        async def immediate_chat(_request, status_queue, runtime_config=None):
+            await status_queue.put({"type": "status", "message": "Finishing"})
+            await status_queue.put({"type": "done", "data": {"response": "Completed"}})
+
+        async def timeout_after_task_runs(awaitable, timeout):
+            awaitable.close()
+            await asyncio.sleep(0)
+            raise asyncio.TimeoutError
+
+        class StubHttpRequest:
+            def __init__(self):
+                self.state = type("State", (), {"auth_user": None})()
+
+        async def collect_stream_body():
+            response = await web_app.chat_with_splunk_stream(StubHttpRequest(), {"message": "Test"})
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+            return "".join(chunks)
+
+        web_app.process_chat_with_streaming = immediate_chat
+        web_app.asyncio.wait_for = timeout_after_task_runs
+        try:
+            sse_body = asyncio.run(collect_stream_body())
+        finally:
+            web_app.process_chat_with_streaming = original_process_chat
+            web_app.asyncio.wait_for = original_wait_for
+
+        self.assertIn('"message": "Finishing"', sse_body)
+        self.assertIn('"type": "response"', sse_body)
+        self.assertIn('"response": "Completed"', sse_body)
+
     def test_finalize_user_facing_response_text_uses_fallback_after_sanitization(self):
         self.assertEqual(
             web_app.finalize_user_facing_response_text(
