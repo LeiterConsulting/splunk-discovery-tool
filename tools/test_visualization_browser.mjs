@@ -139,6 +139,34 @@ async function waitForServer(baseUrl, timeoutMs = 30000) {
     throw new Error(`Timed out waiting for ${baseUrl}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
+async function postJson(url, payload = {}) {
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    });
+    const responsePayload = await response.json().catch(() => ({}));
+    assert(
+        response.ok,
+        `${url} returned HTTP ${response.status}: ${responsePayload?.detail || responsePayload?.message || 'unknown error'}`,
+    );
+    return responsePayload;
+}
+
+async function prepareOperatorExportCapability(baseUrl, seededRuntimeState) {
+    await postJson(`${baseUrl}/api/capabilities/export_tools/install`);
+    await postJson(`${baseUrl}/api/capabilities/export_tools/config`, {
+        config: {
+            source_dir: path.join(repoRoot, 'output'),
+            export_dir: seededRuntimeState.exportDir,
+        },
+    });
+    await postJson(`${baseUrl}/api/capabilities/export_tools/enable`);
+    await postJson(`${baseUrl}/api/capabilities/export_tools/test`);
+}
+
 function findOverlappingLabels(labels) {
     const overlaps = [];
 
@@ -761,6 +789,14 @@ async function findLatestSummarySession() {
 async function seedOperatorRuntimeState() {
     const runtimeStatePath = path.join(repoRoot, 'output', 'runtime_state.json');
     const exportDir = path.join(repoRoot, 'output', 'exports');
+    const configPaths = [
+        path.join(repoRoot, 'config.encrypted'),
+        path.join(repoRoot, '.config.key'),
+    ];
+    const originalConfigFiles = new Map();
+    for (const configPath of configPaths) {
+        originalConfigFiles.set(configPath, await pathExists(configPath) ? await readFile(configPath) : null);
+    }
     const originalRuntimeState = await pathExists(runtimeStatePath)
         ? await readFile(runtimeStatePath, 'utf8')
         : null;
@@ -839,6 +875,13 @@ async function seedOperatorRuntimeState() {
             }
             if (fixtureSession) {
                 await fixtureSession.restore();
+            }
+            for (const [configPath, originalContent] of originalConfigFiles) {
+                if (originalContent === null) {
+                    await rm(configPath, { force: true });
+                } else {
+                    await writeFile(configPath, originalContent);
+                }
             }
         },
     };
@@ -1569,6 +1612,7 @@ async function main() {
         const baseUrl = `http://127.0.0.1:${port}`;
         serverHandle = startServer(port);
         await waitForServer(baseUrl);
+        await prepareOperatorExportCapability(baseUrl, seededRuntimeState);
 
         const visualizationResult = await runPhase('visualization regression', () => runBrowserRegression(baseUrl));
         const welcomeSplashResult = await runPhase('welcome splash regression', () => runWelcomeSplashRegression(baseUrl));

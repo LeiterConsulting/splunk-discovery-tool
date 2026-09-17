@@ -1658,6 +1658,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         original_get_memory_store_path = web_app._get_memory_store_path
         original_cache = dict(web_app.chat_agent_memory)
         original_chat_settings = dict(web_app.chat_session_settings)
+        original_overrides = dict(web_app.chat_settings_explicit_overrides)
 
         class StubLLMClient:
             async def generate_response(self, messages, max_tokens, temperature):
@@ -1683,6 +1684,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             }
             web_app.chat_session_settings["enable_rag_context"] = True
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
+            web_app.chat_settings_explicit_overrides["enable_rag_context"] = True
 
             try:
                 result = asyncio.run(
@@ -1701,6 +1703,8 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                 web_app._get_memory_store_path = original_get_memory_store_path
                 web_app.chat_session_settings.clear()
                 web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_settings_explicit_overrides.clear()
+                web_app.chat_settings_explicit_overrides.update(original_overrides)
                 web_app.chat_agent_memory.clear()
                 web_app.chat_agent_memory.update(original_cache)
 
@@ -1720,6 +1724,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         original_extract_recoverable_tool_call = web_app.extract_recoverable_tool_call
         original_cache = dict(web_app.chat_agent_memory)
         original_chat_settings = dict(web_app.chat_session_settings)
+        original_overrides = dict(web_app.chat_settings_explicit_overrides)
 
         class StubLLMClient:
             async def generate_response(self, messages, max_tokens, temperature):
@@ -1787,6 +1792,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             }
             web_app.chat_session_settings["enable_rag_context"] = True
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
+            web_app.chat_settings_explicit_overrides["enable_rag_context"] = True
 
             try:
                 result = asyncio.run(
@@ -1807,6 +1813,8 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                 web_app.extract_recoverable_tool_call = original_extract_recoverable_tool_call
                 web_app.chat_session_settings.clear()
                 web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_settings_explicit_overrides.clear()
+                web_app.chat_settings_explicit_overrides.update(original_overrides)
                 web_app.chat_agent_memory.clear()
                 web_app.chat_agent_memory.update(original_cache)
 
@@ -2361,6 +2369,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         original_get_memory_store_path = web_app._get_memory_store_path
         original_cache = dict(web_app.chat_agent_memory)
         original_chat_settings = dict(web_app.chat_session_settings)
+        original_overrides = dict(web_app.chat_settings_explicit_overrides)
 
         report_knowledge = {
             "viability": {"status": "usable", "score": 84, "age_days": 1, "usable": True},
@@ -2415,6 +2424,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             }
             web_app.chat_session_settings["enable_rag_context"] = True
             web_app.chat_session_settings["enable_splunk_augmentation"] = True
+            web_app.chat_settings_explicit_overrides["enable_rag_context"] = True
 
             try:
                 result = asyncio.run(
@@ -2436,6 +2446,8 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                 web_app._get_memory_store_path = original_get_memory_store_path
                 web_app.chat_session_settings.clear()
                 web_app.chat_session_settings.update(original_chat_settings)
+                web_app.chat_settings_explicit_overrides.clear()
+                web_app.chat_settings_explicit_overrides.update(original_overrides)
                 web_app.chat_agent_memory.clear()
                 web_app.chat_agent_memory.update(original_cache)
 
