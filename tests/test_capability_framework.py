@@ -1094,6 +1094,9 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 os.chdir(original_cwd)
 
     def test_rag_chromadb_search_surfaces_known_good_reusable_spl_queries(self):
+        if importlib.util.find_spec("chromadb") is None:
+            self.skipTest("chromadb is not installed in the active environment")
+
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             temp_path = Path(temp_dir)
             config_path = temp_path / "config.encrypted"
@@ -1197,6 +1200,9 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 os.chdir(original_cwd)
 
     def test_rag_chromadb_search_migrates_legacy_saved_spl_library_assets(self):
+        if importlib.util.find_spec("chromadb") is None:
+            self.skipTest("chromadb is not installed in the active environment")
+
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             temp_path = Path(temp_dir)
             config_path = temp_path / "config.encrypted"
