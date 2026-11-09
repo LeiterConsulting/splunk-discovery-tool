@@ -293,6 +293,71 @@ warn_if_running_old_code() {
     fi
 }
 
+# "port pid" for every listener on the ports the app can use (8003 and the 20 fallback ports)
+app_port_listeners() {
+    local last=$((DEFAULT_PORT + 20))
+    if command -v lsof > /dev/null 2>&1; then
+        lsof -nP -iTCP:"$DEFAULT_PORT-$last" -sTCP:LISTEN 2>/dev/null \
+            | awk 'NR > 1 { n = split($9, parts, ":"); print parts[n], $2 }' | sort -un
+    elif command -v ss > /dev/null 2>&1; then
+        ss -ltnpH 2>/dev/null | awk -v lo="$DEFAULT_PORT" -v hi="$last" '{
+            n = split($4, parts, ":"); port = parts[n] + 0
+            if (port >= lo && port <= hi && match($0, /pid=[0-9]+/)) print port, substr($0, RSTART + 4, RLENGTH - 4)
+        }' | sort -un
+    fi
+}
+
+# Install folder of an app process, from its command line or working directory
+app_folder_of_pid() {
+    local pid="$1" args="$2" folder=""
+    case "$args" in
+        */src/main.py*)
+            folder="${args%%/src/main.py*}"
+            if [[ "$folder" == *" /"* ]]; then
+                folder="/${folder##* /}"
+            fi
+            ;;
+        *main.py*)
+            if [[ -d "/proc/$pid/cwd" ]]; then
+                folder=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+            elif command -v lsof > /dev/null 2>&1; then
+                folder=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+            fi
+            ;;
+    esac
+    echo "$folder"
+}
+
+# A copy started from another folder keeps answering on its port with its own code, so name each one
+report_other_copies() {
+    local own_pid="$1" own_port="$2"
+    local listeners port pid args folder stop_pids="" header=""
+    listeners=$(app_port_listeners)
+    if [[ -z "$listeners" ]]; then
+        return 0
+    fi
+    while read -r port pid; do
+        if [[ -z "$port" ]] || [[ -z "$pid" ]] || [[ "$pid" == "$own_pid" ]] || [[ "$port" == "$own_port" ]]; then
+            continue
+        fi
+        if [[ -z "$header" ]]; then
+            print_msg "$YELLOW" "⚠ Other programs are using the app's ports on this computer:"
+            header="yes"
+        fi
+        args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        if [[ "$args" == *main.py* ]]; then
+            folder=$(app_folder_of_pid "$pid" "$args")
+            print_msg "$YELLOW" "    port $port: another copy of the app (PID $pid), started from ${folder:-an unknown folder}"
+            stop_pids="$stop_pids $pid"
+        else
+            print_msg "$YELLOW" "    port $port: PID $pid (${args:0:70})"
+        fi
+    done <<< "$listeners"
+    if [[ -n "$stop_pids" ]]; then
+        print_msg "$YELLOW" "  A browser or bookmark that opens one of those ports reaches that copy and its code, not this one."
+        print_msg "$BLUE" "  To run only this copy: kill${stop_pids} && ./install.sh --restart"
+    fi
+}
 # Warn when an earlier launch from another folder left settings there; the app reads them from the folder it starts in
 warn_about_settings_elsewhere() {
     if [[ "$LAUNCH_DIR" == "$INSTALL_DIR" ]]; then
@@ -313,6 +378,7 @@ start_service() {
             print_msg "$YELLOW" "⚠ Service already running (PID: $PID)"
             print_msg "$BLUE" "📡 Web interface: http://localhost:$(running_port)"
             warn_if_running_old_code
+            report_other_copies "$PID" "$(running_port)"
             return 0
         fi
     fi
@@ -355,6 +421,7 @@ start_service() {
         fi
         print_msg "$BLUE" "📡 Web interface: http://localhost:${started_port:-$DEFAULT_PORT}"
         print_msg "$BLUE" "📋 Logs: tail -f $LOG_FILE"
+        report_other_copies "$(cat "$PID_FILE")" "${started_port:-$DEFAULT_PORT}"
     else
         print_msg "$RED" "✗ Failed to start service. Last lines of $LOG_FILE:"
         tail -n 20 "$LOG_FILE" 2>/dev/null || true
@@ -402,6 +469,7 @@ stop_service() {
 check_status() {
     if [[ ! -f "$PID_FILE" ]]; then
         print_msg "$YELLOW" "⚠ Service not running"
+        report_other_copies "" ""
         return 1
     fi
     
@@ -410,6 +478,7 @@ check_status() {
         print_msg "$GREEN" "✓ Service running (PID: $PID)"
         print_msg "$BLUE" "📡 Web interface: http://localhost:$(running_port)"
         warn_if_running_old_code
+        report_other_copies "$PID" "$(running_port)"
         return 0
     else
         print_msg "$YELLOW" "⚠ Service not running (stale PID file)"

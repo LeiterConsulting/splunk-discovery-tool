@@ -166,6 +166,45 @@ function startFakeMcpServer(port) {
     });
 }
 
+// Another copy of the app on a fallback port: 'current' answers the server-status check, 'old' predates it.
+function fakeAppCopyHandler(kind) {
+    return (request, response) => {
+        const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+        const { pathname } = new URL(request.url, 'http://localhost');
+        if (pathname === '/api/auth/status') {
+            response.writeHead(200, headers);
+            response.end(JSON.stringify({ auth_enabled: false, auth_provider: 'local_password', demo_mode: true }));
+            return;
+        }
+        if (pathname === '/api/troubleshoot/server-status' && kind === 'current') {
+            response.writeHead(200, headers);
+            response.end(JSON.stringify({ stale: false, running_commit: '2a9341d97ddd126c39360927c5fce07d5f817b02' }));
+            return;
+        }
+        response.writeHead(404, headers);
+        response.end(JSON.stringify({ detail: 'Not Found' }));
+    };
+}
+
+// The page looks for other copies on the app's default port and the 20 after it.
+async function startFakeAppCopy(kind, firstPort = 8004, lastPort = 8023) {
+    for (let port = firstPort; port <= lastPort; port += 1) {
+        const server = createServer(fakeAppCopyHandler(kind));
+        try {
+            await new Promise((resolve, reject) => {
+                server.once('error', reject);
+                server.listen(port, '127.0.0.1', resolve);
+            });
+            return { server, port };
+        } catch (error) {
+            server.close();
+            if (!['EADDRINUSE', 'EACCES'].includes(error?.code)) {
+                throw error;
+            }
+        }
+    }
+    throw new Error(`No free port between ${firstPort} and ${lastPort} for a fake app copy.`);
+}
 async function openSettings(page) {
     const splash = page.locator('[data-testid="welcome-splash-modal"]');
     await splash.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
@@ -201,6 +240,7 @@ async function main() {
     const serverHandle = startServer(pythonCommand, appPort, tempDir);
     let browser = null;
     let page = null;
+    const fakeCopies = [];
     const pageErrors = [];
     const dialogs = [];
 
@@ -288,16 +328,49 @@ async function main() {
         await page.unroute('**/api/mcp-configs');
 
         // A server older than the page has no troubleshooting endpoints: the banner and the checks say to restart.
-        await page.route('**/api/troubleshoot/**', (route) => route.fulfill({ status: 404, contentType: 'application/json', body: '{"detail":"Not Found"}' }));
+        // An up-to-date copy and another old copy run on fallback ports, as after installing again in a new folder.
+        const currentCopy = await startFakeAppCopy('current');
+        fakeCopies.push(currentCopy.server);
+        const oldCopy = await startFakeAppCopy('old', currentCopy.port + 1);
+        fakeCopies.push(oldCopy.server);
+        const ownTroubleshootRoutes = `${baseUrl}api/troubleshoot/**`;
+        await page.route(ownTroubleshootRoutes, (route) => route.fulfill({ status: 404, contentType: 'application/json', body: '{"detail":"Not Found"}' }));
         await page.reload({ waitUntil: 'domcontentloaded' });
         await openSettings(page);
-        await page.getByTestId('settings-server-stale-banner').waitFor({ timeout: 10000 });
+        const staleBanner = page.getByTestId('settings-server-stale-banner');
+        await staleBanner.waitFor({ timeout: 10000 });
+        const currentCopyLink = page.getByTestId('settings-server-current-copy-link');
+        await currentCopyLink.waitFor({ timeout: 10000 });
+        const currentCopyOrigin = `http://127.0.0.1:${currentCopy.port}`;
+        assert(await currentCopyLink.getAttribute('href') === `${currentCopyOrigin}/`, `The banner should link to the up-to-date copy, got: ${await currentCopyLink.getAttribute('href')}`);
+        const bannerText = await staleBanner.innerText();
+        assert(bannerText.includes(`port ${appPort} is running an older version`), `The banner should name this server's port, got: ${bannerText}`);
+        assert(bannerText.includes('Restarting a copy installed in another folder does not change this one'), 'The banner should explain why restarting a new install does not help.');
+        const otherCopiesText = await page.getByTestId('settings-server-other-copies').innerText();
+        assert(otherCopiesText.includes(String(oldCopy.port)) && otherCopiesText.includes('older code'), `The banner should list the other old copy, got: ${otherCopiesText}`);
         await page.getByTestId('settings-tab-troubleshoot').click();
         await page.getByTestId('troubleshoot-run').click();
         results = await waitForResults(page);
         const staleSummary = await page.getByTestId('troubleshoot-summary').innerText();
         assert(staleSummary.includes('older than this page') && staleSummary.includes('install.sh --restart'), `An old server should be explained, got: ${staleSummary}`);
-        await page.unroute('**/api/troubleshoot/**');
+        const staleReport = await page.getByTestId('troubleshoot-report-text').textContent();
+        assert(staleReport.includes(currentCopyOrigin), 'The report should point to the up-to-date copy.');
+        await page.unroute(ownTroubleshootRoutes);
+
+        // A server that has the checks but started before its files changed names its folder in the restart command.
+        const staleStatusRoute = `${baseUrl}api/troubleshoot/server-status`;
+        await page.route(staleStatusRoute, (route) => route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ stale: true, install_dir: '/srv/dt4sms', running_commit: 'aaaaaaa', disk_commit: 'bbbbbbb', restart_hint: 'Restart the app.' }),
+        }));
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await openSettings(page);
+        await staleBanner.waitFor({ timeout: 10000 });
+        await page.getByTestId('settings-server-current-copy-link').waitFor({ timeout: 10000 });
+        const restartText = await staleBanner.innerText();
+        assert(restartText.includes('cd "/srv/dt4sms" && ./install.sh --restart'), `The banner should give the restart command for its folder, got: ${restartText}`);
+        await page.unroute(staleStatusRoute);
 
         // AI provider: a local Ollama endpoint that isn't listening fails at the network stage.
         await page.getByTestId('settings-tab-connections').click();
@@ -338,6 +411,7 @@ async function main() {
         }
         await stopServer(serverHandle);
         await new Promise((resolve) => fakeMcp.close(() => resolve()));
+        await Promise.all(fakeCopies.map((server) => new Promise((resolve) => server.close(() => resolve()))));
         await removeTempDir(tempDir);
     }
 }

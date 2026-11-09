@@ -217,13 +217,17 @@ The browser loads the new pages as soon as the files change, but the server keep
 
 The installers reinstall Python packages when `requirements.txt` changes, warn when the running service is older than the files, always start the app from the install folder (settings, keys, and output are stored there), and print the port the app actually uses.
 
-### Port 8003 is already in use
+### Port 8003 is already in use, or the banner stays after a restart
 
-The app moves to the next free port automatically, and the installer prints the address it uses. If another copy of the app holds the port, stop it or restart with the installer:
+The app moves to the next free port automatically, and the installer prints the address it uses. A copy of the app installed earlier in another folder keeps answering on its port with its own code, so a bookmark for `http://<host>:8003` reaches that copy, and restarting the new install doesn't change it. When the server is out of date, the Settings banner names its port and links to an up-to-date copy if one is running on a nearby port. The installers list the other copies with their process IDs and folders after starting, and with `--status` / `-Status`:
 
-```powershell
-.\install.ps1 -Restart
+```text
+⚠ Other programs are using the app's ports on this computer:
+    port 8003: another copy of the app (PID 21079), started from /home/me/old-folder
+  To run only this copy: kill 21079 && ./install.sh --restart
 ```
+
+Run the printed command in the folder of the copy you want to keep, so that copy moves back to port 8003. On Windows the command uses `Stop-Process -Id <PID>; .\install.ps1 -Restart`.
 
 ### Windows script execution blocked
 

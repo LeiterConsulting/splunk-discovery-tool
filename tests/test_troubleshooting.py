@@ -40,6 +40,27 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
+def _free_port_run(count: int) -> int:
+    """First of `count` consecutive free ports, so scans over a small range find every test server."""
+    for _ in range(50):
+        base = _free_port()
+        if base + count >= 65535:
+            continue
+        probes = []
+        try:
+            for offset in range(count):
+                probe = socket.socket()
+                probes.append(probe)
+                probe.bind(("127.0.0.1", base + offset))
+            return base
+        except OSError:
+            continue
+        finally:
+            for probe in probes:
+                probe.close()
+    raise RuntimeError("no run of free ports found")
+
+
 def _jwt(claims):
     def _part(value):
         return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
@@ -82,7 +103,7 @@ def _self_signed_cert(directory: Path):
 class _FakeServer:
     """Threaded HTTP(S) server; MCP requests succeed only with GOOD_TOKEN."""
 
-    def __init__(self, tls_files=None, routes=None):
+    def __init__(self, tls_files=None, routes=None, port=0):
         received = self.received = []
         bodies = self.bodies = []
         extra_routes = routes or {}
@@ -116,7 +137,7 @@ class _FakeServer:
             def log_message(self, *args):
                 pass
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         if tls_files:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(str(tls_files[0]), str(tls_files[1]))
@@ -331,6 +352,14 @@ class TroubleshootApiTests(unittest.TestCase):
         self.assertEqual(fresh.status_code, 200, fresh.text)
         self.assertFalse(fresh.json()["stale"])
 
+        self.assertEqual(fresh.json()["pid"], os.getpid())
+        self.assertEqual(fresh.json()["install_dir"], str(web_app.PROJECT_ROOT))
+        self.assertIsInstance(fresh.json()["port"], int)
+
+        viewer = {"auth_enabled": True, "username": "viewer", "role": "viewer", "can_manage": False}
+        with patch.object(web_app, "_troubleshoot_account", return_value=viewer):
+            self.assertNotIn("install_dir", self.client.get("/api/troubleshoot/server-status").json())
+
         stale = dict(web_app.SERVER_STARTUP_STATE, fingerprint="older-code")
         with patch.object(web_app, "SERVER_STARTUP_STATE", stale):
             body = self.client.get("/api/troubleshoot/server-status").json()
@@ -431,6 +460,41 @@ class TroubleshootUnitTests(unittest.TestCase):
         check = stage.checks[0]
         self.assertEqual(check.status, "warn")
         self.assertIn(str(other.port), check.title)
+
+    def test_other_copies_report_their_version_and_how_to_stop_them(self):
+        auth = (200, {"auth_enabled": False, "demo_mode": True})
+        current = {"/api/auth/status": auth, "/api/troubleshoot/server-status": (200, {"stale": False, "running_commit": "2a9341d97ddd"})}
+        base = _free_port_run(4)
+        with _FakeServer(routes={"/api/auth/status": auth}, port=base + 2) as old, _FakeServer(routes=current, port=base + 3) as new:
+            first = base + 2
+            stage = troubleshooting.Stage("app", "App")
+            self._run(troubleshooting.check_other_instances(stage, own_port=base + 1, preferred_port=base, project_root=ROOT))
+            listener = troubleshooting.listener_pid(old.port)
+
+        check = stage.checks[0]
+        self.assertEqual(check.status, "warn")
+        self.assertIn("Other copies of the app are running on ports", check.title)
+        self.assertIn(f"Port {old.port}: an older version of the app", check.detail)
+        self.assertIn(f"Port {new.port}: up to date (commit 2a9341d)", check.detail)
+        self.assertIn(f"started from {ROOT}", check.detail)
+        self.assertIn(f"moves to port {first - 2}", check.fix)
+        if listener is not None:
+            self.assertEqual(listener, os.getpid())
+            self.assertIn(f"PID {os.getpid()}", check.detail)
+            self.assertIn(str(os.getpid()), check.fix)
+
+    def test_install_folder_is_read_from_the_process_command_line(self):
+        cases = {
+            "/opt/homebrew/bin/python3 /Users/me/old copy/src/main.py": "/Users/me/old copy",
+            "python /home/me/dt4sms/src/main.py": "/home/me/dt4sms",
+            '"C:\\Users\\me\\.venv\\Scripts\\python.exe" "C:\\Users\\me\\dt4sms\\src\\main.py"': "C:\\Users\\me\\dt4sms",
+            "C:\\py\\python.exe D:\\apps\\dt4sms\\src\\main.py": "D:\\apps\\dt4sms",
+            "python src/main.py": None,
+            "/usr/sbin/sshd -D": None,
+        }
+        for command, folder in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(troubleshooting.app_folder_from_command(command), folder)
 
     def test_non_admin_only_gets_app_checks(self):
         with tempfile.TemporaryDirectory() as folder:
