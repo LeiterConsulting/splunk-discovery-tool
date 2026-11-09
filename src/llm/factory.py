@@ -16,6 +16,8 @@ from typing import Optional, Protocol, Dict, Any, Callable
 from datetime import datetime
 from urllib.parse import quote
 
+from spl.spl_utils import extract_json_payload
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +69,127 @@ OPENAI_CHAT_COMPLETION_NEW_TOKEN_HINTS = (
     "gpt-5",
 )
 
+
+REASONING_MARKUP_PATTERN = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.IGNORECASE | re.DOTALL)
+DANGLING_REASONING_CLOSE_PATTERN = re.compile(r"^.*?</(think|thinking|reasoning)>", re.IGNORECASE | re.DOTALL)
+UNCLOSED_REASONING_OPEN_PATTERN = re.compile(r"<(think|thinking|reasoning)>.*$", re.IGNORECASE | re.DOTALL)
+
+
+def strip_reasoning_markup(text: Any) -> str:
+    """Remove inline chain-of-thought blocks that some local models emit in the answer text."""
+    if not isinstance(text, str):
+        return "" if text is None else str(text)
+    cleaned = REASONING_MARKUP_PATTERN.sub("", text)
+    if DANGLING_REASONING_CLOSE_PATTERN.search(cleaned) and not re.search(r"<(think|thinking|reasoning)>", cleaned, re.IGNORECASE):
+        cleaned = DANGLING_REASONING_CLOSE_PATTERN.sub("", cleaned, count=1)
+    stripped_open = UNCLOSED_REASONING_OPEN_PATTERN.sub("", cleaned)
+    if stripped_open.strip():
+        cleaned = stripped_open
+    return cleaned.strip()
+
+
+def parse_json_from_llm_text(text: Any) -> Optional[Any]:
+    """Parse JSON from model output, tolerating code fences, prose, and truncation.
+
+    A complete fenced block or whole reply is used as-is. Otherwise the largest
+    JSON value in the text wins, so a reply cut off by the output budget keeps
+    the complete elements of its main array instead of collapsing to the first
+    nested object.
+    """
+    if isinstance(text, (dict, list)):
+        return text
+    cleaned = strip_reasoning_markup(text)
+    if not cleaned:
+        return None
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    for candidate in fenced + [cleaned]:
+        try:
+            return json.loads(candidate.strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return extract_json_payload(cleaned, expect="any")
+
+
+# Discovery analysis replies are lists of short items; these budgets leave room
+# for the capped item counts in build_analysis_prompt without truncation.
+ANALYSIS_MAX_TOKENS = 4096
+ANALYSIS_REASONING_MAX_TOKENS = 8192
+
+_ANALYSIS_GROUNDING = (
+    "Use only facts present in the data. Name indexes, sourcetypes, sources, and hosts exactly as they "
+    "appear and never invent ones that are not listed."
+)
+_ANALYSIS_JSON_RULE = "Reply with only the JSON object, with no prose before or after it."
+
+
+def build_analysis_prompt(data: dict, analysis_type: str) -> str:
+    """Build the discovery analysis prompt shared by every provider.
+
+    Each list-style analysis asks for one JSON object with a named list, a capped
+    item count, and short fields so replies fit small output budgets.
+    """
+    now = datetime.now()
+    time_context = (
+        f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}. "
+        f"Timestamps from {now.year} are current or recent, not future events.\n\n"
+    )
+    payload = json.dumps(data, indent=1, default=str)
+
+    if analysis_type == "classification":
+        return time_context + (
+            "Classify the following Splunk data into categories such as Security (authentication, firewall, "
+            "intrusion detection), Infrastructure (system logs, performance metrics), Business (application "
+            "logs, user activity), and Compliance (audit logs, regulatory data).\n\n"
+            f"Data: {payload}\n\n"
+            f"{_ANALYSIS_GROUNDING}\nReturn a JSON object with the classification results. {_ANALYSIS_JSON_RULE}"
+        )
+    if analysis_type == "recommendations":
+        return time_context + (
+            "Based on the following Splunk environment analysis, recommend the most valuable next steps.\n\n"
+            f"Analysis: {payload}\n\n"
+            f"{_ANALYSIS_GROUNDING}\n"
+            'Return {"recommendations": [...]} with at most 8 items, most valuable first. Each item has '
+            '"title" (short), "description" (under 60 words, naming the discovered data it relies on), '
+            '"priority" ("high", "medium", or "low"), "category", "roi_estimate" (one sentence), and '
+            '"implementation_complexity" ("Low", "Medium", or "High").\n'
+            f"{_ANALYSIS_JSON_RULE}"
+        )
+    if analysis_type == "creative_use_cases":
+        guidance = str(data.get("prompt_guidance") or "").strip() if isinstance(data, dict) else ""
+        return time_context + (
+            "Based on the following Splunk environment data, propose cross-functional use cases that combine "
+            "at least two discovered data sources, address a real operational or business problem, and "
+            "provide measurable value.\n\n"
+            f"Environment analysis: {payload}\n\n"
+            + (f"{guidance}\n" if guidance else "")
+            + f"{_ANALYSIS_GROUNDING}\n"
+            'Return {"use_cases": [...]} with at most 5 items. Each item has "title", "description" (under '
+            '50 words), "data_sources" (list of discovered sourcetype or index names), "business_value" (one '
+            'sentence), "implementation_complexity" ("Low", "Medium", or "High" with a short reason), '
+            '"success_metrics" (list of up to 3 short metrics), "scenario" (one or two sentences), and '
+            '"category".\n'
+            f"{_ANALYSIS_JSON_RULE}"
+        )
+    if analysis_type == "patterns":
+        return time_context + (
+            "Identify notable patterns in this Splunk inventory: data volume and distribution, sourcetype "
+            "characteristics, index usage, data freshness, and data quality signals.\n\n"
+            f"Data: {payload}\n\n"
+            f"{_ANALYSIS_GROUNDING} Do not report fields as missing just because this summary omits them.\n"
+            'Return {"patterns": [...]} with at most 6 items. Each item has "category" (short label), '
+            '"insight" (one or two sentences), and "evidence" (list of up to 3 short facts taken from the '
+            "data, such as names and counts).\n"
+            f"{_ANALYSIS_JSON_RULE}"
+        )
+    return time_context + f"Analyze this Splunk data for {analysis_type} and return JSON.\n\nData: {payload}"
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
 
 def normalize_provider_name(provider: Optional[str]) -> str:
     """Normalize provider labels from UI/config into stable internal identifiers."""
@@ -191,7 +314,9 @@ def get_openai_model_capabilities(model: str) -> Dict[str, Any]:
     """Infer compatibility hints for OpenAI model families used by the app."""
     model_lower = _normalize_openai_model_name(model)
     prefers_responses_api = model_lower.startswith(OPENAI_RESPONSES_MODEL_PREFIXES)
-    supports_temperature = not model_lower.startswith(("o1", "o3", "o4"))
+    is_gpt5_chat = bool(re.match(r"^gpt-5(\.\d+)?-chat", model_lower))
+    reasoning = model_lower.startswith(("o1", "o3", "o4")) or (model_lower.startswith("gpt-5") and not is_gpt5_chat)
+    supports_temperature = not reasoning
 
     chat_token_keys = ["max_tokens"]
     if any(hint in model_lower for hint in OPENAI_CHAT_COMPLETION_NEW_TOKEN_HINTS):
@@ -203,6 +328,7 @@ def get_openai_model_capabilities(model: str) -> Dict[str, Any]:
         "supports_image_generation": is_openai_image_generation_model(model),
         "prefers_responses_api": prefers_responses_api,
         "supports_temperature": supports_temperature,
+        "reasoning": reasoning,
         "chat_token_keys": chat_token_keys,
         "supports_chat_completions": not prefers_responses_api or model_lower.startswith(("gpt-4", "gpt-3.5", "chatgpt-4o")),
     }
@@ -465,9 +591,14 @@ class LLMClient(Protocol):
 
 class OpenAIClient:
     """OpenAI API client implementation with intelligent rate limiting."""
-    
+
+    # (base_url, model) -> signature of the request strategy that last succeeded,
+    # so later calls skip known-incompatible parameter combinations.
+    _preferred_strategies: Dict[tuple, tuple] = {}
+
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4",
-                 endpoint_url: Optional[str] = None, rate_limit_display_callback=None):
+                 endpoint_url: Optional[str] = None, rate_limit_display_callback=None,
+                 tuning: Optional[Dict[str, Any]] = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OpenAI API key required")
@@ -476,9 +607,20 @@ class OpenAIClient:
         for suffix in ["/chat/completions", "/responses"]:
             if normalized_base_url.endswith(suffix):
                 normalized_base_url = normalized_base_url[:-len(suffix)]
+        if re.match(r"^https?://api\.openai\.com$", normalized_base_url, flags=re.IGNORECASE):
+            normalized_base_url = f"{normalized_base_url}/v1"
         self.base_url = normalized_base_url
         self.rate_limit_manager = RateLimitManager(rate_limit_display_callback)
         self.model_capabilities = get_openai_model_capabilities(model)
+        tuning = tuning if isinstance(tuning, dict) else {}
+        default_timeout = 300 if self.model_capabilities.get("reasoning") else 120
+        self.request_timeout = _positive_int(tuning.get("request_timeout"), default_timeout)
+        effort = str(tuning.get("reasoning_effort") or "").strip().lower()
+        self.reasoning_effort = (
+            effort
+            if effort in {"minimal", "low", "medium", "high"} and self.model_capabilities.get("reasoning")
+            else None
+        )
 
     def _normalize_messages(self, messages: list) -> list:
         normalized = []
@@ -511,7 +653,8 @@ class OpenAIClient:
         return normalized
 
     def _build_chat_payload(self, messages: list, max_tokens: int, temperature: float,
-                            token_key: str, include_temperature: bool) -> Dict[str, Any]:
+                            token_key: str, include_temperature: bool,
+                            include_reasoning: bool = False) -> Dict[str, Any]:
         payload = {
             "model": self.model,
             "messages": messages,
@@ -519,12 +662,15 @@ class OpenAIClient:
         }
         if include_temperature:
             payload["temperature"] = temperature
+        if include_reasoning and self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
     def _build_responses_payload(self, messages: list, max_tokens: int,
-                                 temperature: float, include_temperature: bool) -> Dict[str, Any]:
+                                 temperature: float, include_temperature: bool,
+                                 include_reasoning: bool = False) -> Dict[str, Any]:
         instructions = []
-        dialogue_lines = []
+        dialogue = []
         for message in messages:
             role = str(message.get("role", "user")).strip().lower()
             content = str(message.get("content", "")).strip()
@@ -532,23 +678,23 @@ class OpenAIClient:
                 continue
             if role == "system":
                 instructions.append(content)
-            elif role == "assistant":
-                dialogue_lines.append(f"Assistant: {content}")
             else:
-                dialogue_lines.append(f"User: {content}")
+                dialogue.append({"role": "assistant" if role == "assistant" else "user", "content": content})
 
-        if not dialogue_lines:
-            dialogue_lines = ["User: Hello"]
+        if not dialogue:
+            dialogue = [{"role": "user", "content": "Hello"}]
 
         payload = {
             "model": self.model,
-            "input": "\n\n".join(dialogue_lines),
+            "input": dialogue,
             "max_output_tokens": max_tokens,
         }
         if instructions:
             payload["instructions"] = "\n\n".join(instructions)
         if include_temperature:
             payload["temperature"] = temperature
+        if include_reasoning and self.reasoning_effort:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
         return payload
 
     def _build_openai_request_strategies(self, messages: list, max_tokens: int,
@@ -556,49 +702,45 @@ class OpenAIClient:
         strategies = []
         seen = set()
 
-        def add_strategy(mode: str, token_key: str, include_temperature: bool):
-            signature = (mode, token_key, include_temperature)
+        def add_strategy(mode: str, token_key: str, include_temperature: bool, include_reasoning: bool):
+            signature = (mode, token_key, include_temperature, include_reasoning)
             if signature in seen:
                 return
             seen.add(signature)
 
             if mode == "responses":
-                payload = self._build_responses_payload(messages, max_tokens, temperature, include_temperature)
+                payload = self._build_responses_payload(messages, max_tokens, temperature, include_temperature, include_reasoning)
                 endpoint = f"{self.base_url}/responses"
             else:
-                payload = self._build_chat_payload(messages, max_tokens, temperature, token_key, include_temperature)
+                payload = self._build_chat_payload(messages, max_tokens, temperature, token_key, include_temperature, include_reasoning)
                 endpoint = f"{self.base_url}/chat/completions"
 
             strategies.append({
                 "mode": mode,
                 "token_key": token_key,
                 "include_temperature": include_temperature,
+                "include_reasoning": include_reasoning,
+                "signature": signature,
                 "endpoint": endpoint,
                 "payload": payload,
             })
 
         chat_token_keys = self.model_capabilities.get("chat_token_keys", ["max_tokens"])
-        supports_temperature = bool(self.model_capabilities.get("supports_temperature", True))
+        supports_temperature = bool(self.model_capabilities.get("supports_temperature", True)) and temperature is not None
+        reasoning_options = [True, False] if self.reasoning_effort else [False]
+        modes = ["responses", "chat"] if self.model_capabilities.get("prefers_responses_api") else ["chat", "responses"]
 
-        if self.model_capabilities.get("prefers_responses_api"):
-            if supports_temperature:
-                add_strategy("responses", "max_output_tokens", True)
-            add_strategy("responses", "max_output_tokens", False)
+        for mode in modes:
+            token_keys = ["max_output_tokens"] if mode == "responses" else chat_token_keys
+            for token_key in token_keys:
+                for include_reasoning in reasoning_options:
+                    if supports_temperature:
+                        add_strategy(mode, token_key, True, include_reasoning)
+                    add_strategy(mode, token_key, False, include_reasoning)
 
-            for token_key in chat_token_keys:
-                if supports_temperature:
-                    add_strategy("chat", token_key, True)
-                add_strategy("chat", token_key, False)
-        else:
-            for token_key in chat_token_keys:
-                if supports_temperature:
-                    add_strategy("chat", token_key, True)
-                add_strategy("chat", token_key, False)
-
-            if supports_temperature:
-                add_strategy("responses", "max_output_tokens", True)
-            add_strategy("responses", "max_output_tokens", False)
-
+        preferred = self._preferred_strategies.get((self.base_url, self.model))
+        if preferred:
+            strategies.sort(key=lambda item: 0 if item["signature"] == preferred else 1)
         return strategies
 
     def _should_try_next_strategy(self, status_code: int, error_text: str) -> bool:
@@ -611,8 +753,10 @@ class OpenAIClient:
         compatibility_hints = [
             "unsupported parameter",
             "unknown parameter",
+            "unrecognized request argument",
             "does not support",
             "not supported",
+            "unsupported value",
             "use the responses api",
             "responses api",
             "chat.completions",
@@ -620,49 +764,61 @@ class OpenAIClient:
             "max_tokens",
             "max_completion_tokens",
             "max_output_tokens",
+            "reasoning",
             "instructions",
             "input",
             "messages",
         ]
         return any(hint in lowered for hint in compatibility_hints)
-            
+
+    @staticmethod
+    def _output_budget_exhausted(response_data: Dict[str, Any]) -> bool:
+        if not isinstance(response_data, dict):
+            return False
+        details = response_data.get("incomplete_details") if isinstance(response_data.get("incomplete_details"), dict) else {}
+        if str(response_data.get("status") or "") == "incomplete" and "max_output" in str(details.get("reason") or ""):
+            return True
+        choices = response_data.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            return str(choices[0].get("finish_reason") or "") == "length"
+        return False
+
     async def generate_response(self, prompt: str = None, messages: list = None, max_tokens: int = 1000, temperature: float = 0.7) -> str:
         """Generate response using OpenAI API with intelligent rate limiting.
-        
+
         Args:
             prompt: Simple text prompt (legacy support)
             messages: List of message objects for chat format
             max_tokens: Maximum tokens in response
-            temperature: Sampling temperature
+            temperature: Sampling temperature; ``None`` omits it
         """
         if messages is None and prompt is not None:
-            # Legacy format: convert prompt to messages
             messages = [{"role": "user", "content": prompt}]
         elif messages is None and prompt is None:
             raise ValueError("Either 'prompt' or 'messages' must be provided")
 
         messages = self._normalize_messages(messages)
-        
+        max_tokens = _positive_int(max_tokens, 1000)
+        budget_retry_used = False
+
         attempt = 0
-        
+
         while attempt < self.rate_limit_manager.max_retries:
             try:
-                # Only adjust max_tokens if we have actual rate limit data
-                # Skip budget calculation for normal requests (performance optimization)
                 adjusted_max_tokens = max_tokens
                 if self.rate_limit_manager.current_limits:
                     budget_info = self.rate_limit_manager.update_request_budget(
                         self.rate_limit_manager.current_limits
                     )
                     adjusted_max_tokens = min(max_tokens, budget_info.get('recommended_max_tokens', max_tokens))
-                
+
                 headers = {
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
                 }
 
                 request_strategies = self._build_openai_request_strategies(messages, adjusted_max_tokens, temperature)
-                rate_limited = False
+                retry_loop = False
                 last_error = None
 
                 async with aiohttp.ClientSession() as session:
@@ -671,14 +827,22 @@ class OpenAIClient:
                             strategy["endpoint"],
                             headers=headers,
                             json=strategy["payload"],
-                            timeout=aiohttp.ClientTimeout(total=60)
+                            timeout=aiohttp.ClientTimeout(total=self.request_timeout)
                         ) as response:
                             if response.status == 200:
                                 result = await response.json()
-                                response_text = extract_text_from_openai_response(result)
+                                response_text = strip_reasoning_markup(extract_text_from_openai_response(result))
+                                self._preferred_strategies[(self.base_url, self.model)] = strategy["signature"]
                                 if response_text:
                                     self.rate_limit_manager.reset_retry_count()
                                     return response_text
+                                if self._output_budget_exhausted(result) and not budget_retry_used and adjusted_max_tokens < 32000:
+                                    # Reasoning tokens consumed the whole budget before any visible text.
+                                    budget_retry_used = True
+                                    max_tokens = min(32000, max(adjusted_max_tokens * 2, 4096))
+                                    logger.info("OpenAI output budget exhausted for %s; retrying with max_tokens=%s", self.model, max_tokens)
+                                    retry_loop = True
+                                    break
                                 raise Exception(f"OpenAI API returned an empty response payload for model {self.model}")
 
                             error_text = await response.text()
@@ -695,13 +859,14 @@ class OpenAIClient:
                                     f"OpenAI rate limit (attempt {attempt + 1}/{self.rate_limit_manager.max_retries})"
                                 )
                                 attempt += 1
-                                rate_limited = True
+                                retry_loop = True
                                 break
 
                             if response.status in {400, 422} and (
                                 "context length" in error_text.lower()
                                 or "maximum context" in error_text.lower()
                                 or "too many tokens" in error_text.lower()
+                                or "context_length_exceeded" in error_text.lower()
                             ):
                                 truncation_info = self.rate_limit_manager.handle_context_length_error(error_text)
 
@@ -721,7 +886,7 @@ class OpenAIClient:
                                     )
 
                                 attempt += 1
-                                rate_limited = True
+                                retry_loop = True
                                 break
 
                             if response.status in {401, 403}:
@@ -730,7 +895,8 @@ class OpenAIClient:
                             last_error = (
                                 f"OpenAI {strategy['mode']} request failed for model {self.model} "
                                 f"(status {response.status}, token_key={strategy['token_key']}, "
-                                f"temperature={'on' if strategy['include_temperature'] else 'off'}): {error_text}"
+                                f"temperature={'on' if strategy['include_temperature'] else 'off'}, "
+                                f"reasoning={'on' if strategy['include_reasoning'] else 'off'}): {error_text}"
                             )
 
                             if self._should_try_next_strategy(response.status, error_text):
@@ -739,164 +905,69 @@ class OpenAIClient:
 
                             raise Exception(last_error)
 
-                if rate_limited:
+                if retry_loop:
                     continue
 
                 if last_error:
                     raise Exception(last_error)
 
                 raise Exception(f"OpenAI request failed without a usable strategy for model {self.model}")
-                            
-            except aiohttp.ClientError as e:
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt >= self.rate_limit_manager.max_retries - 1:
-                    raise Exception(f"Failed to generate OpenAI response after {attempt + 1} attempts: {e}")
-                
-                # Network error - use exponential backoff
+                    raise Exception(f"Failed to generate OpenAI response after {attempt + 1} attempts: {e or 'request timed out'}")
+
                 delay = self.rate_limit_manager.base_delay * (2 ** attempt)
                 await self.rate_limit_manager.wait_for_rate_limit(
-                    delay, 
+                    delay,
                     f"Network error retry (attempt {attempt + 1}/{self.rate_limit_manager.max_retries})"
                 )
                 attempt += 1
                 continue
             except Exception as e:
                 raise Exception(f"Failed to generate OpenAI response: {e}")
-        
+
         raise Exception("Max retry attempts exceeded")
-        
+
     def _truncate_messages(self, messages: list, truncation_info: Dict[str, Any]) -> list:
-        """Truncate messages to fit within context limits."""
+        """Truncate messages to fit within context limits, keeping system messages and the latest turn."""
         if not truncation_info.get('should_truncate_prompt'):
             return messages
-            
-        # Always keep the system message if present
+
+        ratio = float(truncation_info.get('truncation_ratio', 0.6) or 0.6)
+        ratio = max(0.1, min(ratio, 0.95))
         system_messages = [msg for msg in messages if msg.get('role') == 'system']
         other_messages = [msg for msg in messages if msg.get('role') != 'system']
-        
-        # Calculate target length for other messages
-        ratio = truncation_info.get('truncation_ratio', 0.6)
-        target_count = max(1, int(len(other_messages) * ratio))
-        
-        # Keep the most recent messages (preserve conversation flow)
-        truncated_messages = other_messages[-target_count:] if target_count < len(other_messages) else other_messages
-        
-        return system_messages + truncated_messages
-        
+
+        if len(other_messages) > 1:
+            target_count = max(1, int(len(other_messages) * ratio))
+            if target_count < len(other_messages):
+                return system_messages + other_messages[-target_count:]
+
+        # Too few turns to drop: shorten the longest message instead, keeping its start and end.
+        shortened = [dict(msg) for msg in messages]
+        longest_index = max(range(len(shortened)), key=lambda idx: len(str(shortened[idx].get('content', ''))))
+        content = str(shortened[longest_index].get('content', ''))
+        keep = max(200, int(len(content) * ratio))
+        if keep < len(content):
+            head = int(keep * 0.7)
+            tail = keep - head
+            shortened[longest_index]['content'] = (
+                content[:head] + "\n...[content truncated to fit the model context]...\n" + content[-tail:]
+            )
+        return shortened
+
     async def analyze_data(self, data: dict, analysis_type: str) -> dict:
         """Analyze data using OpenAI."""
         prompt = self._build_analysis_prompt(data, analysis_type)
-        response = await self.generate_response(prompt, max_tokens=2000)
-        
-        # Try to parse JSON response, handling markdown code blocks
-        try:
-            # Clean up response - remove markdown code blocks if present
-            cleaned_response = response.strip()
-            if cleaned_response.startswith('```'):
-                # Remove opening ```json or ```
-                lines = cleaned_response.split('\n')
-                if lines[0].startswith('```'):
-                    lines = lines[1:]
-                # Remove closing ```
-                if lines and lines[-1].strip() == '```':
-                    lines = lines[:-1]
-                cleaned_response = '\n'.join(lines)
-            
-            return json.loads(cleaned_response)
-        except json.JSONDecodeError:
-            # If still can't parse, return as text analysis
-            return {"analysis": response, "insights": ["Analysis completed"]}
-    
+        max_tokens = ANALYSIS_REASONING_MAX_TOKENS if self.model_capabilities.get("reasoning") else ANALYSIS_MAX_TOKENS
+        response = await self.generate_response(prompt, max_tokens=max_tokens, temperature=0.2)
+        parsed = parse_json_from_llm_text(response)
+        if parsed is not None:
+            return parsed
+        return {"analysis": response, "insights": ["Analysis completed"]}
     def _build_analysis_prompt(self, data: dict, analysis_type: str) -> str:
-        """Build analysis prompt for different types of analysis."""
-        # Add current context information
-        current_time = datetime.now()
-        current_year = current_time.year
-        time_context = f"""
-IMPORTANT CONTEXT: The current date and time is {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC. 
-We are currently in the year {current_year}. Any timestamps showing {current_year} are NOT future events - they are current or recent events.
-When analyzing temporal patterns, consider that {current_year} events are happening now or in the recent past.
-
-"""
-        
-        if analysis_type == "classification":
-            return time_context + f"""
-Analyze the following Splunk data and classify it into categories:
-
-Data: {json.dumps(data, indent=2)}
-
-Please classify this data into categories like:
-- Security (authentication, firewall, intrusion detection)
-- Infrastructure (system logs, performance metrics)
-- Business (application logs, user activity)
-- Compliance (audit logs, regulatory data)
-
-Return a JSON response with the classification results.
-"""
-        elif analysis_type == "recommendations":
-            return time_context + f"""
-Based on the following Splunk environment analysis, generate use case recommendations:
-
-Analysis: {json.dumps(data, indent=2)}
-
-Generate specific use case recommendations with:
-- Title and description
-- Priority (high/medium/low)
-- Category
-- ROI estimate
-- Implementation complexity
-
-Return a JSON array of recommendations.
-"""
-        elif analysis_type == "creative_use_cases":
-            return time_context + f"""
-Based on the following Splunk environment data, generate creative, cross-functional use cases that combine multiple data sources:
-
-Environment Analysis: {json.dumps(data, indent=2)}
-
-{data.get('prompt_guidance', '')}
-
-Generate innovative use cases that:
-1. Combine at least 2 different data source types
-2. Address real business challenges
-3. Provide measurable value
-4. Consider implementation complexity
-
-For each use case, provide:
-- Title: Clear, business-focused name
-- Description: Detailed explanation of the use case
-- Data Sources: List of required data sources
-- Business Value: Expected outcomes and benefits  
-- Implementation Complexity: Low/Medium/High with reasoning
-- Success Metrics: How to measure success
-- Scenario: Real-world example of how it works
-- Category: Business area (Security, Operations, Analytics, etc.)
-
-Think creatively about scenarios like:
-- User behavior correlation across systems
-- Anomaly detection using multiple data streams
-- Business intelligence from operational data
-- Risk assessment from behavioral patterns
-- Compliance automation across departments
-
-Return a JSON array with structured use case objects.
-"""
-        elif analysis_type == "patterns":
-            return time_context + f"""
-Analyze the following Splunk data to identify notable patterns and insights:
-
-Data: {json.dumps(data, indent=2)}
-
-Identify patterns in:
-- Data volume and distribution
-- Source types and their characteristics  
-- Index usage patterns
-- Temporal patterns (remember: we are in {current_year}, so {current_year} timestamps are current!)
-- Data quality indicators
-
-Return insights as a JSON object with a 'patterns' array.
-"""
-        else:
-            return time_context + f"Analyze this Splunk data for {analysis_type}: {json.dumps(data, indent=2)}"
+        return build_analysis_prompt(data, analysis_type)
 
 
 class CustomLLMClient:
@@ -906,13 +977,20 @@ class CustomLLMClient:
     _endpoint_cache = {}
     
     def __init__(self, endpoint_url: str, api_key: Optional[str] = None, model: str = "llama2",
-                 rate_limit_display_callback: Optional[Callable] = None, provider: str = "custom"):
+                 rate_limit_display_callback: Optional[Callable] = None, provider: str = "custom",
+                 tuning: Optional[Dict[str, Any]] = None):
         # Use the endpoint URL EXACTLY as configured by admin - no modifications
         self.endpoint_url = endpoint_url.rstrip('/')  # Only remove trailing slash
         self.api_key = api_key
         self.model = model
         self.rate_limit_display_callback = rate_limit_display_callback
         self.provider = normalize_provider_name(provider)
+        tuning = tuning if isinstance(tuning, dict) else {}
+        self.request_timeout = _positive_int(tuning.get("request_timeout"), 600)
+        self.num_ctx = _positive_int(tuning.get("num_ctx"), 0) or None
+        self.supports_temperature = tuning.get("supports_temperature", True) is not False
+        think_setting = tuning.get("ollama_think")
+        self.ollama_think = think_setting if isinstance(think_setting, (bool, str)) else None
         
         # Detect LLM provider type for connection strategy
         detected_provider_type = self._detect_provider(endpoint_url)
@@ -939,7 +1017,12 @@ class CustomLLMClient:
             PayloadAdapter
         )
         self.health_monitor = get_health_monitor(endpoint_url)
-        self.timeout_manager = AdaptiveTimeoutManager(self.health_monitor)
+        # Local runtimes are routinely slower than hosted APIs; slowness alone is not a failure.
+        self.health_monitor.configure_thresholds(
+            healthy_response_time=max(30.0, self.request_timeout * 0.5),
+            degraded_response_time=max(120.0, float(self.request_timeout)),
+        )
+        self.timeout_manager = AdaptiveTimeoutManager(self.health_monitor, base_timeout=self.request_timeout)
         self.hung_detector = HungRequestDetector(no_progress_timeout=30)
         self.payload_adapter = PayloadAdapter(self.health_monitor)
         
@@ -1022,15 +1105,18 @@ class CustomLLMClient:
                 f"{base}/completions",
                 base,
             ])
-        else:
-            if self.provider_type == "ollama":
-                candidates.extend([
-                    f"{base}/v1/chat/completions",
-                    f"{base}/chat/completions",
-                    f"{base}/api/chat",
-                    f"{base}/api/generate",
-                ])
+        elif self.provider_type == "ollama":
+            # Native /api/chat honors num_ctx and num_predict; the OpenAI-compatible
+            # route ignores them, which silently truncates long prompts on small defaults.
             candidates.extend([
+                f"{base}/api/chat",
+                f"{base}/v1/chat/completions",
+                f"{base}/api/generate",
+            ])
+        else:
+            candidates.extend([
+                f"{base}/v1/chat/completions",
+                f"{base}/chat/completions",
                 f"{base}/v1/completions",
                 f"{base}/completions",
                 base,
@@ -1097,9 +1183,8 @@ class CustomLLMClient:
             adapted_messages = messages
             adapted_max_tokens = max_tokens
             
-            # Fixed 20-minute timeout for all local LLM requests
-            # User has been warned via UI and can abort if needed
-            request_timeout = 1200  # 20 minutes
+            # At least 20 minutes for local vLLM requests; the UI warns about long waits.
+            request_timeout = max(1200, self.request_timeout)
             
             total_chars = sum(len(str(m.get('content', ''))) for m in adapted_messages)
             estimated_input_tokens = total_chars // 4
@@ -1167,9 +1252,9 @@ class CustomLLMClient:
                     elapsed = time.time() - request_start
                     request_time += elapsed
 
-                    if candidate_response.status_code == 404:
-                        logger.warning(f"[CustomLLM-SYNC] Endpoint not found: {candidate_url}")
-                        last_error = Exception(f"HTTP 404 at {candidate_url}")
+                    if candidate_response.status_code in (404, 405):
+                        logger.warning(f"[CustomLLM-SYNC] Endpoint not available ({candidate_response.status_code}): {candidate_url}")
+                        last_error = Exception(f"HTTP {candidate_response.status_code} at {candidate_url}")
                         continue
                     if self._is_recoverable_ollama_candidate_error(candidate_response.status_code, candidate_response.text):
                         logger.warning(
@@ -1269,11 +1354,22 @@ class CustomLLMClient:
         return await loop.run_in_executor(None, self.generate_response_sync, messages, max_tokens, temperature)
     
     def _messages_to_prompt(self, messages: list) -> str:
-        """Convert messages format to simple prompt text."""
+        """Convert messages to prompt text for completion-style endpoints, keeping speaker roles."""
         if not messages:
             return ""
-        # Join all user messages
-        return "\n\n".join([msg.get("content", "") for msg in messages if msg.get("role") in ["user", "system"]])
+        usable = [msg for msg in messages if isinstance(msg, dict) and str(msg.get("content", "")).strip()]
+        if len(usable) == 1:
+            return str(usable[0].get("content", "")).strip()
+        prompt = messages_to_plain_text(usable)
+        return f"{prompt}\n\nAssistant:" if prompt else ""
+
+    def _ollama_options(self, max_tokens: int, temperature: Optional[float]) -> Dict[str, Any]:
+        options: Dict[str, Any] = {"num_predict": max_tokens}
+        if temperature is not None and self.supports_temperature:
+            options["temperature"] = temperature
+        if self.num_ctx:
+            options["num_ctx"] = self.num_ctx
+        return options
     
     def _build_payload(self, endpoint_format: str, messages: list, prompt_text: str, max_tokens: int, temperature: float) -> dict:
         """Build request payload for specific endpoint format."""
@@ -1288,40 +1384,36 @@ class CustomLLMClient:
                     "content": content
                 })
         
-        if endpoint_format in ["OpenAI v1", "OpenAI"]:
-            # Always explicitly disable streaming for compatibility
-            return {
+        include_temperature = temperature is not None and self.supports_temperature
+
+        if endpoint_format == "Ollama Chat":
+            payload = {
                 "model": self.model,
                 "messages": formatted_messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "stream": False
+                "stream": False,
+                "options": self._ollama_options(max_tokens, temperature),
             }
-        elif endpoint_format == "LM Studio":
-            return {
+            if self.ollama_think is not None:
+                payload["think"] = self.ollama_think
+            return payload
+        if endpoint_format == "Ollama Generate":
+            payload = {
                 "model": self.model,
-                "messages": formatted_messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "stream": False
+                "prompt": prompt_text,
+                "stream": False,
+                "options": self._ollama_options(max_tokens, temperature),
             }
-        elif endpoint_format == "Ollama Chat":
-            return {"model": self.model, "messages": formatted_messages, "stream": False}
-        elif endpoint_format == "Ollama Generate":
-            return {"model": self.model, "prompt": prompt_text, "stream": False}
-        elif endpoint_format in ["vLLM Completions", "Generic Completions"]:
-            return {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
-        elif endpoint_format == "Generic Chat":
-            return {"model": self.model, "messages": formatted_messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
+            if self.ollama_think is not None:
+                payload["think"] = self.ollama_think
+            return payload
+        if endpoint_format in ["vLLM Completions", "Generic Completions"]:
+            payload = {"model": self.model, "prompt": prompt_text, "max_tokens": max_tokens, "stream": False}
         else:
-            # Default to OpenAI format with stream disabled
-            return {
-                "model": self.model,
-                "messages": formatted_messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "stream": False
-            }
+            # OpenAI v1, LM Studio, Generic Chat, and unknown formats share the chat schema.
+            payload = {"model": self.model, "messages": formatted_messages, "max_tokens": max_tokens, "stream": False}
+        if include_temperature:
+            payload["temperature"] = temperature
+        return payload
 
     def _normalize_native_tool_call(self, tool_call: dict) -> Optional[dict]:
         """Convert native tool call payloads into the tagged chat-agent format."""
@@ -1371,6 +1463,22 @@ class CustomLLMClient:
         return "\n".join(rendered_calls)
     
     def _extract_response_content(self, response_data: dict, endpoint_format: str) -> str:
+        """Extract the visible answer, dropping chain-of-thought blocks some models inline."""
+        content = self._extract_raw_response_content(response_data, endpoint_format)
+        cleaned = strip_reasoning_markup(content)
+        if not cleaned and isinstance(response_data, dict):
+            message = response_data.get("message")
+            if not isinstance(message, dict):
+                choices = response_data.get("choices") if isinstance(response_data.get("choices"), list) else []
+                message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
+            if isinstance(message, dict) and any(message.get(key) for key in ("thinking", "reasoning", "reasoning_content")):
+                logger.warning(
+                    "[CustomLLM] Model %s returned reasoning without a final answer; the output budget may be too small",
+                    self.model,
+                )
+        return cleaned
+
+    def _extract_raw_response_content(self, response_data: dict, endpoint_format: str) -> str:
         """Extract response content based on endpoint format."""
         try:
             if endpoint_format in ["OpenAI v1", "OpenAI", "LM Studio"]:
@@ -1436,118 +1544,19 @@ class CustomLLMClient:
     async def analyze_data(self, data: dict, analysis_type: str) -> dict:
         """Analyze data using custom LLM."""
         prompt = self._build_analysis_prompt(data, analysis_type)
-        response = await self.generate_response(prompt, max_tokens=2000)
-        
-        # Try to parse JSON response, handling markdown code blocks
-        try:
-            # Clean up response - remove markdown code blocks if present
-            cleaned_response = response.strip()
-            if cleaned_response.startswith('```'):
-                # Remove opening ```json or ```
-                lines = cleaned_response.split('\n')
-                if lines[0].startswith('```'):
-                    lines = lines[1:]
-                # Remove closing ```
-                if lines and lines[-1].strip() == '```':
-                    lines = lines[:-1]
-                cleaned_response = '\n'.join(lines)
-            
-            return json.loads(cleaned_response)
-        except json.JSONDecodeError:
-            # If still can't parse, return as text analysis
-            return {"analysis": response, "insights": ["Analysis completed"]}
+        max_tokens = ANALYSIS_MAX_TOKENS
+        num_ctx = getattr(self, "num_ctx", None)
+        if num_ctx:
+            # Leave most of a small local context window for the prompt itself.
+            max_tokens = max(1024, min(max_tokens, num_ctx // 3))
+        response = await self.generate_response(prompt, max_tokens=max_tokens, temperature=0.2)
+        parsed = parse_json_from_llm_text(response)
+        if parsed is not None:
+            return parsed
+        return {"analysis": response, "insights": ["Analysis completed"]}
     
     def _build_analysis_prompt(self, data: dict, analysis_type: str) -> str:
-        """Build analysis prompt for different types of analysis."""
-        # Add current context information
-        current_time = datetime.now()
-        current_year = current_time.year
-        time_context = f"""
-IMPORTANT CONTEXT: The current date and time is {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC. 
-We are currently in the year {current_year}. Any timestamps showing {current_year} are NOT future events - they are current or recent events.
-When analyzing temporal patterns, consider that {current_year} events are happening now or in the recent past.
-
-"""
-        
-        if analysis_type == "classification":
-            return time_context + f"""
-Analyze the following Splunk data and classify it into categories:
-
-Data: {json.dumps(data, indent=2)}
-
-Please classify this data into categories like:
-- Security (authentication, firewall, intrusion detection)
-- Infrastructure (system logs, performance metrics)
-- Business (application logs, user activity)
-- Compliance (audit logs, regulatory data)
-
-Return a JSON response with the classification results.
-"""
-        elif analysis_type == "recommendations":
-            return time_context + f"""
-Based on the following Splunk environment analysis, generate use case recommendations:
-
-Analysis: {json.dumps(data, indent=2)}
-
-Generate specific use case recommendations with:
-- Title and description
-- Priority (high/medium/low)
-- Category
-- ROI estimate
-- Implementation complexity
-
-Return a JSON array of recommendations.
-"""
-        elif analysis_type == "creative_use_cases":
-            return time_context + f"""
-Based on the following Splunk environment data, generate creative, cross-functional use cases that combine multiple data sources:
-
-Environment Analysis: {json.dumps(data, indent=2)}
-
-{data.get('prompt_guidance', '')}
-
-Generate innovative use cases that:
-1. Combine at least 2 different data source types
-2. Address real business challenges
-3. Provide measurable value
-4. Consider implementation complexity
-
-For each use case, provide:
-- Title: Clear, business-focused name
-- Description: Detailed explanation of the use case
-- Data Sources: List of required data sources
-- Business Value: Expected outcomes and benefits  
-- Implementation Complexity: Low/Medium/High with reasoning
-- Success Metrics: How to measure success
-- Scenario: Real-world example of how it works
-- Category: Business area (Security, Operations, Analytics, etc.)
-
-Think creatively about scenarios like:
-- User behavior correlation across systems
-- Anomaly detection using multiple data streams
-- Business intelligence from operational data
-- Risk assessment from behavioral patterns
-- Compliance automation across departments
-
-Return a JSON array with structured use case objects.
-"""
-        elif analysis_type == "patterns":
-            return time_context + f"""
-Analyze the following Splunk data to identify notable patterns and insights:
-
-Data: {json.dumps(data, indent=2)}
-
-Identify patterns in:
-- Data volume and distribution
-- Source types and their characteristics  
-- Index usage patterns
-- Temporal patterns (remember: we are in {current_year}, so {current_year} timestamps are current!)
-- Data quality indicators
-
-Return insights as a JSON object with a 'patterns' array.
-"""
-        else:
-            return time_context + f"Analyze this Splunk data for {analysis_type}: {json.dumps(data, indent=2)}"
+        return build_analysis_prompt(data, analysis_type)
 
 
 class LLMClientFactory:
@@ -1653,44 +1662,86 @@ class LLMClientFactory:
         return "\n".join([t for t in texts if t]).strip()
 
     @staticmethod
+    def _normalize_chat_messages(messages: list) -> list:
+        normalized = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).strip().lower()
+            if role not in {"system", "user", "assistant"}:
+                role = "user"
+            content = str(msg.get("content", "")).strip()
+            if content:
+                normalized.append({"role": role, "content": content})
+        return normalized or [{"role": "user", "content": "Hello"}]
+
+    @staticmethod
     async def _generate_azure_response(endpoint_url: str, api_key: str, model: str, messages: list,
-                                       max_tokens: int, temperature: float) -> str:
+                                       max_tokens: int, temperature: Optional[float],
+                                       timeout: int = 120, reasoning_effort: Optional[str] = None) -> str:
         if not api_key:
             raise ValueError("Azure provider requires api_key")
+        chat_url = LLMClientFactory._normalize_azure_chat_url(endpoint_url, model)
+        reasoning_deployment = bool(get_openai_model_capabilities(model).get("reasoning"))
+        # Reasoning deployments need max_completion_tokens, which older API versions reject.
         url = LLMClientFactory._append_api_version(
-            LLMClientFactory._normalize_azure_chat_url(endpoint_url, model)
+            chat_url, "2024-12-01-preview" if reasoning_deployment else "2024-02-15-preview"
         )
         headers = {
             "Content-Type": "application/json",
             "api-key": api_key,
         }
-        payload = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
 
+        attempts: list = []
+        if reasoning_deployment:
+            if reasoning_effort:
+                attempts.append({"max_completion_tokens": max_tokens, "reasoning_effort": reasoning_effort})
+            attempts.append({"max_completion_tokens": max_tokens})
+        if temperature is not None and not reasoning_deployment:
+            attempts.append({"max_tokens": max_tokens, "temperature": temperature})
+        attempts.append({"max_tokens": max_tokens})
+        attempts.append({"max_completion_tokens": max_tokens})
+        unique_attempts = []
+        for options in attempts:
+            if options not in unique_attempts:
+                unique_attempts.append(options)
+
+        chat_messages = LLMClientFactory._normalize_chat_messages(messages)
+        last_error = ""
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
-                if response.status != 200:
+            for options in unique_attempts:
+                payload = {"messages": chat_messages, **options}
+                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return strip_reasoning_markup(extract_text_from_openai_response(data))
                     body = await response.text()
-                    raise Exception(f"Azure OpenAI error {response.status}: {body[:300]}")
-                data = await response.json()
-                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    last_error = f"Azure OpenAI error {response.status}: {body[:300]}"
+                    lowered = body.lower()
+                    if response.status in {400, 422} and any(
+                        hint in lowered
+                        for hint in ("max_tokens", "max_completion_tokens", "temperature", "reasoning_effort", "unsupported", "not supported")
+                    ):
+                        continue
+                    raise Exception(last_error)
+        raise Exception(last_error or "Azure OpenAI request failed")
 
     @staticmethod
     async def _generate_anthropic_response(endpoint_url: Optional[str], api_key: str, model: str, messages: list,
-                                           max_tokens: int, temperature: float) -> str:
+                                           max_tokens: int, temperature: Optional[float], timeout: int = 120) -> str:
         if not api_key:
             raise ValueError("Anthropic provider requires api_key")
         url = LLMClientFactory._normalize_anthropic_url(endpoint_url)
         system_prompt, anthropic_messages = LLMClientFactory._build_anthropic_messages(messages)
+        if anthropic_messages and anthropic_messages[0]["role"] != "user":
+            anthropic_messages.insert(0, {"role": "user", "content": "Continue the conversation."})
         payload = {
             "model": model,
             "messages": anthropic_messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        if temperature is not None:
+            payload["temperature"] = max(0.0, min(1.0, float(temperature)))
         if system_prompt:
             payload["system"] = system_prompt
 
@@ -1701,7 +1752,7 @@ class LLMClientFactory:
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 if response.status != 200:
                     body = await response.text()
                     raise Exception(f"Anthropic error {response.status}: {body[:300]}")
@@ -1713,53 +1764,89 @@ class LLMClientFactory:
                         text = item.get("text", "")
                         if isinstance(text, str) and text.strip():
                             text_parts.append(text)
-                return "\n".join(text_parts).strip()
+                return strip_reasoning_markup("\n".join(text_parts))
+
+    @staticmethod
+    def _build_gemini_request(messages: list) -> tuple[str, list]:
+        system_lines = []
+        contents = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).strip().lower()
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system":
+                system_lines.append(content)
+                continue
+            contents.append({"role": "model" if role == "assistant" else "user", "parts": [{"text": content}]})
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": "Hello"}]}]
+        return "\n\n".join(system_lines), contents
 
     @staticmethod
     async def _generate_gemini_response(endpoint_url: Optional[str], api_key: str, model: str, messages: list,
-                                        max_tokens: int, temperature: float) -> str:
+                                        max_tokens: int, temperature: Optional[float], timeout: int = 120) -> str:
         if not api_key:
             raise ValueError("Gemini provider requires api_key")
         base_url = LLMClientFactory._normalize_gemini_url(endpoint_url, model)
         url = base_url if "?key=" in base_url else f"{base_url}?key={quote(api_key)}"
-        payload = {
-            "contents": LLMClientFactory._build_gemini_contents(messages),
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-            }
-        }
+        system_text, contents = LLMClientFactory._build_gemini_request(messages)
+
+        model_lower = str(model or "").lower()
+        thinking_model = bool(re.search(r"gemini-(2\.5|[3-9])", model_lower))
+        generation_config: Dict[str, Any] = {"maxOutputTokens": max_tokens}
+        if temperature is not None:
+            generation_config["temperature"] = temperature
+        if thinking_model:
+            # Thinking tokens count against maxOutputTokens; reserve room for the visible answer.
+            generation_config["maxOutputTokens"] = max(max_tokens, 2048)
+            generation_config["thinkingConfig"] = {"thinkingBudget": max(128, min(2048, max_tokens // 4))}
+
+        payload: Dict[str, Any] = {"contents": contents, "generationConfig": generation_config}
+        if system_text:
+            payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers={"Content-Type": "application/json"}, json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=60)) as response:
-                if response.status != 200:
+            for _ in range(2):
+                async with session.post(url, headers={"Content-Type": "application/json"}, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return strip_reasoning_markup(LLMClientFactory._extract_gemini_text(data))
                     body = await response.text()
+                    if response.status == 400 and "thinking" in body.lower() and "thinkingConfig" in generation_config:
+                        generation_config.pop("thinkingConfig", None)
+                        continue
                     raise Exception(f"Gemini error {response.status}: {body[:300]}")
-                data = await response.json()
-                return LLMClientFactory._extract_gemini_text(data)
-    
+        raise Exception("Gemini request failed")
+
     @staticmethod
-    def create_client(provider: str = "openai", custom_endpoint: Optional[str] = None, 
+    def create_client(provider: str = "openai", custom_endpoint: Optional[str] = None,
                      api_key: Optional[str] = None, model: str = "gpt-4",
-                     rate_limit_display_callback=None) -> LLMClient:
+                     rate_limit_display_callback=None,
+                     tuning: Optional[Dict[str, Any]] = None) -> LLMClient:
         """
         Create an LLM client based on the specified provider.
-        
+
         Args:
-            provider: Either "openai" or "custom"
-            custom_endpoint: Required if provider is "custom"
-            api_key: API key for OpenAI (optional, will use env var if not provided)
-            model: Model name for OpenAI (default: gpt-4)
+            provider: openai, azure, anthropic, gemini, ollama, or custom
+            custom_endpoint: Required for azure and custom providers
+            api_key: API key (OpenAI falls back to OPENAI_API_KEY)
+            model: Model or deployment name
             rate_limit_display_callback: Optional callback for rate limit display
-            
+            tuning: Optional runtime settings from ``llm.model_profiles.recommend_settings``
+                (request_timeout, reasoning_effort, num_ctx, ollama_think, supports_temperature)
+
         Returns:
             LLMClient instance
-            
+
         Raises:
             ValueError: If invalid provider or missing requirements
         """
         normalized_provider = normalize_provider_name(provider)
+        tuning = tuning if isinstance(tuning, dict) else {}
 
         if normalized_provider == "openai":
             return OpenAIClient(
@@ -1767,6 +1854,7 @@ class LLMClientFactory:
                 model=model,
                 endpoint_url=custom_endpoint,
                 rate_limit_display_callback=rate_limit_display_callback,
+                tuning=tuning,
             )
 
         if normalized_provider == "custom":
@@ -1777,7 +1865,8 @@ class LLMClientFactory:
                 api_key=api_key,
                 model=model,
                 rate_limit_display_callback=rate_limit_display_callback,
-                provider="custom"
+                provider="custom",
+                tuning=tuning,
             )
 
         if normalized_provider == "ollama":
@@ -1786,16 +1875,23 @@ class LLMClientFactory:
                 api_key=api_key,
                 model=model,
                 rate_limit_display_callback=rate_limit_display_callback,
-                provider="ollama"
+                provider="ollama",
+                tuning=tuning,
             )
 
         if normalized_provider in {"azure", "anthropic", "gemini"}:
             class _ProviderAdapter:
-                def __init__(self, provider_name: str, endpoint: Optional[str], key: Optional[str], model_name: str):
+                def __init__(self, provider_name: str, endpoint: Optional[str], key: Optional[str], model_name: str,
+                             adapter_tuning: Dict[str, Any]):
                     self.provider_name = provider_name
+                    self.provider_type = provider_name
                     self.endpoint = endpoint
                     self.key = key
                     self.model_name = model_name
+                    self.model = model_name
+                    self.request_timeout = _positive_int(adapter_tuning.get("request_timeout"), 120)
+                    self.reasoning_effort = adapter_tuning.get("reasoning_effort")
+                    self.supports_temperature = adapter_tuning.get("supports_temperature", True) is not False
 
                 async def generate_response(self, prompt: str = None, messages: list = None,
                                             max_tokens: int = 1000, temperature: float = 0.7) -> str:
@@ -1803,6 +1899,7 @@ class LLMClientFactory:
                         if prompt is None:
                             raise ValueError("Either 'prompt' or 'messages' must be provided")
                         messages = [{"role": "user", "content": prompt}]
+                    effective_temperature = temperature if self.supports_temperature else None
 
                     if self.provider_name == "azure":
                         return await LLMClientFactory._generate_azure_response(
@@ -1811,7 +1908,9 @@ class LLMClientFactory:
                             model=self.model_name,
                             messages=messages,
                             max_tokens=max_tokens,
-                            temperature=temperature,
+                            temperature=effective_temperature,
+                            timeout=self.request_timeout,
+                            reasoning_effort=self.reasoning_effort,
                         )
 
                     if self.provider_name == "anthropic":
@@ -1821,7 +1920,8 @@ class LLMClientFactory:
                             model=self.model_name,
                             messages=messages,
                             max_tokens=max_tokens,
-                            temperature=temperature,
+                            temperature=effective_temperature,
+                            timeout=self.request_timeout,
                         )
 
                     return await LLMClientFactory._generate_gemini_response(
@@ -1830,26 +1930,27 @@ class LLMClientFactory:
                         model=self.model_name,
                         messages=messages,
                         max_tokens=max_tokens,
-                        temperature=temperature,
+                        temperature=effective_temperature,
+                        timeout=self.request_timeout,
                     )
 
                 async def analyze_data(self, data: dict, analysis_type: str) -> dict:
-                    prompt = f"Analyze this Splunk data for {analysis_type}: {json.dumps(data, indent=2)}"
-                    response = await self.generate_response(prompt=prompt, max_tokens=2000)
-                    try:
-                        return json.loads(response)
-                    except json.JSONDecodeError:
-                        return {"analysis": response, "insights": ["Analysis completed"]}
+                    prompt = build_analysis_prompt(data, analysis_type)
+                    response = await self.generate_response(prompt=prompt, max_tokens=ANALYSIS_MAX_TOKENS, temperature=0.2)
+                    parsed = parse_json_from_llm_text(response)
+                    if parsed is not None:
+                        return parsed
+                    return {"analysis": response, "insights": ["Analysis completed"]}
 
             return _ProviderAdapter(
                 provider_name=normalized_provider,
                 endpoint=custom_endpoint,
                 key=api_key,
                 model_name=model,
+                adapter_tuning=tuning,
             )
 
         raise ValueError(f"Unsupported LLM provider: {provider}")
-            
     @staticmethod
     def get_available_providers() -> list[str]:
         """Get list of available LLM providers."""

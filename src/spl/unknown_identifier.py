@@ -4,6 +4,8 @@ Unknown Data Identifier - Detects ambiguous data sources and generates contextua
 
 from typing import Dict, List, Any
 
+from discovery.local_analyzer import safe_float, safe_int
+
 
 class UnknownDataIdentifier:
     """Identify and generate questions about unknown/ambiguous data sources."""
@@ -57,8 +59,8 @@ class UnknownDataIdentifier:
             if 'title' in data and 'currentDBSizeMB' in data:
                 index_name = data.get('title', '')
                 if not self._is_known_index(index_name):
-                    size_mb = float(data.get('currentDBSizeMB', 0))
-                    events = int(data.get('totalEventCount', 0))
+                    size_mb = safe_float(data.get('currentDBSizeMB'))
+                    events = safe_int(data.get('totalEventCount'))
                     
                     # Only flag if it has significant data OR is completely unknown
                     confidence = self._calculate_confidence(index_name, 'index')
@@ -75,7 +77,7 @@ class UnknownDataIdentifier:
             elif 'sourcetype' in data and 'totalCount' in data:
                 st_name = data.get('sourcetype', '')
                 if not self._is_known_sourcetype(st_name):
-                    events = int(data.get('totalCount', 0))
+                    events = safe_int(data.get('totalCount'))
                     
                     # Only flag if it has significant data OR is completely unknown
                     confidence = self._calculate_confidence(st_name, 'sourcetype')
@@ -157,8 +159,8 @@ class UnknownDataIdentifier:
             if 'title' in data and 'currentDBSizeMB' in data:
                 index_name = data.get('title', '')
                 confidence = self._calculate_confidence(index_name, 'index')
-                size_mb = float(data.get('currentDBSizeMB', 0))
-                events = int(data.get('totalEventCount', 0))
+                size_mb = safe_float(data.get('currentDBSizeMB'))
+                events = safe_int(data.get('totalEventCount'))
                 
                 if (size_mb > 1 or events > 100) and confidence < 70:
                     all_items.append({
@@ -173,7 +175,7 @@ class UnknownDataIdentifier:
             elif 'sourcetype' in data and 'totalCount' in data:
                 st_name = data.get('sourcetype', '')
                 confidence = self._calculate_confidence(st_name, 'sourcetype')
-                events = int(data.get('totalCount', 0))
+                events = safe_int(data.get('totalCount'))
                 
                 if events > 100 and confidence < 70:
                     all_items.append({
@@ -410,12 +412,12 @@ class UnknownDataIdentifier:
     def _extract_context(self, item: Dict) -> Dict[str, Any]:
         """Extract contextual information about the item."""
         context = {
-            "has_volume": item.get('events', 0) > 1000,
-            "volume_category": self._categorize_volume(item.get('events', 0))
+            "has_volume": safe_int(item.get('events')) > 1000,
+            "volume_category": self._categorize_volume(safe_int(item.get('events')))
         }
         
         if item['type'] == 'index':
-            context['has_significant_data'] = item.get('size_mb', 0) > 10
+            context['has_significant_data'] = safe_float(item.get('size_mb')) > 10
         
         return context
     

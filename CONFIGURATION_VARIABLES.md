@@ -11,9 +11,15 @@ Comprehensive enumeration of all configurable parameters, thresholds, and consta
 class LLMConfig:
     provider: str = "openai"           # Supported: openai, azure, anthropic, gemini, custom
     model: str = "gpt-4o-mini"         # Default model
-    max_tokens: int = 16000            # Default max tokens per request
-    temperature: float = 0.7           # Default temperature for responses
+    max_tokens: int = 16000            # Max tokens per request (used when auto_tune is off)
+    temperature: float = 0.7           # Temperature (used when auto_tune is off)
+    auto_tune: bool = True             # Derive runtime settings from the model profile
+    context_window: int = 0            # 0 = derive from the model profile
+    request_timeout: int = 0           # Seconds; 0 = derive from the model profile
+    reasoning_effort: str = ""         # "", "low", "medium", or "high"
 ```
+
+Saved LLM credentials carry the same `auto_tune`, `context_window`, `request_timeout`, and `reasoning_effort` fields. Config files written by other versions still load; unknown keys are ignored.
 
 Provider endpoint requirements:
 - `openai`: endpoint optional (defaults to OpenAI public API)
@@ -22,7 +28,24 @@ Provider endpoint requirements:
 - `gemini`: endpoint optional (defaults to `https://generativelanguage.googleapis.com`)
 - `custom`: endpoint required
 
-### 1.2 Rate Limiting (src/llm/factory.py)
+### 1.2 Auto-Tuning (src/llm/model_profiles.py)
+```python
+BALANCED_WEIGHTS = {"quality": 0.45, "speed": 0.30, "cost": 0.25}  # Model ranking weights
+HOSTED_CONTEXT_CAP = 128000        # Prompt planning cap for hosted models
+LOCAL_CONTEXT_CAP = 32768          # Prompt planning cap for local runtimes (keeps responses fast)
+DEFAULT_UNKNOWN_CONTEXT = 8192     # Context assumed when nothing reports one
+
+# recommend_settings(profile) when auto_tune is on
+max_tokens: hosted 8192 (16000 for reasoning models), local 4096 (8192 for reasoning),
+            capped by the model's output limit and half of the effective context
+temperature: 0.2                   # Omitted for models with a fixed temperature
+request_timeout: hosted 120s (300s reasoning), local 600s (900s reasoning)
+reasoning_effort: "low"            # OpenAI/Azure reasoning models and gpt-oss
+```
+
+Chat budgets come from `chat_budgets()`: the first step gets about 50% and follow-up steps about 60% of `max_tokens` (at least 2048 tokens for reasoning models and 512 otherwise), and history turns and evidence rows scale with the context window.
+
+### 1.3 Rate Limiting (src/llm/factory.py)
 ```python
 class RateLimitManager:
     base_delay: float = 1.0            # Initial delay between retries (seconds)
@@ -114,10 +137,13 @@ Behavior notes:
 
 ### 3.1 Execution Limits (src/web_app.py)
 ```python
-max_execution_time: int = 90           # Discovery timeout (90 seconds)
-max_iterations: int = 5                # Maximum query iterations before stopping
+max_execution_time: int = 90           # Chat tool-loop time limit (seconds)
+max_iterations: int = 5                # Maximum tool steps for one chat request
+convergence_detection: int = 5         # Stop after this many steps without new data (minimum 2)
 convergence_check_threshold: int = 5   # Minimum iterations before checking for convergence
 ```
+
+Chat searches that name no index run with `index=*` added. A search that repeats an earlier empty search with only the index changed is skipped, and the model is told to search all indexes in one step instead.
 
 ### 3.2 Context & Data Handling
 ```python
@@ -320,7 +346,10 @@ Notes:
 llm_list_models_endpoint = "/api/llm/list-models"          # Provider-aware model/deployment fetch
 llm_test_connection_endpoint = "/api/llm/test-connection"  # Provider-aware connectivity + generation test
 llm_assess_max_tokens_endpoint = "/api/llm/assess-max-tokens"
+llm_health_endpoint = "/api/llm/health"
 ```
+
+`/api/llm/list-models` also returns `ranked` (per-model profile and balanced score), `recommended`, `recommended_model`, and `ranking_basis`. `/api/llm/test-connection` returns the tuned settings it used and the recommended settings for the model.
 
 ---
 

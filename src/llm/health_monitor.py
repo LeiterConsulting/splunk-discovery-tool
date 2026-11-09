@@ -90,8 +90,19 @@ class LLMHealthMonitor:
         # Thresholds for health status
         self.healthy_error_rate = 0.05  # 5%
         self.degraded_error_rate = 0.20  # 20%
-        self.healthy_response_time = 10.0  # seconds
-        self.degraded_response_time = 30.0  # seconds
+        self.healthy_response_time = 30.0  # seconds
+        self.degraded_response_time = 120.0  # seconds
+
+    def configure_thresholds(self, healthy_response_time: Optional[float] = None,
+                             degraded_response_time: Optional[float] = None):
+        """Set response-time thresholds that match the runtime (local models are slower)."""
+        if healthy_response_time and healthy_response_time > 0:
+            self.healthy_response_time = float(healthy_response_time)
+        if degraded_response_time and degraded_response_time > 0:
+            self.degraded_response_time = max(float(degraded_response_time), self.healthy_response_time)
+        if self.metrics.total_requests:
+            self._update_health_status()
+            self._calculate_recommendations()
         
     def record_request(self, success: bool, response_time: float, is_timeout: bool = False):
         """
@@ -161,42 +172,40 @@ class LLMHealthMonitor:
         error_rate = self.metrics.error_rate
         avg_time = self.metrics.avg_response_time
         consecutive = self.metrics.consecutive_failures
-        
+
+        if self.metrics.total_requests == 0:
+            self.metrics.status = HealthStatus.UNKNOWN
+            return
+
         # Critical: 5+ consecutive failures = unhealthy
         if consecutive >= 5:
             self.metrics.status = HealthStatus.UNHEALTHY
             return
-        
-        # Check error rate and response time
-        if error_rate <= self.healthy_error_rate and avg_time <= self.healthy_response_time:
-            self.metrics.status = HealthStatus.HEALTHY
-        elif error_rate <= self.degraded_error_rate and avg_time <= self.degraded_response_time:
+
+        # Failures drive the status; slow but successful responses only degrade it.
+        if error_rate > self.degraded_error_rate:
+            self.metrics.status = HealthStatus.UNHEALTHY
+        elif error_rate > self.healthy_error_rate or avg_time > self.degraded_response_time:
+            self.metrics.status = HealthStatus.DEGRADED
+        elif avg_time > self.healthy_response_time:
             self.metrics.status = HealthStatus.DEGRADED
         else:
-            self.metrics.status = HealthStatus.UNHEALTHY
+            self.metrics.status = HealthStatus.HEALTHY
     
     def _calculate_recommendations(self):
         """Calculate adaptive timeout and token recommendations"""
         status = self.metrics.status
-        avg_time = self.metrics.avg_response_time
         p95_time = self.metrics.p95_response_time
         
         # Adaptive timeout calculation
-        if status == HealthStatus.HEALTHY:
-            # Use p95 + 50% buffer
-            base_timeout = max(p95_time * 1.5, 10.0)
-            self.metrics.recommended_timeout = int(min(base_timeout, 60))
+        if status in {HealthStatus.HEALTHY, HealthStatus.UNKNOWN}:
+            self.metrics.recommended_timeout = int(max(p95_time * 1.5, 30.0))
             self.metrics.recommended_max_tokens = 16000
-            
         elif status == HealthStatus.DEGRADED:
-            # Use p95 + 100% buffer, reduce tokens
-            base_timeout = max(p95_time * 2.0, 20.0)
-            self.metrics.recommended_timeout = int(min(base_timeout, 90))
-            self.metrics.recommended_max_tokens = 8000
-            
-        else:  # UNHEALTHY or UNKNOWN
-            # Very conservative
-            self.metrics.recommended_timeout = 120
+            self.metrics.recommended_timeout = int(max(p95_time * 2.0, 60.0))
+            self.metrics.recommended_max_tokens = 16000
+        else:  # UNHEALTHY
+            self.metrics.recommended_timeout = int(max(p95_time * 2.0, 120.0))
             self.metrics.recommended_max_tokens = 4000
     
     def get_metrics(self) -> HealthMetrics:
@@ -242,38 +251,33 @@ class AdaptiveTimeoutManager:
     Manages adaptive timeouts based on endpoint health and request characteristics.
     """
     
-    def __init__(self, health_monitor: LLMHealthMonitor):
+    def __init__(self, health_monitor: LLMHealthMonitor, base_timeout: int = 120,
+                 max_timeout: Optional[int] = None):
         self.health_monitor = health_monitor
         self.min_timeout = 10
-        self.max_timeout = 120
-    
+        self.base_timeout = max(self.min_timeout, int(base_timeout or 120))
+        self.max_timeout = int(max_timeout) if max_timeout else self.base_timeout * 3
+
     def calculate_timeout(self, payload_size: int = 1000) -> int:
         """
         Calculate adaptive timeout for a request.
-        
+
+        Starts from the tuned base timeout, stretches it when observed p95 latency
+        is higher, and adds prompt-processing time for large payloads.
+
         Args:
             payload_size: Estimated token count in request
-        
+
         Returns:
             Timeout in seconds
         """
         metrics = self.health_monitor.get_metrics()
-        
-        # Base timeout from health monitor recommendation
-        base_timeout = metrics.recommended_timeout
-        
-        # Adjust for payload size (larger payloads need more time)
-        # Assume ~100 tokens/second processing rate
-        token_factor = payload_size / 100
-        
-        # Adjust for recent error rate (higher errors = more buffer)
-        error_factor = 1.0 + (metrics.error_rate * 2)
-        
-        # Calculate final timeout
-        timeout = base_timeout + token_factor
-        timeout = timeout * error_factor
-        
-        # Clamp to reasonable bounds
+        timeout = float(self.base_timeout)
+        if metrics.successful_requests >= 3 and metrics.p95_response_time > 0:
+            timeout = max(timeout, metrics.p95_response_time * 2.0)
+        timeout += max(0, payload_size) / 200.0
+        if metrics.status == HealthStatus.UNHEALTHY and metrics.timeout_count:
+            timeout *= 1.25
         return int(max(min(timeout, self.max_timeout), self.min_timeout))
     
     def get_read_timeout(self, total_timeout: int) -> int:
@@ -392,25 +396,15 @@ class PayloadAdapter:
             Tuple of (adapted_messages, adapted_max_tokens)
         """
         status = self.health_monitor.get_status()
+
+        # Only shrink requests after repeated failures. A fresh or slow endpoint gets
+        # the full request: dropping context silently makes answers worse, not faster.
+        if status != HealthStatus.UNHEALTHY:
+            return messages, max_tokens
+
         recommended = self.health_monitor.get_metrics().recommended_max_tokens
-        
-        # Adjust max_tokens based on health
-        adapted_tokens = min(max_tokens, recommended)
-        
-        # Adjust message count/size based on health
-        if status == HealthStatus.HEALTHY:
-            # No truncation needed
-            return messages, adapted_tokens
-        
-        elif status == HealthStatus.DEGRADED:
-            # Reduce to 70% of messages
-            truncated = self._truncate_messages(messages, ratio=0.7)
-            return truncated, adapted_tokens
-        
-        else:  # UNHEALTHY
-            # Aggressive reduction to 50%
-            truncated = self._truncate_messages(messages, ratio=0.5)
-            return truncated, adapted_tokens
+        adapted_tokens = min(max_tokens, max(int(recommended or 0), 2048))
+        return self._truncate_messages(messages, ratio=0.7), adapted_tokens
     
     def _truncate_messages(self, messages: list, ratio: float) -> list:
         """

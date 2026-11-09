@@ -875,6 +875,8 @@
         };
 
         const CHAT_STATE_STORAGE_KEY = 'dt4sms_chat_state_v1';
+        const CHAT_MISSION_STORAGE_KEY = 'dt4sms_chat_mission_v1';
+        const CHAT_MISSION_MAX_CHARS = 600;
         const WELCOME_SPLASH_PREFERENCE_KEY = 'dt4sms_welcome_splash_dismissed_v1';
         const CONSTRUCT_THEME_SESSION_KEY = 'dt4sms_construct_theme_session_v1';
         const CONSTRUCT_THEME_KEY_SEQUENCE = 'rabbit';
@@ -1349,6 +1351,34 @@
             }
         };
 
+        // The mission is stored separately so clearing the chat keeps the user's goal.
+        const loadChatMission = () => {
+            try {
+                if (typeof window === 'undefined' || !window.localStorage) {
+                    return '';
+                }
+                const value = window.localStorage.getItem(CHAT_MISSION_STORAGE_KEY);
+                return typeof value === 'string' ? value.slice(0, CHAT_MISSION_MAX_CHARS) : '';
+            } catch (error) {
+                return '';
+            }
+        };
+
+        const saveChatMission = (value) => {
+            try {
+                if (typeof window === 'undefined' || !window.localStorage) {
+                    return;
+                }
+                if (value && value.trim()) {
+                    window.localStorage.setItem(CHAT_MISSION_STORAGE_KEY, value.slice(0, CHAT_MISSION_MAX_CHARS));
+                } else {
+                    window.localStorage.removeItem(CHAT_MISSION_STORAGE_KEY);
+                }
+            } catch (error) {
+                console.warn('Failed to save chat mission', error);
+            }
+        };
+
         const loadWelcomeSplashDismissed = () => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
@@ -1386,6 +1416,50 @@
             if (value === 'local ollama' || value === 'ollama endpoint') return 'ollama';
             if (value === 'custom' && (endpointValue.includes('ollama') || endpointValue.includes(':11434'))) return 'ollama';
             return value;
+        };
+
+        const escapeSettingsHtml = (value) => String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+
+        const readLlmTuningFormValues = (fallback = {}) => {
+            const toPositiveInt = (element, fallbackValue) => {
+                if (!element) return Number(fallbackValue) > 0 ? Number(fallbackValue) : 0;
+                const parsed = parseInt(element.value || '0', 10);
+                return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+            };
+            const autoTuneEl = document.getElementById('llm-auto-tune');
+            const effortEl = document.getElementById('llm-reasoning-effort');
+            return {
+                auto_tune: autoTuneEl ? autoTuneEl.checked : fallback.auto_tune !== false,
+                context_window: toPositiveInt(document.getElementById('llm-context-window'), fallback.context_window),
+                request_timeout: toPositiveInt(document.getElementById('llm-request-timeout'), fallback.request_timeout),
+                reasoning_effort: effortEl ? effortEl.value : (fallback.reasoning_effort || ''),
+            };
+        };
+
+        const formatTuningTokens = (value) => {
+            const numeric = Number(value);
+            if (!Number.isFinite(numeric) || numeric <= 0) return 'n/a';
+            if (numeric >= 1000) {
+                return numeric % 1024 === 0 ? `${numeric / 1024}K` : `${Math.round(numeric / 1000)}K`;
+            }
+            return String(numeric);
+        };
+
+        const describeLlmTuning = (tuning) => {
+            if (!tuning || typeof tuning !== 'object') return '';
+            const parts = [
+                `${formatTuningTokens(tuning.context_window)} context`,
+                `${tuning.max_tokens} max output tokens`,
+                tuning.temperature === null || tuning.temperature === undefined ? 'fixed temperature' : `temperature ${tuning.temperature}`,
+                `${tuning.request_timeout}s timeout`,
+            ];
+            if (tuning.reasoning_effort) parts.push(`reasoning effort ${tuning.reasoning_effort}`);
+            return parts.join(' · ');
         };
 
         // Error Boundary to catch React rendering errors
@@ -2150,6 +2224,7 @@
             const [isChatFullscreen, setIsChatFullscreen] = useState(false);
             const [chatMessages, setChatMessages] = useState(() => Array.isArray(initialChatState.chatMessages) ? initialChatState.chatMessages : []);
             const [chatInput, setChatInput] = useState('');
+            const [chatMission, setChatMission] = useState(() => loadChatMission());
             const [isTyping, setIsTyping] = useState(false);
             const [chatStatus, setChatStatus] = useState(''); // Real-time status during investigation
             const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
@@ -2242,6 +2317,9 @@
             const [availableModels, setAvailableModels] = useState([]); // Available models from API
             const [isLoadingModels, setIsLoadingModels] = useState(false); // Loading state for model fetch
             const [selectedModel, setSelectedModel] = useState(''); // Currently selected model
+            const [modelRanking, setModelRanking] = useState([]); // Balanced ranking returned with the model list
+            const [llmAutoTune, setLlmAutoTune] = useState(true);
+            const [llmTuningSummary, setLlmTuningSummary] = useState(null); // Latest tuning from Test Connection or Auto-Assess
             const SPL_LIBRARY_ASSET_TYPE = 'spl_query_library';
             const defaultRagAssetDraft = {
                 title: '',
@@ -2380,6 +2458,13 @@
             const isDarkTheme = resolvedTheme === 'dark' || isConstructTheme;
             const normalizedSelectedModel = (selectedModel || config?.llm?.model || '').trim().toLowerCase();
             const isOpenAIImageModelSelected = selectedProvider === 'openai' && normalizedSelectedModel.startsWith('gpt-image-');
+            const recommendedModelEntry = modelRanking.find((item) => item && item.recommended) || null;
+            const selectedModelRanking = modelRanking.find((item) => item && item.model === (selectedModel || config?.llm?.model)) || null;
+            const configAutoTune = config?.llm?.auto_tune;
+            useEffect(() => {
+                setLlmAutoTune(configAutoTune !== false);
+            }, [configAutoTune]);
+            const activeLlmTuning = llmTuningSummary || config?.llm_effective_tuning || null;
             const panelClass = isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200';
             const panelMutedClass = isDarkTheme ? 'bg-gray-700 border-gray-600' : 'bg-gray-50 border-gray-200';
             const headingClass = isDarkTheme ? 'text-gray-100' : 'text-gray-900';
@@ -4157,6 +4242,10 @@
                     serverConversationHistory: compactPersistedConversationHistory(serverConversationHistory),
                 });
             }, [chatSessionId, chatMessages, serverConversationHistory]);
+
+            useEffect(() => {
+                saveChatMission(chatMission);
+            }, [chatMission]);
 
             useEffect(() => {
                 connectWebSocket();
@@ -9336,26 +9425,26 @@
                                     <div class="flex-1 min-w-0">
                                         <div class="flex items-center gap-2 mb-2">
                                             <i class="fab ${providerIcon} ${providerColor} text-lg"></i>
-                                            <h5 class="text-base font-bold text-gray-900 truncate">${cred.name}</h5>
+                                            <h5 class="text-base font-bold text-gray-900 truncate">${escapeSettingsHtml(cred.name)}</h5>
                                             ${isActive ? '<span class="ml-2 px-2 py-0.5 bg-amber-500 text-gray-900 text-xs font-bold rounded-full uppercase">Active</span>' : ''}
                                         </div>
                                         <div class="text-sm text-gray-600 space-y-1.5 pl-1">
                                             <div class="flex items-center gap-2">
                                                 <i class="fas fa-cog w-4 text-gray-400"></i>
-                                                <span><span class="font-semibold text-gray-700">Provider:</span> ${provider}</span>
+                                                <span><span class="font-semibold text-gray-700">Provider:</span> ${escapeSettingsHtml(provider)}</span>
                                             </div>
                                             <div class="flex items-center gap-2">
                                                 <i class="fas fa-brain w-4 text-gray-400"></i>
-                                                <span><span class="font-semibold text-gray-700">Model:</span> ${cred.model}</span>
+                                                <span><span class="font-semibold text-gray-700">Model:</span> ${escapeSettingsHtml(cred.model)}</span>
                                             </div>
                                             ${cred.endpoint_url ? `
                                             <div class="flex items-center gap-2">
                                                 <i class="fas fa-link w-4 text-gray-400"></i>
-                                                <span class="truncate"><span class="font-semibold text-gray-700">Endpoint:</span> <code class="text-xs bg-gray-100 px-1 rounded">${cred.endpoint_url}</code></span>
+                                                <span class="truncate"><span class="font-semibold text-gray-700">Endpoint:</span> <code class="text-xs bg-gray-100 px-1 rounded">${escapeSettingsHtml(cred.endpoint_url)}</code></span>
                                             </div>` : ''}
                                             <div class="flex items-center gap-2">
                                                 <i class="fas fa-sliders-h w-4 text-gray-400"></i>
-                                                <span><span class="font-semibold text-gray-700">Settings:</span> ${cred.max_tokens} tokens, ${cred.temperature} temp</span>
+                                                <span><span class="font-semibold text-gray-700">Settings:</span> ${cred.auto_tune === false ? `${escapeSettingsHtml(cred.max_tokens)} tokens, ${escapeSettingsHtml(cred.temperature)} temp` : 'Auto-tuned for the model'}</span>
                                             </div>
                                         </div>
                                     </div>
@@ -9428,6 +9517,9 @@
                         setShowConfigForm(true); // Show the config form when loading a credential
                         setSelectedModel(newConfig.llm.model); // Set the selected model
                         setAvailableModels([]); // Clear fetched models when loading credential
+                        setModelRanking([]);
+                        setLlmTuningSummary(null);
+                        setLlmAutoTune(newConfig.llm.auto_tune !== false);
 
                         // Then update form fields
                         setTimeout(() => {
@@ -9447,6 +9539,18 @@
                             const temperatureInput = document.getElementById('llm-temperature');
                             if (temperatureInput) {
                                 temperatureInput.value = newConfig.llm.temperature;
+                            }
+                            const contextWindowInput = document.getElementById('llm-context-window');
+                            if (contextWindowInput) {
+                                contextWindowInput.value = newConfig.llm.context_window || 0;
+                            }
+                            const requestTimeoutInput = document.getElementById('llm-request-timeout');
+                            if (requestTimeoutInput) {
+                                requestTimeoutInput.value = newConfig.llm.request_timeout || 0;
+                            }
+                            const reasoningEffortInput = document.getElementById('llm-reasoning-effort');
+                            if (reasoningEffortInput) {
+                                reasoningEffortInput.value = newConfig.llm.reasoning_effort || '';
                             }
 
                             // Update API Key field - force placeholder update
@@ -11147,7 +11251,8 @@
                             message: userMessage,
                             history: historyToSend,
                             chat_session_id: chatSessionIdOverride,
-                            investigation_mode: investigationMode
+                            investigation_mode: investigationMode,
+                            mission: chatMission.trim()
                         })
                     });
 
@@ -16293,6 +16398,34 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                     </div>
                                 </div>
 
+                                {/* Chat Mission */}
+                                <div className={`px-6 py-3 border-b flex items-center gap-3 ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
+                                    <label htmlFor="chat-mission-input" className={`text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}`}>
+                                        <i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Mission
+                                    </label>
+                                    <input
+                                        id="chat-mission-input"
+                                        type="text"
+                                        value={chatMission}
+                                        maxLength={CHAT_MISSION_MAX_CHARS}
+                                        onChange={(event) => setChatMission(event.target.value)}
+                                        placeholder="Optional goal for this chat, e.g. find out why freezer sensor data stopped arriving"
+                                        title="The assistant keeps its searches, answers, and suggested next steps aligned with this goal."
+                                        className={`flex-1 min-w-0 px-3 py-1.5 text-sm rounded border ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
+                                    />
+                                    {chatMission && (
+                                        <button
+                                            type="button"
+                                            onClick={() => setChatMission('')}
+                                            className={`px-2 py-1 text-xs ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}
+                                            aria-label="Clear chat mission"
+                                            title="Clear mission"
+                                        >
+                                            <i className="fas fa-times"></i>
+                                        </button>
+                                    )}
+                                </div>
+
                                 {/* Chat Messages */}
                                 <div className={`flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? 'bg-gray-900' : 'bg-white'}`}>
                                     <div className="space-y-4" style={fullscreenChatConversationStyle}>
@@ -16760,10 +16893,10 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 <div className="space-y-4">
                                                     <div>
                                                         <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                            Max Tokens: {chatSettings.max_tokens}
-                                                            {config?.llm?.max_tokens && (
+                                                            Max Tokens cap: {chatSettings.max_tokens}
+                                                            {activeLlmTuning?.max_tokens && (
                                                                 <span className="ml-2 text-xs text-purple-600">
-                                                                    (Profile: {config.llm.max_tokens})
+                                                                    (Model budget: {activeLlmTuning.max_tokens}; the lower value applies)
                                                                 </span>
                                                             )}
                                                         </label>
@@ -16779,6 +16912,11 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     <div>
                                                         <label className="block text-sm font-medium text-gray-700 mb-2">
                                                             Temperature: {chatSettings.temperature.toFixed(1)}
+                                                            {activeLlmTuning && activeLlmTuning.temperature !== null && activeLlmTuning.temperature !== undefined && (
+                                                                <span className="ml-2 text-xs text-purple-600">
+                                                                    (Connection default: {activeLlmTuning.temperature}; moving the slider overrides it for this session)
+                                                                </span>
+                                                            )}
                                                         </label>
                                                         <input
                                                             type="range"
@@ -19191,6 +19329,8 @@ ${query.spl}`,
                                                         onChange={(e) => {
                                                             setSelectedProvider(e.target.value);
                                                             setAvailableModels([]);
+                                                            setModelRanking([]);
+                                                            setLlmTuningSummary(null);
                                                             setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(e.target.value));
                                                             handleSettingsChange();
                                                         }}
@@ -19277,13 +19417,21 @@ ${query.spl}`,
 
                                                                 if (response.ok) {
                                                                     const data = await response.json();
-                                                                    setAvailableModels(data.models);
-                                                                    if (data.models.length > 0) {
-                                                                        setSelectedModel(data.models[0]);
+                                                                    const ranked = Array.isArray(data.ranked) ? data.ranked : [];
+                                                                    const orderedModels = ranked.length > 0 ? ranked.map((item) => item.model) : (data.models || []);
+                                                                    const currentModel = (document.getElementById('llm-model')?.value || selectedModel || '').trim();
+                                                                    setModelRanking(ranked);
+                                                                    setAvailableModels(orderedModels);
+                                                                    if (orderedModels.length > 0) {
+                                                                        setSelectedModel(
+                                                                            currentModel && orderedModels.includes(currentModel)
+                                                                                ? currentModel
+                                                                                : (data.recommended_model || orderedModels[0])
+                                                                        );
                                                                     }
                                                                 } else {
-                                                                    const error = await response.json();
-                                                                    alert('Failed to fetch models: ' + error.detail);
+                                                                    const error = await response.json().catch(() => ({}));
+                                                                    alert('Failed to fetch models: ' + (error.detail || response.statusText));
                                                                 }
                                                             } catch (error) {
                                                                 alert('Error fetching models: ' + error.message);
@@ -19308,9 +19456,13 @@ ${query.spl}`,
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="llm-model"
                                                     >
-                                                        {availableModels.map(model => (
-                                                            <option key={model} value={model}>{model}</option>
-                                                        ))}
+                                                        {availableModels.map(model => {
+                                                            const ranking = modelRanking.find((item) => item.model === model);
+                                                            const suffix = ranking?.recommended
+                                                                ? ' ★ recommended'
+                                                                : (ranking && ranking.eligible === false ? ' (not a chat model)' : '');
+                                                            return <option key={model} value={model}>{model}{suffix}</option>;
+                                                        })}
                                                     </select>
                                                 ) : (
                                                     <input
@@ -19332,20 +19484,87 @@ ${query.spl}`,
                                                         }}
                                                     />
                                                 )}
-                                                {selectedProvider !== 'openai' && (
+                                                {recommendedModelEntry && (
+                                                    <div data-testid="llm-model-recommendation" className="mt-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+                                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                                            <span>
+                                                                <i className="fas fa-star mr-1"></i>
+                                                                <span className="font-semibold">Recommended:</span> <span className="font-mono">{recommendedModelEntry.model}</span>
+                                                                <span className="ml-1 text-emerald-700">(best balance of quality, speed, and cost)</span>
+                                                            </span>
+                                                            {recommendedModelEntry.model !== selectedModel && (
+                                                                <button
+                                                                    type="button"
+                                                                    data-testid="llm-use-recommended-model"
+                                                                    onClick={() => {
+                                                                        setSelectedModel(recommendedModelEntry.model);
+                                                                        handleSettingsChange();
+                                                                    }}
+                                                                    className="px-2 py-0.5 rounded bg-emerald-600 text-white hover:bg-emerald-700"
+                                                                >
+                                                                    Use recommended
+                                                                </button>
+                                                            )}
+                                                        </div>
+                                                        {Array.isArray(recommendedModelEntry.reasons) && recommendedModelEntry.reasons.length > 0 && (
+                                                            <ul className="mt-1 list-disc pl-4 space-y-0.5">
+                                                                {recommendedModelEntry.reasons.slice(0, 4).map((reason, reasonIdx) => (
+                                                                    <li key={`recommended-reason-${reasonIdx}`}>{reason}</li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                {selectedModelRanking && !selectedModelRanking.recommended && Array.isArray(selectedModelRanking.notes) && selectedModelRanking.notes.length > 0 && (
+                                                    <p className="mt-1 text-xs text-amber-700">{selectedModelRanking.notes.join(' ')}</p>
+                                                )}
+                                                {selectedProvider !== 'openai' && !recommendedModelEntry && (
                                                     <p className="mt-1 text-xs text-gray-500 italic">
-                                                        Tip: Click "Fetch Models" to query provider model/deployment inventory where supported
+                                                        Tip: Click "Fetch Models" to list available models and get a recommendation
                                                     </p>
+                                                )}
+                                            </div>
+                                            <div data-testid="llm-auto-tune-panel" className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2">
+                                                <label className="flex items-start gap-2 text-sm text-indigo-900">
+                                                    <input
+                                                        type="checkbox"
+                                                        id="llm-auto-tune"
+                                                        className="mt-1"
+                                                        checked={llmAutoTune}
+                                                        onChange={(e) => {
+                                                            setLlmAutoTune(e.target.checked);
+                                                            handleSettingsChange();
+                                                        }}
+                                                    />
+                                                    <span>
+                                                        <span className="font-medium">Auto-tune for this model</span> (recommended)
+                                                        <span className="block text-xs text-indigo-700">
+                                                            Sets output budget, temperature, context window, timeout, and reasoning effort from the model profile. Turn off to use the Max Tokens and Temperature values below exactly.
+                                                        </span>
+                                                    </span>
+                                                </label>
+                                                {activeLlmTuning && (
+                                                    <div data-testid="llm-tuning-summary" className="mt-2 text-xs text-indigo-800">
+                                                        <div className="font-medium">{describeLlmTuning(activeLlmTuning)}</div>
+                                                        {activeLlmTuning.source && (
+                                                            <div className="text-indigo-700">Based on {activeLlmTuning.source}.</div>
+                                                        )}
+                                                        {Array.isArray(activeLlmTuning.notes) && activeLlmTuning.notes.length > 0 && (
+                                                            <div className="text-amber-700">{activeLlmTuning.notes.join(' ')}</div>
+                                                        )}
+                                                    </div>
                                                 )}
                                             </div>
                                             <div>
                                                 <label className="block text-sm font-medium text-gray-700 mb-1">
                                                     Max Tokens
+                                                    {llmAutoTune && <span className="ml-2 text-xs text-gray-500">(used when auto-tune is off)</span>}
                                                     <button
+                                                        type="button"
                                                         onClick={async (event) => {
                                                             const btn = event.currentTarget;
                                                             btn.disabled = true;
-                                                            btn.innerHTML = '<i className="fas fa-spinner fa-spin"></i> Testing...';
+                                                            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking...';
                                                             try {
                                                                 const provider = document.getElementById('llm-provider')?.value || selectedProvider;
                                                                 const model = document.getElementById('llm-model')?.value || selectedModel || config.llm.model;
@@ -19364,25 +19583,36 @@ ${query.spl}`,
                                                                     })
                                                                 });
                                                                 const result = await response.json();
+                                                                if (!response.ok) {
+                                                                    throw new Error(result.detail || 'Assessment failed');
+                                                                }
                                                                 if (Number.isFinite(result.recommended_max_tokens)) {
                                                                     document.getElementById('llm-max-tokens').value = result.recommended_max_tokens;
                                                                 }
+                                                                const recommendedTemperature = result.recommended_config?.temperature;
+                                                                const temperatureInput = document.getElementById('llm-temperature');
+                                                                if (temperatureInput && Number.isFinite(recommendedTemperature)) {
+                                                                    temperatureInput.value = recommendedTemperature;
+                                                                }
+                                                                if (result.tuning) {
+                                                                    setLlmTuningSummary(result.tuning);
+                                                                }
                                                                 btn.innerHTML = result.applicable === false
-                                                                    ? '<i className="fas fa-image"></i> Not Required'
-                                                                    : '<i className="fas fa-check"></i> Done';
+                                                                    ? '<i class="fas fa-image"></i> Not Required'
+                                                                    : '<i class="fas fa-check"></i> Done';
                                                                 setTimeout(() => {
                                                                     btn.disabled = isOpenAIImageModelSelected;
                                                                     btn.innerHTML = isOpenAIImageModelSelected
-                                                                        ? '<i className="fas fa-image"></i> Not Used'
-                                                                        : '<i className="fas fa-magic"></i> Auto-Assess';
+                                                                        ? '<i class="fas fa-image"></i> Not Used'
+                                                                        : '<i class="fas fa-magic"></i> Auto-Assess';
                                                                 }, 2000);
                                                             } catch (error) {
-                                                                btn.innerHTML = '<i className="fas fa-times"></i> Failed';
+                                                                btn.innerHTML = '<i class="fas fa-times"></i> Failed';
                                                                 setTimeout(() => {
                                                                     btn.disabled = isOpenAIImageModelSelected;
                                                                     btn.innerHTML = isOpenAIImageModelSelected
-                                                                        ? '<i className="fas fa-image"></i> Not Used'
-                                                                        : '<i className="fas fa-magic"></i> Auto-Assess';
+                                                                        ? '<i class="fas fa-image"></i> Not Used'
+                                                                        : '<i class="fas fa-magic"></i> Auto-Assess';
                                                                 }, 2000);
                                                             }
                                                         }}
@@ -19398,7 +19628,7 @@ ${query.spl}`,
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                     id="llm-max-tokens"
                                                     onChange={handleSettingsChange}
-                                                    disabled={isOpenAIImageModelSelected}
+                                                    disabled={isOpenAIImageModelSelected || llmAutoTune}
                                                 />
                                                 {isOpenAIImageModelSelected && (
                                                     <p className="mt-1 text-xs text-amber-700">
@@ -19415,42 +19645,78 @@ ${query.spl}`,
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                     id="llm-temperature"
                                                     onChange={handleSettingsChange}
+                                                    disabled={llmAutoTune}
                                                 />
                                             </div>
+                                            <details data-testid="llm-advanced-tuning" className="rounded-md border border-gray-200 px-3 py-2">
+                                                <summary className="cursor-pointer text-sm font-medium text-gray-700">Advanced tuning overrides</summary>
+                                                <p className="mt-1 text-xs text-gray-500">Leave at 0 or Automatic to use the model profile. These apply with or without auto-tune.</p>
+                                                <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                                                    <label className="text-xs text-gray-700">
+                                                        Context window (tokens)
+                                                        <input
+                                                            type="number"
+                                                            min="0"
+                                                            step="1024"
+                                                            id="llm-context-window"
+                                                            defaultValue={config.llm.context_window || 0}
+                                                            className="mt-1 w-full px-2 py-1 border border-gray-300 rounded-md"
+                                                            onChange={handleSettingsChange}
+                                                        />
+                                                    </label>
+                                                    <label className="text-xs text-gray-700">
+                                                        Request timeout (seconds)
+                                                        <input
+                                                            type="number"
+                                                            min="0"
+                                                            max="3600"
+                                                            id="llm-request-timeout"
+                                                            defaultValue={config.llm.request_timeout || 0}
+                                                            className="mt-1 w-full px-2 py-1 border border-gray-300 rounded-md"
+                                                            onChange={handleSettingsChange}
+                                                        />
+                                                    </label>
+                                                    <label className="text-xs text-gray-700">
+                                                        Reasoning effort
+                                                        <select
+                                                            id="llm-reasoning-effort"
+                                                            defaultValue={config.llm.reasoning_effort || ''}
+                                                            className="mt-1 w-full px-2 py-1 border border-gray-300 rounded-md"
+                                                            onChange={handleSettingsChange}
+                                                        >
+                                                            <option value="">Automatic</option>
+                                                            <option value="minimal">Minimal</option>
+                                                            <option value="low">Low</option>
+                                                            <option value="medium">Medium</option>
+                                                            <option value="high">High</option>
+                                                        </select>
+                                                    </label>
+                                                </div>
+                                            </details>
 
                                             {/* Test Connection Button */}
                                             <div className="pt-3 border-t border-gray-200">
                                                 <button
-                                                    onClick={async () => {
-                                                        const btn = event.target;
+                                                    type="button"
+                                                    data-testid="llm-test-connection"
+                                                    onClick={async (event) => {
+                                                        const btn = event.currentTarget;
                                                         const resultsDiv = document.getElementById('llm-test-results');
+                                                        const idleLabel = '<i class="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
+                                                        const resetButton = () => setTimeout(() => {
+                                                            btn.disabled = false;
+                                                            btn.innerHTML = idleLabel;
+                                                        }, 3000);
 
                                                         btn.disabled = true;
-                                                        btn.innerHTML = '<i className="fas fa-spinner fa-spin mr-2"></i> Testing Connection...';
-                                                        resultsDiv.innerHTML = '<div className="text-blue-600"><i className="fas fa-spinner fa-spin mr-2"></i> Running tests...</div>';
+                                                        btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Testing Connection...';
+                                                        resultsDiv.innerHTML = '<div class="text-blue-600"><i class="fas fa-spinner fa-spin mr-2"></i> Running tests...</div>';
                                                         resultsDiv.style.display = 'block';
 
                                                         try {
-                                                            // First save current settings
+                                                            // Test the values in the form without saving them; Save Settings persists them.
                                                             const provider = document.getElementById('llm-provider').value;
                                                             const endpointUrlInput = document.getElementById('llm-endpoint-url');
-
-                                                            await fetch('/api/config', {
-                                                                method: 'POST',
-                                                                headers: { 'Content-Type': 'application/json' },
-                                                                body: JSON.stringify({
-                                                                    llm: {
-                                                                        provider: provider,
-                                                                        api_key: document.getElementById('llm-api-key').value || undefined,
-                                                                        model: document.getElementById('llm-model').value,
-                                                                        endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
-                                                                        max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
-                                                                        temperature: parseFloat(document.getElementById('llm-temperature').value)
-                                                                    }
-                                                                })
-                                                            });
-
-                                                            // Then test the connection
                                                             const response = await fetch('/api/llm/test-connection', {
                                                                 method: 'POST',
                                                                 headers: { 'Content-Type': 'application/json' },
@@ -19461,85 +19727,76 @@ ${query.spl}`,
                                                                         model: document.getElementById('llm-model').value,
                                                                         endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
                                                                         max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
-                                                                        temperature: parseFloat(document.getElementById('llm-temperature').value)
+                                                                        temperature: parseFloat(document.getElementById('llm-temperature').value),
+                                                                        ...readLlmTuningFormValues(config.llm),
                                                                     }
                                                                 })
                                                             });
                                                             const result = await response.json();
+                                                            const esc = escapeSettingsHtml;
 
-                                                            let html = '<div className="space-y-2">';
-
-                                                            // Show URL cleaning notification if applicable
-                                                            if (result.url_cleaned && result.original_endpoint) {
-                                                                html += '<div className="bg-blue-100 border border-blue-300 rounded-lg p-3 mb-2">';
-                                                                html += '<div className="font-semibold text-blue-800"><i className="fas fa-info-circle mr-2"></i>Endpoint URL Cleaned</div>';
-                                                                html += '<div className="text-xs text-blue-700 mt-1">';
-                                                                html += 'Removed API path from endpoint URL for proper testing.<br>';
-                                                                html += '<span className="font-mono">From: ' + result.original_endpoint + '</span><br>';
-                                                                html += '<span className="font-mono">To: ' + result.endpoint + '</span><br>';
-                                                                html += '<span className="italic mt-1">Tip: Enter only the base URL (e.g., http://localhost:8000)</span>';
-                                                                html += '</div>';
-                                                                html += '</div>';
-                                                            }
-
-                                                            // Overall status
+                                                            let html = '<div class="space-y-2">';
                                                             if (result.status === 'success') {
-                                                                html += '<div className="bg-green-100 border border-green-300 rounded-lg p-3 mb-2">';
-                                                                html += '<div className="font-semibold text-green-800"><i className="fas fa-check-circle mr-2"></i>All Tests Passed!</div>';
-                                                                html += '<div className="text-sm text-green-700 mt-1">' + result.message + '</div>';
+                                                                html += '<div class="bg-green-100 border border-green-300 rounded-lg p-3 mb-2">';
+                                                                html += '<div class="font-semibold text-green-800"><i class="fas fa-check-circle mr-2"></i>All Tests Passed</div>';
+                                                                html += '<div class="text-sm text-green-700 mt-1">' + esc(result.message) + '</div>';
                                                                 html += '</div>';
 
-                                                                // Auto-apply recommended config
-                                                                if (result.recommended_config && Number.isFinite(result.recommended_config.max_tokens)) {
-                                                                    document.getElementById('llm-max-tokens').value = result.recommended_config.max_tokens;
+                                                                const recommended = result.recommended_config || {};
+                                                                if (Number.isFinite(recommended.max_tokens)) {
+                                                                    document.getElementById('llm-max-tokens').value = recommended.max_tokens;
                                                                 }
-                                                            } else if (result.status === 'error') {
-                                                                html += '<div className="bg-red-100 border border-red-300 rounded-lg p-3 mb-2">';
-                                                                html += '<div className="font-semibold text-red-800"><i className="fas fa-times-circle mr-2"></i>Test Failed</div>';
-                                                                html += '<div className="text-sm text-red-700 mt-1">' + (result.message || result.error) + '</div>';
+                                                                const temperatureInput = document.getElementById('llm-temperature');
+                                                                if (temperatureInput && Number.isFinite(recommended.temperature)) {
+                                                                    temperatureInput.value = recommended.temperature;
+                                                                }
+                                                                if (result.tuning) {
+                                                                    setLlmTuningSummary(result.tuning);
+                                                                    html += '<div class="bg-indigo-50 border border-indigo-200 rounded-lg p-3 mb-2 text-xs text-indigo-900">';
+                                                                    html += '<div class="font-semibold"><i class="fas fa-sliders-h mr-1"></i>Recommended runtime settings</div>';
+                                                                    html += '<div class="mt-1">' + esc(describeLlmTuning(result.tuning)) + '</div>';
+                                                                    const rationale = Array.isArray(result.tuning.rationale) ? result.tuning.rationale : [];
+                                                                    if (rationale.length > 0) {
+                                                                        html += '<ul class="mt-1 list-disc pl-4">' + rationale.map((line) => '<li>' + esc(line) + '</li>').join('') + '</ul>';
+                                                                    }
+                                                                    html += '<div class="mt-1 text-indigo-700">Click Save Settings to keep these values.</div>';
+                                                                    html += '</div>';
+                                                                }
+                                                            } else {
+                                                                html += '<div class="bg-red-100 border border-red-300 rounded-lg p-3 mb-2">';
+                                                                html += '<div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2"></i>Test Failed</div>';
+                                                                html += '<div class="text-sm text-red-700 mt-1">' + esc(result.message || result.error || 'Unknown error') + '</div>';
                                                                 html += '</div>';
                                                             }
 
-                                                            // Individual test results
-                                                            html += '<div className="text-xs font-semibold text-gray-700 mb-1">Test Details:</div>';
-
+                                                            html += '<div class="text-xs font-semibold text-gray-700 mb-1">Test Details:</div>';
+                                                            const tones = { success: ['green', 'check'], error: ['red', 'times'], warning: ['yellow', 'exclamation-triangle'] };
                                                             for (const [testName, testResult] of Object.entries(result.tests || {})) {
-                                                                const statusIcon = testResult.status === 'success' ? 'check' :
-                                                                                 testResult.status === 'error' ? 'times' :
-                                                                                 testResult.status === 'warning' ? 'exclamation-triangle' : 'info-circle';
-                                                                const statusColor = testResult.status === 'success' ? 'green' :
-                                                                                  testResult.status === 'error' ? 'red' :
-                                                                                  testResult.status === 'warning' ? 'yellow' : 'blue';
-
-                                                                html += `<div className="bg-${statusColor}-50 border border-${statusColor}-200 rounded p-2 mb-1">`;
-                                                                html += `<div className="text-xs font-medium text-${statusColor}-800">`;
-                                                                html += `<i className="fas fa-${statusIcon} mr-1"></i>${testName.charAt(0).toUpperCase() + testName.slice(1)}: ${testResult.message}`;
+                                                                const [statusColor, statusIcon] = tones[testResult.status] || ['blue', 'info-circle'];
+                                                                const label = testName.replace(/_/g, ' ');
+                                                                html += `<div class="bg-${statusColor}-50 border border-${statusColor}-200 rounded p-2 mb-1">`;
+                                                                html += `<div class="text-xs font-medium text-${statusColor}-800">`;
+                                                                html += `<i class="fas fa-${statusIcon} mr-1"></i>${esc(label.charAt(0).toUpperCase() + label.slice(1))}: ${esc(testResult.message)}`;
                                                                 html += '</div>';
                                                                 if (testResult.response_preview) {
-                                                                    html += `<div className="text-xs text-gray-600 mt-1 italic">"${testResult.response_preview}"</div>`;
+                                                                    html += `<div class="text-xs text-gray-600 mt-1 italic">"${esc(testResult.response_preview)}"</div>`;
                                                                 }
                                                                 html += '</div>';
                                                             }
-
                                                             html += '</div>';
                                                             resultsDiv.innerHTML = html;
 
-                                                            btn.innerHTML = '<i className="fas fa-check mr-2"></i> Test Complete';
-                                                            setTimeout(() => {
-                                                                btn.disabled = false;
-                                                                btn.innerHTML = '<i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
-                                                            }, 3000);
-
+                                                            btn.innerHTML = result.status === 'success'
+                                                                ? '<i class="fas fa-check mr-2"></i> Test Complete'
+                                                                : '<i class="fas fa-times mr-2"></i> Test Failed';
+                                                            resetButton();
                                                         } catch (error) {
-                                                            resultsDiv.innerHTML = `<div className="bg-red-100 border border-red-300 rounded-lg p-3">
-                                                                <div className="font-semibold text-red-800"><i className="fas fa-times-circle mr-2"></i>Error</div>
-                                                                <div className="text-sm text-red-700 mt-1">${error.message}</div>
+                                                            resultsDiv.innerHTML = `<div class="bg-red-100 border border-red-300 rounded-lg p-3">
+                                                                <div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2"></i>Error</div>
+                                                                <div class="text-sm text-red-700 mt-1">${escapeSettingsHtml(error.message)}</div>
                                                             </div>`;
-                                                            btn.innerHTML = '<i className="fas fa-times mr-2"></i> Test Failed';
-                                                            setTimeout(() => {
-                                                                btn.disabled = false;
-                                                                btn.innerHTML = '<i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
-                                                            }, 3000);
+                                                            btn.innerHTML = '<i class="fas fa-times mr-2"></i> Test Failed';
+                                                            resetButton();
                                                         }
                                                     }}
                                                     className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
@@ -19668,7 +19925,8 @@ ${query.spl}`,
                                                         model: (modelInput ? modelInput.value : selectedModel) || config.llm.model,
                                                         endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : undefined,
                                                         max_tokens: maxTokensEl ? parseInt(maxTokensEl.value) : config.llm.max_tokens,
-                                                        temperature: tempEl ? parseFloat(tempEl.value) : config.llm.temperature
+                                                        temperature: tempEl ? parseFloat(tempEl.value) : config.llm.temperature,
+                                                        ...readLlmTuningFormValues(config.llm),
                                                     },
                                                     security: {
                                                         ...(config.security || {}),
@@ -19816,7 +20074,8 @@ This action cannot be undone.`);
                                                             model: document.getElementById('llm-model').value,
                                                             endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : null,
                                                             max_tokens: parseInt(document.getElementById('llm-max-tokens').value),
-                                                            temperature: parseFloat(document.getElementById('llm-temperature').value)
+                                                            temperature: parseFloat(document.getElementById('llm-temperature').value),
+                                                            ...readLlmTuningFormValues(config.llm),
                                                         })
                                                     });
 

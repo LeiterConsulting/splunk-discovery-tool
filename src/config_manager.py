@@ -12,6 +12,14 @@ from dataclasses import dataclass, asdict, field
 
 from capabilities.models import CapabilityConfig
 
+
+def _known_fields(dataclass_type, values: Any) -> Dict[str, Any]:
+    """Keep only keys the dataclass defines, so configs written by other versions still load."""
+    if not isinstance(values, dict):
+        return {}
+    allowed = set(getattr(dataclass_type, '__dataclass_fields__', {}).keys())
+    return {key: value for key, value in values.items() if key in allowed}
+
 @dataclass
 class MCPConfig:
     """MCP Server configuration"""
@@ -30,6 +38,10 @@ class LLMCredential:
     endpoint_url: Optional[str] = None
     max_tokens: int = 16000
     temperature: float = 0.7
+    auto_tune: bool = True
+    context_window: int = 0  # 0 = derive from the model profile
+    request_timeout: int = 0  # seconds; 0 = derive from the model profile
+    reasoning_effort: str = ""  # "", "low", "medium", or "high"
 
 @dataclass
 class MCPCredential:
@@ -50,6 +62,12 @@ class LLMConfig:
     endpoint_url: Optional[str] = None
     max_tokens: int = 16000
     temperature: float = 0.7
+    # When auto_tune is on, the app picks output budget, temperature, context, and
+    # timeouts from the model profile; max_tokens and temperature apply only when off.
+    auto_tune: bool = True
+    context_window: int = 0  # 0 = derive from the model profile
+    request_timeout: int = 0  # seconds; 0 = derive from the model profile
+    reasoning_effort: str = ""  # "", "low", "medium", or "high"
 
 @dataclass
 class ServerConfig:
@@ -195,22 +213,22 @@ class ConfigManager:
             config_dict = self._decrypt(encrypted_data)
             
             # Reconstruct AppConfig from dict
-            mcp = MCPConfig(**config_dict.get('mcp', {}))
-            llm = LLMConfig(**config_dict.get('llm', {}))
-            server = ServerConfig(**config_dict.get('server', {}))
-            security = SecurityConfig(**config_dict.get('security', {}))
+            mcp = MCPConfig(**_known_fields(MCPConfig, config_dict.get('mcp', {})))
+            llm = LLMConfig(**_known_fields(LLMConfig, config_dict.get('llm', {})))
+            server = ServerConfig(**_known_fields(ServerConfig, config_dict.get('server', {})))
+            security = SecurityConfig(**_known_fields(SecurityConfig, config_dict.get('security', {})))
             
             # Reconstruct saved credentials
             saved_creds_dict = config_dict.get('saved_credentials', {})
             saved_credentials = {
-                name: LLMCredential(**cred_data) 
+                name: LLMCredential(**_known_fields(LLMCredential, cred_data))
                 for name, cred_data in saved_creds_dict.items()
             }
             
             # Reconstruct saved MCP configs
             saved_mcp_dict = config_dict.get('saved_mcp_configs', {})
             saved_mcp_configs = {
-                name: MCPCredential(**mcp_data)
+                name: MCPCredential(**_known_fields(MCPCredential, mcp_data))
                 for name, mcp_data in saved_mcp_dict.items()
             }
 
@@ -365,7 +383,9 @@ class ConfigManager:
     # Credential Vault Management
     def save_credential(self, name: str, provider: str, api_key: str, model: str, 
                        endpoint_url: Optional[str] = None, max_tokens: int = 16000, 
-                       temperature: float = 0.7) -> bool:
+                       temperature: float = 0.7, auto_tune: bool = True,
+                       context_window: int = 0, request_timeout: int = 0,
+                       reasoning_effort: str = "") -> bool:
         """Save a named LLM credential"""
         credential = LLMCredential(
             name=name,
@@ -374,7 +394,11 @@ class ConfigManager:
             model=model,
             endpoint_url=endpoint_url,
             max_tokens=max_tokens,
-            temperature=temperature
+            temperature=temperature,
+            auto_tune=bool(auto_tune),
+            context_window=int(context_window or 0),
+            request_timeout=int(request_timeout or 0),
+            reasoning_effort=str(reasoning_effort or ""),
         )
         self._config.saved_credentials[name] = credential
         return self.save(self._config)
@@ -407,6 +431,10 @@ class ConfigManager:
             self._config.llm.endpoint_url = credential.endpoint_url
             self._config.llm.max_tokens = credential.max_tokens
             self._config.llm.temperature = credential.temperature
+            self._config.llm.auto_tune = credential.auto_tune
+            self._config.llm.context_window = credential.context_window
+            self._config.llm.request_timeout = credential.request_timeout
+            self._config.llm.reasoning_effort = credential.reasoning_effort
             self._config.active_credential_name = name  # Track active credential
             return self.save(self._config)
         return False
@@ -425,7 +453,11 @@ class ConfigManager:
                 'model': cred.model,
                 'endpoint_url': cred.endpoint_url,
                 'max_tokens': cred.max_tokens,
-                'temperature': cred.temperature
+                'temperature': cred.temperature,
+                'auto_tune': cred.auto_tune,
+                'context_window': cred.context_window,
+                'request_timeout': cred.request_timeout,
+                'reasoning_effort': cred.reasoning_effort,
             }
         
         # Export saved MCP configs with masked tokens
@@ -458,7 +490,11 @@ class ConfigManager:
                 'model': config.llm.model,
                 'endpoint_url': config.llm.endpoint_url,
                 'max_tokens': config.llm.max_tokens,
-                'temperature': config.llm.temperature
+                'temperature': config.llm.temperature,
+                'auto_tune': config.llm.auto_tune,
+                'context_window': config.llm.context_window,
+                'request_timeout': config.llm.request_timeout,
+                'reasoning_effort': config.llm.reasoning_effort,
             },
             'saved_credentials': safe_creds,
             'saved_mcp_configs': safe_mcp_configs,
