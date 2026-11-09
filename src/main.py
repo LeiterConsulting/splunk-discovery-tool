@@ -19,7 +19,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from web_app import app, config_manager
 
 
+def _has_local_listener(port: int) -> bool:
+    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.3)
+                if probe.connect_ex((address, port)) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def _is_port_available(port: int, host: str = "0.0.0.0") -> bool:
+    # macOS lets an SO_REUSEADDR bind on 0.0.0.0 succeed while another server listens on
+    # 127.0.0.1, which leaves two instances answering on one port.
+    if _has_local_listener(port):
+        return False
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

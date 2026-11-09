@@ -1425,6 +1425,13 @@
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
 
+        const formatApiErrorDetail = (detail) => {
+            if (!detail) return 'Unknown error';
+            if (typeof detail === 'string') return detail;
+            if (Array.isArray(detail)) return detail.map((item) => item?.msg || JSON.stringify(item)).join('; ');
+            return JSON.stringify(detail);
+        };
+
         const readLlmTuningFormValues = (fallback = {}) => {
             const toPositiveInt = (element, fallbackValue) => {
                 if (!element) return Number(fallbackValue) > 0 ? Number(fallbackValue) : 0;
@@ -2386,6 +2393,7 @@
             const [isMCPSaveModalOpen, setIsMCPSaveModalOpen] = useState(false); // MCP save modal visibility
             const [mcpConfigName, setMCPConfigName] = useState(''); // MCP config name for saving
             const [mcpConfigDescription, setMCPConfigDescription] = useState(''); // MCP config description
+            const [mcpSaveDraft, setMCPSaveDraft] = useState(null); // MCP form values captured when the save dialog opens
             const [showMCPConfigForm, setShowMCPConfigForm] = useState(false); // Show/hide MCP configuration form
             const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState('Enter token'); // Track token placeholder state
             const [showSuggestedQueries, setShowSuggestedQueries] = useState(false);
@@ -9450,14 +9458,14 @@
                                     </div>
                                     <div class="flex flex-col gap-2 shrink-0">
                                         <button
-                                            onclick="loadCredentialIntoSettings('${cred.name.replace(/'/g, "\'")}')"
+                                            data-credential-name="${escapeSettingsHtml(cred.name)}" onclick="loadCredentialIntoSettings(this.dataset.credentialName)"
                                             class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                             title="Load this credential into the settings form above"
                                         >
                                             <i class="fas fa-download mr-2"></i>Load
                                         </button>
                                         <button
-                                            onclick="deleteCredential('${cred.name.replace(/'/g, "\'")}')"
+                                            data-credential-name="${escapeSettingsHtml(cred.name)}" onclick="deleteCredential(this.dataset.credentialName)"
                                             class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                             title="Permanently delete this saved credential"
                                         >
@@ -9497,12 +9505,12 @@
                             <div class="text-center py-10">
                                 <i class="fas fa-spinner fa-spin text-purple-600 text-4xl mb-4"></i>
                                 <p class="text-base font-semibold text-gray-700">Loading credential...</p>
-                                <p class="text-sm text-gray-500 mt-2">${name}</p>
+                                <p class="text-sm text-gray-500 mt-2">${escapeSettingsHtml(name)}</p>
                             </div>
                         `;
                     }
 
-                    const response = await fetch(`/api/credentials/${name}/load`, { method: 'POST' });
+                    const response = await fetch(`/api/credentials/${encodeURIComponent(name)}/load`, { method: 'POST' });
                     const result = await response.json();
 
                     if (response.ok) {
@@ -9596,7 +9604,7 @@
                 if (!confirmed) return;
 
                 try {
-                    const response = await fetch(`/api/credentials/${name}`, { method: 'DELETE' });
+                    const response = await fetch(`/api/credentials/${encodeURIComponent(name)}`, { method: 'DELETE' });
                     if (response.ok) {
                         await loadCredentials();
 
@@ -9608,7 +9616,7 @@
                                 <i class="fas fa-trash-alt text-2xl"></i>
                                 <div>
                                     <p class="font-bold text-base">Credential Deleted</p>
-                                    <p class="text-sm opacity-90">${name}</p>
+                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                                 </div>
                             </div>
                         `;
@@ -9625,6 +9633,32 @@
                 } catch (error) {
                     alert(`Error: ${error.message}`);
                 }
+            };
+
+            // Capture the MCP form when the save dialog opens so the preview and the request use the same values.
+            const openMCPSaveModal = (profileName) => {
+                const urlEl = document.getElementById('mcp-url');
+                const tokenEl = document.getElementById('mcp-token');
+                const verifySslEl = document.getElementById('mcp-verify-ssl');
+                const name = String(profileName || '');
+                setMCPSaveDraft({
+                    mode: name ? 'update' : 'new',
+                    url: String(urlEl?.value || config?.mcp?.url || '').trim(),
+                    token: tokenEl?.value || '',
+                    verify_ssl: verifySslEl ? verifySslEl.checked : Boolean(config?.mcp?.verify_ssl),
+                });
+                setMCPConfigName(name);
+                setMCPConfigDescription(name ? (savedMCPConfigs?.[name]?.description || '') : '');
+                setIsMCPSaveModalOpen(true);
+            };
+
+            const describeMCPDraftToken = (draft, profileName) => {
+                if (!draft) return 'Not set';
+                if (draft.token) return 'New token entered';
+                if (savedMCPConfigs?.[String(profileName || '').trim()]?.token) return 'Keep saved token';
+                const normalizeUrl = (value) => String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+                if (config?.mcp?.token && normalizeUrl(draft.url) === normalizeUrl(config?.mcp?.url)) return 'Use current token';
+                return 'Not set';
             };
 
             // MCP Configuration Vault Functions
@@ -9663,14 +9697,15 @@
                                 <div class="flex-1 min-w-0">
                                     <div class="flex items-center gap-2 mb-2">
                                         <i class="fas fa-server text-green-600 text-lg"></i>
-                                        <h5 class="text-base font-bold text-gray-900 truncate">${mcp.name}</h5>
+                                        <h5 class="text-base font-bold text-gray-900 truncate">${escapeSettingsHtml(mcp.name)}</h5>
                                         ${mcp.name === activeMCPName ? '<span class="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-bold rounded-full">ACTIVE</span>' : ''}
+                                        ${mcp.token ? '' : '<span class="px-2 py-0.5 bg-amber-100 text-amber-800 text-xs font-bold rounded-full" title="Load this configuration, enter the token, and update it">NO TOKEN</span>'}
                                     </div>
-                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${mcp.description}</p>` : ''}
+                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${escapeSettingsHtml(mcp.description)}</p>` : ''}
                                     <div class="text-sm text-gray-600 space-y-1.5 pl-1">
                                         <div class="flex items-center gap-2">
                                             <i class="fas fa-link w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">URL:</span> ${mcp.url}</span>
+                                            <span><span class="font-semibold text-gray-700">URL:</span> ${escapeSettingsHtml(mcp.url)}</span>
                                         </div>
                                         <div class="flex items-center gap-2">
                                             <i class="fas fa-shield-alt w-4 text-gray-400"></i>
@@ -9680,21 +9715,21 @@
                                 </div>
                                 <div class="flex flex-col gap-2 shrink-0">
                                     <button
-                                        onclick="testMCPConfig('${mcp.name}')"
+                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="testMCPConfig(this.dataset.mcpName)"
                                         class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                         title="Test connection to this MCP server"
                                     >
                                         <i class="fas fa-network-wired mr-2"></i>Test
                                     </button>
                                     <button
-                                        onclick="loadMCPConfigIntoSettings('${mcp.name}')"
+                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="loadMCPConfigIntoSettings(this.dataset.mcpName)"
                                         class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                         title="Load this configuration into active settings"
                                     >
                                         <i class="fas fa-download mr-2"></i>Load
                                     </button>
                                     <button
-                                        onclick="deleteMCPConfig('${mcp.name}')"
+                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="deleteMCPConfig(this.dataset.mcpName)"
                                         class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                         title="Permanently delete this saved configuration"
                                     >
@@ -9727,11 +9762,11 @@
                         <div class="text-center py-10">
                             <i class="fas fa-spinner fa-spin text-green-600 text-4xl mb-4"></i>
                             <p class="text-base font-semibold text-gray-700">Loading configuration...</p>
-                            <p class="text-sm text-gray-500 mt-2">${name}</p>
+                            <p class="text-sm text-gray-500 mt-2">${escapeSettingsHtml(name)}</p>
                         </div>
                     `;
 
-                    const response = await fetch(`/api/mcp-configs/${name}/load`, { method: 'POST' });
+                    const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/load`, { method: 'POST' });
                     if (response.ok) {
                         const result = await response.json();
                         const newConfig = result.config;
@@ -9740,7 +9775,7 @@
                         setConfig(newConfig);
                         setLoadedMCPConfigName(name);
                         setShowMCPConfigForm(true); // Show the form when loading a config
-                        setMCPTokenPlaceholder('(Already Configured)'); // Set placeholder for loaded config
+                        setMCPTokenPlaceholder(newConfig?.mcp?.token === '***' ? '(Already Configured)' : 'Enter token');
 
                         // Update form fields with the loaded config
                         setTimeout(() => {
@@ -9763,7 +9798,7 @@
                                 <i class="fas fa-check-circle text-2xl"></i>
                                 <div>
                                     <p class="font-bold text-base">Configuration Loaded!</p>
-                                    <p class="text-sm opacity-90">${name}</p>
+                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                                 </div>
                             </div>
                         `;
@@ -9777,7 +9812,7 @@
                     } else {
                         mcpList.innerHTML = originalHTML;
                         const result = await response.json();
-                        alert(`Failed to load configuration: ${result.detail}`);
+                        alert(`Failed to load configuration: ${formatApiErrorDetail(result.detail)}`);
                     }
                 } catch (error) {
                     alert(`Error loading configuration: ${error.message}`);
@@ -9790,7 +9825,7 @@
                 if (!confirmed) return;
 
                 try {
-                    const response = await fetch(`/api/mcp-configs/${name}`, { method: 'DELETE' });
+                    const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}`, { method: 'DELETE' });
                     if (response.ok) {
                         await loadMCPConfigs();
 
@@ -9802,7 +9837,7 @@
                                 <i class="fas fa-trash-alt text-2xl"></i>
                                 <div>
                                     <p class="font-bold text-base">Configuration Deleted</p>
-                                    <p class="text-sm opacity-90">${name}</p>
+                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                                 </div>
                             </div>
                         `;
@@ -9834,13 +9869,13 @@
                             <i class="fas fa-spinner fa-spin text-2xl"></i>
                             <div>
                                 <p class="font-bold text-base">Testing Connection...</p>
-                                <p class="text-sm opacity-90">${name}</p>
+                                <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                             </div>
                         </div>
                     `;
                     document.body.appendChild(testingDiv);
 
-                    const response = await fetch(`/api/mcp-configs/${name}/test`, { method: 'POST' });
+                    const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/test`, { method: 'POST' });
                     const result = await response.json();
 
                     // Remove testing notification
@@ -9865,7 +9900,7 @@
                             <i class="fas ${icon} text-2xl"></i>
                             <div>
                                 <p class="font-bold text-base">${result.status === 'success' ? 'Connection Successful!' : result.status === 'warning' ? 'Connection Warning' : 'Connection Failed'}</p>
-                                <p class="text-sm opacity-90">${result.message}</p>
+                                <p class="text-sm opacity-90">${escapeSettingsHtml(result.message)}</p>
                             </div>
                         </div>
                     `;
@@ -19160,7 +19195,7 @@ ${query.spl}`,
                                                             const verifySslEl = document.getElementById('mcp-verify-ssl');
 
                                                             const testUrl = urlEl?.value || config.mcp.url;
-                                                            const testToken = tokenEl?.value || config.mcp.token;
+                                                            const testToken = tokenEl?.value || '';
                                                             const testVerifySsl = verifySslEl?.checked ?? config.mcp.verify_ssl;
 
                                                             if (!testUrl) {
@@ -19180,7 +19215,8 @@ ${query.spl}`,
                                                                     body: JSON.stringify({
                                                                         url: testUrl,
                                                                         token: testToken,
-                                                                        verify_ssl: testVerifySsl
+                                                                        verify_ssl: testVerifySsl,
+                                                                        name: loadedMCPConfigName || undefined
                                                                     })
                                                                 });
 
@@ -19207,19 +19243,13 @@ ${query.spl}`,
                                                     {loadedMCPConfigName ? (
                                                         <>
                                                             <button
-                                                                onClick={() => {
-                                                                    setMCPConfigName('');
-                                                                    setIsMCPSaveModalOpen(true);
-                                                                }}
+                                                                onClick={() => openMCPSaveModal('')}
                                                                 className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
                                                             >
                                                                 <i className="fas fa-plus-circle mr-2"></i>Save as New
                                                             </button>
                                                             <button
-                                                                onClick={() => {
-                                                                    setMCPConfigName(loadedMCPConfigName);
-                                                                    setIsMCPSaveModalOpen(true);
-                                                                }}
+                                                                onClick={() => openMCPSaveModal(loadedMCPConfigName)}
                                                                 className="w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
                                                             >
                                                                 <i className="fas fa-sync-alt mr-2"></i>Update Active Configuration
@@ -19227,10 +19257,7 @@ ${query.spl}`,
                                                         </>
                                                     ) : (
                                                         <button
-                                                            onClick={() => {
-                                                                setMCPConfigName('');
-                                                                setIsMCPSaveModalOpen(true);
-                                                            }}
+                                                            onClick={() => openMCPSaveModal('')}
                                                             className="w-full px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all"
                                                         >
                                                             <i className="fas fa-save mr-2"></i>Save as New Configuration
@@ -20058,6 +20085,9 @@ This will replace:
 
 This action cannot be undone.`);
                                                     if (!confirmed) return;
+                                                } else if (savedCredentials?.[credentialName.trim()]) {
+                                                    const confirmed = confirm(`A credential named "${credentialName.trim()}" already exists.\n\nOverwrite it?`);
+                                                    if (!confirmed) return;
                                                 }
 
                                                 try {
@@ -20079,6 +20109,8 @@ This action cannot be undone.`);
                                                         })
                                                     });
 
+                                                    const result = await response.json().catch(() => ({}));
+
                                                     if (response.ok) {
                                                         // Close modal
                                                         setIsCredentialModalOpen(false);
@@ -20088,6 +20120,9 @@ This action cannot be undone.`);
 
                                                         // Refresh credential list
                                                         await loadCredentials();
+                                                        if (result.activated) {
+                                                            await loadConfig();
+                                                        }
 
                                                         // Show success message
                                                         const successDiv = document.createElement('div');
@@ -20097,7 +20132,7 @@ This action cannot be undone.`);
                                                                 <i class="fas ${wasUpdate ? 'fa-sync-alt' : 'fa-check-circle'} text-2xl"></i>
                                                                 <div>
                                                                     <p class="font-bold text-base">Credential ${wasUpdate ? 'Updated' : 'Saved'}!</p>
-                                                                    <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${credentialName}</p>
+                                                                    <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${escapeSettingsHtml(credentialName)}</p>
                                                                 </div>
                                                             </div>
                                                         `;
@@ -20109,8 +20144,7 @@ This action cannot be undone.`);
                                                             setTimeout(() => successDiv.remove(), 300);
                                                         }, 2500);
                                                     } else {
-                                                        const error = await response.json();
-                                                        alert('Failed to save credential: ' + (error.detail || 'Unknown error'));
+                                                        alert('Failed to save credential: ' + formatApiErrorDetail(result.detail));
                                                     }
                                                 } catch (error) {
                                                     alert('Error saving credential: ' + error.message);
@@ -20133,19 +20167,20 @@ This action cannot be undone.`);
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
                             <div className={`rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`}>
                                 {/* Header */}
-                                <div className={`px-6 py-4 rounded-t-xl ${loadedMCPConfigName ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 text-white'}`}>
+                                <div className={`px-6 py-4 rounded-t-xl ${(mcpSaveDraft?.mode === 'update') ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 text-white'}`}>
                                     <div className="flex items-center justify-between">
                                         <div className="flex items-center gap-3">
-                                            <i className={`text-2xl ${loadedMCPConfigName ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
-                                            <h2 className="text-xl font-bold">{loadedMCPConfigName ? 'Update' : 'Save'} MCP Configuration</h2>
+                                            <i className={`text-2xl ${(mcpSaveDraft?.mode === 'update') ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
+                                            <h2 className="text-xl font-bold">{(mcpSaveDraft?.mode === 'update') ? 'Update' : 'Save'} MCP Configuration</h2>
                                         </div>
                                         <button
                                             onClick={() => {
                                                 setIsMCPSaveModalOpen(false);
                                                 setMCPConfigName('');
                                                 setMCPConfigDescription('');
+                                                setMCPSaveDraft(null);
                                             }}
-                                            className={`transition-colors ${loadedMCPConfigName ? 'text-gray-900 hover:text-gray-600' : 'text-white hover:text-gray-200'}`}
+                                            className={`transition-colors ${(mcpSaveDraft?.mode === 'update') ? 'text-gray-900 hover:text-gray-600' : 'text-white hover:text-gray-200'}`}
                                         >
                                             <i className="fas fa-times text-xl"></i>
                                         </button>
@@ -20154,7 +20189,7 @@ This action cannot be undone.`);
 
                                 {/* Content */}
                                 <div className="p-6">
-                                    {loadedMCPConfigName ? (
+                                    {(mcpSaveDraft?.mode === 'update') ? (
                                         <div className="bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4">
                                             <div className="flex items-start">
                                                 <i className="fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5"></i>
@@ -20183,10 +20218,10 @@ This action cannot be undone.`);
                                             onChange={(e) => setMCPConfigName(e.target.value)}
                                             placeholder="e.g., Production Splunk, Dev Environment"
                                             className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'}`}
-                                            disabled={loadedMCPConfigName}
-                                            autoFocus={!loadedMCPConfigName}
+                                            disabled={(mcpSaveDraft?.mode === 'update')}
+                                            autoFocus={!(mcpSaveDraft?.mode === 'update')}
                                         />
-                                        {loadedMCPConfigName && (
+                                        {(mcpSaveDraft?.mode === 'update') && (
                                             <p className={`text-xs mt-1 italic ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>Configuration name cannot be changed when updating</p>
                                         )}
                                     </div>
@@ -20206,11 +20241,11 @@ This action cannot be undone.`);
 
                                     {/* Preview */}
                                     <div className={`rounded-lg p-4 mb-6 border ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                        <h4 className={`text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>Current Settings Preview</h4>
+                                        <h4 className={`text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-700'}`}>Settings to Save</h4>
                                         <div className={`space-y-1 text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            <div><span className="font-medium">URL:</span> {config?.mcp?.url || 'N/A'}</div>
-                                            <div><span className="font-medium">Token:</span> {config?.mcp?.token ? '***' : 'Not set'}</div>
-                                            <div><span className="font-medium">Verify SSL:</span> {config?.mcp?.verify_ssl ? 'Yes' : 'No'}</div>
+                                            <div><span className="font-medium">URL:</span> {mcpSaveDraft?.url || 'N/A'}</div>
+                                            <div><span className="font-medium">Token:</span> {describeMCPDraftToken(mcpSaveDraft, mcpConfigName)}</div>
+                                            <div><span className="font-medium">Verify SSL:</span> {mcpSaveDraft?.verify_ssl ? 'Yes' : 'No'}</div>
                                         </div>
                                     </div>
 
@@ -20221,6 +20256,7 @@ This action cannot be undone.`);
                                                 setIsMCPSaveModalOpen(false);
                                                 setMCPConfigName('');
                                                 setMCPConfigDescription('');
+                                                setMCPSaveDraft(null);
                                             }}
                                             className={`flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}
                                         >
@@ -20228,24 +20264,33 @@ This action cannot be undone.`);
                                         </button>
                                         <button
                                             onClick={async () => {
-                                                if (!mcpConfigName.trim()) {
+                                                const savedName = mcpConfigName.trim();
+                                                const isUpdate = mcpSaveDraft?.mode === 'update';
+                                                const draft = mcpSaveDraft || {};
+                                                if (!savedName) {
                                                     alert('Please enter a configuration name');
                                                     return;
                                                 }
+                                                if (!draft.url) {
+                                                    alert('Please enter an MCP URL');
+                                                    return;
+                                                }
 
-                                                // Additional confirmation for updates
-                                                if (loadedMCPConfigName) {
+                                                if (isUpdate) {
                                                     const confirmed = confirm(`⚠️ Confirm Update
 
-Are you sure you want to overwrite "${mcpConfigName}"?
+Are you sure you want to overwrite "${savedName}"?
 
 This will replace:
 • MCP URL
-• Token
+• Token (a blank token keeps the saved one)
 • SSL Settings
 • Description
 
 This action cannot be undone.`);
+                                                    if (!confirmed) return;
+                                                } else if (savedMCPConfigs?.[savedName]) {
+                                                    const confirmed = confirm(`A configuration named "${savedName}" already exists.\n\nOverwrite it?`);
                                                     if (!confirmed) return;
                                                 }
 
@@ -20254,34 +20299,46 @@ This action cannot be undone.`);
                                                         method: 'POST',
                                                         headers: { 'Content-Type': 'application/json' },
                                                         body: JSON.stringify({
-                                                            name: mcpConfigName.trim(),
-                                                            url: document.getElementById('mcp-url').value,
-                                                            token: document.getElementById('mcp-token').value || config.mcp.token,
-                                                            verify_ssl: document.getElementById('mcp-verify-ssl').checked,
+                                                            name: savedName,
+                                                            url: draft.url,
+                                                            token: draft.token || '',
+                                                            verify_ssl: Boolean(draft.verify_ssl),
                                                             description: mcpConfigDescription.trim() || null
                                                         })
                                                     });
+                                                    const result = await response.json().catch(() => ({}));
 
                                                     if (response.ok) {
-                                                        // Close modal
                                                         setIsMCPSaveModalOpen(false);
-                                                        const savedName = mcpConfigName.trim();
-                                                        const wasUpdate = loadedMCPConfigName;
+                                                        setMCPSaveDraft(null);
                                                         setMCPConfigName('');
                                                         setMCPConfigDescription('');
 
-                                                        // Refresh MCP configs list
+                                                        if (result.activated) {
+                                                            if (result.config) {
+                                                                setConfig(result.config);
+                                                            }
+                                                            setLoadedMCPConfigName(savedName);
+                                                            const tokenInput = document.getElementById('mcp-token');
+                                                            if (tokenInput) {
+                                                                tokenInput.value = '';
+                                                            }
+                                                            await loadConfig();
+                                                        }
                                                         await loadMCPConfigs();
 
-                                                        // Show success message
+                                                        const detailLine = result.activated
+                                                            ? 'Active MCP connection updated'
+                                                            : (result.token_configured === false ? 'Saved without a token' : '');
                                                         const successDiv = document.createElement('div');
-                                                        successDiv.className = `fixed top-6 right-6 ${wasUpdate ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600' : 'bg-green-600 text-white'} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
+                                                        successDiv.className = `fixed top-6 right-6 ${isUpdate ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600' : 'bg-green-600 text-white'} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
                                                         successDiv.innerHTML = `
                                                             <div class="flex items-center gap-3">
-                                                                <i class="fas ${wasUpdate ? 'fa-sync-alt' : 'fa-check-circle'} text-2xl"></i>
+                                                                <i class="fas ${isUpdate ? 'fa-sync-alt' : 'fa-check-circle'} text-2xl"></i>
                                                                 <div>
-                                                                    <p class="font-bold text-base">Configuration ${wasUpdate ? 'Updated' : 'Saved'}!</p>
-                                                                    <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${savedName}</p>
+                                                                    <p class="font-bold text-base">Configuration ${isUpdate ? 'Updated' : 'Saved'}!</p>
+                                                                    <p class="text-sm ${isUpdate ? 'opacity-80' : 'opacity-90'}">${escapeSettingsHtml(savedName)}</p>
+                                                                    ${detailLine ? `<p class="text-xs opacity-80">${escapeSettingsHtml(detailLine)}</p>` : ''}
                                                                 </div>
                                                             </div>
                                                         `;
@@ -20293,18 +20350,17 @@ This action cannot be undone.`);
                                                             setTimeout(() => successDiv.remove(), 300);
                                                         }, 2500);
                                                     } else {
-                                                        const error = await response.json();
-                                                        alert('Failed to save configuration: ' + (error.detail || 'Unknown error'));
+                                                        alert('Failed to save configuration: ' + formatApiErrorDetail(result.detail));
                                                     }
                                                 } catch (error) {
                                                     alert('Error saving configuration: ' + error.message);
                                                 }
                                             }}
                                             disabled={!mcpConfigName.trim()}
-                                            className={`flex-1 px-4 py-2 ${loadedMCPConfigName ? 'bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white'} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`}
+                                            className={`flex-1 px-4 py-2 ${(mcpSaveDraft?.mode === 'update') ? 'bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600' : 'bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white'} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`}
                                         >
-                                            <i className={`mr-2 ${loadedMCPConfigName ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
-                                            {loadedMCPConfigName ? 'Update Configuration' : 'Save Configuration'}
+                                            <i className={`mr-2 ${(mcpSaveDraft?.mode === 'update') ? 'fas fa-sync-alt' : 'fas fa-save'}`}></i>
+                                            {(mcpSaveDraft?.mode === 'update') ? 'Update Configuration' : 'Save Configuration'}
                                         </button>
                                     </div>
                                 </div>

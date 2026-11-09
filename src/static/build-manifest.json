@@ -1,12 +1,12 @@
 {
-  "built_at_utc": "2026-11-09T18:43:47.181Z",
+  "built_at_utc": "2026-11-09T19:32:53.004Z",
   "source": {
-    "legacy_html_sha256": "b5cb09649c2f330c243c2d648e6554a868b5b5723c2ca6dfe9f0b54f431be3f1",
-    "app_source_sha256": "fe97c424991ec0fd250cf1e12460def3527027035e6051a27a698e412a0f2f62"
+    "legacy_html_sha256": "4bb14abb158ea601c7152c90112880e98f426ae1ea4b494aa3c8f509d512e3fc",
+    "app_source_sha256": "9fe93c2bb934399c3812889ad5cc6c6e59f01c75aa1f24f6ac2e26160238c256"
   },
   "artifacts": {
     "index_html_sha256": "f29306d8a25dbacb11bd73e1a2577caebbaeb2f21e710bd8ba3552b2b1651d89",
-    "app_js_sha256": "b621709c1f70df1150e3acab474b33703d1d7f3280b08bba6db253354261f962"
+    "app_js_sha256": "ae9d97b8a6bea8fdcef3284ef6eecead8f688a3c73b27f972db6cf1c26c94470"
   },
   "runtime": {
     "script_refs": [

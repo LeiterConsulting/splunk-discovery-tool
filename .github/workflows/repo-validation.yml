@@ -73,6 +73,9 @@ jobs:
       - name: Run visualization browser regression
         run: npm run test:browser
 
+      - name: Run settings profile browser regression
+        run: npm run test:settings-profiles-browser
+
       - name: Run Ruff
         run: python -m ruff check src tests
 
