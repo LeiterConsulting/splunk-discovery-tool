@@ -321,6 +321,49 @@ function Write-StaleCodeWarning {
     }
 }
 
+# A copy started from another folder keeps answering on its port with its own code, so name each one
+function Write-OtherCopies {
+    param([string]$OwnProcessId, [string]$OwnPort)
+    $first = [int]$DEFAULT_PORT
+    $listeners = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -ge $first -and $_.LocalPort -le ($first + 20) } |
+        Sort-Object -Property LocalPort -Unique
+    if (-not $listeners) {
+        return
+    }
+    $stopIds = @()
+    $header = $false
+    foreach ($listener in $listeners) {
+        $port = [string]$listener.LocalPort
+        $procId = [string]$listener.OwningProcess
+        if (($procId -eq $OwnProcessId) -or ($port -eq $OwnPort)) {
+            continue
+        }
+        if (-not $header) {
+            Write-ColorMsg $ColorYellow "⚠ Other programs are using the app's ports on this computer:"
+            $header = $true
+        }
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $procId" -ErrorAction SilentlyContinue
+        $commandLine = if ($proc) { [string]$proc.CommandLine } else { "" }
+        if ($commandLine -match 'main\.py') {
+            $folder = "an unknown folder"
+            if ($commandLine -match '"([^"]+)\\src\\main\.py"') {
+                $folder = $Matches[1]
+            } elseif ($commandLine -match '(?:^|\s)([A-Za-z]:\\\S*?)\\src\\main\.py') {
+                $folder = $Matches[1]
+            }
+            Write-ColorMsg $ColorYellow "    port ${port}: another copy of the app (PID $procId), started from $folder"
+            $stopIds += $procId
+        } else {
+            $name = if ($proc) { [string]$proc.Name } else { "unknown program" }
+            Write-ColorMsg $ColorYellow "    port ${port}: PID $procId ($name)"
+        }
+    }
+    if ($stopIds.Count -gt 0) {
+        Write-ColorMsg $ColorYellow "  A browser or bookmark that opens one of those ports reaches that copy and its code, not this one."
+        Write-ColorMsg $ColorBlue "  To run only this copy: Stop-Process -Id $($stopIds -join ','); .\install.ps1 -Restart"
+    }
+}
 # Start service
 function Start-DT4SMSService {
     # Check if already running
@@ -330,6 +373,7 @@ function Start-DT4SMSService {
             Write-ColorMsg $ColorYellow "⚠ Service already running (PID: $processId)"
             Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:$(Get-RunningPort)"
             Write-StaleCodeWarning
+            Write-OtherCopies -OwnProcessId ([string]$processId).Trim() -OwnPort (Get-RunningPort)
             return
         }
     }
@@ -403,6 +447,7 @@ function Start-DT4SMSService {
         Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:$startedPort"
         Write-ColorMsg $ColorBlue "📋 Logs: Get-Content $LOG_FILE -Wait"
         Write-ColorMsg $ColorBlue "📋 Errors: Get-Content $ERR_LOG_FILE -Wait"
+        Write-OtherCopies -OwnProcessId ([string]$process.Id) -OwnPort $startedPort
     } else {
         Write-ColorMsg $ColorRed "✗ Failed to start service. Check logs: $LOG_FILE"
         Write-ColorMsg $ColorBlue "📋 Error log: $ERR_LOG_FILE"
@@ -438,6 +483,7 @@ function Stop-DT4SMSService {
 function Get-ServiceStatus {
     if (-not (Test-Path $PID_FILE)) {
         Write-ColorMsg $ColorYellow "⚠ Service not running"
+        Write-OtherCopies -OwnProcessId "" -OwnPort ""
         return $false
     }
     
@@ -446,6 +492,7 @@ function Get-ServiceStatus {
         Write-ColorMsg $ColorGreen "✓ Service running (PID: $processId)"
         Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:$(Get-RunningPort)"
         Write-StaleCodeWarning
+        Write-OtherCopies -OwnProcessId ([string]$processId).Trim() -OwnPort (Get-RunningPort)
         return $true
     } else {
         Write-ColorMsg $ColorYellow "⚠ Service not running (stale PID file)"

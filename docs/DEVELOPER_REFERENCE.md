@@ -109,7 +109,8 @@ Requirement: preserve MCP + LLM settings behavior.
 - Visual refresh is allowed; function contract should not change
 - Troubleshooting (`src/troubleshooting.py`) has no FastAPI dependency; `web_app.py` passes in the config manager, the startup state, the account, and the save endpoint's validation errors
   - `POST /api/troubleshoot/mcp` and `POST /api/troubleshoot/llm` take the same fields as the save endpoints plus `check_save` and `check_connection`, never save, and return `status`, `summary`, `summary_fix`, `stages[].checks[]` (`pass`/`warn`/`fail`/`info`/`skip`), and a redacted plain-text `report`
-  - `GET /api/troubleshoot/server-status` compares the code fingerprint captured at startup with the install folder; a 404 tells the browser the server predates the page
+  - `GET /api/troubleshoot/server-status` compares the code fingerprint captured at startup with the install folder and returns `port`, `pid`, and (for admins) `install_dir`; a 404 tells the browser the server predates the page
+  - When the server is out of date, the browser probes `server-status` and `/api/auth/status` on the configured port and the next 20 (the fallback range in `src/main.py`) to find other copies; the server-side other-copies check does the same from `127.0.0.1` and adds each listener's PID and folder from `lsof`/`ss`/`ps` (or `netstat` and `Win32_Process` on Windows)
   - The saving stage uses `ConfigManager.probe_save`, which writes, reads back, and deletes a temporary copy next to the settings file
   - When a save path gains a new failure mode, add a check with a plain-language title and fix, plus a case in `tests/test_troubleshooting.py`
 

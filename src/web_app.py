@@ -14371,10 +14371,17 @@ def _profile_name_errors(name: str, kind: str) -> List[str]:
 
 
 @app.get("/api/troubleshoot/server-status")
-async def troubleshoot_server_status():
+async def troubleshoot_server_status(request: Request):
     """Tell the browser whether the server still runs the code it started with (a git pull without a restart)."""
     status = server_code_status(PROJECT_ROOT, SERVER_STARTUP_STATE)
     status["started_at"] = datetime.fromtimestamp(status["started_at"], timezone.utc).isoformat()
+    status["port"] = _request_port(request)
+    try:
+        can_manage = bool(_troubleshoot_account(request).get("can_manage"))
+    except HTTPException:
+        can_manage = False
+    if can_manage:
+        status["install_dir"] = str(PROJECT_ROOT)
     return status
 
 

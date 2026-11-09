@@ -68,6 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Network: proxy, DNS, TCP, and TLS trust with certificate details and Splunk self-signed certificate advice
   - Response: MCP `tools/list` (redirects, 401/403/404/405, HTML pages, event streams, JSON-RPC errors, tool count) and AI provider errors classified into plain-language causes
 - `GET /api/troubleshoot/server-status`: Settings shows a banner when the server runs older code than the install folder (for example after `git pull` without a restart), or when the server is too old to have the endpoint
+  - The banner names the server's port (and, for admins, its folder and restart command), looks for other copies of the app on ports 8003-8023, links to an up-to-date copy, and explains that restarting a copy in another folder doesn't change the one answering
+  - The troubleshooter's other-copies check reports each copy's version, process ID, and folder, with the command that stops the older ones
+- `install.sh` and `install.ps1` list other copies of the app on its ports (process ID and folder) after starting and with `--status` / `-Status`, with one command to stop them and restart this copy
 - Troubleshoot buttons next to Test Connection in the MCP and AI provider forms; failed saves and MCP tests offer to open the troubleshooter with the same values
 - **CA Bundle File** field in the MCP form, saved with the configuration and used by Test Connection
 - Regression suites: `tests/test_troubleshooting.py` and `tools/test_settings_troubleshoot_browser.mjs` (`npm run test:settings-troubleshoot-browser`, also run in CI); CI also checks `install.sh` and `install.ps1` syntax
@@ -81,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tokens and API keys pasted with a `Bearer ` prefix or surrounding whitespace were saved as-is and then rejected by the server
 - A capability refresh error after a successful save turned the save into an HTTP 500
 - `./install.sh` reported port 8003 even when the app had moved to another port, and launching it from another folder stored settings in that folder
+- After installing again in a new folder, the out-of-date banner kept appearing on the old copy's port and told users to restart, which only restarted the new copy on a fallback port
 - Saving an MCP configuration from the form dropped its CA bundle path, and Test Connection ignored the CA bundle and sent a request without the JSON-RPC `jsonrpc`/`id` fields that strict MCP servers require
 
 ### 🧩 Workspace & Summarization UX Hardening

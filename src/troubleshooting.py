@@ -18,6 +18,7 @@ import re
 import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import urllib.request
@@ -234,10 +235,11 @@ def _local_time(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
 
 
-def _restart_hint() -> str:
+def _restart_hint(project_root: Optional[Path] = None) -> str:
+    folder = f"in {project_root}" if project_root else "in the install folder"
     if os.name == "nt":
-        return "Restart the app: run .\\install.ps1 -Restart in the install folder, then reload this page."
-    return "Restart the app: run ./install.sh --restart in the install folder, then reload this page."
+        return f"Restart the app: run .\\install.ps1 -Restart {folder}, then reload this page."
+    return f"Restart the app: run ./install.sh --restart {folder}, then reload this page."
 
 
 def server_code_status(project_root: Path, startup: Dict[str, Any]) -> Dict[str, Any]:
@@ -247,6 +249,7 @@ def server_code_status(project_root: Path, startup: Dict[str, Any]) -> Dict[str,
         "started_at": float(startup.get("started_at") or time.time()),
         "running_commit": startup.get("commit"),
         "disk_commit": read_git_commit(project_root),
+        "pid": startup.get("pid"),
         "restart_hint": _restart_hint(),
     }
 
@@ -275,7 +278,7 @@ def check_server_code(stage: Stage, project_root: Path, startup: Dict[str, Any])
             "The browser loads the new pages while the server keeps running the old code, "
             "so saves and tests can fail in ways that are already fixed."
         ),
-        _restart_hint(),
+        _restart_hint(project_root),
     )
 
 
@@ -382,34 +385,187 @@ async def _looks_like_this_app(client: httpx.AsyncClient, port: int) -> bool:
         return False
 
 
-async def check_other_instances(stage: Stage, own_port: Optional[int], preferred_port: int) -> None:
+def _run_quiet(args: List[str], timeout: float = 3.0) -> str:
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    return result.stdout or ""
+
+
+def _lsof() -> Optional[str]:
+    return shutil.which("lsof") or next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None)
+
+
+def app_folder_from_command(command: str) -> Optional[str]:
+    """Install folder of a process whose command line runs <folder>/src/main.py."""
+    match = re.search(r"[\\/]src[\\/]main\.py\b", command or "")
+    if not match:
+        return None
+    head = command[: match.start()]
+    quote = max(head.rfind('"'), head.rfind("'"))
+    if quote >= 0:
+        return head[quote + 1:] or None
+    drives = [m.start(1) for m in re.finditer(r"(?:^|\s)([A-Za-z]:[\\/])", head)]
+    if drives:
+        return head[drives[-1]:]
+    start = head.rfind(" /")
+    if start >= 0:
+        return head[start + 1:]
+    return head if head.startswith("/") else None
+
+
+def listener_pid(port: int) -> Optional[int]:
+    if os.name == "nt":
+        for line in _run_quiet(["netstat", "-ano", "-p", "tcp"]).splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].rsplit(":", 1)[-1] == str(port) \
+                    and parts[3].upper() == "LISTENING" and parts[4].isdigit():
+                return int(parts[4])
+        return None
+    lsof = _lsof()
+    if lsof:
+        for token in _run_quiet([lsof, "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"]).split():
+            if token.isdigit():
+                return int(token)
+    ss = shutil.which("ss")
+    if ss:
+        match = re.search(r"pid=(\d+)", _run_quiet([ss, "-ltnpH", f"sport = :{port}"]))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _process_command(pid: int) -> str:
+    if os.name == "nt":
+        script = f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}').CommandLine"
+        return _run_quiet(["powershell", "-NoProfile", "-Command", script], timeout=8.0).strip()
+    return _run_quiet(["ps", "-o", "args=", "-p", str(int(pid))]).strip()
+
+
+def _process_cwd(pid: int) -> Optional[str]:
+    proc_cwd = Path(f"/proc/{int(pid)}/cwd")
+    try:
+        if proc_cwd.exists():
+            return os.readlink(proc_cwd)
+    except OSError:
+        pass
+    lsof = _lsof()
+    if lsof:
+        for line in _run_quiet([lsof, "-a", "-p", str(int(pid)), "-d", "cwd", "-Fn"]).splitlines():
+            if line.startswith("n"):
+                return line[1:]
+    return None
+
+
+def describe_listener(port: int) -> Dict[str, Any]:
+    """PID and install folder of the local process listening on a port, as far as the OS tells us."""
+    pid = listener_pid(port)
+    if not pid:
+        return {}
+    command = _process_command(pid)
+    folder = app_folder_from_command(command)
+    if not folder and re.search(r"(?:^|[\s\"'])src[\\/]main\.py\b", command):
+        folder = _process_cwd(pid)
+    return {"pid": pid, "folder": folder}
+
+
+async def _copy_code_state(client: httpx.AsyncClient, port: int) -> Dict[str, Any]:
+    """Which code another copy runs: its server-status answer, or 404 when it predates these checks."""
+    try:
+        response = await client.get(f"http://127.0.0.1:{port}/api/troubleshoot/server-status")
+    except Exception:
+        return {"state": "unknown"}
+    if response.status_code == 404:
+        return {"state": "old"}
+    if response.status_code in (401, 403):
+        return {"state": "signin"}
+    try:
+        data = response.json()
+    except ValueError:
+        return {"state": "unknown"}
+    if not isinstance(data, dict) or "stale" not in data:
+        return {"state": "unknown"}
+    return {"state": "stale" if data.get("stale") else "current", "commit": data.get("running_commit")}
+
+
+_COPY_STATE_TEXT = {
+    "current": "up to date",
+    "stale": "running older code than its folder (it started before an update)",
+    "old": "an older version of the app",
+    "signin": "version unknown (it requires sign-in)",
+    "unknown": "version unknown",
+}
+
+
+def _describe_copy(copy: Dict[str, Any]) -> str:
+    state = copy.get("state") or "unknown"
+    text = _COPY_STATE_TEXT.get(state, _COPY_STATE_TEXT["unknown"])
+    if state == "current" and copy.get("commit"):
+        text += f" (commit {_short(copy['commit'])})"
+    extras = []
+    if copy.get("pid"):
+        extras.append(f"PID {copy['pid']}")
+    if copy.get("folder"):
+        extras.append(f"started from {copy['folder']}")
+    suffix = f" [{', '.join(extras)}]" if extras else ""
+    return f"Port {copy['port']}: {text}{suffix}."
+
+
+async def check_other_instances(
+    stage: Stage, own_port: Optional[int], preferred_port: int, project_root: Optional[Path] = None
+) -> None:
     ports = [port for port in range(preferred_port, preferred_port + INSTANCE_SCAN_SPAN + 1) if port != own_port]
     open_flags = await asyncio.gather(*(_port_open("127.0.0.1", port, 0.3) for port in ports))
     candidates = [port for port, is_open in zip(ports, open_flags) if is_open]
-    found: List[int] = []
+    copies: List[Dict[str, Any]] = []
     if candidates:
         async with httpx.AsyncClient(timeout=1.5, trust_env=False) as client:
             for port in candidates:
                 if await _looks_like_this_app(client, port):
-                    found.append(port)
+                    copies.append({"port": port, **(await _copy_code_state(client, port))})
+        for copy in copies:
+            copy.update(await asyncio.to_thread(describe_listener, copy["port"]))
     port_note = ""
     if own_port and own_port != preferred_port:
         port_note = f" This copy runs on port {own_port} because port {preferred_port} was busy when it started."
-    if found:
-        listed = ", ".join(str(port) for port in found)
-        stage.add(
-            "other_instances",
-            f"Another copy of the app is running on port {listed}",
-            WARN,
-            (
-                f"This page comes from port {own_port or preferred_port}.{port_note} Each copy has its own code version "
-                "and may read a different settings file, so a copy started before an update still behaves the old way."
-            ),
-            (
+    if copies:
+        listed = ", ".join(str(copy["port"]) for copy in copies)
+        title = (
+            f"Another copy of the app is running on port {listed}"
+            if len(copies) == 1
+            else f"Other copies of the app are running on ports {listed}"
+        )
+        own_folder = f" (started from {project_root})" if project_root else ""
+        pids = [str(copy["pid"]) for copy in copies if copy.get("pid")]
+        if pids:
+            stop = f"Stop-Process -Id {','.join(pids)}" if os.name == "nt" else f"kill {' '.join(pids)}"
+            fix = f"Use one copy. Stop the other copies on this computer: {stop}"
+        else:
+            fix = (
                 "Use one copy. Stop the others with the installer's stop command in the folder each was started from"
                 + (", or find the process with: lsof -nP -iTCP:<port> -sTCP:LISTEN" if os.name != "nt" else "")
-                + ". Then open the address the installer prints."
+            )
+        if own_port and own_port != preferred_port:
+            restart = ".\\install.ps1 -Restart" if os.name == "nt" else "./install.sh --restart"
+            fix += (
+                f". Then run {restart}{f' in {project_root}' if project_root else ''} so this copy moves to "
+                f"port {preferred_port}, and open that address."
+            )
+        else:
+            fix += ". Then open the address the installer prints."
+        stage.add(
+            "other_instances",
+            title,
+            WARN,
+            (
+                f"This page comes from port {own_port or preferred_port}{own_folder}.{port_note} "
+                + " ".join(_describe_copy(copy) for copy in copies)
+                + " Each copy runs its own code version and may read a different settings file, so a copy started "
+                "before an update still behaves the old way, and a browser or bookmark that opens its port reaches it "
+                "instead of this one."
             ),
+            fix,
         )
     else:
         stage.add(
@@ -445,7 +601,7 @@ async def app_stage(
     check_server_code(stage, project_root, startup)
     check_dependencies(stage, project_root)
     check_python(stage, project_root)
-    await check_other_instances(stage, own_port, preferred_port)
+    await check_other_instances(stage, own_port, preferred_port, project_root)
     check_account(stage, account)
     return stage
 

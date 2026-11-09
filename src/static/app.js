@@ -473,6 +473,7 @@
     return snippet ? `${status}: ${snippet}` : status;
   };
   const TROUBLESHOOT_RESTART_HINT = "Restart the app in its install folder: ./install.sh --restart (macOS/Linux) or .\\install.ps1 -Restart (Windows). Then reload this page.";
+  const APP_COPY_SCAN_SPAN = 20;
   const readLlmTuningFormValues = (fallback = {}) => {
     const toPositiveInt = (element, fallbackValue) => {
       if (!element) return Number(fallbackValue) > 0 ? Number(fallbackValue) : 0;
@@ -6386,9 +6387,10 @@ This action cannot be undone.`);
         detail = text ? `The browser reported: ${text}` : "";
         fix = "Check that the app is still running (./install.sh --status or .\\install.ps1 -Status) and that this page uses the address the app printed when it started.";
       } else if (response.status === 404 || response.status === 405) {
+        const currentCopy = ((serverCodeStatus == null ? void 0 : serverCodeStatus.other_copies) || []).find((copy) => copy.state === "current");
         title = "The running app is older than this page";
-        detail = `The server doesn't know the troubleshooting request (${describeApiFailure(response, data, text)}). This happens when the files were updated, for example with git pull, but the app wasn't restarted. The old server code can also make saves fail in ways the update already fixes.`;
-        fix = TROUBLESHOOT_RESTART_HINT;
+        detail = `The server on port ${pagePort()} doesn't know the troubleshooting request (${describeApiFailure(response, data, text)}). This happens when the files were updated, for example with git pull, but this copy of the app wasn't restarted, or when an older copy installed in another folder still holds this port. The old server code can also make saves fail in ways the update already fixes.`;
+        fix = currentCopy ? `${TROUBLESHOOT_RESTART_HINT} Or open the up-to-date copy at ${currentCopy.origin} and stop this one with ./install.sh --stop in its folder.` : `${TROUBLESHOOT_RESTART_HINT} If you installed the app again in a new folder, stop this older copy with ./install.sh --stop in its old folder and open the address the new install printed.`;
       } else if (response.status === 401) {
         title = "You are signed out";
         detail = describeApiFailure(response, data, text);
@@ -6493,28 +6495,87 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       }
       setTroubleshootCopied(copied ? "copied" : "failed");
     };
+    const pagePort = () => Number(window.location.port) || (window.location.protocol === "https:" ? 443 : 80);
+    const probeAppCopy = async (port) => {
+      const origin = `${window.location.protocol}//${window.location.hostname}:${port}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1500);
+      const request = (route) => fetch(`${origin}${route}`, { mode: "cors", credentials: "omit", cache: "no-store", signal: controller.signal });
+      try {
+        const response = await request("/api/troubleshoot/server-status");
+        if (response.ok) {
+          const data = await response.json().catch(() => null);
+          if (!data || typeof data !== "object" || !("stale" in data)) {
+            return null;
+          }
+          return { port, origin, state: data.stale ? "stale" : "current", commit: data.running_commit || null };
+        }
+        if (![401, 403, 404].includes(response.status)) {
+          return null;
+        }
+        const authData = await (await request("/api/auth/status")).json().catch(() => null);
+        if (!authData || typeof authData !== "object" || !("demo_mode" in authData)) {
+          return null;
+        }
+        return { port, origin, state: response.status === 404 ? "old" : "signin" };
+      } catch (error) {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const findOtherAppCopies = async () => {
+      var _a2;
+      const preferred = Number((_a2 = config == null ? void 0 : config.server) == null ? void 0 : _a2.port) || 8003;
+      const own = pagePort();
+      const ports = [];
+      for (let port = preferred; port <= preferred + APP_COPY_SCAN_SPAN; port += 1) {
+        if (port !== own) {
+          ports.push(port);
+        }
+      }
+      return (await Promise.all(ports.map(probeAppCopy))).filter(Boolean);
+    };
     const checkServerCodeStatus = async () => {
+      let status = null;
       try {
         const response = await fetch("/api/troubleshoot/server-status");
         if (response.status === 404) {
-          setServerCodeStatus({ stale: true, outdated_server: true, restart_hint: TROUBLESHOOT_RESTART_HINT });
-          return;
+          status = { stale: true, outdated_server: true, restart_hint: TROUBLESHOOT_RESTART_HINT };
+        } else if (response.ok) {
+          const data = await response.json();
+          status = data && typeof data === "object" ? data : null;
         }
-        if (!response.ok) {
-          setServerCodeStatus(null);
-          return;
-        }
-        const data = await response.json();
-        setServerCodeStatus(data && typeof data === "object" ? data : null);
       } catch (error) {
-        setServerCodeStatus(null);
+        status = null;
+      }
+      setServerCodeStatus(status);
+      if (status == null ? void 0 : status.stale) {
+        const otherCopies = await findOtherAppCopies();
+        setServerCodeStatus((current) => current === status ? { ...status, other_copies: otherCopies } : current);
       }
     };
+    const restartCommandFor = (folder) => /^[A-Za-z]:[\\/]/.test(folder) ? `cd "${folder}"; .\\install.ps1 -Restart` : `cd "${folder}" && ./install.sh --restart`;
     const renderServerCodeBanner = () => {
       if (!(serverCodeStatus == null ? void 0 : serverCodeStatus.stale)) {
         return null;
       }
-      return /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-server-stale-banner", className: "rounded-lg border-2 border-amber-400 bg-amber-50 p-4 text-sm text-amber-900" }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-2" }), "The app was updated, but the server is still running the old version"), /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, "Until the app restarts, saving and testing can fail in ways the update already fixes. ", serverCodeStatus.restart_hint || TROUBLESHOOT_RESTART_HINT), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: checkServerCodeStatus, className: "mt-2 text-xs font-medium underline" }, "Check again"));
+      const port = pagePort();
+      const copies = Array.isArray(serverCodeStatus.other_copies) ? serverCodeStatus.other_copies : [];
+      const currentCopy = copies.find((copy) => copy.state === "current");
+      const otherCopies = copies.filter((copy) => copy !== currentCopy);
+      const folder = String(serverCodeStatus.install_dir || "");
+      let fix;
+      if (serverCodeStatus.outdated_server && currentCopy) {
+        fix = `Use the up-to-date copy, and stop the older ones so bookmarks for port ${port} don't reach old code: run ./install.sh --stop (or .\\install.ps1 -Stop on Windows) in each older copy's folder. On the app's computer, ./install.sh --status in the up-to-date copy's folder lists the copies still running.`;
+      } else if (serverCodeStatus.outdated_server) {
+        fix = `${TROUBLESHOOT_RESTART_HINT} If you installed the app again in a new folder, this is the older copy: stop it with ./install.sh --stop (or .\\install.ps1 -Stop) in its old folder, then open the address the new install printed.`;
+      } else if (folder) {
+        fix = `Restart it: ${restartCommandFor(folder)}. Then reload this page.`;
+      } else {
+        fix = serverCodeStatus.restart_hint || TROUBLESHOOT_RESTART_HINT;
+      }
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-server-stale-banner", className: "rounded-lg border-2 border-amber-400 bg-amber-50 p-4 text-sm text-amber-900" }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-2" }), serverCodeStatus.outdated_server ? `The server on port ${port} is running an older version of the app` : `The server on port ${port} is still running the code it had before an update`), /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, serverCodeStatus.outdated_server ? "This page is newer than the server behind it, usually because the files were updated (for example with git pull) after this copy started. Until this copy restarts, saving and testing can fail in ways the update already fixes. Restarting a copy installed in another folder does not change this one." : `Files in ${folder || "its install folder"} changed after it started. Until it restarts, saving and testing can fail in ways the update already fixes.`), currentCopy && /* @__PURE__ */ React.createElement("div", { className: "mt-2", "data-testid": "settings-server-current-copy" }, "An up-to-date copy of the app is running on port ", currentCopy.port, currentCopy.commit ? ` (commit ${String(currentCopy.commit).slice(0, 7)})` : "", ".", " ", /* @__PURE__ */ React.createElement("a", { href: `${currentCopy.origin}/`, "data-testid": "settings-server-current-copy-link", className: "font-semibold underline" }, "Open ", currentCopy.origin)), otherCopies.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-2", "data-testid": "settings-server-other-copies" }, "Other copies of the app are also running on ", otherCopies.length > 1 ? "ports" : "port", " ", otherCopies.map((copy) => copy.port).join(", "), otherCopies.some((copy) => copy.state === "old" || copy.state === "stale") ? ", at least one with older code" : "", "."), /* @__PURE__ */ React.createElement("div", { className: "mt-2" }, fix), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: checkServerCodeStatus, className: "mt-2 text-xs font-medium underline" }, "Check again"));
     };
     const renderTroubleshootResult = (result, panelClass2) => {
       const overall = TROUBLESHOOT_STATUS_STYLES[result.status] || TROUBLESHOOT_STATUS_STYLES.info;
