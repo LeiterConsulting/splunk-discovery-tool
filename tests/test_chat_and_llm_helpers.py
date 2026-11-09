@@ -13,7 +13,19 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
-from llm.factory import CustomLLMClient, filter_openai_generation_models, get_openai_model_capabilities, is_openai_image_generation_model
+from llm.factory import (
+    ANALYSIS_MAX_TOKENS,
+    ANALYSIS_REASONING_MAX_TOKENS,
+    CustomLLMClient,
+    OpenAIClient,
+    build_analysis_prompt,
+    filter_openai_generation_models,
+    get_openai_model_capabilities,
+    is_openai_image_generation_model,
+    parse_json_from_llm_text,
+)
+from llm import runtime_tuning
+from llm.model_profiles import build_model_profile, clear_model_metadata_cache, recommend_settings
 from capabilities.models import CapabilityActionResult, CapabilityConfig
 from discovery.context_manager import DiscoveryContextManager
 from discovery.engine import DiscoveryEngine
@@ -285,6 +297,35 @@ class OpenAIModelHelperTests(unittest.TestCase):
         self.assertEqual(normalized[0]["signal"], "netops: 88M, _internal: 84M")
         self.assertEqual(normalized[0]["evidence"], ["netops: 88M", "_internal: 84M"])
 
+    def test_normalize_v2_notable_patterns_for_ui_keeps_plain_observations(self):
+        raw_patterns = [
+            "Largest indexes by event count: firewall (20,000 events, 300.0 MB)",
+            "2 of 6 indexes contain no events",
+        ]
+
+        normalized = web_app._normalize_v2_notable_patterns_for_ui(raw_patterns)
+
+        self.assertEqual(len(normalized), 2)
+        self.assertEqual(normalized[0]["title"], "Largest indexes by event count")
+        self.assertIn("firewall (20,000 events", normalized[0]["description"])
+        self.assertIn("2 of 6 indexes contain no events", normalized[1]["description"])
+
+    def test_context_manager_reads_pattern_mappings_and_plain_text(self):
+        manager = DiscoveryContextManager(Path(tempfile.gettempdir()))
+        manager._discovery_data = {
+            "overview": {
+                "notable_patterns": [
+                    {"category": "Volume", "insight": "firewall dominates", "evidence": []},
+                    "2 of 6 indexes contain no events",
+                ]
+            }
+        }
+
+        patterns = manager._parse_notable_patterns()
+
+        self.assertEqual(patterns[0]["category"], "Volume")
+        self.assertEqual(patterns[1]["insight"], "2 of 6 indexes contain no events")
+
     def test_normalize_v2_notable_patterns_for_ui_merges_duplicate_headlines(self):
         raw_patterns = [
             {
@@ -310,6 +351,88 @@ class OpenAIModelHelperTests(unittest.TestCase):
         self.assertIn("_internal: 110M", normalized[0]["evidence"])
         self.assertIn("wmata: 8175 MB / 45.4M events", normalized[0]["evidence"])
 
+
+class AnalysisJsonParsingTests(unittest.TestCase):
+    TRUNCATED_USE_CASES = (
+        '[\n {"title": "Correlate logons with network loss", "description": "Join WinEventLog:Security and ping_monitor.",'
+        ' "data_sources": [{"type": "sourcetype", "name": "WinEventLog:Security"}, {"type": "sourcetype", "name": "ping_monitor"}]},\n'
+        ' {"title": "Process restarts after patching", "description": "Track ops_health restarts.", "data_sources": ["ops_health"]},\n'
+        ' {"title": "Third idea", "descr'
+    )
+
+    def test_truncated_top_level_array_keeps_complete_items(self):
+        parsed = parse_json_from_llm_text(self.TRUNCATED_USE_CASES)
+
+        self.assertIsInstance(parsed, list)
+        self.assertEqual([item["title"] for item in parsed], ["Correlate logons with network loss", "Process restarts after patching"])
+
+    def test_truncated_named_list_keeps_complete_items(self):
+        raw = (
+            '{"patterns": [{"category": "Volume", "insight": "netflow dominates."}, '
+            '{"category": "Freshness", "insight": "legacy stopped.", "evidence": ["index=legacy"]}, {"category": "Qual'
+        )
+
+        parsed = parse_json_from_llm_text(raw)
+
+        self.assertEqual([item["category"] for item in parsed], ["Volume", "Freshness"])
+
+    def test_prose_prefers_the_main_payload_over_a_small_object(self):
+        raw = 'Using {"window": "24h"} as context, here are the results:\n[{"title": "A", "description": "x"}, {"title": "B", "description": "y"}]'
+
+        self.assertEqual(len(parse_json_from_llm_text(raw)), 2)
+
+    def test_complete_fenced_reply_parses_unchanged(self):
+        self.assertEqual(parse_json_from_llm_text('```json\n{"recommendations": []}\n```'), {"recommendations": []})
+        self.assertIsNone(parse_json_from_llm_text("No JSON here."))
+
+    def test_analysis_prompts_request_named_capped_lists(self):
+        data = {"prompt_guidance": "Only reference discovered sourcetypes."}
+        expectations = {
+            "recommendations": ('{"recommendations": [...]}', "at most 8"),
+            "creative_use_cases": ('{"use_cases": [...]}', "at most 5"),
+            "patterns": ('{"patterns": [...]}', "at most 6"),
+        }
+        for analysis_type, (shape, cap) in expectations.items():
+            prompt = build_analysis_prompt(data, analysis_type)
+            self.assertIn(shape, prompt, analysis_type)
+            self.assertIn(cap, prompt, analysis_type)
+            self.assertIn("never invent", prompt, analysis_type)
+        self.assertIn("Only reference discovered sourcetypes.", build_analysis_prompt(data, "creative_use_cases"))
+
+    def test_openai_analyze_data_uses_analysis_budget_and_salvages_truncation(self):
+        client = OpenAIClient.__new__(OpenAIClient)
+        client.model_capabilities = {"reasoning": False}
+        calls = []
+
+        async def fake_generate(prompt, max_tokens=1000, temperature=0.7):
+            calls.append(max_tokens)
+            return self.TRUNCATED_USE_CASES
+
+        client.generate_response = fake_generate
+        result = asyncio.run(client.analyze_data({"sourcetypes": ["ping_monitor"]}, "creative_use_cases"))
+
+        self.assertEqual(calls, [ANALYSIS_MAX_TOKENS])
+        self.assertEqual(len(result), 2)
+
+        client.model_capabilities = {"reasoning": True}
+        asyncio.run(client.analyze_data({}, "patterns"))
+        self.assertEqual(calls[-1], ANALYSIS_REASONING_MAX_TOKENS)
+
+    def test_custom_analyze_data_budget_fits_small_context(self):
+        client = CustomLLMClient.__new__(CustomLLMClient)
+        calls = []
+
+        async def fake_generate(prompt, max_tokens=1000, temperature=0.7):
+            calls.append(max_tokens)
+            return '{"patterns": []}'
+
+        client.generate_response = fake_generate
+        client.num_ctx = 8192
+        asyncio.run(client.analyze_data({}, "patterns"))
+        client.num_ctx = None
+        asyncio.run(client.analyze_data({}, "patterns"))
+
+        self.assertEqual(calls, [8192 // 3, ANALYSIS_MAX_TOKENS])
 
 class CustomLLMClientCompatibilityTests(unittest.TestCase):
     class _StubMetrics:
@@ -386,10 +509,50 @@ class CustomLLMClientCompatibilityTests(unittest.TestCase):
 
         candidates = client._build_candidate_urls()
 
-        self.assertEqual(candidates[0], "http://localhost:11434/v1/chat/completions")
-        self.assertEqual(candidates[1], "http://localhost:11434/chat/completions")
-        self.assertIn("http://localhost:11434/api/chat", candidates)
+        # Native /api/chat first: it is the only Ollama route that honors num_ctx/num_predict.
+        self.assertEqual(candidates[0], "http://localhost:11434/api/chat")
+        self.assertEqual(candidates[1], "http://localhost:11434/v1/chat/completions")
         self.assertIn("http://localhost:11434/api/generate", candidates)
+        self.assertNotIn("http://localhost:11434/chat/completions", candidates)
+
+    def test_non_ollama_base_url_tries_chat_completions_first(self):
+        client = CustomLLMClient("http://localhost:1234", model="local-model", provider="custom")
+
+        candidates = client._build_candidate_urls()
+
+        self.assertEqual(candidates[0], "http://localhost:1234/v1/chat/completions")
+        self.assertEqual(candidates[1], "http://localhost:1234/chat/completions")
+        self.assertIn("http://localhost:1234/v1/completions", candidates)
+
+    def test_ollama_chat_payload_carries_tuned_options(self):
+        client = CustomLLMClient(
+            "http://localhost:11434/api/chat",
+            model="qwen3:8b",
+            provider="ollama",
+            tuning={"num_ctx": 32768, "ollama_think": False, "request_timeout": 600},
+        )
+        client.health_monitor = self._StubHealthMonitor()
+        client.timeout_manager = self._StubTimeoutManager()
+        client.payload_adapter = self._StubPayloadAdapter()
+        client.session = self._StubSession(self._StubResponse({"message": {"content": "<think>plan</think>Final answer."}}))
+        client.use_session = True
+
+        response = client.generate_response_sync([{"role": "user", "content": "Hi"}], max_tokens=900, temperature=0.2)
+
+        payload = client.session.calls[0]["json"]
+        self.assertEqual(response, "Final answer.")
+        self.assertEqual(payload["options"], {"num_predict": 900, "temperature": 0.2, "num_ctx": 32768})
+        self.assertIs(payload["think"], False)
+
+    def test_openai_compatible_response_ignores_reasoning_field(self):
+        client = self._build_client(
+            "http://localhost:8000/v1/chat/completions",
+            {"choices": [{"message": {"content": "Answer only.", "reasoning_content": "hidden chain of thought"}}]},
+        )
+
+        response = client.generate_response_sync([{"role": "user", "content": "Q"}], max_tokens=64, temperature=0.2)
+
+        self.assertEqual(response, "Answer only.")
 
     def test_generate_response_sync_extracts_ollama_chat_content(self):
         client = self._build_client(
@@ -504,7 +667,6 @@ class CustomLLMClientCompatibilityTests(unittest.TestCase):
                 status_code=500,
             ),
             self._StubResponse({"error": "not found"}, status_code=404),
-            self._StubResponse({"error": "not found"}, status_code=404),
             self._StubResponse({"response": "Recovered via generate fallback."}),
         ])
         client.use_session = True
@@ -516,8 +678,8 @@ class CustomLLMClientCompatibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(response, "Recovered via generate fallback.")
-        self.assertEqual(client.session.calls[0]["url"], "http://localhost:11434/v1/chat/completions")
-        self.assertEqual(client.session.calls[3]["url"], "http://localhost:11434/api/generate")
+        self.assertEqual(client.session.calls[0]["url"], "http://localhost:11434/api/chat")
+        self.assertEqual(client.session.calls[2]["url"], "http://localhost:11434/api/generate")
         self.assertEqual(client.endpoint_url, "http://localhost:11434/api/generate")
 
     def test_generate_response_sync_builds_ollama_generate_payload(self):
@@ -601,6 +763,59 @@ class LLMSettingsTests(unittest.TestCase):
             result = asyncio.run(web_app.list_models(StubRequest(request_payload)))
 
         self.assertEqual(result["models"], ["gpt-oss:20b", "llama3.2:1b"])
+        self.assertEqual([item["model"] for item in result["ranked"]][0], result["recommended_model"])
+        self.assertEqual(sorted(item["model"] for item in result["ranked"]), result["models"])
+        self.assertTrue(result["recommended"]["recommended"])
+
+    def test_list_models_ranks_ollama_inventory_with_tag_metadata(self):
+        clear_model_metadata_cache()
+
+        class StubRequest:
+            async def json(self):
+                return {"provider": "ollama", "endpoint_url": ""}
+
+        class StubResponse:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class StubAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                return StubResponse({
+                    "models": [
+                        {"name": "nomic-embed-text:latest", "capabilities": ["embedding"], "details": {"parameter_size": "137M"}},
+                        {"name": "llama3.1:8b", "capabilities": ["completion", "tools"], "details": {"parameter_size": "8.0B", "context_length": 131072}},
+                        {"name": "qwen3-coder:latest", "capabilities": ["completion", "tools"], "details": {"parameter_size": "30.5B", "context_length": 262144}},
+                    ]
+                })
+
+        with patch.object(web_app.httpx, "AsyncClient", StubAsyncClient):
+            result = asyncio.run(web_app.list_models(StubRequest()))
+
+        ranked = result["ranked"]
+        self.assertEqual(ranked[-1]["model"], "nomic-embed-text:latest")
+        self.assertFalse(ranked[-1]["eligible"])
+        self.assertNotEqual(result["recommended_model"], "nomic-embed-text:latest")
+        self.assertTrue(all(item["reasons"] for item in ranked))
+        cached = runtime_tuning.lookup_model_metadata("ollama", "", "llama3.1:8b")
+        self.assertEqual(cached.get("context_window"), 131072)
+        clear_model_metadata_cache()
 
     def test_assess_max_tokens_uses_provider_safe_default_for_ollama(self):
         stub_config = type(
@@ -636,12 +851,21 @@ class LLMSettingsTests(unittest.TestCase):
             async def json(self):
                 return self._payload
 
-        with patch.object(web_app.config_manager, "get", return_value=stub_config):
+        clear_model_metadata_cache()
+        with patch.object(web_app.config_manager, "get", return_value=stub_config), patch.object(
+            runtime_tuning, "fetch_ollama_model_metadata", return_value={}
+        ):
             result = asyncio.run(web_app.assess_max_tokens(StubRequest(request_payload)))
+        clear_model_metadata_cache()
 
-        self.assertEqual(result["status"], "info")
-        self.assertEqual(result["recommended_max_tokens"], 4096)
-        self.assertIn("provider-safe default", result["message"])
+        expected = recommend_settings(build_model_profile("ollama", "gpt-oss:20b"))
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["recommended_max_tokens"], expected["max_tokens"])
+        self.assertEqual(result["recommended_config"]["max_tokens"], expected["max_tokens"])
+        self.assertTrue(result["recommended_config"]["auto_tune"])
+        self.assertEqual(result["tuning"]["source"], "model catalog")
+        self.assertLessEqual(result["tuning"]["context_window"], 32768)
+        self.assertIn("output tokens", result["message"])
 
     def test_assess_max_tokens_skips_openai_image_models(self):
         stub_config = type(
@@ -835,6 +1059,7 @@ class LLMSettingsTests(unittest.TestCase):
             async def generate_response(self, messages, max_tokens, temperature):
                 return "test successful"
 
+        clear_model_metadata_cache()
         with patch.object(web_app.config_manager, "get", return_value=stub_config), patch.object(
             web_app.httpx,
             "AsyncClient",
@@ -843,20 +1068,69 @@ class LLMSettingsTests(unittest.TestCase):
             web_app.LLMClientFactory,
             "create_client",
             return_value=StubLLMClient(),
-        ) as create_client_mock:
+        ) as create_client_mock, patch.object(runtime_tuning, "fetch_ollama_model_metadata", return_value={}):
             result = asyncio.run(web_app.test_llm_connection(StubRequest(request_payload)))
+        clear_model_metadata_cache()
 
+        expected = recommend_settings(build_model_profile("ollama", "gpt-oss:20b"))
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["endpoint"], web_app.DEFAULT_OLLAMA_ENDPOINT_URL)
         self.assertEqual(result["tests"]["connection"]["status"], "success")
         self.assertEqual(result["tests"]["model"]["status"], "success")
-        self.assertEqual(result["tests"]["max_tokens"]["detected_max"], 4096)
-        create_client_mock.assert_called_once_with(
-            provider="ollama",
-            custom_endpoint=web_app.DEFAULT_OLLAMA_ENDPOINT_URL,
-            api_key="",
-            model="gpt-oss:20b",
-        )
+        self.assertEqual(result["tests"]["max_tokens"]["detected_max"], expected["max_tokens"])
+        self.assertEqual(result["recommended_config"]["max_tokens"], expected["max_tokens"])
+        self.assertEqual(result["tuning"]["request_timeout"], expected["request_timeout"])
+        create_client_mock.assert_called_once()
+        call_kwargs = create_client_mock.call_args.kwargs
+        self.assertEqual(call_kwargs["provider"], "ollama")
+        self.assertEqual(call_kwargs["custom_endpoint"], web_app.DEFAULT_OLLAMA_ENDPOINT_URL)
+        self.assertEqual(call_kwargs["api_key"], "")
+        self.assertEqual(call_kwargs["model"], "gpt-oss:20b")
+        self.assertEqual(call_kwargs["tuning"]["num_ctx"], expected["num_ctx"])
+        self.assertEqual(call_kwargs["tuning"]["ollama_think"], "low")
+
+    def test_test_llm_connection_reports_missing_ollama_model(self):
+        stub_config = type(
+            "StubConfig",
+            (),
+            {"llm": type("StubLLM", (), {"provider": "ollama", "api_key": "", "model": "llama3.1:8b", "endpoint_url": None, "max_tokens": 4096, "temperature": 0.2})()},
+        )()
+
+        class StubRequest:
+            async def json(self):
+                return {"llm": {"provider": "ollama", "model": "not-installed:7b", "endpoint_url": ""}}
+
+        class StubResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"models": [{"name": "llama3.1:8b"}]}
+
+        class StubAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, headers=None):
+                return StubResponse()
+
+        with patch.object(web_app.config_manager, "get", return_value=stub_config), patch.object(
+            web_app.httpx, "AsyncClient", StubAsyncClient
+        ), patch.object(
+            web_app.LLMClientFactory, "create_client", side_effect=AssertionError("generation should not run")
+        ):
+            result = asyncio.run(web_app.test_llm_connection(StubRequest()))
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("ollama pull not-installed:7b", result["tests"]["connection"]["message"])
 
 
 class ChatSettingsTests(unittest.TestCase):
@@ -968,6 +1242,50 @@ class ChatHelperTests(unittest.TestCase):
 
         self.assertEqual(recommendations, [{"title": "Keep this recommendation", "priority": "high"}])
 
+    def test_analyze_result_rows_ranks_aggregated_values_by_their_count(self):
+        rows = [
+            {"sourcetype": "mcp_monitoring_dashboard", "count": "691"},
+            {"sourcetype": "mcp_server", "count": "14189"},
+            {"sourcetype": "mongod", "count": "7037"},
+            {"sourcetype": "node:sidecar:postgres:stdout", "count": "1113"},
+            {"sourcetype": "splunkd", "count": "25466"},
+            {"sourcetype": "splunkd_access", "count": "11535"},
+        ]
+
+        analysis = web_app.analyze_result_rows(rows)
+        top = analysis["top_dimensions"][0]
+        self.assertEqual(top["ranked_by"], "count")
+        self.assertEqual(top["values"][:3], ["splunkd (25,466)", "mcp_server (14,189)", "splunkd_access (11,535)"])
+        self.assertEqual(len(top["values"]), 5)
+        self.assertEqual(analysis["next_pivots"][0], "Filter on sourcetype=splunkd")
+
+        summary = web_app.summarize_tool_outcome("splunk_run_query", {"status": "data", "rows": rows})
+        brief = web_app.format_result_summary_for_llm(summary)
+        self.assertIn("Top sourcetype values by count: splunkd (25,466), mcp_server (14,189)", brief)
+        self.assertIn("mongod (7,037)", brief)
+
+        zeros = [{"index": "a", "count": "0"}, {"index": "b", "count": "0"}]
+        self.assertEqual(web_app.analyze_result_rows(zeros)["top_dimensions"], [])
+    def test_analyze_result_rows_skips_splunk_internal_fields(self):
+        rows = [
+            {
+                "_bkt": f"_internal~1379~{i}", "_cd": f"1379:{8607542 + i}", "_serial": str(i), "_si": "splunk,_internal",
+                "_time": f"2026-11-09T13:2{i}:17", "_raw": f"URLError {i}", "date_hour": "13", "punct": "--_::",
+                "source": "/opt/splunk/var/log/splunk/python.log" if i % 2 else "/opt/splunk/var/log/splunk/splunkd.log",
+                "sourcetype": "splunk_python" if i % 2 else "splunkd",
+            }
+            for i in range(6)
+        ]
+
+        analysis = web_app.analyze_result_rows(rows)
+
+        self.assertTrue(analysis["top_dimensions"])
+        self.assertTrue(all(not item["field"].startswith(("_", "date_")) for item in analysis["top_dimensions"]))
+        self.assertNotIn("punct", [item["field"] for item in analysis["top_dimensions"]])
+        self.assertFalse(any("_cd" in pivot for pivot in analysis["next_pivots"]))
+        self.assertIn("_time", analysis["sample_fields"])
+        self.assertNotIn("_raw", analysis["sample_fields"])
+
     def test_persona_playbooks_ignore_non_mapping_recommendations(self):
         overview = type(
             "OverviewStub",
@@ -1066,14 +1384,52 @@ class ChatHelperTests(unittest.TestCase):
             web_app.chat_session_settings.clear()
             web_app.chat_session_settings.update(original_chat_settings)
 
+        expected = recommend_settings(build_model_profile("ollama", "gpt-oss:20b"))
         self.assertEqual(profile["provider"], "ollama")
-        self.assertEqual(profile["context_history_limit"], 4)
-        self.assertEqual(profile["initial_max_tokens"], 1200)
-        self.assertEqual(profile["followup_max_tokens"], 1400)
-        self.assertEqual(profile["final_max_tokens"], 1800)
-        self.assertEqual(profile["retry_max_tokens"], 1200)
-        self.assertAlmostEqual(profile["temperature_multiplier"], 0.9)
+        self.assertTrue(profile["auto_tune"])
+        self.assertEqual(profile["context_history_limit"], min(6, expected["chat"]["history_turns"]))
+        self.assertEqual(profile["final_max_tokens"], expected["max_tokens"])
+        self.assertEqual(profile["initial_max_tokens"], expected["chat"]["initial_max_tokens"])
+        self.assertLessEqual(profile["initial_max_tokens"], profile["final_max_tokens"])
+        self.assertLessEqual(profile["followup_max_tokens"], profile["final_max_tokens"])
+        # Reasoning models need room for hidden thinking tokens on every step.
+        self.assertGreaterEqual(profile["initial_max_tokens"], 2048)
+        self.assertAlmostEqual(profile["temperature"], 0.2)
+        self.assertLessEqual(profile["context_window"], 32768)
         self.assertIn("Do not emit <think>", profile["reasoning_guard"])
+
+    def test_build_chat_runtime_profile_respects_manual_settings_and_small_context(self):
+        manual_llm = type(
+            "LLMSettingsStub",
+            (),
+            {
+                "provider": "ollama",
+                "endpoint_url": "http://localhost:11434",
+                "model": "llama3:8b",
+                "auto_tune": False,
+                "max_tokens": 1500,
+                "temperature": 0.5,
+            },
+        )()
+        stub_config = type("Config", (), {"llm": manual_llm})()
+        original_chat_settings = dict(web_app.chat_session_settings)
+        try:
+            web_app.chat_session_settings["max_tokens"] = 16000
+            web_app.chat_session_settings["context_history"] = 6
+            profile = web_app.build_chat_runtime_profile(stub_config, None)
+            web_app.chat_session_settings["max_tokens"] = 1000
+            capped = web_app.build_chat_runtime_profile(stub_config, None)
+        finally:
+            web_app.chat_session_settings.clear()
+            web_app.chat_session_settings.update(original_chat_settings)
+
+        self.assertFalse(profile["auto_tune"])
+        self.assertEqual(profile["final_max_tokens"], 1500)
+        self.assertAlmostEqual(profile["temperature"], 0.5)
+        # llama3 (not 3.1) ships an 8K context, so history and evidence shrink.
+        self.assertEqual(profile["context_history_limit"], 2)
+        self.assertTrue(profile["use_compact_prompt"])
+        self.assertEqual(capped["final_max_tokens"], 1000)
 
     def test_extract_primary_spl_query_prefers_last_non_empty_query(self):
         tool_calls = [
@@ -2321,7 +2677,8 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             web_app.discover_mcp_tools = stub_discover_mcp_tools
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
             web_app.chat_session_settings["enable_rag_context"] = False
-            web_app.chat_session_settings["context_history"] = 6
+            # The session history cap applies even when the model's context allows more turns.
+            web_app.chat_session_settings["context_history"] = 4
             web_app.chat_session_settings["max_tokens"] = 16000
 
             try:
@@ -2353,9 +2710,10 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                 web_app.chat_agent_memory.clear()
                 web_app.chat_agent_memory.update(original_cache)
 
+        expected = recommend_settings(build_model_profile("ollama", "gpt-oss:20b"))
         self.assertEqual(result.get("response"), "Ollama runtime profile applied.")
-        self.assertEqual(captured.get("max_tokens"), 1200)
-        self.assertAlmostEqual(captured.get("temperature"), 0.63)
+        self.assertEqual(captured.get("max_tokens"), expected["chat"]["initial_max_tokens"])
+        self.assertAlmostEqual(captured.get("temperature"), 0.2)
         self.assertEqual(
             [msg.get("content") for msg in captured.get("messages", []) if msg.get("role") in {"user", "assistant"}],
             ["Turn 3", "Turn 4", "Turn 5", "Turn 6", "Summarize the current platform state."],

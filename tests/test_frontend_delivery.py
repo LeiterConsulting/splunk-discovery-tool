@@ -246,7 +246,7 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("endpoint_url: (provider !== 'openai' && endpointUrlInput) ? endpointUrlInput.value : null", template_source)
         self.assertIn("const normalizeProvider = (provider, endpointUrl = '') => {", template_source)
         self.assertIn("if (value === 'custom' && (endpointValue.includes('ollama') || endpointValue.includes(':11434'))) return 'ollama';", template_source)
-        self.assertIn("<span><span class=\"font-semibold text-gray-700\">Provider:</span> ${provider}</span>", template_source)
+        self.assertIn("<span><span class=\"font-semibold text-gray-700\">Provider:</span> ${escapeSettingsHtml(provider)}</span>", template_source)
 
     def test_construct_theme_is_session_gated_and_scoped_to_priority_surfaces(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")

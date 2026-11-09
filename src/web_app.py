@@ -31,6 +31,7 @@ import threading
 from urllib.parse import quote, urlencode
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, Tuple
 import uvicorn
 import httpx
@@ -59,7 +60,44 @@ from llm.factory import (
     normalize_ollama_endpoint_url,
     normalize_provider_name,
 )
+from llm.model_profiles import (
+    budget_tokens,
+    describe_profile,
+    parse_ollama_model_entry,
+    parse_openai_compatible_model_entry,
+    rank_models,
+    remember_model_metadata,
+)
+from llm.runtime_tuning import (
+    client_tuning,
+    lookup_model_metadata,
+    resolve_llm_tuning,
+    runtime_provider_for,
+)
 from discovery.context_manager import get_context_manager
+from discovery.local_analyzer import metadata_recent_time_utc
+from chat_agent import (
+    announces_unexecuted_search,
+    build_grounded_chat_prompt,
+    build_tool_catalog_text,
+    build_tool_feedback,
+    classify_tool_result,
+    format_mission_context,
+    index_agnostic_signature,
+    is_small_talk,
+    normalize_mission,
+    render_rows_for_llm,
+    tool_call_signature,
+)
+from mcp_tool_args import adapt_tool_arguments, parse_jsonrpc_error
+from spl.spl_utils import (
+    BLOCKED_COMMANDS as SPL_BLOCKED_COMMANDS,
+    assess_spl_safety,
+    ensure_spl_time_bounds,
+    extract_json_payload,
+    extract_spl_entities,
+    scope_spl_to_index,
+)
 from frontend_legacy import get_frontend_html
 from security_manager import SecurityManager
 
@@ -2569,8 +2607,48 @@ def detect_chat_runtime_provider(config: Any, llm_client: Any = None) -> str:
     return configured_provider or runtime_provider or "generic"
 
 
+LOCAL_RUNTIME_PROVIDERS = {"custom", "generic", "ollama", "vllm", "local-vllm"}
+REASONING_MARKUP_GUARD = (
+    "Do not emit <think>, </think>, <thinking>, or chain-of-thought markup. "
+    "Return either a direct answer or a single <TOOL_CALL> block plus one short sentence."
+)
+
+
+def resolve_active_llm_tuning(config: Any, allow_fetch: bool = False) -> Dict[str, Any]:
+    """Return the effective tuning for the configured model (profile, budgets, timeouts)."""
+    return resolve_llm_tuning(getattr(config, "llm", None), allow_fetch=allow_fetch)
+
+
+def get_effective_llm_max_tokens(config: Any) -> int:
+    """Return the output budget the app plans against for the configured model."""
+    try:
+        return int(resolve_active_llm_tuning(config)["max_tokens"])
+    except Exception:
+        try:
+            return max(512, int(getattr(getattr(config, "llm", None), "max_tokens", 4096) or 4096))
+        except (TypeError, ValueError):
+            return 4096
+
+
+def llm_call_budget(config: Any, fraction: float, floor: int = 768, ceiling: Optional[int] = None) -> int:
+    """Size one LLM call from the effective output budget, with a reasoning-aware floor."""
+    try:
+        tuning = resolve_active_llm_tuning(config)
+        effective_max = int(tuning["max_tokens"])
+        reasoning = bool(tuning.get("reasoning"))
+    except Exception:
+        effective_max = get_effective_llm_max_tokens(config)
+        reasoning = False
+    if reasoning:
+        # Hidden reasoning tokens count against the budget, so small caps return empty text.
+        floor = max(floor, 2048)
+        if ceiling:
+            ceiling = max(ceiling, floor)
+    return budget_tokens(effective_max, fraction, floor, ceiling)
+
+
 def build_chat_runtime_profile(config: Any, llm_client: Any = None) -> Dict[str, Any]:
-    """Return provider-aware chat behavior defaults for the active runtime."""
+    """Return chat budgets and prompt behavior tuned to the active model."""
     try:
         session_max_tokens = int(chat_session_settings.get("max_tokens", 16000) or 16000)
     except (TypeError, ValueError):
@@ -2582,50 +2660,48 @@ def build_chat_runtime_profile(config: Any, llm_client: Any = None) -> Dict[str,
 
     effective_provider = detect_chat_runtime_provider(config, llm_client)
     model_name = str(getattr(getattr(config, "llm", None), "model", "") or "").strip().lower()
+    tuning = resolve_active_llm_tuning(config)
+    budgets = dict(tuning.get("chat") or {})
+    session_cap = max(256, session_max_tokens)
 
-    profile = {
+    def _cap(value: Any) -> int:
+        return int(max(256, min(int(value or 1024), session_cap)))
+
+    local_runtime = effective_provider in LOCAL_RUNTIME_PROVIDERS
+    small_context = int(tuning.get("context_window") or 0) <= 16384
+    temperature = tuning.get("temperature")
+    if chat_settings_explicit_overrides.get("temperature") and tuning.get("supports_temperature", True):
+        try:
+            temperature = max(0.0, min(2.0, float(chat_session_settings.get("temperature"))))
+        except (TypeError, ValueError):
+            pass
+
+    return {
         "provider": effective_provider,
         "model": model_name,
-        "use_compact_prompt": effective_provider in {"custom", "generic", "ollama", "vllm", "local-vllm"},
-        "short_circuit_greetings": effective_provider in {"custom", "generic", "ollama", "vllm", "local-vllm"},
-        "context_history_limit": max(1, context_history_limit),
-        "initial_max_tokens": max(400, min(2000, int(session_max_tokens * 0.15))),
-        "followup_max_tokens": max(500, min(2500, int(session_max_tokens * 0.18))),
-        "final_max_tokens": max(600, min(3000, int(session_max_tokens * 0.25))),
-        "retry_max_tokens": max(400, min(2000, int(session_max_tokens * 0.15))),
+        "auto_tune": bool(tuning.get("auto_tune", True)),
+        "use_compact_prompt": local_runtime or small_context,
+        "short_circuit_greetings": local_runtime,
+        "context_history_limit": max(1, min(context_history_limit, int(budgets.get("history_turns") or context_history_limit))),
+        "initial_max_tokens": _cap(budgets.get("initial_max_tokens")),
+        "followup_max_tokens": _cap(budgets.get("followup_max_tokens")),
+        "final_max_tokens": _cap(budgets.get("final_max_tokens")),
+        "retry_max_tokens": _cap(budgets.get("retry_max_tokens")),
+        "evidence_rows": int(budgets.get("evidence_rows") or 10),
+        "evidence_chars": int(budgets.get("evidence_chars") or 6000),
+        "prompt_budget_tokens": int(budgets.get("prompt_budget_tokens") or 6000),
+        "context_window": int(tuning.get("context_window") or 0),
+        "supports_tools": bool(tuning.get("supports_tools")),
+        "reasoning": bool(tuning.get("reasoning")),
+        "temperature": 0.2 if temperature is None else float(temperature),
         "temperature_multiplier": 1.0,
-        "reasoning_guard": "",
+        "reasoning_guard": REASONING_MARKUP_GUARD if (local_runtime or tuning.get("reasoning")) else "",
     }
-
-    if effective_provider == "ollama":
-        profile.update({
-            "use_compact_prompt": True,
-            "short_circuit_greetings": True,
-            "context_history_limit": min(profile["context_history_limit"], 4),
-            "initial_max_tokens": max(384, min(1200, int(session_max_tokens * 0.10))),
-            "followup_max_tokens": max(512, min(1400, int(session_max_tokens * 0.12))),
-            "final_max_tokens": max(640, min(1800, int(session_max_tokens * 0.16))),
-            "retry_max_tokens": max(384, min(1200, int(session_max_tokens * 0.10))),
-            "temperature_multiplier": 0.9,
-            "reasoning_guard": (
-                "8) Do not emit <think>, </think>, <thinking>, or chain-of-thought markup. "
-                "Return either a direct answer or a single <TOOL_CALL> block plus one short sentence."
-            ),
-        })
-
-    if effective_provider in {"vllm", "local-vllm"}:
-        profile.update({
-            "use_compact_prompt": True,
-            "short_circuit_greetings": True,
-            "context_history_limit": min(profile["context_history_limit"], 5),
-            "temperature_multiplier": 0.95,
-        })
-
-    return profile
 
 
 chat_settings_explicit_overrides = {
     "enable_rag_context": False,
+    "temperature": False,
 }
 
 
@@ -2634,14 +2710,19 @@ def sync_chat_settings_with_capability_defaults() -> None:
     if not chat_settings_explicit_overrides.get("enable_rag_context", False):
         chat_session_settings["enable_rag_context"] = should_enable_rag_context_by_default()
 
+def _llm_client_cache_key(llm_config: Any) -> int:
+    fields = (
+        "provider", "endpoint_url", "model", "api_key", "auto_tune", "context_window",
+        "request_timeout", "reasoning_effort", "max_tokens", "temperature",
+    )
+    return hash(tuple(str(getattr(llm_config, name, "")) for name in fields))
+
+
 def get_or_create_llm_client(config):
     """Get cached LLM client or create new one if config changed."""
     global _cached_llm_client, _cached_config_hash
 
-    # Generate hash from relevant config values
-    config_hash = hash(f"{config.llm.provider}{config.llm.endpoint_url}{config.llm.model}{config.llm.api_key}")
-
-    # Return cached client if config hasn't changed
+    config_hash = _llm_client_cache_key(config.llm)
     if _cached_llm_client is not None and _cached_config_hash == config_hash:
         return _cached_llm_client
 
@@ -2651,13 +2732,19 @@ def get_or_create_llm_client(config):
     if provider_name in {"azure", "custom"} and not endpoint_url:
         raise ValueError(f"Provider '{config.llm.provider}' requires endpoint_url")
 
+    tuning = resolve_active_llm_tuning(config, allow_fetch=True)
     _cached_llm_client = LLMClientFactory.create_client(
         provider=provider_name,
         custom_endpoint=endpoint_url,
         api_key=config.llm.api_key,
-        model=config.llm.model
+        model=config.llm.model,
+        tuning=client_tuning(tuning),
     )
-    print(f"[LLM Cache] Created {provider_name} client ({config.llm.model})")
+    print(
+        f"[LLM Cache] Created {provider_name} client ({config.llm.model}): "
+        f"max_tokens={tuning.get('max_tokens')} context={tuning.get('context_window')} "
+        f"timeout={tuning.get('request_timeout')}s auto_tune={tuning.get('auto_tune')}"
+    )
 
     _cached_config_hash = config_hash
     return _cached_llm_client
@@ -3203,8 +3290,42 @@ MCP_TOOL_DESCRIPTIONS = {
 _cached_mcp_tools = {
     "identity": None,
     "tools": set(),
+    "descriptions": {},
+    "schemas": {},
     "timestamp": 0.0
 }
+
+MCP_QUERY_TIMEOUT_SECONDS = 120.0
+MCP_METADATA_TIMEOUT_SECONDS = 45.0
+_mcp_request_counter = {"value": 0}
+
+
+def _next_mcp_request_id() -> int:
+    _mcp_request_counter["value"] += 1
+    return _mcp_request_counter["value"]
+
+
+def _mcp_call_timeout(tool_name: str) -> float:
+    override = os.environ.get("DT4SMS_MCP_TIMEOUT_SECONDS", "").strip()
+    if override:
+        try:
+            return max(5.0, float(override))
+        except ValueError:
+            pass
+    if tool_name in {"splunk_run_query", "run_splunk_query"}:
+        return MCP_QUERY_TIMEOUT_SECONDS
+    return MCP_METADATA_TIMEOUT_SECONDS
+
+
+def get_cached_mcp_tool_metadata(config: Any = None) -> Dict[str, Dict[str, Any]]:
+    """Return descriptions and input schemas from the last tools/list call."""
+    identity = _build_mcp_runtime_identity(config) if config is not None else _cached_mcp_tools.get("identity")
+    if identity is None or _cached_mcp_tools.get("identity") != identity:
+        return {"descriptions": {}, "schemas": {}}
+    return {
+        "descriptions": dict(_cached_mcp_tools.get("descriptions") or {}),
+        "schemas": dict(_cached_mcp_tools.get("schemas") or {}),
+    }
 
 DISCOVERY_PIPELINE_VERSION = "v2"
 OPENAI_IMAGE_MODEL = "gpt-image-2"
@@ -4048,6 +4169,7 @@ discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL] = discovery_runtime_state
 _persist_runtime_state()
 
 chat_agent_memory: Dict[str, Dict[str, Any]] = {}
+_chat_memory_write_lock = threading.Lock()
 
 
 def sanitize_chat_session_id(chat_session_id: str) -> str:
@@ -4089,7 +4211,8 @@ def _default_chat_memory(chat_session_id: str) -> Dict[str, Any]:
         },
         "time_preferences": [],
         "last_tools_used": [],
-        "last_result": {}
+        "last_result": {},
+        "mission": "",
     }
 
 
@@ -4121,12 +4244,20 @@ def save_chat_memory(chat_session_id: str, memory: Dict[str, Any]) -> None:
     memory["updated_at"] = datetime.now().isoformat()
     chat_agent_memory[session_key] = memory
 
+    path = _get_memory_store_path(session_key)
+    # Concurrent chat requests for one session must never leave a half-written memory file behind.
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        path = _get_memory_store_path(session_key)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(memory, f, indent=2)
+        with _chat_memory_write_lock:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(memory, f, indent=2, default=str)
+            os.replace(temp_path, path)
     except Exception:
-        pass
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
 
 def _append_unique(target_list: List[str], values: List[str], limit: int = 25) -> List[str]:
@@ -4160,10 +4291,11 @@ def _extract_memory_signals(text: str) -> Dict[str, List[str]]:
     terms.extend(re.findall(r'"([^"\n]{2,80})"', text))
     terms.extend(re.findall(r"'([^'\n]{2,80})'", text))
 
-    indexes = re.findall(r'index=([\w\*\-\.]+)', text, flags=re.IGNORECASE)
-    sourcetypes = re.findall(r'sourcetype=([\w\*\-:\.]+)', text, flags=re.IGNORECASE)
-    hosts = re.findall(r'host=([\w\*\-\.]+)', text, flags=re.IGNORECASE)
-    sources = re.findall(r'source=([^\s\|]+)', text, flags=re.IGNORECASE)
+    # A bare "*" is not a usable anchor for follow-on searches, so it is dropped.
+    indexes = [value for value in re.findall(r'\bindex\s*=\s*"?([\w\*\-\.]+)', text, flags=re.IGNORECASE) if value.strip("*")]
+    sourcetypes = [value for value in re.findall(r'\bsourcetype\s*=\s*"?([\w\*\-:\.]+)', text, flags=re.IGNORECASE) if value.strip("*")]
+    hosts = [value for value in re.findall(r'\bhost\s*=\s*"?([\w\*\-\.]+)', text, flags=re.IGNORECASE) if value.strip("*")]
+    sources = [value for value in re.findall(r'\bsource\s*=\s*"?([^\s\|"]+)', text, flags=re.IGNORECASE) if value.strip("*")]
 
     natural_language_index = extract_index_from_message(text)
     if natural_language_index:
@@ -4205,10 +4337,10 @@ def _extract_memory_signals(text: str) -> Dict[str, List[str]]:
 
     return {
         "terms": terms,
-        "indexes": indexes,
-        "sourcetypes": sourcetypes,
-        "hosts": hosts,
-        "sources": sources,
+        "indexes": list(dict.fromkeys(indexes)),
+        "sourcetypes": list(dict.fromkeys(sourcetypes)),
+        "hosts": list(dict.fromkeys(hosts)),
+        "sources": list(dict.fromkeys(sources)),
         "time_preferences": time_preferences,
         "intent": intent
     }
@@ -4239,7 +4371,8 @@ def _extract_last_result_context(tool_calls: Optional[List[Dict[str, Any]]]) -> 
         return ""
 
     index_value = query_signals.get("indexes", [])[-1] if query_signals.get("indexes") else _pick_from_row(["index", "INDEX"])
-    host_value = query_signals.get("hosts", [])[-1] if query_signals.get("hosts") else _pick_from_row(["host", "HOST", "src", "src_ip", "dest"])
+    # Only real host fields: src/dest values are not Splunk hosts, so host=<src> pivots would miss.
+    host_value = query_signals.get("hosts", [])[-1] if query_signals.get("hosts") else _pick_from_row(["host", "HOST"])
     sourcetype_value = query_signals.get("sourcetypes", [])[-1] if query_signals.get("sourcetypes") else _pick_from_row(["sourcetype", "SOURCETYPE"])
 
     result_fields = summary.get("sample_fields", []) if isinstance(summary.get("sample_fields", []), list) else []
@@ -4815,8 +4948,8 @@ def _detect_conversation_focus(
         return "security"
     if any(token in focus_text for token in ["platform health", "_internal", "_audit", "_introspection", "ingestion", "license", "scheduler", "search failure", "splunk health"]):
         return "platform_health"
-    if any(token in focus_text for token in ["wmata", "api availability", "collector", "latency spike", "feed health"]):
-        return "wmata"
+    if any(token in focus_text for token in ["api availability", "collector", "latency spike", "feed health", "error rate", "response time", "uptime"]):
+        return "service_health"
     if any(token in focus_text for token in ["network", "latency", "packet loss", "connectivity", "ping"]):
         return "network"
     if any(token in focus_text for token in ["compliance", "audit", "governance", "admin action", "privileged action"]):
@@ -4894,17 +5027,17 @@ def _build_focus_follow_on_actions(
                 "inspect_ingestion_failures",
             ),
         ])
-    elif focus == "wmata":
+    elif focus == "service_health":
         actions.extend([
             _make_follow_on_action(
-                "Review WMATA feed health",
-                "Check WMATA API and collector data over the last 24 hours for outages, elevated errors, and latency spikes.",
-                "validate_wmata_health",
+                "Review service feed health",
+                f"Check the API or collector data{index_clause} over {time_window_label} for outages, elevated errors, and latency spikes.",
+                "validate_service_health",
             ),
             _make_follow_on_action(
-                "Compare WMATA sources",
-                "Compare WMATA sources or collectors by error rate and response time over the last 24 hours.",
-                "compare_wmata_sources",
+                "Compare sources by error rate",
+                f"Compare sources or collectors{index_clause} by error rate and response time over {time_window_label}.",
+                "compare_service_sources",
             ),
         ])
     elif focus == "network":
@@ -5323,17 +5456,38 @@ def build_follow_on_actions(
         last_call = next((call for call in reversed(tool_calls) if isinstance(call, dict)), {})
         latest_summary = last_call.get("summary", {}) if isinstance(last_call.get("summary", {}), dict) else {}
 
+    latest_status = str(latest_summary.get("status") or "").strip().lower()
+    mission = normalize_mission(memory.get("mission")) if isinstance(memory, dict) else ""
     response_actions = _extract_response_follow_on_actions(effective_assistant_response)
-    output_actions = _build_output_follow_on_actions(latest_summary, remembered_index, remembered_host, time_window_label)
+
+    if tool_calls and latest_status == "error":
+        # Re-running a failed search with a wider window or a pivot fails the same way;
+        # the useful next step is to repair it or confirm the names it relies on.
+        actions.extend(response_actions)
+        actions.append(_build_failed_search_follow_on_action(tool_calls, latest_summary))
+        if remembered_index:
+            actions.append(_make_follow_on_action(
+                "List available indexes",
+                "List indexes",
+                "list_indexes",
+            ))
+        return _dedupe_follow_on_actions(actions, limit=3)
+
+    latest_has_no_data = bool(tool_calls) and (
+        _safe_int(latest_summary.get("row_count")) == 0 or bool(latest_summary.get("zero_counts"))
+    )
+    output_actions = [] if latest_has_no_data else _build_output_follow_on_actions(
+        latest_summary, remembered_index, remembered_host, time_window_label
+    )
     focus_actions = _build_focus_follow_on_actions(focus, remembered_index, remembered_host, time_window_label)
 
     actions.extend(response_actions)
 
     if output_actions:
         actions.extend(output_actions)
-        if focus in {"security", "platform_health", "wmata", "network", "compliance", "recommendations", "top_risks", "coverage_gaps", "use_cases", "readiness"}:
+        if focus in {"security", "platform_health", "service_health", "network", "compliance", "recommendations", "top_risks", "coverage_gaps", "use_cases", "readiness"}:
             actions.extend(focus_actions[:1])
-    else:
+    elif not latest_has_no_data:
         actions.extend(focus_actions)
 
     if tool_calls:
@@ -5341,10 +5495,11 @@ def build_follow_on_actions(
         summary = last_call.get("summary", {}) if isinstance(last_call, dict) else {}
         row_count = _safe_int(summary.get("row_count"))
 
-        if row_count == 0:
-            broaden_prompt = "Retry the last search over the last 7 days and tell me whether any relevant data exists."
+        if latest_has_no_data:
+            wider_window = _wider_time_window_label(earliest_time)
+            broaden_prompt = f"Retry the last search over the {wider_window} and tell me whether any relevant data exists."
             if remembered_index:
-                broaden_prompt = f"Retry the last search for index={remembered_index} over the last 7 days and tell me whether any relevant data exists."
+                broaden_prompt = f"Retry the last search for index={remembered_index} over the {wider_window} and tell me whether any relevant data exists."
             actions.append(_make_follow_on_action("Broaden the time range", broaden_prompt, "broaden_time"))
             if remembered_index:
                 actions.append(_make_follow_on_action(
@@ -5378,6 +5533,16 @@ def build_follow_on_actions(
                     "host_pivot",
                 ))
 
+    if mission:
+        actions.insert(min(2, len(actions)), _make_follow_on_action(
+            "Next step for the mission",
+            (
+                f"Based on what we found so far, run the next most useful search for my mission: {mission[:200]}. "
+                "Then summarize progress and what is still unknown."
+            ),
+            "advance_mission",
+        ))
+
     if not actions:
         if remembered_index:
             actions.append(_make_follow_on_action(
@@ -5393,6 +5558,32 @@ def build_follow_on_actions(
             ))
 
     return _dedupe_follow_on_actions(actions, limit=3)
+
+
+def _wider_time_window_label(earliest_time: str) -> str:
+    earliest = str(earliest_time or "").strip().lower()
+    if earliest in {"-30d", "-30d@d", "-1mon", "-1mon@mon"}:
+        return "last 90 days"
+    if earliest in {"-7d", "-7d@d", "-1w", "-1w@w", "-14d"}:
+        return "last 30 days"
+    return "last 7 days"
+
+
+def _build_failed_search_follow_on_action(
+    tool_calls: List[Dict[str, Any]],
+    latest_summary: Dict[str, Any],
+) -> Dict[str, str]:
+    last_call = next((call for call in reversed(tool_calls) if isinstance(call, dict)), {})
+    args = last_call.get("args", {}) if isinstance(last_call.get("args", {}), dict) else {}
+    failed_query = str(args.get("query") or "").strip()
+    error_text = re.sub(r"\s+", " ", str(latest_summary.get("message") or "")).strip()
+    prompt = "The last Splunk request failed"
+    if error_text:
+        prompt += f" with this error: {error_text[:240]}"
+    prompt += ". Explain the likely cause, correct the request, and run it again."
+    if failed_query:
+        prompt += f"\n\nFailed search: {failed_query[:400]}"
+    return _make_follow_on_action("Fix the failed search", prompt, "repair_failed_search")
 
 
 def resolve_tool_name(tool_name: str, available_tools: Optional[set] = None) -> str:
@@ -5418,13 +5609,15 @@ def normalize_tool_arguments(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
     if tool_name in {"splunk_get_info", "get_splunk_info", "splunk_get_user_info", "splunk_get_user_list", "get_user_list"}:
         return {}
 
+    # The GA Splunk MCP server names these arguments index_name and type. When a
+    # live input schema is cached, execute_mcp_tool_call adapts names to it.
     if tool_name in {"splunk_get_index_info", "get_index_info"}:
-        if "index_name" in normalized and "index" not in normalized:
-            normalized["index"] = normalized.pop("index_name")
+        if "index" in normalized and "index_name" not in normalized:
+            normalized["index_name"] = normalized.pop("index")
 
     if tool_name in {"splunk_get_knowledge_objects", "get_knowledge_objects"}:
-        if "type" in normalized and "object_type" not in normalized:
-            normalized["object_type"] = normalized["type"]
+        if "object_type" in normalized and "type" not in normalized:
+            normalized["type"] = normalized.pop("object_type")
 
     return normalized
 
@@ -5648,7 +5841,9 @@ def detect_last_offline_target(user_message: str) -> Optional[str]:
         return None
 
     message = user_message.strip().lower()
-    if "offline" not in message and "down" not in message:
+    # Word boundaries keep "breakdown", "download" and "slowdown" from reading as "down".
+    offline_wording = re.compile(r"\b(?:offline|down|unreachable)\b")
+    if not offline_wording.search(message):
         return None
 
     patterns = [
@@ -5664,7 +5859,7 @@ def detect_last_offline_target(user_message: str) -> Optional[str]:
             return match.group(1).strip()
 
     ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", message)
-    if ip_match and ("offline" in message or "down" in message):
+    if ip_match:
         return ip_match.group(1)
 
     return None
@@ -5861,41 +6056,84 @@ def detect_basic_inventory_intent(user_message: str, memory: Optional[Dict[str, 
     if not isinstance(user_message, str):
         return None
     message = user_message.lower()
-    remembered_index = extract_index_from_message(user_message) or _remembered_entity(memory or {}, "index")
-    remembered_host = extract_host_or_ip_from_message(user_message) or _remembered_entity(memory or {}, "host")
+    explicit_index = extract_index_from_message(user_message)
+    explicit_host = extract_host_or_ip_from_message(user_message)
+    remembered_index = explicit_index or _remembered_entity(memory or {}, "index")
+    remembered_host = explicit_host or _remembered_entity(memory or {}, "host")
 
-    if remembered_index and any(token in message for token in ["timechart", "trend over time", "volume over time", "show trend"]):
-        return "timechart_index_trend"
-    if remembered_index and any(token in message for token in ["break it down", "breakdown", "by sourcetype", "by host"]):
-        return "breakdown_index"
-    if remembered_index and any(token in message for token in ["baseline count", "baseline check", "confirm data availability", "data availability"]):
-        return "baseline_index_check"
-    if remembered_host and any(token in message for token in ["pivot on host", "investigate host", "related anomalies", "host anomalies"]):
-        return "host_pivot"
+    def _mentions(tokens: List[str]) -> bool:
+        return any(token in message for token in tokens)
 
-    if any(token in message for token in ["list indexes", "show indexes", "what indexes", "available indexes"]):
-        return "list_indexes"
-    if any(token in message for token in ["top indexes", "largest indexes", "most active indexes", "indexes by volume"]):
-        return "top_indexes"
-    if any(token in message for token in ["events by index", "event count by index", "count by index"]):
-        return "top_indexes"
-    if any(token in message for token in ["top errors", "most errors", "error summary", "error breakdown"]):
-        return "top_errors"
-    if any(token in message for token in ["auth failures", "authentication failures", "failed logins", "login failures"]):
-        return "latest_auth_failures"
-    if any(token in message for token in ["how many events in index", "event count for index", "count events in index", "events in index"]):
-        if extract_index_from_message(user_message):
-            return "count_index_events"
-    if any(token in message for token in ["list sourcetypes", "show sourcetypes", "what sourcetypes"]):
-        return "list_sourcetypes"
-    if any(token in message for token in ["list hosts", "show hosts", "what hosts", "active hosts"]):
-        return "list_hosts"
-    if any(token in message for token in ["last seen", "latest heartbeat", "last heartbeat", "last event for host", "latest event for host"]):
-        if extract_host_or_ip_from_message(user_message):
-            return "latest_host_heartbeat"
-    if "template" in message and "splunk" in message and "edge processor" not in message:
-        return "list_templates"
+    candidates: List[Tuple[str, bool, List[Optional[str]]]] = [
+        ("timechart_index_trend", bool(remembered_index) and _mentions(["timechart", "trend over time", "volume over time", "show trend"]), [remembered_index]),
+        ("breakdown_index", bool(remembered_index) and _mentions(["break it down", "breakdown", "break down", "by sourcetype", "by host"]), [remembered_index]),
+        ("baseline_index_check", bool(remembered_index) and _mentions(["baseline count", "baseline check", "confirm data availability", "data availability"]), [remembered_index]),
+        ("host_pivot", bool(remembered_host) and _mentions(["pivot on host", "investigate host", "related anomalies", "host anomalies"]), [remembered_host, remembered_index]),
+        ("list_indexes", _mentions(["list indexes", "show indexes", "what indexes", "available indexes"]), []),
+        ("top_indexes", _mentions(["top indexes", "largest indexes", "most active indexes", "indexes by volume", "events by index", "event count by index", "count by index"]), []),
+        ("top_errors", _mentions(["top errors", "most errors", "error summary", "error breakdown"]), []),
+        ("latest_auth_failures", _mentions(["auth failures", "authentication failures", "failed logins", "login failures"]), []),
+        ("count_index_events", bool(explicit_index) and _mentions(["how many events in index", "event count for index", "count events in index", "events in index"]), [explicit_index]),
+        ("list_sourcetypes", _mentions(["list sourcetypes", "show sourcetypes", "what sourcetypes"]), []),
+        ("list_hosts", _mentions(["list hosts", "show hosts", "what hosts", "active hosts"]), []),
+        ("latest_host_heartbeat", bool(explicit_host) and _mentions(["last seen", "latest heartbeat", "last heartbeat", "last event for host", "latest event for host"]), [explicit_host]),
+        ("list_templates", "template" in message and "splunk" in message and "edge processor" not in message, []),
+    ]
+    for route, triggered, anchors in candidates:
+        if triggered and _is_plain_route_request(message, route, anchors):
+            return route
     return None
+
+
+_ROUTE_COMMON_WORDS = frozenset(
+    (
+        "a an the of for in on over to from by and or with within at me my our we us i you please can could would will "
+        "show give get tell run do does did is are was were be been what which what's whats there have has got it its "
+        "this that these those them same again also just only any all every each data event events index indexes "
+        "sourcetype sourcetypes host hosts source sources splunk environment last past previous recent recently during "
+        "hour hours day days week weeks month months minute minutes now today yesterday window time range spl "
+        "reusable query search"
+    ).split()
+)
+_ROUTE_WORDS: Dict[str, frozenset] = {
+    "timechart_index_trend": frozenset("timechart trend trends volume chart graph plot".split()),
+    "breakdown_index": frozenset("break breakdown down split group grouped".split()),
+    "baseline_index_check": frozenset("baseline check confirm availability available whether exists exist count counts".split()),
+    "host_pivot": frozenset("pivot investigate related anomalies anomaly identify unusual".split()),
+    "list_indexes": frozenset("list available".split()),
+    "top_indexes": frozenset("top largest biggest most active busiest volume count counts".split()),
+    "top_errors": frozenset("top most errors error summary breakdown".split()),
+    "latest_auth_failures": frozenset("auth authentication failures failure failed logins login latest".split()),
+    "count_index_events": frozenset("how many count number total".split()),
+    "list_sourcetypes": frozenset("list available".split()),
+    "list_hosts": frozenset("list available active sending reporting".split()),
+    "latest_host_heartbeat": frozenset("last seen latest heartbeat when".split()),
+    "list_templates": frozenset("template templates list available knowledge objects saved searches".split()),
+}
+_ROUTE_TIME_TOKEN = re.compile(r"^-?\d+[smhdwy]?$")
+
+
+def _is_plain_route_request(message: str, route: str, anchors: List[Optional[str]]) -> bool:
+    """True when the message asks only for what the deterministic ``route`` computes.
+
+    Routes run a fixed search, so a request with extra qualifiers ("break down
+    errors by host") must go to the model rather than get an unfiltered answer.
+    """
+    allowed = _ROUTE_COMMON_WORDS | _ROUTE_WORDS.get(route, frozenset())
+    anchor_values = {str(anchor).strip().lower() for anchor in anchors if anchor}
+    for raw_token in re.findall(r"[^\s,;?!()]+", message.lower()):
+        token = raw_token.strip(".'\"`:")
+        if not token or token in allowed or token in anchor_values or _ROUTE_TIME_TOKEN.match(token):
+            continue
+        key, separator, value = token.partition("=")
+        if separator:
+            value = value.strip("'\"")
+            if key in {"earliest", "latest"}:
+                continue
+            if key in {"index", "host"} and value in anchor_values:
+                continue
+        return False
+    return True
 
 
 def should_bypass_basic_inventory_intent(request: Optional[Dict[str, Any]]) -> bool:
@@ -5936,9 +6174,16 @@ def extract_host_or_ip_from_message(user_message: str) -> Optional[str]:
     ip_match = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", user_message)
     if ip_match:
         return ip_match.group(0)
-    host_match = re.search(r"host\s*[=:]?\s*([a-zA-Z0-9_\-.]+)", user_message, flags=re.IGNORECASE)
+    host_match = re.search(r"\bhost\s*[=:]\s*[\"']?([a-zA-Z0-9_][a-zA-Z0-9_\-.]*)", user_message, flags=re.IGNORECASE)
     if host_match:
-        return host_match.group(1).strip()
+        return host_match.group(1).strip().rstrip(".") or None
+    # Without "=" only accept names that look like hosts (router-01, web1.example.com),
+    # so phrases such as "host anomalies" or "hosts" are not read as host names.
+    host_match = re.search(r"\bhost\s+[\"']?([a-zA-Z0-9_]*[\d\-.][a-zA-Z0-9_\-.]*)", user_message, flags=re.IGNORECASE)
+    if host_match:
+        candidate = host_match.group(1).strip().rstrip(".")
+        if re.search(r"[a-zA-Z0-9]", candidate):
+            return candidate
     return None
 
 
@@ -5989,6 +6234,40 @@ def parse_tool_call_payload(raw_json: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Local models (notably Llama 3 through Ollama) sometimes leak chat-template tokens
+# or open their reply with a bare "assistant" role line.
+_CHAT_TEMPLATE_TOKEN_PATTERN = re.compile(
+    r'<\|(?:start_header_id|end_header_id|eot_id|im_start|im_end|begin_of_text|end_of_text)\|>'
+)
+_LEADING_ROLE_LABEL_PATTERN = re.compile(r'\A\s*assistant\s*(?::\s*|\n+)', re.IGNORECASE)
+
+
+_TOOL_JSON_START_RE = re.compile(r'\{\s*"tool"\s*:')
+_TRAILING_CODE_OPENER_RE = re.compile(r'(?:```[A-Za-z]*|`)\s*\Z')
+
+
+def _find_trailing_tool_call_json(response_text: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Find a {"tool": ..., "args": {...}} object that ends the reply, bare or in backticks/a fence.
+
+    Only a call at the very end counts; JSON followed by more prose reads as an example.
+    Returns the start offset of the object and the parsed payload.
+    """
+    if not isinstance(response_text, str) or '"tool"' not in response_text:
+        return None
+    decoder = json.JSONDecoder()
+    for match in _TOOL_JSON_START_RE.finditer(response_text):
+        try:
+            payload, end = decoder.raw_decode(response_text, match.start())
+        except json.JSONDecodeError:
+            continue
+        if response_text[end:].strip().strip('`').strip():
+            continue
+        tool = payload.get("tool") if isinstance(payload, dict) else None
+        if isinstance(tool, str) and tool.strip() and isinstance(payload.get("args", {}), dict):
+            return match.start(), payload
+    return None
+
+
 def sanitize_llm_response_text(text: str) -> str:
     """Remove control markup like TOOL_CALL/CONTEXT_REQUEST from user-facing text."""
     if not isinstance(text, str):
@@ -6000,11 +6279,38 @@ def sanitize_llm_response_text(text: str) -> str:
     cleaned = re.sub(r'<TOOL_CALL>.*?</TOOL_CALL>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<TOOL_CALL>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = cleaned.replace('</TOOL_CALL>', '')
+    trailing_call = _find_trailing_tool_call_json(cleaned)
+    if trailing_call:
+        cleaned = _TRAILING_CODE_OPENER_RE.sub('', cleaned[:trailing_call[0]])
+    cleaned = _CHAT_TEMPLATE_TOKEN_PATTERN.sub('', cleaned)
+    cleaned = _LEADING_ROLE_LABEL_PATTERN.sub('', cleaned, count=1)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
 
+UNSCOPED_SEARCH_NOTE = (
+    "Note: the search named no index, so index=* was added; without it Splunk only searches the role's default "
+    "indexes. index=* does not include internal indexes such as _internal or _audit, so name those explicitly."
+)
+
+
+def scope_unscoped_chat_search(tool_args: Dict[str, Any]) -> bool:
+    """Add index=* to an event search that names no index; True when the query changed."""
+    query = tool_args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return False
+    scoped = scope_spl_to_index(query, "*")
+    if scoped == query:
+        return False
+    tool_args["query"] = scoped
+    return True
+
+
 DEFAULT_DIRECT_CHAT_RESPONSE = "I couldn't generate a complete answer for that request. Please try again."
+UNEXECUTED_SEARCH_NUDGE = (
+    "You said you would run a search but did not include a TOOL_CALL. If live Splunk data is needed, "
+    "reply with only the TOOL_CALL now. Otherwise reply with your final answer."
+)
 DEFAULT_TOOL_INVESTIGATION_RESPONSE = "Investigation complete. See findings above."
 
 
@@ -6640,18 +6946,19 @@ def build_final_user_answer_prompt(
 3. Then summarize what happened when it ran, including specific data/numbers if available.
 4. End with any relevant context, caveats, or recommendations."""
     else:
-        instructions = """1. Direct answer to their question with specific data/numbers
-2. Key findings and patterns you discovered
-3. Any relevant context or recommendations"""
+        instructions = """1. Direct answer to their question with the specific numbers and values from the findings
+2. What was searched (SPL and time range) and what is still unchecked
+3. One or two concrete next steps"""
 
-    return f"""You successfully investigated the user's question: \"{user_message}\"
+    return f"""Write the final answer to the user's question: \"{user_message}\"
 
-ACCUMULATED FINDINGS:
+FINDINGS FROM THE SEARCHES THAT RAN:
 {insights_summary}
 
-Now provide a COMPLETE, USER-FACING answer that includes:
+Provide a COMPLETE, USER-FACING answer that includes:
 {instructions}
 
+Use only the findings above and the earlier tool results. A search with zero results only shows that nothing matched that search; do not treat it as proof that a system is healthy or broken. Event totals and index sizes do not show whether data is recent. Do not say you will run more searches; offer them as next steps.
 Write as if speaking directly to the user (avoid phrases like \"I investigated\", \"I found\", \"I will\", etc.)."""
 
 
@@ -6715,13 +7022,47 @@ def _recover_tool_call_from_tagged_payload(
     }
 
 
+_TOOL_CALL_OPEN_RE = re.compile(r"<\s*TOOL_CALL\s*>", re.IGNORECASE)
+
+
+def _extract_unterminated_tool_call(
+    response_text: str,
+    default_earliest: str = "-24h",
+    default_latest: str = "now",
+) -> Optional[Dict[str, Any]]:
+    """Read a valid JSON payload after <TOOL_CALL> when the closing tag is missing or misspelled."""
+    match = _TOOL_CALL_OPEN_RE.search(response_text)
+    if not match:
+        return None
+    remainder = response_text[match.end():].lstrip()
+    if not remainder.startswith("{"):
+        return None
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(remainder)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("tool"), str) or not payload["tool"].strip():
+        return None
+    args = dict(payload.get("args")) if isinstance(payload.get("args"), dict) else {}
+    if "query" in args:
+        args.setdefault("earliest_time", default_earliest)
+        args.setdefault("latest_time", default_latest)
+    return {"method": "tools/call", "params": {"name": payload["tool"].strip(), "arguments": args}}
+
+
 def extract_recoverable_tool_call(
     response_text: str,
     query_tool_name: str,
     default_earliest: str = "-24h",
     default_latest: str = "now",
 ) -> Optional[Dict[str, Any]]:
-    """Recover the next tool call from tagged JSON, malformed tags, bare JSON, or SPL text."""
+    """Recover the next tool call from tagged JSON, malformed tags, or a bare JSON payload.
+
+    A tool-call JSON object that ends the reply also counts, even inside
+    backticks or a code fence. SPL that only appears in prose or code fences is
+    never turned into a tool call: models routinely show example searches, and
+    running those would hit Splunk with queries nobody asked for.
+    """
     if not isinstance(response_text, str) or not response_text.strip():
         return None
 
@@ -6737,6 +7078,10 @@ def extract_recoverable_tool_call(
     )
     if recovered:
         return recovered
+
+    unterminated = _extract_unterminated_tool_call(response_text, default_earliest, default_latest)
+    if unterminated:
+        return unterminated
 
     stripped = response_text.strip()
     if stripped.startswith("{") and 'tool' in stripped:
@@ -6755,19 +7100,14 @@ def extract_recoverable_tool_call(
                 }
             }
 
-    spl_query = extract_spl_from_response_text(response_text)
-    if spl_query:
-        return {
-            "method": "tools/call",
-            "params": {
-                "name": query_tool_name,
-                "arguments": {
-                    "query": spl_query,
-                    "earliest_time": default_earliest,
-                    "latest_time": default_latest,
-                }
-            }
-        }
+    trailing_call = _find_trailing_tool_call_json(response_text)
+    if trailing_call:
+        payload = trailing_call[1]
+        args = dict(payload.get("args") or {})
+        if "query" in args:
+            args.setdefault("earliest_time", default_earliest)
+            args.setdefault("latest_time", default_latest)
+        return {"method": "tools/call", "params": {"name": payload["tool"].strip(), "arguments": args}}
 
     return None
 
@@ -6814,11 +7154,14 @@ def build_compact_chat_prompt(
     rag_context: str,
     memory_context: str,
     available_tools_text: str,
-    discovery_age_warning: Optional[str]
+    discovery_age_warning: Optional[str],
+    mission: str = "",
 ) -> str:
-    """Compact, deterministic-first prompt for reliable Splunk chat behavior."""
-    return f"""You are a precise Splunk assistant. Prioritize correctness over creativity.
-
+    """Compact, deterministic-first prompt for local and small-context models."""
+    mission_block = format_mission_context(mission)
+    mission_section = f"\n{mission_block}\n" if mission_block else ""
+    return f"""You are a helpful, precise Splunk assistant. You help the user work with their own Splunk data through MCP tools. Prioritize correctness over creativity.
+{mission_section}
 Context:
 {discovery_context}
 {rag_context}
@@ -6832,13 +7175,15 @@ Rules:
 1) Your primary expertise is DT4SMS, Splunk, discovery outputs, optional capabilities, and RAG context.
 2) You may answer broader questions directly, but do not claim tool-backed or environment-specific evidence unless it comes from the provided context or executed tools.
 3) When a session continuity gate is present, treat the current request as a follow-up unless the user clearly changes topic.
-4) For data requests, execute tools rather than guessing.
-5) If one query returns no data, broaden time range once and try a nearby index.
-6) If still no data, explicitly say no data found and show what was tried.
-7) Keep answers concise and factual.
+4) For live data requests, make a tool call instead of guessing. Use one tool call per reply and wait for the result.
+5) Only use index, sourcetype, and host names from the context or earlier results. Searches must be read-only.
+6) If a query returns no data, broaden once (wider time range, fewer filters, or index=* instead of one index at a time). If there is still no data, say so and show what was tried. Zero matches only means nothing matched that search; it does not show that a system is healthy or broken.
+7) Answer with the actual numbers from the results, name the SPL and time range you used, and keep it concise.
+8) Do not claim all or every host, target, or source is covered unless the results include the expected list; say what was observed instead.
+9) Event totals and index sizes do not show whether data is recent. Judge freshness only from latest-event times or time-bounded searches.
 
-Tool call format (required when querying):
-<TOOL_CALL>{{"tool": "{query_tool_name}", "args": {{"query": "search index=main | head 5", "earliest_time": "-24h", "latest_time": "now"}}}}</TOOL_CALL>
+Tool call format (required when querying; SPL in code fences is never executed):
+<TOOL_CALL>{{"tool": "{query_tool_name}", "args": {{"query": "| tstats count where index=* by index", "earliest_time": "-24h", "latest_time": "now"}}}}</TOOL_CALL>
 """
 
 
@@ -7587,6 +7932,7 @@ def register_discovery_session(
     personas: Optional[Dict[str, Any]] = None,
     readiness_score: Optional[int] = None,
     discovery_scope: Optional[Dict[str, Any]] = None,
+    discovery_quality: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Register a discovery session in manifest for retrieval and UI history."""
     sessions = load_discovery_sessions()
@@ -7610,13 +7956,14 @@ def register_discovery_session(
             "total_sourcetypes": getattr(overview, "total_sourcetypes", 0),
             "total_hosts": getattr(overview, "total_hosts", 0),
             "total_users": getattr(overview, "total_users", 0),
-            "data_volume_24h": getattr(overview, "data_volume_24h", "unknown"),
+            "data_volume_24h": _format_data_volume(getattr(overview, "data_volume_24h", None)),
             "splunk_version": getattr(overview, "splunk_version", "unknown")
         },
         "report_paths": report_paths,
         "mcp_capabilities": mcp_capabilities,
         "personas": personas or {},
         "readiness_score": readiness_score if isinstance(readiness_score, int) else 0,
+        "discovery_quality": discovery_quality if isinstance(discovery_quality, dict) else {},
         "stats": {
             "discovery_steps": discovery_step_count,
             "classification_groups": len(classifications) if isinstance(classifications, dict) else 0,
@@ -8379,6 +8726,71 @@ def _context_explorer_has_structured_patterns(context_explorer: Any) -> bool:
     return True
 
 
+def _format_data_volume(value: Any) -> str:
+    """Render the 24h ingest volume (megabytes from license usage) for people; missing data stays explicit."""
+    if value is None or isinstance(value, bool):
+        return "Unavailable"
+    if isinstance(value, (int, float)):
+        megabytes = float(value)
+        if megabytes >= 1024 * 1024:
+            return f"{megabytes / 1024 / 1024:,.2f} TB"
+        if megabytes >= 1024:
+            return f"{megabytes / 1024:,.2f} GB"
+        return f"{megabytes:,.1f} MB"
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "unknown", "n/a", "unavailable"}:
+        return "Unavailable"
+    return text
+
+
+def build_discovery_quality(
+    llm_status: Any,
+    pipeline_errors: Any,
+    artifact_payload: Any,
+) -> Dict[str, Any]:
+    """Summarize how complete a discovery run was so the UI and chat do not overstate its results."""
+    payload = artifact_payload if isinstance(artifact_payload, dict) else {}
+    stages = llm_status if isinstance(llm_status, dict) else {}
+    degraded_stages = sorted(
+        stage for stage, status in stages.items()
+        if isinstance(status, dict) and status.get("status") != "ok"
+    )
+    step_status = payload.get("discovery_step_status") if isinstance(payload.get("discovery_step_status"), dict) else {}
+    failed_steps = sorted(
+        name for name, status in step_status.items()
+        if isinstance(status, dict) and status.get("status") in {"error", "skipped"}
+    )
+    unsupported_steps = sorted(
+        name for name, status in step_status.items()
+        if isinstance(status, dict) and status.get("status") == "unsupported"
+    )
+    errors = [item for item in (pipeline_errors or []) if isinstance(item, (dict, str))] if isinstance(pipeline_errors, list) else []
+    score_basis = payload.get("score_basis") if isinstance(payload.get("score_basis"), dict) else {}
+    if errors or failed_steps:
+        status = "partial"
+    elif degraded_stages:
+        status = "deterministic_fallback"
+    else:
+        status = "complete"
+    return {
+        "status": status,
+        "llm_degraded_stages": degraded_stages,
+        "failed_steps": failed_steps,
+        "unsupported_steps": unsupported_steps,
+        "pipeline_errors": errors[:10],
+        "score_method": score_basis.get("method") or ("evidence_weighted_v1" if payload.get("readiness_score") is not None else "legacy_heuristic"),
+        "score_explanation": str(score_basis.get("explanation") or ""),
+    }
+
+
+def _readiness_headline(readiness_score: int) -> str:
+    if readiness_score >= 80:
+        return "Discovery collected strong evidence across the core surfaces; focus on the prioritized recommendations."
+    if readiness_score >= 55:
+        return "Discovery shows a workable baseline with evidence gaps to close before relying on it for decisions."
+    return "Discovery found significant gaps in collected evidence or data freshness; resolve them before acting on recommendations."
+
+
 def compute_discovery_readiness_score(
     overview: Any,
     recommendations: List[Dict[str, Any]],
@@ -8468,7 +8880,7 @@ def build_context_explorer_payload(
                 sourcetypes.append({
                     "name": normalized_sourcetype,
                     "events": _safe_int(data.get("totalCount") or data.get("count") or data.get("eventCount")),
-                    "recent_time": data.get("recentTimeIso") or data.get("lastTimeIso") or "",
+                    "recent_time": metadata_recent_time_utc(data),
                 })
 
         host_name = data.get("host") or data.get("hostname")
@@ -8503,7 +8915,7 @@ def build_context_explorer_payload(
             "total_indexes": _safe_int(overview.get("total_indexes", len(indexes))),
             "total_sourcetypes": _safe_int(overview.get("total_sourcetypes", len(sourcetypes))),
             "total_hosts": _safe_int(overview.get("total_hosts", len(hosts))),
-            "data_volume_24h": str(overview.get("data_volume_24h", "unknown") or "unknown"),
+            "data_volume_24h": _format_data_volume(overview.get("data_volume_24h")),
             "license_state": str(overview.get("license_state", "unknown") or "unknown"),
         },
         "anchors": {
@@ -8570,7 +8982,8 @@ def build_persona_playbooks(
     overview: Any,
     recommendations: List[Dict[str, Any]],
     suggested_use_cases: List[Dict[str, Any]],
-    mcp_capabilities: Dict[str, Any]
+    mcp_capabilities: Dict[str, Any],
+    readiness_score: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build persona-specific outputs for admins, analysts, and executives."""
     # LLM analysis is an untrusted schema boundary. A text fallback must not
@@ -8603,10 +9016,11 @@ def build_persona_playbooks(
             "success_metric": (use_case.get("success_metrics", ["Actionable detection uplift"]) or ["Actionable detection uplift"])[0]
         })
 
-    readiness_score = compute_discovery_readiness_score(overview, recs, use_cases, mcp_capabilities)
+    if not isinstance(readiness_score, int) or isinstance(readiness_score, bool):
+        readiness_score = compute_discovery_readiness_score(overview, recs, use_cases, mcp_capabilities)
     exec_brief = {
         "platform_readiness_score": readiness_score,
-        "headline": "Splunk discovery indicates strong baseline with clear optimization opportunities.",
+        "headline": _readiness_headline(readiness_score),
         "business_value_themes": [
             "Risk reduction through improved coverage and detection fidelity",
             "Operational efficiency via standardization and automation",
@@ -8680,7 +9094,8 @@ def hydrate_discovery_session(session: Optional[Dict[str, Any]]) -> Optional[Dic
             overview_proxy,
             recommendations_data if isinstance(recommendations_data, list) else [],
             use_cases_data if isinstance(use_cases_data, list) else [],
-            mcp_data if isinstance(mcp_data, dict) else {}
+            mcp_data if isinstance(mcp_data, dict) else {},
+            readiness_score=hydrated["readiness_score"],
         )
     except Exception:
         return hydrated
@@ -9214,7 +9629,7 @@ async def _build_m26_14_llm_analysis_payload(
     try:
         raw_response = await llm_client.generate_response(
             messages=messages,
-            max_tokens=max(400, min(int(getattr(getattr(config, "llm", None), "max_tokens", 1200) or 1200), 1200)),
+            max_tokens=llm_call_budget(config, 0.3, floor=400, ceiling=1200),
             temperature=0.2,
         )
     except Exception as exc:
@@ -9690,11 +10105,28 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
         ssl_verify = False
 
     payload = {
+        "jsonrpc": "2.0",
+        "id": _next_mcp_request_id(),
         "method": "tools/list",
         "params": {}
     }
 
     discovered = set()
+    descriptions: Dict[str, str] = {}
+    schemas: Dict[str, Any] = {}
+
+    def _collect(tool_entries: Any) -> None:
+        if not isinstance(tool_entries, list):
+            return
+        for tool in tool_entries:
+            if not isinstance(tool, dict) or not tool.get("name"):
+                continue
+            name = str(tool["name"])
+            discovered.add(name)
+            if isinstance(tool.get("description"), str) and tool["description"].strip():
+                descriptions[name] = tool["description"].strip()
+            if isinstance(tool.get("inputSchema"), dict):
+                schemas[name] = tool["inputSchema"]
 
     try:
         async with httpx.AsyncClient(verify=ssl_verify, timeout=15.0) as client:
@@ -9704,13 +10136,12 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
 
             data = response.json()
             result_obj = data.get("result", {}) if isinstance(data, dict) else {}
+            if not isinstance(result_obj, dict):
+                result_obj = {}
 
-            if isinstance(result_obj.get("tools"), list):
-                for tool in result_obj.get("tools", []):
-                    if isinstance(tool, dict) and tool.get("name"):
-                        discovered.add(tool["name"])
+            _collect(result_obj.get("tools"))
 
-            content = result_obj.get("content", []) if isinstance(result_obj, dict) else []
+            content = result_obj.get("content", [])
             if isinstance(content, list):
                 for item in content:
                     if not isinstance(item, dict):
@@ -9723,14 +10154,14 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
                     except json.JSONDecodeError:
                         continue
 
-                    if isinstance(parsed, dict) and isinstance(parsed.get("tools"), list):
-                        for tool in parsed["tools"]:
-                            if isinstance(tool, dict) and tool.get("name"):
-                                discovered.add(tool["name"])
+                    if isinstance(parsed, dict):
+                        _collect(parsed.get("tools"))
 
         if discovered:
             _cached_mcp_tools["identity"] = cache_identity
             _cached_mcp_tools["tools"] = discovered
+            _cached_mcp_tools["descriptions"] = descriptions
+            _cached_mcp_tools["schemas"] = schemas
             _cached_mcp_tools["timestamp"] = now
 
         return discovered or cached_tools
@@ -9955,7 +10386,7 @@ class WebSocketDisplayManager:
         overview_payload = {
             "total_indexes": overview.total_indexes,
             "total_sourcetypes": overview.total_sourcetypes,
-            "data_volume_24h": overview.data_volume_24h,
+            "data_volume_24h": _format_data_volume(overview.data_volume_24h),
             "active_sources": overview.active_sources,
             "estimated_time": overview.estimated_time,
             "notable_patterns": overview.notable_patterns
@@ -10294,30 +10725,31 @@ async def run_discovery(
         debug_log(f"Config loaded - provider: {config.llm.provider}, model: {config.llm.model}", "info")
         debug_log(f"API key present: {bool(config.llm.api_key)}, length: {len(config.llm.api_key) if config.llm.api_key else 0}", "info")
 
-        available_mcp_tools = await discover_mcp_tools(config)
-        if not available_mcp_tools:
-            available_mcp_tools = {
-                "splunk_run_query",
-                "splunk_get_info",
-                "splunk_get_indexes",
-                "splunk_get_index_info",
-                "splunk_get_metadata",
-                "splunk_get_user_info",
-                "splunk_get_knowledge_objects"
-            }
+        discovered_mcp_tools = await discover_mcp_tools(config)
+        available_mcp_tools = set(discovered_mcp_tools or ()) or {
+            "splunk_run_query",
+            "splunk_get_info",
+            "splunk_get_indexes",
+            "splunk_get_index_info",
+            "splunk_get_metadata",
+            "splunk_get_user_info",
+            "splunk_get_knowledge_objects"
+        }
         available_mcp_tools_sorted = sorted(list(available_mcp_tools))
         
         # Initialize LLM client (cached for performance)
         llm_client = get_or_create_llm_client(config)
         display.success("✅ LLM client initialized")
         
-        # Initialize discovery engine
+        # Only a real tools/list result is shared with the engine; with the fallback set it lists tools itself.
         discovery_engine = DiscoveryEngine(
             mcp_url=config.mcp.url,
             mcp_token=config.mcp.token,
             llm_client=llm_client,
             verify_ssl=config.mcp.verify_ssl,
-            ca_bundle_path=config.mcp.ca_bundle_path
+            ca_bundle_path=config.mcp.ca_bundle_path,
+            available_tools=discovered_mcp_tools or None,
+            tool_schemas=get_cached_mcp_tool_metadata(config).get("schemas") if discovered_mcp_tools else None,
         )
         display.success("✅ Discovery engine initialized")
         
@@ -10339,16 +10771,23 @@ async def run_discovery(
             report_paths = v2_result.get("report_paths", [])
             timestamp = v2_result.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
             discovery_step_count = _safe_int(v2_result.get("discovery_step_count", 0))
+            artifact_payload = v2_result.get("artifact_payload") if isinstance(v2_result.get("artifact_payload"), dict) else {}
+            llm_status = v2_result.get("llm_status") if isinstance(v2_result.get("llm_status"), dict) else {}
+            pipeline_errors = v2_result.get("pipeline_errors") if isinstance(v2_result.get("pipeline_errors"), list) else []
+            discovery_quality = build_discovery_quality(llm_status, pipeline_errors, artifact_payload)
 
-            readiness_score = compute_discovery_readiness_score(
-                overview,
-                recommendations if isinstance(recommendations, list) else [],
-                suggested_use_cases if isinstance(suggested_use_cases, list) else [],
-                {
-                    "tool_count": len(available_mcp_tools_sorted),
-                    "tools": available_mcp_tools_sorted
-                }
-            )
+            # The pipeline's evidence-weighted score is the one written to the blueprint; keep the UI consistent with it.
+            readiness_score = artifact_payload.get("readiness_score")
+            if not isinstance(readiness_score, int) or isinstance(readiness_score, bool):
+                readiness_score = compute_discovery_readiness_score(
+                    overview,
+                    recommendations if isinstance(recommendations, list) else [],
+                    suggested_use_cases if isinstance(suggested_use_cases, list) else [],
+                    {
+                        "tool_count": len(available_mcp_tools_sorted),
+                        "tools": available_mcp_tools_sorted
+                    }
+                )
             persona_playbooks = build_persona_playbooks(
                 overview,
                 recommendations if isinstance(recommendations, list) else [],
@@ -10356,7 +10795,8 @@ async def run_discovery(
                 {
                     "tool_count": len(available_mcp_tools_sorted),
                     "tools": available_mcp_tools_sorted
-                }
+                },
+                readiness_score=readiness_score,
             )
 
             session_record = register_discovery_session(
@@ -10374,8 +10814,15 @@ async def run_discovery(
                 personas=persona_playbooks,
                 readiness_score=readiness_score,
                 discovery_scope=resolved_scope_info,
+                discovery_quality=discovery_quality,
             )
 
+            if discovery_quality["status"] == "partial":
+                display.warning(
+                    "⚠️ Discovery finished with gaps: "
+                    + ", ".join((discovery_quality["failed_steps"] + [str(item.get("stage", item)) if isinstance(item, dict) else str(item) for item in discovery_quality["pipeline_errors"]])[:8])
+                    + ". The readiness score reflects the missing evidence."
+                )
             display.success("✅ Discovery artifact bundle generated")
             display.show_final_summary(report_paths)
 
@@ -10406,6 +10853,10 @@ async def run_discovery(
                 "suggested_use_cases": suggested_use_cases,
                 "session": session_record,
                 "readiness_score": readiness_score,
+                "score_basis": artifact_payload.get("score_basis", {}),
+                "llm_status": llm_status,
+                "pipeline_errors": pipeline_errors,
+                "discovery_quality": discovery_quality,
                 "persona_playbooks": persona_playbooks,
                 "mcp_capabilities": {
                     "tool_count": len(available_mcp_tools_sorted),
@@ -10614,8 +11065,7 @@ async def run_discovery(
                     f.write(f"- **Total Source Types:** {overview.total_sourcetypes}\n")
                     f.write(f"- **Total Hosts:** {overview.total_hosts}\n")
                     f.write(f"- **Total Sources:** {overview.total_sources}\n")
-                    if overview.data_volume_24h:
-                        f.write(f"- **24h Data Volume:** {overview.data_volume_24h}\n")
+                    f.write(f"- **24h Data Volume:** {_format_data_volume(overview.data_volume_24h)}\n")
                     if overview.splunk_version:
                         f.write(f"- **Splunk Version:** {overview.splunk_version} (Build: {overview.splunk_build})\n")
                     if overview.license_state:
@@ -11284,6 +11734,10 @@ class LLMSettings(BaseModel):
     endpoint_url: Optional[str] = None
     max_tokens: int = 16000
     temperature: float = 0.7
+    auto_tune: bool = True
+    context_window: int = Field(default=0, ge=0, le=10_000_000)
+    request_timeout: int = Field(default=0, ge=0, le=3600)
+    reasoning_effort: str = Field(default="", pattern="^(|minimal|low|medium|high)$")
 
 class ServerSettings(BaseModel):
     port: int
@@ -11588,7 +12042,12 @@ Full summary payload (truncated only if needed for API safety):
 async def get_config(request: Request):
     """Get current configuration (safe export with masked secrets)"""
     require_admin_user(request)
-    return config_manager.export_safe()
+    payload = config_manager.export_safe()
+    try:
+        payload["llm_effective_tuning"] = _tuning_summary(resolve_active_llm_tuning(config_manager.get()))
+    except Exception as tuning_error:
+        print(f"[Config] Could not resolve effective LLM tuning: {tuning_error}")
+    return payload
 
 @app.post("/api/config")
 async def update_config(request: Request, config_update: ConfigUpdate):
@@ -12515,24 +12974,33 @@ class CredentialCreate(BaseModel):
     endpoint_url: Optional[str] = None
     max_tokens: int = 16000
     temperature: float = 0.7
+    auto_tune: bool = True
+    context_window: int = Field(default=0, ge=0, le=10_000_000)
+    request_timeout: int = Field(default=0, ge=0, le=3600)
+    reasoning_effort: str = Field(default="", pattern="^(|minimal|low|medium|high)$")
+
+
+def _credential_public_view(cred: Any) -> Dict[str, Any]:
+    return {
+        'name': cred.name,
+        'provider': cred.provider,
+        'api_key': '***' if cred.api_key else '',
+        'model': cred.model,
+        'endpoint_url': cred.endpoint_url,
+        'max_tokens': cred.max_tokens,
+        'temperature': cred.temperature,
+        'auto_tune': getattr(cred, 'auto_tune', True),
+        'context_window': getattr(cred, 'context_window', 0),
+        'request_timeout': getattr(cred, 'request_timeout', 0),
+        'reasoning_effort': getattr(cred, 'reasoning_effort', ''),
+    }
 
 @app.get("/api/credentials")
 async def list_credentials(request: Request):
     """Get all saved credentials (with masked API keys)"""
     require_admin_user(request)
     credentials = config_manager.list_credentials()
-    return {
-        name: {
-            'name': cred.name,
-            'provider': cred.provider,
-            'api_key': '***' if cred.api_key else '',
-            'model': cred.model,
-            'endpoint_url': cred.endpoint_url,
-            'max_tokens': cred.max_tokens,
-            'temperature': cred.temperature
-        }
-        for name, cred in credentials.items()
-    }
+    return {name: _credential_public_view(cred) for name, cred in credentials.items()}
 
 @app.post("/api/credentials")
 async def save_credential(request: Request, credential: CredentialCreate):
@@ -12546,7 +13014,11 @@ async def save_credential(request: Request, credential: CredentialCreate):
             model=credential.model,
             endpoint_url=credential.endpoint_url,
             max_tokens=credential.max_tokens,
-            temperature=credential.temperature
+            temperature=credential.temperature,
+            auto_tune=credential.auto_tune,
+            context_window=credential.context_window,
+            request_timeout=credential.request_timeout,
+            reasoning_effort=credential.reasoning_effort,
         )
         if success:
             return {"status": "success", "message": f"Credential '{credential.name}' saved"}
@@ -12562,16 +13034,8 @@ async def get_credential(request: Request, name: str):
     cred = config_manager.get_credential(name)
     if not cred:
         raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
-    
-    return {
-        'name': cred.name,
-        'provider': cred.provider,
-        'api_key': '***' if cred.api_key else '',
-        'model': cred.model,
-        'endpoint_url': cred.endpoint_url,
-        'max_tokens': cred.max_tokens,
-        'temperature': cred.temperature
-    }
+
+    return _credential_public_view(cred)
 
 @app.delete("/api/credentials/{name}")
 async def delete_credential(request: Request, name: str):
@@ -12804,8 +13268,8 @@ async def update_chat_settings(settings: Dict[str, Any]):
     for key, value in settings.items():
         if key in valid_keys:
             chat_session_settings[key] = value
-            if key == "enable_rag_context":
-                chat_settings_explicit_overrides["enable_rag_context"] = True
+            if key in chat_settings_explicit_overrides:
+                chat_settings_explicit_overrides[key] = True
     
     return {"status": "success", "settings": chat_session_settings.copy()}
 
@@ -12814,10 +13278,39 @@ async def reset_chat_settings():
     """Reset chat settings to defaults"""
     global chat_session_settings
     
-    chat_settings_explicit_overrides["enable_rag_context"] = False
+    for key in chat_settings_explicit_overrides:
+        chat_settings_explicit_overrides[key] = False
     chat_session_settings = build_default_chat_settings()
     
     return {"status": "success", "settings": chat_session_settings.copy()}
+
+def _model_listing_response(
+    provider: str,
+    names: List[Any],
+    metadata_by_model: Optional[Dict[str, Dict[str, Any]]] = None,
+    endpoint_url: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return model names plus a balanced quality/speed/cost ranking and the recommended pick."""
+    unique_names = sorted({name for name in names if isinstance(name, str) and name.strip()})
+    metadata_by_model = {name: meta for name, meta in (metadata_by_model or {}).items() if isinstance(meta, dict)}
+    runtime_provider = runtime_provider_for(provider, endpoint_url)
+    for name, meta in metadata_by_model.items():
+        if meta:
+            remember_model_metadata(runtime_provider, endpoint_url, name, meta)
+    ranked = rank_models(runtime_provider, unique_names, metadata_by_model, endpoint_url)
+    recommended = next((item for item in ranked if item.get("recommended")), None)
+    payload: Dict[str, Any] = {
+        "models": unique_names,
+        "ranked": ranked,
+        "recommended": recommended,
+        "recommended_model": recommended["model"] if recommended else None,
+        "ranking_basis": "balanced quality, speed, and cost",
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
 
 @app.post("/api/llm/list-models")
 async def list_models(request: Request):
@@ -12845,12 +13338,17 @@ async def list_models(request: Request):
                 )
                 response.raise_for_status()
                 models_data = response.json()
-                raw_models = sorted({m.get('id') for m in models_data.get('data', []) if isinstance(m, dict) and m.get('id')})
-                filtered_models = filter_openai_generation_models([m for m in raw_models if isinstance(m, str)])
-                return {
-                    'models': filtered_models,
-                    'filtered_out': max(0, len(raw_models) - len(filtered_models)),
-                }
+                entries = [m for m in models_data.get('data', []) if isinstance(m, dict) and isinstance(m.get('id'), str)]
+                raw_models = sorted({m['id'] for m in entries})
+                filtered_models = filter_openai_generation_models(raw_models)
+                metadata = {m['id']: parse_openai_compatible_model_entry(m) for m in entries if m['id'] in filtered_models}
+                return _model_listing_response(
+                    provider,
+                    filtered_models,
+                    metadata,
+                    endpoint_url,
+                    extra={'filtered_out': max(0, len(raw_models) - len(filtered_models))},
+                )
 
             if provider == 'azure':
                 if not endpoint_url:
@@ -12897,7 +13395,7 @@ async def list_models(request: Request):
                 merged = sorted({m for m in deployments + model_ids if isinstance(m, str) and m.strip()})
                 if not merged:
                     raise HTTPException(status_code=400, detail="Could not fetch Azure deployments/models from endpoint")
-                return {'models': merged}
+                return _model_listing_response(provider, merged, None, endpoint_url)
 
             if provider == 'anthropic':
                 if not api_key:
@@ -12912,8 +13410,8 @@ async def list_models(request: Request):
                 )
                 response.raise_for_status()
                 payload = response.json()
-                models = sorted({item.get('id') for item in payload.get('data', []) if isinstance(item, dict) and item.get('id')})
-                return {'models': [m for m in models if isinstance(m, str)]}
+                models = [item.get('id') for item in payload.get('data', []) if isinstance(item, dict)]
+                return _model_listing_response(provider, models, None, endpoint_url)
 
             if provider == 'gemini':
                 if not api_key:
@@ -12923,6 +13421,7 @@ async def list_models(request: Request):
                 response.raise_for_status()
                 payload = response.json()
                 models = []
+                metadata = {}
                 for item in payload.get('models', []):
                     if not isinstance(item, dict):
                         continue
@@ -12931,11 +13430,13 @@ async def list_models(request: Request):
                         name = name.split('/', 1)[1]
                     if isinstance(name, str) and name.strip():
                         models.append(name)
-                return {'models': sorted({m for m in models if isinstance(m, str)})}
+                        metadata[name] = parse_openai_compatible_model_entry(item)
+                return _model_listing_response(provider, models, metadata, endpoint_url)
 
             if provider == 'ollama':
                 base = normalize_ollama_endpoint_url(endpoint_url)
                 models = []
+                metadata = {}
 
                 response = await client.get(f"{base}/api/tags")
                 response.raise_for_status()
@@ -12947,6 +13448,7 @@ async def list_models(request: Request):
                     model_name = item.get('name') or item.get('model') or item.get('id')
                     if isinstance(model_name, str) and model_name.strip():
                         models.append(model_name)
+                        metadata[model_name] = parse_ollama_model_entry(item)
 
                 if not models:
                     try:
@@ -12964,7 +13466,7 @@ async def list_models(request: Request):
                 if not models:
                     raise HTTPException(status_code=400, detail="Could not fetch models from Ollama endpoint")
 
-                return {'models': sorted({m for m in models if isinstance(m, str)})}
+                return _model_listing_response(provider, models, metadata, endpoint_url)
 
             if provider == 'custom':
                 if not endpoint_url:
@@ -12987,30 +13489,31 @@ async def list_models(request: Request):
                         payload = response.json()
 
                         if isinstance(payload, dict) and isinstance(payload.get('data'), list):
-                            models = [m.get('id') for m in payload.get('data', []) if isinstance(m, dict) and m.get('id')]
-                            return {'models': sorted({m for m in models if isinstance(m, str)})}
+                            entries = [m for m in payload.get('data', []) if isinstance(m, dict) and isinstance(m.get('id'), str)]
+                            metadata = {m['id']: parse_openai_compatible_model_entry(m) for m in entries}
+                            return _model_listing_response(provider, [m['id'] for m in entries], metadata, endpoint_url)
 
                         if isinstance(payload, dict) and isinstance(payload.get('models'), list):
                             models = []
+                            metadata = {}
                             for item in payload.get('models', []):
-                                if isinstance(item, dict):
-                                    model_name = item.get('name') or item.get('id')
-                                else:
-                                    model_name = item
+                                model_name = (item.get('name') or item.get('id')) if isinstance(item, dict) else item
                                 if isinstance(model_name, str) and model_name.strip():
                                     models.append(model_name)
-                            return {'models': sorted({m for m in models if isinstance(m, str)})}
+                                    if isinstance(item, dict):
+                                        metadata[model_name] = parse_ollama_model_entry(item)
+                            return _model_listing_response(provider, models, metadata, endpoint_url)
 
                         if isinstance(payload, list):
                             models = []
+                            metadata = {}
                             for item in payload:
-                                if isinstance(item, dict):
-                                    model_name = item.get('id') or item.get('name')
-                                else:
-                                    model_name = item
+                                model_name = (item.get('id') or item.get('name')) if isinstance(item, dict) else item
                                 if isinstance(model_name, str) and model_name.strip():
                                     models.append(model_name)
-                            return {'models': sorted({m for m in models if isinstance(m, str)})}
+                                    if isinstance(item, dict):
+                                        metadata[model_name] = parse_openai_compatible_model_entry(item)
+                            return _model_listing_response(provider, models, metadata, endpoint_url)
                     except Exception:
                         continue
 
@@ -13246,9 +13749,66 @@ async def get_dependencies():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get dependencies: {str(e)}")
 
+def _llm_settings_view(llm_payload: Dict[str, Any], current_llm: Any, **overrides: Any) -> SimpleNamespace:
+    """Merge request-supplied LLM settings over the saved config for one-off tuning checks."""
+    fields = (
+        "provider", "api_key", "model", "endpoint_url", "max_tokens", "temperature",
+        "auto_tune", "context_window", "request_timeout", "reasoning_effort",
+    )
+    values = {name: llm_payload.get(name, getattr(current_llm, name, None)) for name in fields}
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _tuning_source_label(profile: Any) -> str:
+    sources = list(getattr(profile, "sources", []) or [])
+    if "endpoint" in sources:
+        return "endpoint metadata"
+    if "catalog" in sources:
+        return "model catalog"
+    return "model size and family heuristics"
+
+
+def _tuning_summary(tuning: Dict[str, Any]) -> Dict[str, Any]:
+    profile = tuning["profile"]
+    return {
+        "auto_tune": bool(tuning.get("auto_tune", True)),
+        "max_tokens": tuning["max_tokens"],
+        "temperature": tuning.get("temperature"),
+        "context_window": tuning["context_window"],
+        "model_context_window": tuning.get("model_context_window"),
+        "request_timeout": tuning["request_timeout"],
+        "reasoning_effort": tuning.get("reasoning_effort") or "",
+        "supports_tools": bool(tuning.get("supports_tools")),
+        "reasoning": bool(tuning.get("reasoning")),
+        "hosted": bool(getattr(profile, "hosted", False)),
+        "score": profile.score(),
+        "source": _tuning_source_label(profile),
+        "reasons": describe_profile(profile),
+        "notes": list(getattr(profile, "notes", []) or []),
+        "rationale": list(tuning.get("rationale") or []),
+    }
+
+
+def _recommended_llm_config(tuning: Dict[str, Any]) -> Dict[str, Any]:
+    """Fields the settings form can apply; context and timeout stay automatic unless overridden."""
+    config_values: Dict[str, Any] = {"max_tokens": tuning["max_tokens"], "auto_tune": True}
+    if tuning.get("temperature") is not None:
+        config_values["temperature"] = tuning["temperature"]
+    return config_values
+
+
+def _custom_endpoint_base(endpoint_url: str) -> str:
+    base = str(endpoint_url or "").strip().rstrip("/")
+    for suffix in ("/v1/chat/completions", "/chat/completions", "/v1/completions", "/completions", "/api/chat", "/api/generate", "/v1/models", "/models", "/v1"):
+        if base.lower().endswith(suffix):
+            return base[: -len(suffix)].rstrip("/")
+    return base
+
+
 @app.post("/api/llm/assess-max-tokens")
 async def assess_max_tokens(request: Request):
-    """Assess the actual max_tokens limit by testing the LLM API"""
+    """Recommend max_tokens and related runtime settings from the model profile."""
     try:
         payload = {}
         try:
@@ -13268,7 +13828,7 @@ async def assess_max_tokens(request: Request):
 
         if provider == "ollama":
             endpoint_url = normalize_ollama_endpoint_url(endpoint_url)
-        
+
         if provider in {"openai", "azure", "anthropic", "gemini"} and not api_key:
             raise HTTPException(status_code=400, detail="LLM API key not configured")
 
@@ -13280,73 +13840,35 @@ async def assess_max_tokens(request: Request):
                 "message": f"{model} uses the OpenAI images API. max_tokens is not required for summary infographic execution; output is limited by image size instead.",
             }
 
-        if provider != "openai":
-            defaults = {
-                "azure": 8000,
-                "anthropic": 8192,
-                "gemini": 8192,
-                "ollama": 4096,
-                "custom": 4000,
-            }
-            fallback = defaults.get(provider, 4000)
-            return {
-                "recommended_max_tokens": fallback,
-                "status": "info",
-                "message": f"Automatic max token probing is optimized for OpenAI. Using provider-safe default for {provider}: {fallback}"
-            }
-        
-        llm_client = LLMClientFactory.create_client(
+        llm_view = _llm_settings_view(
+            llm_payload,
+            config.llm,
             provider=provider,
-            custom_endpoint=endpoint_url,
             api_key=api_key,
             model=model,
+            endpoint_url=endpoint_url,
+            auto_tune=True,
+            request_timeout=0,
+            reasoning_effort="",
         )
-        
-        # Try progressively larger max_tokens until we hit the limit
-        test_values = [128000, 64000, 32000, 16000, 8000, 4000, 2000, 1000]
-        
-        for test_max in test_values:
-            try:
-                await llm_client.generate_response(
-                    messages=[{"role": "user", "content": "Reply with exactly: ok"}],
-                    max_tokens=test_max,
-                    temperature=0.0,
-                )
-                
-                return {
-                    "recommended_max_tokens": test_max,
-                    "status": "success",
-                    "message": f"Model supports at least {test_max} tokens",
-                    "tested_value": test_max
-                }
-                
-            except Exception as e:
-                error_str = str(e)
-                import re
-                match = re.search(r'supports at most (\d+)', error_str)
-                if not match:
-                    match = re.search(r'max(?:imum)?[^\d]{0,20}(\d+)', error_str, flags=re.IGNORECASE)
-                if match:
-                    actual_limit = int(match.group(1))
-                    recommended = int(actual_limit * 0.9)
-                    return {
-                        "recommended_max_tokens": recommended,
-                        "actual_limit": actual_limit,
-                        "status": "success",
-                        "message": f"Model supports {actual_limit} tokens, recommending {recommended} (90% of limit)"
-                    }
-                
-                if 'max_tokens' in error_str.lower():
-                    continue
-                    
-                raise HTTPException(status_code=500, detail=f"LLM test error: {error_str}")
-        
+        tuning = await asyncio.to_thread(resolve_llm_tuning, llm_view, True)
+        summary = _tuning_summary(tuning)
+        estimated = summary["source"] == "model size and family heuristics"
+        message = (
+            f"Recommended {tuning['max_tokens']} output tokens for {model} "
+            f"(planning context {tuning['context_window']} tokens) from {summary['source']}."
+        )
+        if estimated:
+            message += " The model is not in the catalog, so limits are estimated; run Test Connection to confirm."
         return {
-            "recommended_max_tokens": 1000,
-            "status": "fallback",
-            "message": "Could not determine limit, using conservative fallback"
+            "recommended_max_tokens": tuning["max_tokens"],
+            "applicable": True,
+            "status": "info" if estimated else "success",
+            "message": message,
+            "recommended_config": _recommended_llm_config(tuning),
+            "tuning": summary,
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -13355,7 +13877,7 @@ async def assess_max_tokens(request: Request):
 
 @app.post("/api/llm/test-connection")
 async def test_llm_connection(request: Request):
-    """Test provider-specific LLM connectivity and generation using current or supplied settings."""
+    """Test provider-specific LLM connectivity and generation, then report auto-tuned settings."""
     try:
         payload = {}
         try:
@@ -13372,8 +13894,10 @@ async def test_llm_connection(request: Request):
         api_key = llm_payload.get("api_key", current_config.llm.api_key)
         model = llm_payload.get("model", current_config.llm.model)
         endpoint_url = llm_payload.get("endpoint_url", current_config.llm.endpoint_url)
-        max_tokens = int(llm_payload.get("max_tokens", current_config.llm.max_tokens or 1000))
-        temperature = float(llm_payload.get("temperature", current_config.llm.temperature or 0.7))
+        try:
+            temperature = float(llm_payload.get("temperature", current_config.llm.temperature or 0.7))
+        except (TypeError, ValueError):
+            temperature = 0.7
 
         if provider == "ollama":
             endpoint_url = normalize_ollama_endpoint_url(endpoint_url)
@@ -13422,6 +13946,7 @@ async def test_llm_connection(request: Request):
             results["model_capabilities"] = openai_model_capabilities
 
         uses_openai_image_generation = provider == "openai" and openai_model_capabilities.get("supports_image_generation", False)
+        model_metadata: Optional[Dict[str, Any]] = None
 
         # Test 1: Connectivity probe
         try:
@@ -13476,6 +14001,11 @@ async def test_llm_connection(request: Request):
                     base = (endpoint_url or "https://generativelanguage.googleapis.com").rstrip('/')
                     probe = await client.get(f"{base}/v1beta/models?key={quote(api_key)}")
                     probe.raise_for_status()
+                    probe_payload = probe.json() if hasattr(probe, "json") else {}
+                    for item in probe_payload.get("models", []) if isinstance(probe_payload, dict) else []:
+                        if isinstance(item, dict) and str(item.get("name") or "").split("/", 1)[-1] == model:
+                            model_metadata = parse_openai_compatible_model_entry(item)
+                            break
                     results["tests"]["connection"] = {"status": "success", "message": "Gemini models endpoint reachable"}
 
                 elif provider == "ollama":
@@ -13490,31 +14020,64 @@ async def test_llm_connection(request: Request):
                         model_name = item.get("name") or item.get("model") or item.get("id")
                         if isinstance(model_name, str) and model_name.strip():
                             ollama_models.append(model_name)
+                            if model_name == model:
+                                model_metadata = parse_ollama_model_entry(item)
                     if ollama_models:
                         results["available_models"] = sorted({name for name in ollama_models})
+                        if model and model not in ollama_models:
+                            raise Exception(f"Model '{model}' is not installed on this Ollama server. Run: ollama pull {model}")
                     results["tests"]["connection"] = {"status": "success", "message": "Ollama model inventory reachable"}
 
                 else:  # custom
-                    base = endpoint_url.rstrip('/')
-                    checks = [
-                        base,
-                        f"{base}/v1/models",
-                        f"{base}/models",
-                        f"{base}/api/tags",
-                        f"{base}/health",
-                    ]
-                    reachable = False
-                    for url in checks:
+                    base = _custom_endpoint_base(endpoint_url)
+                    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                    listing_urls = [f"{base}/v1/models", f"{base}/models", f"{base}/api/tags"]
+                    answered = False
+                    auth_failed = False
+                    listed = False
+                    for url in listing_urls + [f"{base}/health", base]:
                         try:
-                            resp = await client.get(url)
-                            if resp.status_code < 500:
-                                reachable = True
-                                break
+                            resp = await client.get(url, headers=headers)
                         except Exception:
                             continue
-                    if not reachable:
-                        raise Exception("Custom endpoint not reachable or not responding with usable API shape")
-                    results["tests"]["connection"] = {"status": "success", "message": "Custom endpoint reachable"}
+                        answered = True
+                        if resp.status_code in {401, 403}:
+                            auth_failed = True
+                            continue
+                        if not 200 <= resp.status_code < 300:
+                            continue
+                        if url in listing_urls:
+                            try:
+                                listing = resp.json()
+                            except Exception:
+                                listing = None
+                            entries = []
+                            if isinstance(listing, dict):
+                                entries = listing.get("data") or listing.get("models") or []
+                            elif isinstance(listing, list):
+                                entries = listing
+                            for item in entries if isinstance(entries, list) else []:
+                                if not isinstance(item, dict):
+                                    continue
+                                item_name = str(item.get("id") or item.get("name") or item.get("model") or "")
+                                if item_name == model:
+                                    model_metadata = (
+                                        parse_ollama_model_entry(item) if "details" in item else parse_openai_compatible_model_entry(item)
+                                    )
+                                    break
+                            listed = isinstance(listing, (dict, list))
+                        break
+                    if auth_failed and not listed:
+                        raise Exception("Custom endpoint rejected the API key (HTTP 401/403)")
+                    if not answered:
+                        raise Exception("Custom endpoint not reachable")
+                    if listed:
+                        results["tests"]["connection"] = {"status": "success", "message": "Custom endpoint model list reachable"}
+                    else:
+                        results["tests"]["connection"] = {
+                            "status": "warning",
+                            "message": "Endpoint answered but does not expose a model list; checking generation directly",
+                        }
 
         except Exception as connection_error:
             results["tests"]["connection"] = {
@@ -13525,39 +14088,85 @@ async def test_llm_connection(request: Request):
             results["status"] = "error"
             return results
 
-        # Test 2: Model generation
+        if uses_openai_image_generation:
+            if openai_model_ids and not openai_model_ids_include(openai_model_ids, model):
+                results["tests"]["model"] = {
+                    "status": "error",
+                    "message": f"Image model '{model}' is not listed for this OpenAI credential"
+                }
+                results["status"] = "error"
+                return results
+
+            results["tests"]["model"] = {
+                "status": "info",
+                "message": f"{model} uses the OpenAI images API. Skipped text completion probe; summary infographic generation should use the dedicated image endpoint.",
+            }
+            results["tests"]["max_tokens"] = {
+                "status": "info",
+                "detected_max": None,
+                "message": f"max_tokens is not used for {model}. Summary infographic generation is constrained by image output size instead.",
+            }
+            results["status"] = "success"
+            results["message"] = "All provider tests passed"
+            results["recommended_config"] = {"temperature": temperature}
+            return results
+
+        llm_view = _llm_settings_view(
+            llm_payload,
+            current_config.llm,
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            endpoint_url=endpoint_url,
+        )
+        needs_fetch = model_metadata is None or "context_window" not in (model_metadata or {})
+        if needs_fetch and provider in {"ollama", "custom"}:
+            fetched = await asyncio.to_thread(
+                lookup_model_metadata, provider, endpoint_url, model, api_key, True
+            )
+            model_metadata = {**(fetched or {}), **(model_metadata or {})}
+        tuning = resolve_llm_tuning(llm_view, metadata=model_metadata if model_metadata is not None else None)
+        recommended = resolve_llm_tuning(
+            _llm_settings_view(
+                llm_payload,
+                current_config.llm,
+                provider=provider,
+                api_key=api_key,
+                model=model,
+                endpoint_url=endpoint_url,
+                auto_tune=True,
+                request_timeout=0,
+                reasoning_effort="",
+            ),
+            metadata=model_metadata if model_metadata is not None else None,
+        )
+
+        # Test 2: Model generation with the tuned client settings
         try:
-            if uses_openai_image_generation:
-                if openai_model_ids and not openai_model_ids_include(openai_model_ids, model):
-                    results["tests"]["model"] = {
-                        "status": "error",
-                        "message": f"Image model '{model}' is not listed for this OpenAI credential"
-                    }
-                    results["status"] = "error"
-                    return results
-
-                results["tests"]["model"] = {
-                    "status": "info",
-                    "message": f"{model} uses the OpenAI images API. Skipped text completion probe; summary infographic generation should use the dedicated image endpoint.",
-                }
-            else:
-                llm_client = LLMClientFactory.create_client(
-                    provider=provider,
-                    custom_endpoint=endpoint_url,
-                    api_key=api_key,
-                    model=model
-                )
-
-                model_response = await llm_client.generate_response(
-                    messages=[{"role": "user", "content": "Reply with exactly: test successful"}],
-                    max_tokens=min(max_tokens, 64),
-                    temperature=0.0,
-                )
-                results["tests"]["model"] = {
-                    "status": "success",
-                    "message": "Model responded successfully",
-                    "response_preview": str(model_response)[:120]
-                }
+            llm_client = LLMClientFactory.create_client(
+                provider=provider,
+                custom_endpoint=endpoint_url,
+                api_key=api_key,
+                model=model,
+                tuning=client_tuning(tuning),
+            )
+            probe_tokens = 1024 if tuning.get("reasoning") else 64
+            started = time.monotonic()
+            model_response = await llm_client.generate_response(
+                messages=[{"role": "user", "content": "Reply with exactly: test successful"}],
+                max_tokens=probe_tokens,
+                temperature=0.0,
+            )
+            latency_ms = int((time.monotonic() - started) * 1000)
+            preview = str(model_response or "").strip()
+            if not preview:
+                raise Exception("Model returned an empty response")
+            results["tests"]["model"] = {
+                "status": "success",
+                "message": f"Model responded in {latency_ms} ms",
+                "latency_ms": latency_ms,
+                "response_preview": preview[:120],
+            }
         except Exception as model_error:
             results["tests"]["model"] = {
                 "status": "error",
@@ -13567,41 +14176,21 @@ async def test_llm_connection(request: Request):
             results["status"] = "error"
             return results
 
-        # Test 3: Recommended token configuration
-        if uses_openai_image_generation:
-            results["tests"]["max_tokens"] = {
-                "status": "info",
-                "detected_max": None,
-                "message": f"max_tokens is not used for {model}. Summary infographic generation is constrained by image output size instead.",
-            }
-        else:
-            recommended_max = max(512, min(max_tokens, 16000))
-            if provider == "gemini":
-                recommended_max = max(512, min(max_tokens, 8192))
-            elif provider == "anthropic":
-                recommended_max = max(512, min(max_tokens, 8192))
-            elif provider == "ollama":
-                recommended_max = max(512, min(max_tokens, 4096))
-            elif provider == "custom":
-                recommended_max = max(512, min(max_tokens, 4096))
-
-            results["tests"]["max_tokens"] = {
-                "status": "info",
-                "detected_max": recommended_max,
-                "message": f"Using provider-safe recommended max_tokens={recommended_max}"
-            }
-
+        # Test 3: Auto-tuned runtime configuration
+        summary = _tuning_summary(recommended)
+        results["tests"]["max_tokens"] = {
+            "status": "success" if summary["source"] != "model size and family heuristics" else "info",
+            "detected_max": recommended["max_tokens"],
+            "message": (
+                f"Auto-tuned max_tokens={recommended['max_tokens']}, context={recommended['context_window']}, "
+                f"timeout={recommended['request_timeout']}s from {summary['source']}"
+            ),
+        }
         results["status"] = "success"
         results["message"] = "All provider tests passed"
-        if uses_openai_image_generation:
-            results["recommended_config"] = {
-                "temperature": temperature
-            }
-        else:
-            results["recommended_config"] = {
-                "max_tokens": recommended_max,
-                "temperature": temperature
-            }
+        results["recommended_config"] = _recommended_llm_config(recommended)
+        results["tuning"] = summary
+        results["active_tuning"] = _tuning_summary(tuning)
         return results
 
     except Exception as e:
@@ -13612,7 +14201,6 @@ async def test_llm_connection(request: Request):
             "error": str(e),
             "message": f"Test failed: {str(e)}"
         }
-
 
 @app.get("/summarize-progress/{session_id}")
 async def get_summarize_progress(session_id: str, request: Request):
@@ -14103,6 +14691,7 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
     discovered_indexes = set()
     discovered_sourcetypes = set()
     discovered_hosts = set()
+    index_event_counts: Dict[str, int] = {}
     for result in discovery_results:
         data = result.get('data', {})
         if isinstance(data, dict):
@@ -14118,6 +14707,7 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
                 discovered_indexes.add(index_value.strip())
         if 'title' in data and 'totalEventCount' in data:
             discovered_indexes.add(data['title'])
+            index_event_counts[str(data['title'])] = _safe_int(data.get('totalEventCount'))
         elif 'sourcetype' in data:
             discovered_sourcetypes.add(data['sourcetype'])
 
@@ -14160,46 +14750,44 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
         return "🟡 LOW"
 
     def _preferred_anchor_index() -> str:
-        if discovered_indexes_list:
-            return discovered_indexes_list[0]
-        return "*"
+        """Busiest non-internal index with data; "*" when discovery found none."""
+        ranked = sorted(
+            (name for name in discovered_indexes_list if index_event_counts.get(name, 0) > 0),
+            key=lambda name: (name.startswith("_"), -index_event_counts.get(name, 0), name),
+        )
+        return ranked[0] if ranked else "*"
 
     def _anchor_spl_to_environment(spl_query: str) -> str:
+        # An unscoped search only reads the role's default indexes, so make it explicit.
+        # index=* is used rather than guessing one index the query may not live in;
+        # generating commands (| tstats, | rest) and scoped searches are left unchanged.
         query = (spl_query or "").strip()
         if not query:
             return query
-        if not discovered_indexes_list:
-            return query
-        query_lower = query.lower()
-        has_index = any(f"index={idx.lower()}" in query_lower for idx in discovered_indexes_list)
-        if has_index:
-            return query
-        anchor_index = discovered_indexes_list[0]
-        if query.startswith("|"):
-            return f"index={anchor_index} {query}"
-        if query_lower.startswith("search "):
-            return f"search index={anchor_index} {query[len('search '):]}"
-        return f"index={anchor_index} | {query}"
+        return scope_spl_to_index(query, "*")
 
     def _strip_code_fence(text: str) -> str:
         cleaned = _safe_str(text)
         cleaned = cleaned.replace("```spl", "").replace("```sql", "").replace("```", "").strip()
         return cleaned
 
-    def _extract_environment_evidence(spl_query: str) -> List[str]:
-        evidence = []
-        q = (spl_query or "").lower()
-        for idx in discovered_indexes_list[:20]:
-            if f"index={idx.lower()}" in q:
-                evidence.append(f"index:{idx}")
-        for st in discovered_sourcetypes_list[:20]:
-            if st.lower() in q:
-                evidence.append(f"sourcetype:{st}")
-        for host in discovered_hosts_list[:20]:
-            if host.lower() in q:
-                evidence.append(f"host:{host}")
-        if not evidence and discovered_indexes_list:
-            evidence.append(f"index:{discovered_indexes_list[0]}")
+    known_entity_names = {
+        "indexes": ("index", {name.lower(): name for name in discovered_indexes_list}),
+        "sourcetypes": ("sourcetype", {name.lower(): name for name in discovered_sourcetypes_list}),
+        "hosts": ("host", {name.lower(): name for name in discovered_hosts_list}),
+    }
+
+    def _extract_environment_evidence(spl_queries: Any) -> List[str]:
+        """Discovered entities the SPL actually searches; empty when it uses none."""
+        queries = [spl_queries] if isinstance(spl_queries, str) else list(spl_queries or [])
+        evidence: List[str] = []
+        for spl_query in queries:
+            referenced = extract_spl_entities(str(spl_query or ""))
+            for category, (label, known_names) in known_entity_names.items():
+                for value in referenced.get(category, []):
+                    known_name = known_names.get(str(value).lower())
+                    if known_name and f"{label}:{known_name}" not in evidence:
+                        evidence.append(f"{label}:{known_name}")
         return evidence[:5]
 
     def _flatten_findings(findings: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -14264,13 +14852,10 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
         if not raw_spl:
             anchor_index = _preferred_anchor_index()
             raw_spl = f"index={anchor_index} earliest=-24h | stats count by sourcetype host | sort - count"
-        normalized_spl = _anchor_spl_to_environment(raw_spl)
-        if "earliest=" not in normalized_spl.lower():
-            normalized_spl = normalized_spl.replace("|", "earliest=-24h |", 1) if "|" in normalized_spl else f"{normalized_spl} earliest=-24h"
+        normalized_spl = ensure_spl_time_bounds(_anchor_spl_to_environment(raw_spl), "-24h")
 
-        evidence = query.get("environment_evidence")
-        if not isinstance(evidence, list) or not evidence:
-            evidence = _extract_environment_evidence(normalized_spl)
+        # Evidence comes from what the SPL searches, not from what the model claims it uses.
+        evidence = _extract_environment_evidence(normalized_spl)
 
         severity = matching_finding.get("severity", "medium") if matching_finding else "medium"
         priority = _safe_str(query.get("priority"), _priority_from_severity(severity))
@@ -14297,8 +14882,6 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
 
     def _context_engine_queries(finding_pool: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         anchor_index = _preferred_anchor_index()
-        anchor_sourcetype = discovered_sourcetypes_list[0] if discovered_sourcetypes_list else "*"
-        anchor_host = discovered_hosts_list[0] if discovered_hosts_list else "*"
 
         candidates = [
             {
@@ -14306,7 +14889,7 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
                 "description": "Track ingestion drift by index and sourcetype to detect sudden blind spots.",
                 "use_case": "Performance Monitoring",
                 "category": "Infrastructure & Performance",
-                "spl": f"index={anchor_index} earliest=-24h | bin _time span=1h | stats count dc(host) as hosts dc(sourcetype) as sourcetypes by _time | eval ingestion_risk=if(count<100,'review','ok')",
+                "spl": f"index={anchor_index} earliest=-24h | bin _time span=1h | stats count dc(host) as hosts dc(sourcetype) as sourcetypes by _time | eval ingestion_risk=if(count<100,\"review\",\"ok\")",
                 "finding_reference": (finding_pool[0]["reference"] if finding_pool else "Coverage and ingestion monitoring"),
                 "execution_time": "< 30s",
                 "business_value": "Flags ingestion degradation early before detections lose fidelity.",
@@ -14319,7 +14902,7 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
                 "description": "Validate that expected security telemetry is present and consistent.",
                 "use_case": "Security Investigation",
                 "category": "Security & Compliance",
-                "spl": f"index={anchor_index} sourcetype={anchor_sourcetype} earliest=-24h | stats count by sourcetype host | sort - count",
+                "spl": "| tstats count where index=* earliest=-24h by index sourcetype | sort - count",
                 "finding_reference": "Risk validation for security monitoring coverage.",
                 "execution_time": "< 30s",
                 "business_value": "Confirms security-useful data remains searchable and complete.",
@@ -14332,7 +14915,7 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
                 "description": "Profile volume and spread for unknown entities requiring classification.",
                 "use_case": "Data Quality",
                 "category": "Data Quality",
-                "spl": f"index={anchor_index} host={anchor_host} earliest=-7d | stats count by sourcetype host index | sort - count",
+                "spl": "| tstats count where index=* earliest=-7d by index sourcetype host | sort count | head 50",
                 "finding_reference": "Unknown entities need context before onboarding decisions.",
                 "execution_time": "< 45s",
                 "business_value": "Turns unknown data into actionable ownership and onboarding tasks.",
@@ -14408,8 +14991,9 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
         else:
             verification_spl = f"index={_preferred_anchor_index()} earliest=-24h | stats count as post_change_events"
 
-        evidence_blob = verification_spl + " " + " ".join(_safe_str(step.get("spl")) for step in normalized_steps)
-        evidence = _extract_environment_evidence(evidence_blob)
+        evidence = _extract_environment_evidence(
+            [verification_spl] + [_safe_str(step.get("spl")) for step in normalized_steps]
+        )
 
         matching_finding = finding_pool[idx] if idx < len(finding_pool) else (finding_pool[0] if finding_pool else None)
 
@@ -14550,35 +15134,23 @@ Return ONLY the JSON object."""
     )
     
     try:
-        # Use 25% of configured max_tokens for findings extraction
-        findings_max_tokens = min(4000, int(config.llm.max_tokens * 0.25))
+        findings_max_tokens = llm_call_budget(config, 0.5, floor=1536, ceiling=4000)
         findings_response = await llm_client.generate_response(
             prompt=findings_prompt,
             max_tokens=findings_max_tokens,
             temperature=0.3
         )
         
-        # Parse JSON response
-        import re
-        json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', findings_response, re.DOTALL)
-        if json_match:
-            findings_json = json_match.group(1)
-        else:
-            json_match = re.search(r'(\{.*\})', findings_response, re.DOTALL)
-            findings_json = json_match.group(1) if json_match else '{}'
-        
-        # Validate before parsing
-        if not findings_json.strip():
-            raise ValueError("Empty JSON response")
-        
-        ai_findings = json.loads(findings_json)
+        # Handles fenced JSON, <think> blocks from reasoning models, and trailing commas.
+        ai_findings = extract_json_payload(findings_response, expect="dict")
+        if not isinstance(ai_findings, dict):
+            raise json.JSONDecodeError("No JSON object in findings response", str(findings_response or "")[:200], 0)
         print(f"AI extracted findings: {len(ai_findings.get('security_findings', []))} security, "
               f"{len(ai_findings.get('performance_findings', []))} performance, "
               f"{len(ai_findings.get('data_quality_findings', []))} data quality")
         
     except json.JSONDecodeError as e:
         print(f"Error parsing findings JSON: {e}")
-        print(f"JSON string length: {len(findings_json) if 'findings_json' in locals() else 0}")
         print(f"Response length: {len(findings_response) if 'findings_response' in locals() else 0}")
         ai_findings = {
             "security_findings": [],
@@ -14645,8 +15217,7 @@ Return ONLY the JSON array of 8 queries, nothing else."""
 
     finding_based_queries = []
     try:
-        # Use 50% of configured max_tokens for query generation (needs more for detailed queries)
-        query_max_tokens = min(8000, int(config.llm.max_tokens * 0.5))
+        query_max_tokens = llm_call_budget(config, 1.0, floor=2048, ceiling=8000)
         
         # Debug: Check what we're sending to LLM
         print(f"DEBUG: Generating queries - {len(ai_findings.get('security_findings', []))} security, "
@@ -14664,65 +15235,16 @@ Return ONLY the JSON array of 8 queries, nothing else."""
         print(f"DEBUG: Response starts with: {queries_response[:100]}")
         print(f"DEBUG: Response ends with: {queries_response[-100:]}")
         
-        # Parse JSON response - try multiple extraction methods
-        queries_json = None
-        
-        # Method 1: Extract from code block
-        json_match = re.search(r'```(?:json)?\s*(\[.*\])\s*```', queries_response, re.DOTALL)
-        if json_match:
-            queries_json = json_match.group(1)
-            print(f"DEBUG: Extracted from code block (length: {len(queries_json)})")
-        
-        # Method 2: Find JSON between first [ and last ]
-        if not queries_json:
-            first_bracket = queries_response.find('[')
-            last_bracket = queries_response.rfind(']')
-            if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
-                queries_json = queries_response[first_bracket:last_bracket+1]
-                print(f"DEBUG: Extracted by finding brackets (length: {len(queries_json)})")
-        
-        # Method 3: Empty array fallback
-        if not queries_json:
-            queries_json = '[]'
-            print(f"DEBUG: No JSON array found, using empty array")
-        
-        print(f"DEBUG: Final JSON length: {len(queries_json)}")
-        print(f"DEBUG: JSON starts with: {queries_json[:200]}")
-        print(f"DEBUG: JSON ends with: {queries_json[-200:]}")
-        
-        # Validate before parsing
-        if not queries_json.strip():
-            raise ValueError("Empty JSON response")
-        
-        finding_based_queries = json.loads(queries_json)
-        print(f"✅ AI generated {len(finding_based_queries)} finding-based queries")
-        
-        # Mark as finding-based
+        # Truncated arrays are salvaged into their complete elements.
+        parsed_queries = extract_json_payload(queries_response, expect="list", list_keys=("queries", "spl_queries", "items"))
+        finding_based_queries = [q for q in (parsed_queries or []) if isinstance(q, dict) and str(q.get('spl') or '').strip()]
+        if not finding_based_queries:
+            print("No usable finding-based queries in the model response; using context and template queries")
+        else:
+            print(f"✅ AI generated {len(finding_based_queries)} finding-based queries")
+
         for q in finding_based_queries:
-            q['spl'] = _anchor_spl_to_environment(q.get('spl', ''))
-            q['environment_evidence'] = q.get('environment_evidence') or _extract_environment_evidence(q.get('spl', ''))
             q['query_source'] = 'ai_finding'
-        
-    except json.JSONDecodeError as e:
-        print(f"Error parsing queries JSON: {e}")
-        print(f"JSON string length: {len(queries_json) if 'queries_json' in locals() else 0}")
-        print(f"Response length: {len(queries_response) if 'queries_response' in locals() else 0}")
-        # Try to salvage partial queries
-        try:
-            last_complete = queries_json.rfind('}')
-            if last_complete > 0:
-                salvaged_json = queries_json[:last_complete+1] + ']'
-                finding_based_queries = json.loads(salvaged_json)
-                print(f"Salvaged {len(finding_based_queries)} queries from truncated response")
-                for q in finding_based_queries:
-                    q['spl'] = _anchor_spl_to_environment(q.get('spl', ''))
-                    q['environment_evidence'] = q.get('environment_evidence') or _extract_environment_evidence(q.get('spl', ''))
-                    q['query_source'] = 'ai_finding'
-            else:
-                raise
-        except:
-            print("Could not salvage queries, will use templates")
-            finding_based_queries = []
     except Exception as e:
         print(f"Error generating finding-based queries with AI: {e}")
         finding_based_queries = []
@@ -14840,8 +15362,7 @@ Keep it concise and actionable. Focus on business value, risk reduction, and mea
     )
     
     try:
-        # Use 15% of configured max_tokens for executive summary (concise output)
-        summary_max_tokens = min(2000, int(config.llm.max_tokens * 0.15))
+        summary_max_tokens = llm_call_budget(config, 0.4, floor=1024, ceiling=2000)
         ai_summary = await llm_client.generate_response(
             prompt=summary_prompt,
             max_tokens=summary_max_tokens,
@@ -14923,31 +15444,16 @@ At least 4 tasks must include verification SPL anchored to discovered indexes/so
 Return ONLY the JSON array, no other text."""
 
     try:
-        # Use 50% of configured max_tokens for admin tasks to allow comprehensive responses
-        # (tasks require detailed JSON with multiple fields per task)
-        task_max_tokens = min(8000, int(config.llm.max_tokens * 0.5))
+        # Tasks are detailed JSON with several fields each, so they get the full budget.
+        task_max_tokens = llm_call_budget(config, 1.0, floor=2048, ceiling=8000)
         tasks_response = await llm_client.generate_response(
             prompt=tasks_prompt,
             max_tokens=task_max_tokens,
             temperature=0.6
         )
         
-        # Parse JSON response
-        import re
-        # Extract JSON array from response (handle markdown code blocks)
-        json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', tasks_response, re.DOTALL)
-        if json_match:
-            tasks_json = json_match.group(1)
-        else:
-            # Try to find raw JSON array
-            json_match = re.search(r'(\[.*\])', tasks_response, re.DOTALL)
-            tasks_json = json_match.group(1) if json_match else '[]'
-        
-        # Validate it's valid JSON before parsing
-        if not tasks_json.strip():
-            raise ValueError("Empty JSON response")
-        
-        admin_tasks = json.loads(tasks_json)
+        parsed_tasks = extract_json_payload(tasks_response, expect="list", list_keys=("tasks", "admin_tasks", "items"))
+        admin_tasks = [task for task in (parsed_tasks or []) if isinstance(task, dict)]
         print(f"Generated {len(admin_tasks)} admin tasks")
         
         # Update progress - Tasks generated successfully
@@ -14959,26 +15465,6 @@ Return ONLY the JSON array, no other text."""
             message="Finalizing summary...",
         )
         
-    except json.JSONDecodeError as e:
-        print(f"Error parsing admin tasks JSON: {e}")
-        print(f"JSON string length: {len(tasks_json) if 'tasks_json' in locals() else 0}")
-        print(f"Raw response (first 1000 chars): {tasks_response[:1000] if 'tasks_response' in locals() else 'No response'}")
-        print(f"Raw response (last 500 chars): {tasks_response[-500:] if 'tasks_response' in locals() else 'No response'}")
-        # Try to salvage partial tasks
-        try:
-            # Find the last complete task object
-            last_complete = tasks_json.rfind('}')
-            if last_complete > 0:
-                # Try to close the array
-                salvaged_json = tasks_json[:last_complete+1] + ']'
-                admin_tasks = json.loads(salvaged_json)
-                print(f"Salvaged {len(admin_tasks)} tasks from truncated response")
-            else:
-                raise
-        except:
-            print("Could not salvage tasks, using default task")
-            # Use default task when salvage fails
-            admin_tasks = []
     except Exception as e:
         print(f"Error generating admin tasks: {e}")
         print(f"Raw response: {tasks_response[:500] if 'tasks_response' in locals() else 'No response'}")
@@ -15161,14 +15647,30 @@ async def verify_task(request: Dict[str, Any]):
         }
         
         spl_result = await execute_mcp_tool_call(mcp_tool_call, config)
-        
-        if "error" in spl_result:
+        outcome = classify_tool_result(spl_result)
+
+        # In-band tool errors (result.isError) are failures too, not results to grade.
+        if outcome["status"] == "error":
             return {
                 "status": "error",
-                "message": f"Failed to execute verification query: {spl_result['error']}",
+                "message": f"Failed to execute verification query: {outcome.get('error') or 'unknown error'}",
                 "results": None
             }
-        
+
+        rows = outcome.get("rows") or []
+        rows_text, rows_shown = render_rows_for_llm(rows, max_rows=20, max_chars=3000)
+        if rows:
+            total_rows = outcome.get("total_rows")
+            row_summary = f"{len(rows)} rows returned" + (
+                f" (truncated; {total_rows} in total)" if outcome.get("truncated") and isinstance(total_rows, int) else ""
+            ) + f"; first {rows_shown} shown below."
+        elif outcome.get("text"):
+            row_summary = "The tool returned text instead of rows; it is shown below."
+            rows_text = str(outcome.get("text"))[:3000]
+        else:
+            row_summary = "The query returned 0 rows."
+            rows_text = "(no rows)"
+
         # Analyze results with AI
         llm_client = get_or_create_llm_client(config)
         
@@ -15177,16 +15679,16 @@ async def verify_task(request: Dict[str, Any]):
 **Task Verification:**
 Expected Outcome: {expected_outcome}
 
-**SPL Query Executed:**
+**SPL Query Executed (last 24 hours):**
 {verification_spl}
 
-**Query Results:**
-{json.dumps(spl_result, indent=2)[:2000]}
+**Query Results:** {row_summary}
+{rows_text}
 
 **Analysis Instructions:**
-1. Determine if the task was completed successfully based on the expected outcome
-2. Classify the result as: SUCCESS, PARTIAL, or FAILED
-3. Provide specific metrics comparing the current state to the expected outcome
+1. Decide whether the rows above show the expected outcome. Use only these rows as evidence.
+2. Classify the result as: SUCCESS, PARTIAL, or FAILED. Zero rows proves the outcome only when the expected outcome is that nothing should match.
+3. Quote the specific values from the rows when you describe the current state; never invent values.
 4. If PARTIAL or FAILED, provide actionable recommendations
 
 Return a JSON object with this structure:
@@ -15204,24 +15706,20 @@ Return a JSON object with this structure:
 Return ONLY the JSON object, no other text."""
 
         try:
-            # Use 10% of configured max_tokens for verification analysis (smaller response)
-            analysis_max_tokens = min(1000, int(config.llm.max_tokens * 0.1))
+            analysis_max_tokens = llm_call_budget(config, 0.25, floor=512, ceiling=1000)
             analysis_response = await llm_client.generate_response(
                 prompt=analysis_prompt,
                 max_tokens=analysis_max_tokens,
                 temperature=0.3  # Lower temperature for more consistent analysis
             )
             
-            # Parse JSON response
-            import re
-            json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', analysis_response, re.DOTALL)
-            if json_match:
-                analysis_json = json_match.group(1)
-            else:
-                json_match = re.search(r'(\{.*\})', analysis_response, re.DOTALL)
-                analysis_json = json_match.group(1) if json_match else '{}'
-            
-            analysis = json.loads(analysis_json)
+            analysis = extract_json_payload(analysis_response, expect="dict")
+            if not isinstance(analysis, dict):
+                raise ValueError("The model did not return a JSON verdict")
+            verdict = str(analysis.get("status") or "").strip().lower()
+            analysis["status"] = verdict if verdict in {"success", "partial", "failed"} else "unknown"
+            if not isinstance(analysis.get("message"), str) or not analysis.get("message", "").strip():
+                analysis["message"] = "The model did not explain its verdict; review the query results."
             
         except Exception as e:
             print(f"Error analyzing verification results: {e}")
@@ -15236,6 +15734,7 @@ Return ONLY the JSON object, no other text."""
         # Combine SPL results with AI analysis
         response = {
             **analysis,
+            "row_count": len(rows),
             "results": spl_result,
             "verification_spl": verification_spl,
             "expected_outcome": expected_outcome,
@@ -15246,6 +15745,7 @@ Return ONLY the JSON object, no other text."""
         output_dir = Path("output")
         verification_file = output_dir / f"verification_task{task_index}_{session_id}.json"
         try:
+            output_dir.mkdir(parents=True, exist_ok=True)
             with open(verification_file, 'w', encoding='utf-8') as f:
                 json.dump(response, f, indent=2)
             print(f"Saved verification result to {verification_file}")
@@ -15358,24 +15858,16 @@ Focus on actionable, specific steps. Include SPL queries where helpful.
 Return ONLY the JSON object."""
 
         try:
-            # Use 15% of configured max_tokens for remediation steps
-            remediation_max_tokens = min(2000, int(config.llm.max_tokens * 0.15))
+            remediation_max_tokens = llm_call_budget(config, 0.4, floor=768, ceiling=2000)
             remediation_response = await llm_client.generate_response(
                 prompt=remediation_prompt,
                 max_tokens=remediation_max_tokens,
                 temperature=0.5
             )
             
-            # Parse JSON response
-            import re
-            json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', remediation_response, re.DOTALL)
-            if json_match:
-                remediation_json = json_match.group(1)
-            else:
-                json_match = re.search(r'(\{.*\})', remediation_response, re.DOTALL)
-                remediation_json = json_match.group(1) if json_match else '{}'
-            
-            remediation = json.loads(remediation_json)
+            remediation = extract_json_payload(remediation_response, expect="dict")
+            if not isinstance(remediation, dict) or not remediation.get("remediation_steps"):
+                raise ValueError("The model did not return remediation steps as JSON")
             
         except Exception as e:
             print(f"Error generating remediation: {e}")
@@ -15418,6 +15910,7 @@ Return ONLY the JSON object."""
         output_dir = Path("output")
         remediation_file = output_dir / f"remediation_task{task_index}_{session_id}.json"
         try:
+            output_dir.mkdir(parents=True, exist_ok=True)
             with open(remediation_file, 'w', encoding='utf-8') as f:
                 json.dump(remediation, f, indent=2)
             print(f"Saved remediation to {remediation_file}")
@@ -15725,6 +16218,15 @@ def _extract_v2_notable_patterns_from_text(raw_text: str) -> List[Dict[str, Any]
     return extracted
 
 
+def _plain_text_notable_pattern(raw_text: str) -> Dict[str, Any]:
+    """Turn a plain observation such as "Largest indexes: a, b" into a titled pattern."""
+    cleaned = raw_text.strip()
+    head, separator, tail = cleaned.partition(": ")
+    if separator and 0 < len(head) <= 60 and tail.strip():
+        return {"title": head, "insight": tail.strip()[:600], "evidence": []}
+    return {"category": "Observation", "insight": cleaned[:600], "evidence": []}
+
+
 def _parse_v2_notable_patterns(raw_patterns: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw_patterns, list):
         return []
@@ -15736,7 +16238,11 @@ def _parse_v2_notable_patterns(raw_patterns: Any) -> List[Dict[str, Any]]:
             try:
                 payload = json.loads(item)
             except Exception:
-                parsed_patterns.extend(_extract_v2_notable_patterns_from_text(item))
+                recovered = _extract_v2_notable_patterns_from_text(item)
+                if recovered:
+                    parsed_patterns.extend(recovered)
+                elif item.strip() and item.strip()[0] not in "[{":
+                    parsed_patterns.append(_plain_text_notable_pattern(item))
                 continue
         if isinstance(payload, dict) and isinstance(payload.get('patterns'), list):
             parsed_patterns.extend([pattern for pattern in payload.get('patterns', []) if isinstance(pattern, dict)])
@@ -15927,8 +16433,9 @@ def _rank_v2_entities(finding_ledger: Any, entity_type: str, limit: int = 6) -> 
             }
             if size_mb is not None:
                 entity['size_mb'] = size_mb
-            if isinstance(data.get('recentTimeIso'), str):
-                entity['recent_time'] = data.get('recentTimeIso')
+            recent_time = metadata_recent_time_utc(data)
+            if recent_time:
+                entity['recent_time'] = recent_time
             ranked.append(entity)
 
     return _dedupe_ranked_entities(ranked, limit=limit)
@@ -16042,6 +16549,111 @@ def _build_report_viability(bundle: Dict[str, Any], staleness_days: int) -> Dict
     }
 
 
+_ENTITY_FACT_KINDS = ('index', 'sourcetype', 'source', 'host')
+_ENTITY_FACT_SIGNAL_WORDS = ('stale', 'no recent', 'no events', 'error', 'fail', 'gap', 'drop', 'skew')
+# Name fragments too generic to tie a request to one entity ("splunk health" should not pull in snmp4splunk:health).
+_ENTITY_TOKEN_STOPWORDS = frozenset({
+    'splunk', 'splunkd', 'local', 'localdomain', 'localhost', 'internal', 'audit', 'introspection', 'metrics',
+    'events', 'event', 'error', 'errors', 'python', 'script', 'scripts', 'server', 'default', 'access', 'system',
+    'health', 'stats', 'status', 'history', 'demo', 'guide', 'linux', 'windows', 'json', 'data', 'logs',
+})
+
+
+def _build_entity_facts(finding_ledger: Any, freshness: Any) -> List[Dict[str, str]]:
+    """One short fact line per index/sourcetype/source/host that discovery analyzed."""
+    if not isinstance(finding_ledger, list):
+        return []
+    freshness = freshness if isinstance(freshness, dict) else {}
+    stale_indexes = {str(name) for name in freshness.get('stale_indexes') or [] if name}
+    empty_indexes = {str(name) for name in freshness.get('empty_indexes') or [] if name}
+    facts: List[Dict[str, str]] = []
+    seen: set = set()
+    for entry in finding_ledger:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get('kind') or '').strip().lower()
+        if kind not in _ENTITY_FACT_KINDS:
+            continue
+        data = entry.get('data') if isinstance(entry.get('data'), dict) else {}
+        name = str(data.get('name' if kind == 'index' else kind) or '').strip()
+        if not name:
+            title = str(entry.get('title') or '')
+            name = title.split(':', 1)[1].strip() if ':' in title else ''
+        if not name or (kind, name.lower()) in seen:
+            continue
+        seen.add((kind, name.lower()))
+
+        parts: List[str] = []
+        if kind == 'index':
+            parts.append(f"{_safe_int(data.get('totalEventCount')):,} events in total, {_safe_int(data.get('currentDBSizeMB')):,} MB")
+            if name in empty_indexes:
+                parts.append('no events at all')
+            elif name in stale_indexes:
+                parts.append('no events in the 24h before discovery')
+        else:
+            parts.append(f"{_safe_int(data.get('totalCount') or data.get('count')):,} events")
+            last_event = metadata_recent_time_utc(data)
+            if last_event:
+                parts.append(f"last event {last_event}")
+        for finding in entry.get('findings') or []:
+            cleaned = re.sub(r'^[^\w(]+', '', str(finding or '')).strip()
+            if cleaned and any(word in cleaned.lower() for word in _ENTITY_FACT_SIGNAL_WORDS):
+                parts.append(cleaned[:160])
+                break
+        facts.append({'kind': kind, 'name': name, 'summary': '; '.join(parts)})
+    return facts
+
+
+def _entity_mention_strength(name: str, text: str) -> int:
+    """2 when the full name appears in ``text``, 1 when a distinctive name fragment does, else 0."""
+    lowered = name.lower()
+    if re.search(rf'(?<![\w]){re.escape(lowered)}(?![\w])', text):
+        return 2
+    for token in re.split(r'[^a-z0-9]+', lowered):
+        if len(token) >= 5 and token not in _ENTITY_TOKEN_STOPWORDS and re.search(rf'(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])', text):
+            return 1
+    return 0
+
+
+def match_entity_facts(text: str, entity_facts: Any, limit: int = 6) -> List[Dict[str, str]]:
+    """Discovery facts for entities the text names, full-name matches first.
+
+    A compound name that matched in full only lends its leading fragment to the
+    fragment pass, so "homebridge:collector" still finds homebridge_for_splunk
+    but does not pull in every other "*collector*" entity.
+    """
+    if not isinstance(text, str) or not text.strip() or not isinstance(entity_facts, list):
+        return []
+    lowered = text.lower()
+    facts = [fact for fact in entity_facts if isinstance(fact, dict) and fact.get('name')]
+    exact = [fact for fact in facts if _entity_mention_strength(str(fact['name']), lowered) == 2]
+    residual = lowered
+    for fact in sorted(exact, key=lambda item: -len(str(item['name']))):
+        name = str(fact['name']).lower()
+        tokens = [token for token in re.split(r'[^a-z0-9]+', name) if token]
+        if len(tokens) < 2:
+            continue
+        lead = tokens[0] if len(tokens[0]) >= 5 and tokens[0] not in _ENTITY_TOKEN_STOPWORDS else ''
+        residual = re.sub(rf'(?<![\w]){re.escape(name)}(?![\w])', f' {lead} ', residual)
+    exact_ids = {id(fact) for fact in exact}
+    partial = [fact for fact in facts if id(fact) not in exact_ids and _entity_mention_strength(str(fact['name']), residual)]
+
+    def _kind_rank(fact: Dict[str, Any]) -> int:
+        kind = fact.get('kind')
+        return _ENTITY_FACT_KINDS.index(kind) if kind in _ENTITY_FACT_KINDS else len(_ENTITY_FACT_KINDS)
+
+    ordered = sorted(exact, key=_kind_rank) + sorted(partial, key=_kind_rank)
+    return ordered[:limit]
+
+
+def _format_discovery_timestamp(value: Any) -> str:
+    text = str(value or '').strip()
+    try:
+        return datetime.strptime(text, '%Y%m%d_%H%M%S').strftime('%Y-%m-%d %H:%M')
+    except ValueError:
+        return text
+
+
 def _build_report_knowledge(bundle: Dict[str, Any], viability: Dict[str, Any]) -> Dict[str, Any]:
     blueprint = bundle.get('blueprint', {}) if isinstance(bundle.get('blueprint', {}), dict) else {}
     ai_summary_payload = bundle.get('ai_summary', {}) if isinstance(bundle.get('ai_summary', {}), dict) else {}
@@ -16089,7 +16701,7 @@ def _build_report_knowledge(bundle: Dict[str, Any], viability: Dict[str, Any]) -
         '🔍 DISCOVERY KNOWLEDGE SNAPSHOT:',
         f"- Report viability: {viability.get('status', 'unknown')} (score {viability.get('score', 0)}/100, {viability.get('age_days', 0)} days old)",
         f"- Readiness score: {_safe_int(blueprint.get('readiness_score') or ai_summary_payload.get('readiness_score'))}/100",
-        f"- Surface area: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes, {overview.get('total_hosts', 0)} hosts, {overview.get('total_sources', 0)} sources, {overview.get('data_volume_24h', 'unknown')} over 24h",
+        f"- Surface area: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes, {overview.get('total_hosts', 0)} hosts, {overview.get('total_sources', 0)} sources; 24h ingest {_format_data_volume(overview.get('data_volume_24h'))}",
         f"- Dominant indexes: {_format_ranked_entities(top_indexes[:4], include_size=True) or 'unknown'}",
         f"- Dominant sourcetypes: {_format_ranked_entities(top_sourcetypes[:4]) or 'unknown'}",
         f"- Highest-priority gaps: {', '.join(top_gap_titles[:4]) or 'none identified'}",
@@ -16135,6 +16747,10 @@ def _build_report_knowledge(bundle: Dict[str, Any], viability: Dict[str, Any]) -
         'prompt_context_compact': prompt_context_compact,
         'prompt_context_strategic': prompt_context_strategic,
         'greeting_context': greeting_context,
+        'entity_facts': _build_entity_facts(
+            finding_ledger,
+            (blueprint.get('discovery_metrics') or {}).get('freshness') if isinstance(blueprint.get('discovery_metrics'), dict) else {},
+        ),
         'known_entities': {
             'indexes': [item.get('name') for item in top_indexes if isinstance(item, dict) and item.get('name')],
             'sourcetypes': [item.get('name') for item in top_sourcetypes if isinstance(item, dict) and item.get('name')],
@@ -16144,24 +16760,53 @@ def _build_report_knowledge(bundle: Dict[str, Any], viability: Dict[str, Any]) -
     }
 
 
+_REPORT_KNOWLEDGE_PREFIXES = (
+    'v2_intelligence_blueprint_',
+    'v2_insights_brief_',
+    'v2_ai_summary_',
+    'v2_operator_runbook_',
+    'v2_developer_handoff_',
+)
+_REPORT_KNOWLEDGE_CACHE_TTL_SECONDS = 60.0
+_report_knowledge_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "value": None}
+
+
 def load_latest_report_knowledge(staleness_days: int = 7) -> Optional[Dict[str, Any]]:
-    """Load the latest viable report bundle and synthesize a reusable knowledge object."""
+    """Load the latest viable report bundle and synthesize a reusable knowledge object.
+
+    Chat calls this on every turn, so the parsed bundle is reused until a report file
+    changes or the short TTL (which bounds report-age drift) expires.
+    """
     output_dir = Path('output')
     if not output_dir.exists():
         return None
 
-    timestamps = set()
-    prefixes = [
-        'v2_intelligence_blueprint_',
-        'v2_insights_brief_',
-        'v2_ai_summary_',
-        'v2_operator_runbook_',
-        'v2_developer_handoff_',
-    ]
-    for prefix in prefixes:
+    report_files = []
+    for prefix in _REPORT_KNOWLEDGE_PREFIXES:
         for path in output_dir.glob(f'{prefix}*'):
             if path.is_file():
-                timestamps.add(path.stem.replace(prefix, '', 1))
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                report_files.append((prefix, path, stat.st_mtime_ns, stat.st_size))
+
+    cache_key = (str(output_dir.resolve()), staleness_days, tuple(sorted((str(p), m, s) for _, p, m, s in report_files)))
+    now = time.monotonic()
+    if _report_knowledge_cache.get("key") == cache_key and now < _report_knowledge_cache.get("expires_at", 0.0):
+        return copy.deepcopy(_report_knowledge_cache.get("value"))
+
+    knowledge = _load_latest_report_knowledge_uncached(output_dir, staleness_days, report_files)
+    _report_knowledge_cache.update({
+        "key": cache_key,
+        "expires_at": now + _REPORT_KNOWLEDGE_CACHE_TTL_SECONDS,
+        "value": copy.deepcopy(knowledge),
+    })
+    return knowledge
+
+
+def _load_latest_report_knowledge_uncached(output_dir: Path, staleness_days: int, report_files: List[Any]) -> Optional[Dict[str, Any]]:
+    timestamps = {path.stem.replace(prefix, '', 1) for prefix, path, _, _ in report_files}
 
     best_usable = None
     for timestamp in sorted(timestamps, reverse=True):
@@ -16199,24 +16844,58 @@ def _known_entity_matches(user_message: str, candidates: List[str], limit: int =
     return matches
 
 
+# (domain, words in the user message, fragments of index names that usually hold that data)
+_QUERY_PLAN_DOMAINS: List[Tuple[str, List[str], List[str]]] = [
+    ('security', ['windows', 'security', 'auth', 'login', 'logon', 'privilege', 'lockout', 'malware', 'threat'],
+     ['security', 'wineventlog', 'endpoint', 'auth', 'firewall', 'ids', 'edr', '_audit']),
+    ('platform operations', ['platform', 'splunk health', 'ingestion', 'license', 'scheduler', 'search performance',
+                             '_internal', '_audit', '_introspection', 'indexer', 'queue'],
+     ['_internal', '_audit', '_introspection', '_metrics']),
+    ('application monitoring', ['application', 'api', 'feed', 'collector', 'service', 'http', 'response time'],
+     ['app', 'api', 'web', 'service', 'http']),
+    ('network operations', ['network', 'ping', 'latency', 'packet loss', 'interface', 'connectivity', 'firewall', 'dns'],
+     ['net', 'firewall', 'ping', 'dns', 'proxy', 'router', 'switch']),
+    ('iot monitoring', ['iot', 'sensor', 'device', 'temperature', 'humidity', 'smart home', 'thermostat'],
+     ['iot', 'sensor', 'device', 'home', 'esp']),
+    ('compliance', ['compliance', 'audit', 'admin action', 'governance'],
+     ['_audit', 'audit', 'wineventlog']),
+]
+
+
 def _candidate_indexes_for_domain(domain: str, report_knowledge: Dict[str, Any]) -> List[str]:
     known_indexes = report_knowledge.get('known_entities', {}).get('indexes', []) if isinstance(report_knowledge, dict) else []
-    domain_defaults = {
-        'security': ['endpoint', 'wineventlog', '_audit', 'security'],
-        'platform operations': ['_internal', '_audit', '_introspection'],
-        'application monitoring': ['wmata', 'main'],
-        'network operations': ['netops', 'ping', 'main'],
-        'iot monitoring': ['homebridge_for_splunk', 'esp32', 'main'],
-        'compliance': ['_audit', 'wineventlog'],
-    }
-    candidates = []
-    for desired in domain_defaults.get(domain, []):
+    known_indexes = [name for name in known_indexes if isinstance(name, str) and name.strip()]
+    fragments = next((hints for name, _words, hints in _QUERY_PLAN_DOMAINS if name == domain), [])
+    candidates: List[str] = []
+    for fragment in fragments:
         for index_name in known_indexes:
-            if index_name.lower() == desired.lower() and index_name not in candidates:
+            if fragment in index_name.lower() and index_name not in candidates:
                 candidates.append(index_name)
     if candidates:
         return candidates[:4]
-    return [name for name in known_indexes[:4] if isinstance(name, str)]
+    return known_indexes[:4]
+
+
+def _report_anchor_for_domain(domain: str, report_knowledge: Dict[str, Any]) -> str:
+    """Name the report item that matches the domain, or say that none does."""
+    words = next((list(message_words) + list(hints) for name, message_words, hints in _QUERY_PLAN_DOMAINS if name == domain), [])
+    sources = [
+        ('recommendation', 'recommendations', 'title'),
+        ('coverage gap', 'coverage_gaps', 'gap'),
+        ('risk', 'risk_register', 'risk'),
+    ]
+    for label, key, field in sources:
+        items = report_knowledge.get(key, []) if isinstance(report_knowledge.get(key, []), list) else []
+        for item in items:
+            title = str(item.get(field) or '').strip() if isinstance(item, dict) else ''
+            if title and any(_starts_word(title.lower(), word.strip('_')) for word in words):
+                return f"The discovery report lists a related {label}: {title}."
+    return 'No discovery report item matches this topic; rely on live queries.'
+
+
+def _starts_word(text: str, word: str) -> bool:
+    """``word`` appears at the start of a word in ``text`` ("api" matches "APIs", not "rapid")."""
+    return bool(word) and re.search(rf'(?<![a-z0-9]){re.escape(word)}', text) is not None
 
 
 def build_query_plan_brief(user_message: str, report_knowledge: Optional[Dict[str, Any]], memory: Optional[Dict[str, Any]] = None) -> str:
@@ -16229,25 +16908,22 @@ def build_query_plan_brief(user_message: str, report_knowledge: Optional[Dict[st
     domain = 'general'
     anchor = 'Use the report as baseline context and live queries for recency checks.'
 
-    if any(token in message for token in ['windows', 'security', 'auth', 'login', 'privilege', 'lockout']):
-        domain = 'security'
-        anchor = 'Windows Security Monitoring and Threat Detection is a known high-priority gap with existing telemetry.'
-    elif any(token in message for token in ['platform', 'splunk health', 'ingestion', 'license', 'scheduler', 'search performance', '_internal', '_audit', '_introspection']):
-        domain = 'platform operations'
-        anchor = 'Platform Health and Splunk Operational Monitoring is a top recommendation backed by heavy internal telemetry.'
-    elif any(token in message for token in ['wmata', 'api', 'feed', 'collector']):
-        domain = 'application monitoring'
-        anchor = 'WMATA API monitoring is a top recommendation and a major business/application data surface.'
-    elif any(token in message for token in ['network', 'ping', 'latency', 'packet loss', 'interface', 'connectivity']):
-        domain = 'network operations'
-        anchor = 'Network traffic and connectivity monitoring is a named coverage gap.'
-    elif any(token in message for token in ['compliance', 'audit', 'admin action', 'governance']):
-        domain = 'compliance'
-        anchor = 'Compliance and audit activity monitoring is already identified as a medium-priority risk area.'
+    for domain_name, message_words, _index_hints in _QUERY_PLAN_DOMAINS:
+        if any(_starts_word(message, word) for word in message_words):
+            domain = domain_name
+            anchor = _report_anchor_for_domain(domain_name, report_knowledge)
+            break
 
     remembered_index = _remembered_entity(memory or {}, 'index')
     remembered_host = _remembered_entity(memory or {}, 'host')
-    candidate_indexes = _known_entity_matches(user_message, known_entities.get('indexes', []), limit=4) or _candidate_indexes_for_domain(domain, report_knowledge)
+    mission = normalize_mission((memory or {}).get('mission')) if isinstance(memory, dict) else ''
+    matched_facts = match_entity_facts(f"{user_message}\n{mission}", report_knowledge.get('entity_facts'))
+    fact_indexes = [fact['name'] for fact in matched_facts if fact.get('kind') == 'index']
+    candidate_indexes = (
+        _known_entity_matches(user_message, known_entities.get('indexes', []), limit=4)
+        or fact_indexes
+        or _candidate_indexes_for_domain(domain, report_knowledge)
+    )
     candidate_sourcetypes = _known_entity_matches(user_message, known_entities.get('sourcetypes', []), limit=4)
     if not candidate_sourcetypes and domain == 'security':
         candidate_sourcetypes = [name for name in known_entities.get('sourcetypes', []) if isinstance(name, str) and 'wineventlog' in name.lower()][:3]
@@ -16262,6 +16938,13 @@ def build_query_plan_brief(user_message: str, report_knowledge: Optional[Dict[st
         lines.append(f"- Candidate indexes: {', '.join(candidate_indexes[:4])}")
     if candidate_sourcetypes:
         lines.append(f"- Candidate sourcetypes: {', '.join(candidate_sourcetypes[:4])}")
+    if matched_facts:
+        when = _format_discovery_timestamp(report_knowledge.get('timestamp'))
+        lines.append(
+            f"- Discovery facts for names in the request (from the discovery run{' at ' + when if when else ''}; "
+            "confirm recency with a live search):"
+        )
+        lines.extend(f"  - {fact['kind']} {fact['name']}: {fact['summary']}"[:300] for fact in matched_facts)
     if remembered_index or remembered_host:
         memory_parts = []
         if remembered_index:
@@ -16341,6 +17024,13 @@ def detect_report_intent(user_message: str, report_knowledge: Optional[Dict[str,
         return None
     if any(token in message for token in ['how many', 'count', 'latest event', 'last seen', 'timechart', 'break down', 'show events', 'run query', 'search for']):
         return None
+    # Requests to check something live (including the report follow-on prompts) need real
+    # searches; answering them from the report snapshot would just repeat the report.
+    if any(token in message for token in [
+        'validate', 'with live', 'live splunk', 'live query', 'live data', 'right now', 'prototype',
+        'measure current', 'run a search', 'run a query', 'query splunk', 'search splunk', 'over the last',
+    ]):
+        return None
 
     if any(token in message for token in ['what should i improve', 'what should we improve', 'what should i do next', 'next steps', 'priorities', 'recommend', 'recommendation', 'improve the environment']):
         return 'recommendations'
@@ -16382,7 +17072,7 @@ def build_report_intent_response(intent: str, report_knowledge: Dict[str, Any]) 
         insights = [item for item in (report_knowledge.get('headline_findings', []) or [])[:5] if isinstance(item, str)]
         lines.extend([
             '',
-            f"Environment snapshot: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes, {overview.get('total_hosts', 0)} hosts, {overview.get('total_sources', 0)} sources, and {overview.get('data_volume_24h', 'unknown')} of data over 24 hours.",
+            f"Environment snapshot: {overview.get('total_indexes', 0)} indexes, {overview.get('total_sourcetypes', 0)} sourcetypes, {overview.get('total_hosts', 0)} hosts, and {overview.get('total_sources', 0)} sources; 24h ingest volume: {_format_data_volume(overview.get('data_volume_24h'))}.",
             f"Readiness score: {_safe_int(report_knowledge.get('readiness_score'))} / 100.",
             f"Dominant indexes: {_format_ranked_entities(top_indexes[:4], include_size=True) or 'unknown' }.",
             f"Dominant sourcetypes: {_format_ranked_entities(top_sourcetypes[:4]) or 'unknown' }.",
@@ -16577,11 +17267,11 @@ def build_report_follow_on_actions(
             'Check platform health in _internal, _audit, and _introspection over the last 24 hours and summarize ingestion issues, search failures, and license signals.',
             'validate_platform_health',
         ))
-    if any('wmata' in title for title in recommendation_titles):
+    if any(token in title for title in recommendation_titles for token in ('api ', 'feed', 'collector', 'application')):
         actions.append(_make_follow_on_action(
-            'Review WMATA feed health',
-            'Check WMATA API and collector data over the last 24 hours for outages, elevated errors, and latency spikes.',
-            'validate_wmata_health',
+            'Review service feed health',
+            'Check API and collector data over the last 24 hours for outages, elevated errors, and latency spikes.',
+            'validate_service_health',
         ))
     if any('network' in title for title in recommendation_titles):
         actions.append(_make_follow_on_action(
@@ -16634,6 +17324,44 @@ def _is_numeric_like(value: Any) -> bool:
     return False
 
 
+# Splunk adds these to raw events to describe buckets and parsing; they are never useful pivots.
+_SPLUNK_INTERNAL_RESULT_FIELDS = {
+    'punct', 'linecount', 'splunk_server', 'splunk_server_group', 'timestartpos', 'timeendpos',
+}
+
+
+def _is_internal_result_field(field: Any) -> bool:
+    lowered = str(field or '').strip().lower()
+    return (
+        not lowered
+        or lowered.startswith('_')
+        or lowered.startswith('date_')
+        or lowered in _SPLUNK_INTERNAL_RESULT_FIELDS
+    )
+
+
+_COUNT_METRIC_NAMES = frozenset({'count', 'event_count', 'eventcount', 'events', 'total', 'total_count', 'totalcount'})
+
+
+def _count_metric_field(numeric_fields: List[str]) -> Optional[str]:
+    for field in numeric_fields:
+        lowered = field.lower()
+        if lowered in _COUNT_METRIC_NAMES or lowered.startswith(('count', 'sum(', 'dc(')) or lowered.endswith('_count'):
+            return field
+    return None
+
+
+def _metric_value(value: Any) -> float:
+    try:
+        return float(str(value).replace(',', '').strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_metric(value: float) -> str:
+    return f"{int(value):,}" if float(value).is_integer() else f"{value:,.2f}"
+
+
 def analyze_result_rows(rows: Any) -> Dict[str, Any]:
     """Extract compact structural clues from query results for planning and summarization."""
     if not isinstance(rows, list) or not rows:
@@ -16643,7 +17371,10 @@ def analyze_result_rows(rows: Any) -> Dict[str, Any]:
     if not dict_rows:
         return {}
 
-    sample_fields = list(dict_rows[0].keys())[:12]
+    sample_fields = [
+        field for field in dict_rows[0].keys()
+        if field == '_time' or not _is_internal_result_field(field)
+    ][:12]
     time_fields = [
         field for field in sample_fields
         if field.lower() in {'_time', 'time', 'firsttimeiso', 'lasttimeiso', 'recenttimeiso'}
@@ -16657,27 +17388,33 @@ def analyze_result_rows(rows: Any) -> Dict[str, Any]:
         if sample_values and all(_is_numeric_like(value) for value in sample_values):
             numeric_fields.append(field)
 
+    # Aggregated results have one row per value, so rank by their count column rather
+    # than by how often a value repeats (which would just echo the row order).
+    metric_field = _count_metric_field(numeric_fields)
+    ranking_rows = [row for row in rows[:5000] if isinstance(row, dict)] if metric_field else dict_rows[:50]
     top_dimensions: List[Dict[str, Any]] = []
     for field in sample_fields:
         lowered = field.lower()
         if field in numeric_fields or lowered in time_fields or lowered.endswith('time') or lowered.endswith('timeiso'):
             continue
-        counts: Dict[str, int] = {}
-        for row in dict_rows[:50]:
+        counts: Dict[str, float] = {}
+        for row in ranking_rows:
             value = row.get(field)
             if value in (None, ''):
                 continue
             text = str(value).strip()
             if not text or len(text) > 80:
                 continue
-            counts[text] = counts.get(text, 0) + 1
-        if len(counts) < 2:
+            weight = _metric_value(row.get(metric_field)) if metric_field else 1.0
+            counts[text] = counts.get(text, 0.0) + weight
+        if len(counts) < 2 or max(counts.values()) <= 0:
             continue
         ranked_counts = sorted(counts.items(), key=lambda item: item[1], reverse=True)
         top_dimensions.append({
             'field': field,
             'distinct_count': len(counts),
-            'values': [f"{name} ({count})" for name, count in ranked_counts[:3]],
+            'ranked_by': metric_field or 'rows',
+            'values': [f"{name} ({_format_metric(count)})" for name, count in ranked_counts[:5 if metric_field else 3]],
         })
 
     top_dimensions = sorted(top_dimensions, key=lambda item: item.get('distinct_count', 0), reverse=True)[:3]
@@ -16747,7 +17484,10 @@ def format_result_summary_for_llm(summary: Dict[str, Any]) -> str:
             continue
         field = str(dimension.get('field', '')).strip()
         values = dimension.get('values', []) if isinstance(dimension.get('values', []), list) else []
-        if field and values:
+        ranked_by = str(dimension.get('ranked_by') or '').strip()
+        if field and values and ranked_by and ranked_by != 'rows':
+            lines.append(f"- Top {field} values by {ranked_by}: {', '.join(values[:5])}")
+        elif field and values:
             lines.append(f"- Top {field} values: {', '.join(values[:3])}")
 
     next_pivots = summary.get('next_pivots', []) if isinstance(summary.get('next_pivots', []), list) else []
@@ -16756,6 +17496,212 @@ def format_result_summary_for_llm(summary: Dict[str, Any]) -> str:
 
     return '\n'.join(lines)
 
+
+_INDEX_LATEST_TIME_FIELDS = ("maxTime", "maxTimeIso", "lastTimeIso", "latest_time", "latest", "last_event")
+
+
+def _index_names_without_latest_time(rows: List[Any]) -> List[str]:
+    """Names of index-metadata rows (totalEventCount) that carry no latest-event time."""
+    names: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or "totalEventCount" not in row:
+            continue
+        if any(row.get(field) not in (None, "") for field in _INDEX_LATEST_TIME_FIELDS):
+            continue
+        name = str(row.get("title") or row.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def summarize_tool_outcome(tool_name: str, outcome: Dict[str, Any]) -> Dict[str, Any]:
+    """Summary stored on each tool call; chat memory, follow-on actions and the UI read it."""
+    status = outcome.get("status")
+    if status == "error":
+        message = str(outcome.get("error") or "Unknown error")
+        return {
+            "type": "error",
+            "status": "error",
+            "message": message,
+            "row_count": 0,
+            "findings": [f"Error: {message[:200]}"],
+        }
+
+    rows = list(outcome.get("rows") or [])
+    summary: Dict[str, Any] = {"type": tool_name, "status": status, "row_count": len(rows), "findings": []}
+    if rows:
+        total_rows = outcome.get("total_rows")
+        if outcome.get("truncated") and isinstance(total_rows, int) and total_rows > len(rows):
+            summary["findings"].append(f"{len(rows)} results returned (truncated; {total_rows} in total)")
+        else:
+            summary["findings"].append(f"{len(rows)} results returned")
+        totals_only = _index_names_without_latest_time(rows)
+        if totals_only:
+            summary["findings"].append(
+                f"Index metadata for {', '.join(totals_only[:3])} holds event totals and sizes only, not the time of the "
+                f"latest event, so it does not show whether data is recent. Check recency with "
+                f"| tstats latest(_time) as latest where index={totals_only[0]}"
+            )
+        if outcome.get("zero_counts"):
+            summary["zero_counts"] = True
+            summary["findings"].append("Every count is 0")
+        summary["actual_results"] = rows[:10]
+        analysis = analyze_result_rows(rows)
+        if analysis:
+            summary.update(analysis)
+            top_dimensions = analysis.get("top_dimensions") or []
+            top = top_dimensions[0] if top_dimensions else None
+            if isinstance(top, dict) and top.get("field") and top.get("values"):
+                ranked_by = top.get("ranked_by")
+                label = f"Top {top['field']} by {ranked_by}" if ranked_by and ranked_by != "rows" else f"Top {top['field']}"
+                summary["findings"].append(f"{label}: {', '.join(top['values'][:3])}")
+            bounds = analysis.get("time_bounds") or {}
+            if isinstance(bounds, dict) and bounds.get("field"):
+                summary["findings"].append(
+                    f"Time bounds from {bounds['field']}: {bounds.get('first', 'unknown')} -> {bounds.get('last', 'unknown')}"
+                )
+    elif outcome.get("text"):
+        summary["findings"].append("Text result returned")
+        summary["text"] = str(outcome["text"])[:2000]
+    else:
+        summary["findings"].append("0 results returned")
+    return summary
+
+
+def _row_value(row: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """First present, non-empty value; unlike ``a or b`` it keeps a real 0."""
+    for key in keys:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def extract_event_count(outcome: Dict[str, Any]) -> Optional[int]:
+    """Count from a one-row count search, or None when the search failed."""
+    if outcome.get("status") == "error":
+        return None
+    rows = outcome.get("rows") or []
+    if rows and isinstance(rows[0], dict):
+        for key in ("event_count", "count", "COUNT"):
+            if key in rows[0]:
+                return _safe_int(rows[0].get(key))
+    return 0
+
+
+def format_event_count(count: Optional[int]) -> str:
+    return "unavailable (the search failed)" if count is None else f"{count:,}"
+
+
+def format_tool_call_tag(tool_name: str, args: Dict[str, Any]) -> str:
+    return "<TOOL_CALL>" + json.dumps({"tool": tool_name, "args": args}, default=str) + "</TOOL_CALL>"
+
+
+def build_fatal_mcp_error_message(status_code: Any, detail: str) -> str:
+    """User-facing explanation for MCP failures that retrying cannot fix."""
+    known = {
+        401: (
+            "Authentication failed",
+            [
+                "The MCP token in Settings is correct and has not expired.",
+                "The token belongs to a Splunk user that is allowed to use the MCP server.",
+            ],
+        ),
+        403: (
+            "Access forbidden",
+            [
+                "The Splunk user behind the MCP token has the roles this tool or index needs.",
+                "Network or proxy rules allow the request.",
+            ],
+        ),
+        404: (
+            "MCP endpoint not found",
+            [
+                "The MCP URL in Settings is correct (it usually ends in /services/mcp).",
+                "The Splunk MCP Server app is installed and enabled.",
+            ],
+        ),
+    }
+    title, checks = known.get(
+        status_code,
+        (
+            "Could not reach the Splunk MCP server",
+            [
+                "The MCP server is running and reachable from this machine.",
+                "Firewall, proxy, and TLS settings allow the connection.",
+            ],
+        ),
+    )
+    status_text = f"status {status_code}" if status_code else "an error"
+    lines = [
+        f"**{title}**",
+        "",
+        f"The Splunk MCP server returned {status_text}:",
+        "",
+        "```",
+        (str(detail or "").strip() or "No details were returned.")[:600],
+        "```",
+        "",
+        "Please check:",
+    ]
+    lines.extend(f"{number}. {check}" for number, check in enumerate(checks, 1))
+    lines.extend(["", "I stopped here so the same failing request is not retried."])
+    return "\n".join(lines)
+
+
+def finalize_route_tool_calls(
+    response_text: str,
+    tool_calls: Optional[List[Dict[str, Any]]],
+    annotate_reply: bool = True,
+) -> str:
+    """Mark failed calls of a deterministic route and make its reply say so.
+
+    Deterministic routes build their reply from result rows, so without this
+    a failed search reads as "no data". Pass ``annotate_reply=False`` when the
+    route already explains the failure itself.
+    """
+    outcomes: List[Dict[str, Any]] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict) or "result" not in call:
+            continue
+        outcome = classify_tool_result(call.get("result"))
+        outcomes.append(outcome)
+        if outcome["status"] == "error":
+            call["summary"] = summarize_tool_outcome(str(call.get("tool") or ""), outcome)
+        elif isinstance(call.get("summary"), dict):
+            call["summary"].setdefault("status", outcome["status"])
+
+    failures = [outcome for outcome in outcomes if outcome["status"] == "error"]
+    if not failures or not annotate_reply:
+        return response_text
+    first_error = str(failures[0].get("error") or "unknown error").strip()
+    if len(failures) == len(outcomes):
+        if failures[0].get("fatal"):
+            return build_fatal_mcp_error_message(failures[0].get("status_code"), first_error)
+        return (
+            "I couldn't get this from Splunk because the request failed:\n\n"
+            f"> {first_error[:600]}\n\n"
+            "Check that the index and fields exist and that the MCP user can search them, "
+            "or rephrase the request and I'll try a different search."
+        )
+    return f"{response_text}\n\n_Note: {len(failures)} of {len(outcomes)} Splunk requests failed ({first_error[:240]})._"
+
+
+_SUGGESTED_SPL_FENCE = re.compile(r"```(?:spl|splunk)[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_GENERIC_CODE_FENCE = re.compile(r"```[a-zA-Z]*[ \t]*\n(.*?)```", re.DOTALL)
+
+
+def extract_suggested_spl_from_answer(text: Any) -> Optional[str]:
+    """Return the first SPL code block in a direct answer so the UI can offer to run it."""
+    if not isinstance(text, str) or "```" not in text:
+        return None
+    match = _SUGGESTED_SPL_FENCE.search(text)
+    candidate = match.group(1).strip() if match else ""
+    if not candidate:
+        generic = _GENERIC_CODE_FENCE.search(text)
+        if generic and _looks_like_spl_query_start(generic.group(1)):
+            candidate = generic.group(1).strip()
+    return candidate or None
 
 async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue, runtime_config: Any = None):
     """Process chat request and push status updates to queue."""
@@ -16820,10 +17766,16 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         # Load and update persistent chat memory for this session
         update_chat_memory(chat_session_id, user_message)
         chat_memory = load_chat_memory(chat_session_id)
+        if "mission" in request:
+            requested_mission = normalize_mission(request.get("mission"))
+            if requested_mission != str(chat_memory.get("mission") or ""):
+                chat_memory["mission"] = requested_mission
+                save_chat_memory(chat_session_id, chat_memory)
+        mission = normalize_mission(chat_memory.get("mission"))
         memory_context = build_chat_memory_context(chat_memory)
-        
+
         query_lower = user_message.lower()
-        simple_greetings = any(word in query_lower for word in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'bye'])
+        small_talk = is_small_talk(user_message)
         needs_insights = any(keyword in query_lower for keyword in [
             'summary', 'overview', 'recommend', 'best practice', 'optimization',
             'use case', 'compliance', 'security', 'improve', 'assess', 'risk', 'gap', 'priority'
@@ -16835,7 +17787,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
 
         if report_knowledge:
             discovery_age_warning = report_knowledge.get('warning')
-            if simple_greetings:
+            if small_talk:
                 discovery_context = report_knowledge.get('greeting_context', '')
             else:
                 discovery_context = report_knowledge.get('prompt_context_compact', '')
@@ -16927,17 +17879,19 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             "saia_explain_spl",
             "saia_ask_splunk_question"
         ]
-        ordered_tools = [name for name in primary_tool_order if name in available_mcp_tools]
-        ordered_tools.extend(sorted([name for name in available_mcp_tools if name not in ordered_tools]))
-
-        available_tools_text = "\n".join(
-            f"- {name}: {MCP_TOOL_DESCRIPTIONS.get(name, 'MCP tool available for Splunk operations.')}"
-            for name in ordered_tools
+        try:
+            tool_metadata = get_cached_mcp_tool_metadata(config)
+        except Exception:
+            tool_metadata = {"descriptions": {}, "schemas": {}}
+        available_tools_text = build_tool_catalog_text(
+            available_mcp_tools,
+            descriptions=tool_metadata.get("descriptions"),
+            fallback_descriptions=MCP_TOOL_DESCRIPTIONS,
+            schemas=tool_metadata.get("schemas"),
+            primary_order=primary_tool_order,
         )
 
         query_tool_name = resolve_tool_name("splunk_run_query", available_mcp_tools)
-        provider_name = normalize_provider_name(getattr(config.llm, "provider", ""))
-        is_custom_provider = provider_name in {"custom", "custom endpoint"}
 
         # Deterministic path for "latest entry in <index>" requests to avoid LLM misclassification
         latest_index_name = detect_latest_entry_index_request(user_message)
@@ -16967,6 +17921,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 if isinstance(candidate, str) and candidate.strip():
                     index_names.append(candidate.strip())
 
+            index_check_failed = classify_tool_result(indexes_result)["status"] == "error"
             index_exists = any(name.lower() == normalized_index_name.lower() for name in index_names)
             latest_tool_calls.append({
                 "iteration": 1,
@@ -16982,7 +17937,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 }
             })
 
-            if not index_exists:
+            if not index_exists and not index_check_failed:
                 similar = [name for name in index_names if normalized_index_name.lower() in name.lower()][:5]
                 response_text = f"I validated live index metadata and could not find an index named `{normalized_index_name}`."
                 if similar:
@@ -17047,8 +18002,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             latest_result = await execute_mcp_tool_call(latest_call, config)
             parsed_latest = extract_results_from_mcp_response(latest_result)
             latest_rows = parsed_latest.get("results", []) if isinstance(parsed_latest, dict) else []
-            latest_error_code = parsed_latest.get("status_code") if isinstance(parsed_latest, dict) else None
-            latest_error_message = parsed_latest.get("error_message") if isinstance(parsed_latest, dict) else ""
+            latest_outcome = classify_tool_result(latest_result)
 
             latest_tool_calls.append({
                 "iteration": 2,
@@ -17069,11 +18023,11 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 }
             })
 
-            if isinstance(latest_error_code, int) and latest_error_code >= 400:
+            if latest_outcome["status"] == "error":
+                index_note = "I could not confirm the index exists, and" if index_check_failed else f"I confirmed index `{normalized_index_name}` exists, but"
                 response_text = (
-                    f"I confirmed index `{normalized_index_name}` exists, but the latest-entry query returned an error "
-                    f"(status_code={latest_error_code}).\n\n"
-                    f"{latest_error_message or 'No additional error details were returned.'}"
+                    f"{index_note} the latest-entry search returned an error:\n\n"
+                    f"> {latest_outcome.get('error') or 'No additional error details were returned.'}"
                 )
             elif latest_rows:
                 latest_event = latest_rows[0] if isinstance(latest_rows[0], dict) else {"value": latest_rows[0]}
@@ -17088,6 +18042,11 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                     f"with `search index={normalized_index_name} | sort - _time | head 1`."
                 )
 
+            response_text = finalize_route_tool_calls(
+                response_text,
+                latest_tool_calls,
+                annotate_reply=latest_outcome["status"] != "error",
+            )
             await push_status(latest_status_timeline, "✅ Finalizing response", len(latest_tool_calls))
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(latest_tool_calls)
             response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
@@ -17135,10 +18094,9 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             await push_status(skill_status_timeline, "🧭 Fetching knowledge objects", 1)
 
             attempts = [
-                {"object_type": "saved_searches", "row_limit": 1000},
-                {"object_type": "macros", "row_limit": 1000},
-                {"object_type": "data_models", "row_limit": 500},
-                {"row_limit": 1000}
+                {"type": "saved_searches", "row_limit": 1000},
+                {"type": "macros", "row_limit": 1000},
+                {"type": "data_models", "row_limit": 500},
             ]
 
             collected_rows: List[Dict[str, Any]] = []
@@ -17246,6 +18204,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                         "If you use a naming convention, I can search for that exact prefix next."
                     )
 
+            response_text = finalize_route_tool_calls(response_text, skill_tool_calls)
             await push_status(skill_status_timeline, "✅ Finalizing response", max(1, len(skill_tool_calls)))
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(skill_tool_calls)
             response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
@@ -17292,8 +18251,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
 
             memory_indexes = (chat_memory.get("entities", {}).get("indexes", []) if isinstance(chat_memory, dict) else [])
             candidate_indexes = []
-            for name in (memory_indexes[-4:] if isinstance(memory_indexes, list) else []) + ["network_logs", "main"]:
-                if isinstance(name, str) and name and name not in candidate_indexes:
+            for name in (memory_indexes[-4:] if isinstance(memory_indexes, list) else []):
+                if isinstance(name, str) and name and "*" not in name and name not in candidate_indexes:
                     candidate_indexes.append(name)
 
             offline_terms = '(offline OR down OR unreachable OR disconnected OR "link down" OR status=offline OR status=down)'
@@ -17314,7 +18273,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 })
 
             query_attempts.append({
-                "query": f"search {entity_clause} {offline_terms} {noise_exclusion} | sort - _time | head 1 | table _time host src dest ip status sourcetype source message",
+                "query": f"search index=* {entity_clause} {offline_terms} {noise_exclusion} | sort - _time | head 1 | table _time host src dest ip status sourcetype source message",
                 "earliest_time": "-90d",
                 "latest_time": "now"
             })
@@ -17388,6 +18347,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                     f"If you want, I can retry with a custom index list or alternate status keywords used in your environment."
                 )
 
+            if not found_event:
+                response_text = finalize_route_tool_calls(response_text, offline_tool_calls)
             await push_status(offline_status_timeline, "✅ Finalizing response", max(1, len(offline_tool_calls)))
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(offline_tool_calls)
             response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
@@ -17477,10 +18438,10 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 lines: List[str] = []
                 for row in rows if isinstance(rows, list) else []:
                     if isinstance(row, dict):
-                        idx_name = row.get("index") or row.get("INDEX")
-                        count_value = row.get("count") or row.get("COUNT")
+                        idx_name = _row_value(row, "index", "INDEX")
+                        count_value = _row_value(row, "count", "COUNT", default="n/a")
                         if idx_name is not None:
-                            lines.append(f"- {idx_name}: {count_value if count_value is not None else 'n/a'}")
+                            lines.append(f"- {idx_name}: {count_value}")
                 response_text = "Top indexes by event count (last 7d):\n" + "\n".join(lines[:25]) if lines else "No index volume data was returned for the selected time range."
                 basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(lines)} index rows"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
 
@@ -17493,8 +18454,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 lines = []
                 for row in rows if isinstance(rows, list) else []:
                     if isinstance(row, dict):
-                        source_type = row.get("sourcetype") or row.get("SOURCETYPE") or "unknown"
-                        count_value = row.get("count") or row.get("COUNT") or "n/a"
+                        source_type = _row_value(row, "sourcetype", "SOURCETYPE", default="unknown")
+                        count_value = _row_value(row, "count", "COUNT", default="n/a")
                         lines.append(f"- {source_type}: {count_value}")
                 response_text = "Top error-producing sourcetypes (last 24h):\n" + "\n".join(lines[:20]) if lines else "No error-focused results were returned for the selected time range."
                 basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args, "spl_query": args.get("query"), "result": result, "summary": {"type": query_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(lines)} error rows"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
@@ -17517,30 +18478,23 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 if not target_index:
                     response_text = "I could not identify the index name. Try a prompt like: 'how many events in index=main'."
                 else:
-                    args_24h = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-24h", "latest_time": "now"}
-                    args_7d = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-7d", "latest_time": "now"}
+                    count_query = f"| tstats count as event_count where index={target_index}"
+                    args_24h = {"query": count_query, "earliest_time": "-24h", "latest_time": "now"}
+                    args_7d = {"query": count_query, "earliest_time": "-7d", "latest_time": "now"}
                     await push_status(basic_status_timeline, f"📏 Counting events for index={target_index}", 1)
                     res_24h = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_24h}}, config)
                     res_7d = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_7d}}, config)
-                    parsed_24h = extract_results_from_mcp_response(res_24h)
-                    parsed_7d = extract_results_from_mcp_response(res_7d)
-                    rows_24h = parsed_24h.get("results", []) if isinstance(parsed_24h, dict) else []
-                    rows_7d = parsed_7d.get("results", []) if isinstance(parsed_7d, dict) else []
-
-                    def _extract_count(rows: Any) -> int:
-                        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-                            row = rows[0]
-                            for key in ["event_count", "count", "COUNT"]:
-                                if key in row:
-                                    return _safe_int(row.get(key))
-                        return 0
-
-                    count_24h = _extract_count(rows_24h)
-                    count_7d = _extract_count(rows_7d)
-                    response_text = f"Event counts for index `{target_index}`:\n- Last 24h: {count_24h}\n- Last 7d: {count_7d}"
-                    basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args_24h, "spl_query": args_24h.get("query"), "result": res_24h, "summary": {"type": query_tool_name, "row_count": len(rows_24h) if isinstance(rows_24h, list) else 0, "findings": [f"24h count={count_24h}"], "actual_results": rows_24h[:5] if isinstance(rows_24h, list) else []}})
-                    basic_tool_calls.append({"iteration": 2, "tool": query_tool_name, "args": args_7d, "spl_query": args_7d.get("query"), "result": res_7d, "summary": {"type": query_tool_name, "row_count": len(rows_7d) if isinstance(rows_7d, list) else 0, "findings": [f"7d count={count_7d}"], "actual_results": rows_7d[:5] if isinstance(rows_7d, list) else []}})
-
+                    outcome_24h = classify_tool_result(res_24h)
+                    outcome_7d = classify_tool_result(res_7d)
+                    count_24h = extract_event_count(outcome_24h)
+                    count_7d = extract_event_count(outcome_7d)
+                    response_text = (
+                        f"Event counts for index `{target_index}`:\n"
+                        f"- Last 24h: {format_event_count(count_24h)}\n"
+                        f"- Last 7d: {format_event_count(count_7d)}"
+                    )
+                    basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args_24h, "spl_query": args_24h.get("query"), "result": res_24h, "summary": summarize_tool_outcome(query_tool_name, outcome_24h)})
+                    basic_tool_calls.append({"iteration": 2, "tool": query_tool_name, "args": args_7d, "spl_query": args_7d.get("query"), "result": res_7d, "summary": summarize_tool_outcome(query_tool_name, outcome_7d)})
             elif basic_intent == "timechart_index_trend":
                 target_index = extract_index_from_message(user_message) or _remembered_entity(chat_memory, "index")
                 explicit_earliest, explicit_latest = extract_time_range_from_message(user_message)
@@ -17565,7 +18519,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                     for row in rows if isinstance(rows, list) else []:
                         if isinstance(row, dict):
                             timestamp = row.get("_time") or row.get("time") or row.get("TIME") or "unknown"
-                            count_value = row.get("count") or row.get("COUNT") or row.get("value") or 0
+                            count_value = _row_value(row, "count", "COUNT", "value", default=0)
                             lines.append(f"- {timestamp}: {count_value}")
                     response_text = (
                         f"Event volume trend for index `{target_index}` ({_describe_time_window(earliest_time, latest_time)}):\n"
@@ -17609,7 +18563,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                         if isinstance(row, dict):
                             sourcetype = row.get("sourcetype") or row.get("SOURCETYPE") or "unknown"
                             host = row.get("host") or row.get("HOST") or "unknown"
-                            count_value = row.get("count") or row.get("COUNT") or 0
+                            count_value = _row_value(row, "count", "COUNT", default=0)
                             lines.append(f"- sourcetype={sourcetype} | host={host} | count={count_value}")
                     response_text = (
                         f"Top sourcetype and host breakdown for index `{target_index}` ({_describe_time_window(earliest_time, latest_time)}):\n"
@@ -17634,36 +18588,30 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 if not target_index:
                     response_text = "I need an index anchor for the baseline check. Try including an index, for example: 'Run a baseline count check for index=main'."
                 else:
-                    args_24h = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-24h", "latest_time": "now"}
-                    args_7d = {"query": f"search index={target_index} | stats count as event_count", "earliest_time": "-7d", "latest_time": "now"}
+                    count_query = f"| tstats count as event_count where index={target_index}"
+                    args_24h = {"query": count_query, "earliest_time": "-24h", "latest_time": "now"}
+                    args_7d = {"query": count_query, "earliest_time": "-7d", "latest_time": "now"}
                     await push_status(basic_status_timeline, f"📏 Running baseline checks for index={target_index}", 1)
                     res_24h = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_24h}}, config)
                     res_7d = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": query_tool_name, "arguments": args_7d}}, config)
-                    parsed_24h = extract_results_from_mcp_response(res_24h)
-                    parsed_7d = extract_results_from_mcp_response(res_7d)
-                    rows_24h = parsed_24h.get("results", []) if isinstance(parsed_24h, dict) else []
-                    rows_7d = parsed_7d.get("results", []) if isinstance(parsed_7d, dict) else []
-
-                    def _extract_count(rows: Any) -> int:
-                        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-                            row = rows[0]
-                            for key in ["event_count", "count", "COUNT"]:
-                                if key in row:
-                                    return _safe_int(row.get(key))
-                        return 0
-
-                    count_24h = _extract_count(rows_24h)
-                    count_7d = _extract_count(rows_7d)
-                    availability = "Data is available" if count_7d > 0 else "No data was found"
+                    outcome_24h = classify_tool_result(res_24h)
+                    outcome_7d = classify_tool_result(res_7d)
+                    count_24h = extract_event_count(outcome_24h)
+                    count_7d = extract_event_count(outcome_7d)
+                    if count_7d is None:
+                        availability = "Could not be determined because the 7-day search failed"
+                    elif count_7d > 0:
+                        availability = "Data is available"
+                    else:
+                        availability = "No data was found in the last 7 days"
                     response_text = (
                         f"Baseline check for index `{target_index}`:\n"
-                        f"- Last 24h: {count_24h}\n"
-                        f"- Last 7d: {count_7d}\n"
+                        f"- Last 24h: {format_event_count(count_24h)}\n"
+                        f"- Last 7d: {format_event_count(count_7d)}\n"
                         f"- Assessment: {availability}."
                     )
-                    basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args_24h, "spl_query": args_24h.get("query"), "result": res_24h, "summary": {"type": query_tool_name, "row_count": len(rows_24h) if isinstance(rows_24h, list) else 0, "findings": [f"24h count={count_24h}"], "actual_results": rows_24h[:5] if isinstance(rows_24h, list) else []}})
-                    basic_tool_calls.append({"iteration": 2, "tool": query_tool_name, "args": args_7d, "spl_query": args_7d.get("query"), "result": res_7d, "summary": {"type": query_tool_name, "row_count": len(rows_7d) if isinstance(rows_7d, list) else 0, "findings": [f"7d count={count_7d}"], "actual_results": rows_7d[:5] if isinstance(rows_7d, list) else []}})
-
+                    basic_tool_calls.append({"iteration": 1, "tool": query_tool_name, "args": args_24h, "spl_query": args_24h.get("query"), "result": res_24h, "summary": summarize_tool_outcome(query_tool_name, outcome_24h)})
+                    basic_tool_calls.append({"iteration": 2, "tool": query_tool_name, "args": args_7d, "spl_query": args_7d.get("query"), "result": res_7d, "summary": summarize_tool_outcome(query_tool_name, outcome_7d)})
             elif basic_intent == "host_pivot":
                 target_host = extract_host_or_ip_from_message(user_message) or _remembered_entity(chat_memory, "host")
                 target_index = extract_index_from_message(user_message) or _remembered_entity(chat_memory, "index")
@@ -17690,7 +18638,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                         if isinstance(row, dict):
                             sourcetype = row.get("sourcetype") or row.get("SOURCETYPE") or "unknown"
                             source = row.get("source") or row.get("SOURCE") or "unknown"
-                            count_value = row.get("count") or row.get("COUNT") or 0
+                            count_value = _row_value(row, "count", "COUNT", default=0)
                             lines.append(f"- sourcetype={sourcetype} | source={source} | count={count_value}")
                     response_text = (
                         f"Host pivot for `{target_host}` ({_describe_time_window(earliest_time, latest_time)}):\n"
@@ -17763,7 +18711,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
 
             else:
                 knowledge_tool_name = resolve_tool_name("splunk_get_knowledge_objects", available_mcp_tools)
-                args = {"row_limit": 500}
+                args = {"type": "saved_searches", "row_limit": 500}
                 await push_status(basic_status_timeline, "📚 Loading knowledge objects", 1)
                 result = await execute_mcp_tool_call({"method": "tools/call", "params": {"name": knowledge_tool_name, "arguments": args}}, config)
                 parsed = extract_results_from_mcp_response(result)
@@ -17779,6 +18727,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 response_text = "Template-like knowledge objects:\n" + "\n".join([f"- {value}" for value in templates[:60]]) if templates else "No template-like knowledge objects were returned."
                 basic_tool_calls.append({"iteration": 1, "tool": knowledge_tool_name, "args": args, "spl_query": None, "result": result, "summary": {"type": knowledge_tool_name, "row_count": len(rows) if isinstance(rows, list) else 0, "findings": [f"Found {len(templates)} template-like objects"], "actual_results": rows[:8] if isinstance(rows, list) else []}})
 
+            response_text = finalize_route_tool_calls(response_text, basic_tool_calls)
             await push_status(basic_status_timeline, "✅ Finalizing response", max(1, len(basic_tool_calls)))
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(basic_tool_calls)
             response_text, capability_usage = enrich_response_with_live_reusable_query_reference(
@@ -17824,12 +18773,9 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             rag_max_chunks = _safe_int(chat_session_settings.get("rag_max_chunks", 3))
             rag_context, capability_usage = get_optional_rag_context(user_message, max_chunks=rag_max_chunks)
 
-        # Initialize LLM client (cached for performance)
-        print(f"🔵 [CHAT] Getting LLM client...")
         llm_client = get_or_create_llm_client(config)
-        print(f"🔵 [CHAT] LLM client initialized, provider: {config.llm.provider}")
         chat_runtime_profile = build_chat_runtime_profile(config, llm_client)
-        runtime_temperature = max(0.0, config.llm.temperature * chat_runtime_profile["temperature_multiplier"])
+        runtime_temperature = chat_runtime_profile["temperature"]
         print(
             f"🔵 [CHAT] Runtime profile: provider={chat_runtime_profile['provider']} "
             f"model={chat_runtime_profile['model'] or getattr(config.llm, 'model', '')} "
@@ -17837,203 +18783,17 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             f"context_limit={chat_runtime_profile['context_history_limit']} "
             f"initial_max_tokens={chat_runtime_profile['initial_max_tokens']}"
         )
-        
-        # Use simplified prompt for custom endpoints (local LLMs have smaller context windows)
-        if is_custom_provider:
-            system_prompt = f"""You are a Splunk assistant. Answer from this context or use tools when needed.
 
-{discovery_context}
-{rag_context}
-{memory_context}
+        max_iterations = max(1, _safe_int(chat_session_settings.get("max_iterations", 5)) or 5)
+        max_execution_time = max(10, _safe_int(chat_session_settings.get("max_execution_time", 90)) or 90)
+        stall_limit = max(2, _safe_int(chat_session_settings.get("convergence_detection", 3)) or 3)
+        evidence_rows = max(
+            int(chat_runtime_profile.get("evidence_rows") or 10),
+            _safe_int(chat_session_settings.get("query_sample_size", 0)),
+        )
+        evidence_chars = int(chat_runtime_profile.get("evidence_chars") or 6000)
+        followup_max_tokens = chat_runtime_profile["followup_max_tokens"]
 
-If optional context includes reusable SPL query candidates, prefer adapting the highest-confidence known-good query that matches the request and environment before inventing a brand-new search.
-
-    Tool format: <TOOL_CALL>{{"tool": "{query_tool_name}", "args": {{"query": "YOUR_SPL_HERE"}}}}</TOOL_CALL>"""
-        else:
-            # Full agentic prompt for OpenAI (larger context window, better instruction following)
-            system_prompt = f"""You are an ELITE Splunk expert with 20+ years of experience across:
-- 🛡️ Cybersecurity (threat hunting, incident response, forensics)
-- 🌐 Networking (traffic analysis, firewall logs, network monitoring)
-- 🖥️ System Administration (Windows/Linux logs, performance monitoring)
-- 🔧 IT Operations (infrastructure monitoring, capacity planning)
-- 🚀 DevOps (CI/CD monitoring, application performance)
-- 💾 Database Administration (query optimization, audit logging)
-- ✅ Compliance & Auditing (PCI-DSS, HIPAA, SOX, GDPR)
-
-🌍 ENVIRONMENT CONTEXT:
-{discovery_context}
-{rag_context}
-{discovery_age_warning if 'discovery_age_warning' in locals() else ''}
-{memory_context}
-
-When optional context includes reusable SPL query candidates, prefer adapting the highest-confidence known-good query that matches the request and environment before inventing a brand-new search.
-
-📊 DISCOVERY DATA AVAILABLE:
-Latest discovery reports are available in the output/ folder with comprehensive insights:
-- Executive Summary: High-level findings and recommendations
-- Detailed Discovery: Complete environment inventory
-- Data Classification: Data sensitivity and retention analysis
-- Implementation Guide: Best practices and optimization tips
-- Use Case Suggestions: Security, compliance, and ops recommendations
-
-💡 WHEN TO REFERENCE DISCOVERY DATA:
-- User asks about "overall environment", "summary", "recommendations"
-- Query returns insufficient data - check discovery for historical context
-- Need to understand data patterns, retention, or volume trends
-- Questions about best practices, optimization, or use cases
-
-🎯 YOUR SUPERPOWERS:
-You are an AUTONOMOUS AGENT with the ability to:
-1. Execute multiple queries in sequence to solve complex problems
-2. Learn from errors and automatically retry with improved approaches
-3. Break down complex questions into smaller investigative steps
-4. Cross-reference data across multiple indexes and time ranges
-5. Provide deep insights, not just raw data
-
-🔧 AVAILABLE TOOLS:
-{available_tools_text}
-
-📚 REQUEST ADDITIONAL CONTEXT (On-Demand):
-If you need detailed information, request it dynamically:
-<CONTEXT_REQUEST>type</CONTEXT_REQUEST>
-Available types: indexes, sourcetypes, hosts, alerts, dashboards, users, kv_stores
-
-⚡ AUTONOMOUS REASONING PROTOCOL:
-When you execute a tool and receive results, you can CONTINUE investigating by:
-1. **If Error**: Analyze what went wrong and try a different approach
-   - Bad syntax? Fix the SPL and retry
-   - Index doesn't exist? Query discovery context for correct index
-   - No data? Try broader time range or different index
-   - WHERE clause error? Break into simpler queries
-
-2. **If No Data**: Don't give up! Investigate further:
-   - Try other relevant indexes from the discovery context
-   - Expand the time range (e.g., -7d instead of -24h)
-   - Simplify search criteria
-   - Check if the index is disabled or empty
-
-3. **If Successful**: Decide if you need more data:
-   - Does this fully answer the user's question?
-   - Would additional context make the answer better?
-   - Should you cross-reference with other data sources?
-
-🎨 TOOL EXECUTION FORMAT:
-⚠️ CRITICAL: If the user's question requires querying Splunk data, you MUST provide a <TOOL_CALL> in your response.
-Do NOT say "I'll execute a query" or "Let me check" without actually providing the tool call.
-Either answer directly from your knowledge, OR include a <TOOL_CALL> block.
-
-⚠️ JSON FORMATTING: When writing SPL queries, use SINGLE quotes (') for string literals in your query, NOT double quotes (").
-Example: relative_time(now(), '-7d') NOT relative_time(now(), "-7d")
-This prevents JSON parsing errors.
-
-Always use this exact format for tool calls:
-
-<TOOL_CALL>
-{{
-    "tool": "{query_tool_name}",
-  "args": {{
-    "query": "index=wineventlog earliest=-24h | stats count by EventCode | sort -count | head 10",
-    "earliest_time": "-24h",
-    "latest_time": "now"
-  }}
-}}
-</TOOL_CALL>
-
-I'm checking the top 10 event codes in the wineventlog index from the last 24 hours.
-
-💡 EXPERT BEHAVIORS - BE THE SPLUNK GOD:
-
-**1. Think Like a Cybersecurity Expert:**
-- Identify security risks, anomalies, and indicators of compromise
-- Suggest correlation searches and threat hunting queries
-- Recommend security use cases (failed logins, privilege escalation, data exfiltration)
-
-**2. Think Like a Network Engineer:**
-- Analyze traffic patterns, bandwidth usage, and network performance
-- Identify network bottlenecks and connectivity issues
-- Suggest monitoring for DNS, firewall, and VPN logs
-
-**3. Think Like a System Administrator:**
-- Monitor system health, resource utilization, and errors
-- Identify performance degradation and capacity issues
-- Recommend alerting for critical system events
-
-**4. Think Like a Compliance Officer:**
-- Identify audit requirements and data retention policies
-- Suggest searches for compliance reporting (PCI-DSS, HIPAA, SOX)
-- Recommend data classification and access controls
-
-**5. Think Like a Data Scientist:**
-- Provide statistical analysis and trend identification
-- Suggest correlations and predictive insights
-- Visualize data patterns and anomalies
-
-**6. Be Proactive & Educate:**
-- Don't just answer - teach WHY and provide context
-- Suggest related investigations users should consider
-- Recommend best practices and optimization opportunities
-- Warn about potential security/performance issues you notice
-
-**7. Leverage Intelligence:**
-- Reference discovery insights for strategic recommendations
-- Cross-reference multiple data sources for complete picture
-- If discovery data is stale (>7 days), recommend re-running discovery
-
-📊 RESPONSE PATTERNS:
-
-**For Data Questions:**
-<TOOL_CALL>...</TOOL_CALL>
-[Explain what you're investigating]
-
-[After getting results, either provide final answer OR make another TOOL_CALL if needed]
-
-**For Explanations:**
-[Provide detailed explanation with examples]
-
-**For Complex Investigations:**
-<TOOL_CALL>...</TOOL_CALL>
-[Explain step 1]
-[Wait for results]
-<TOOL_CALL>...</TOOL_CALL>
-[Explain step 2 based on step 1 results]
-[Continue until question fully answered]
-
-🚀 EXAMPLE AUTONOMOUS REASONING:
-
-User: "What indexes have data between 22:00 and 23:00 last Tuesday?"
-
-You: <TOOL_CALL>
-{{
-    "tool": "{query_tool_name}",
-  "args": {{
-    "query": "| tstats count where _time>=relative_time(now(), \"-7d@d+22h\") AND _time<relative_time(now(), \"-7d@d+23h\") by index",
-    "earliest_time": "-7d",
-    "latest_time": "now"
-  }}
-}}
-</TOOL_CALL>
-
-I'm querying all indexes for data during the 22:00-23:00 hour last Tuesday using tstats for fast results.
-
-[If this errors with WHERE clause issue]
-
-<TOOL_CALL>
-{{
-    "tool": "{query_tool_name}",
-  "args": {{
-    "query": "earliest=-7d latest=now index=wineventlog | where _time>=relative_time(now(), \"-7d@d+22h\") AND _time<relative_time(now(), \"-7d@d+23h\") | stats count",
-    "earliest_time": "-7d",
-    "latest_time": "now"
-  }}
-}}
-</TOOL_CALL>
-
-The tstats approach had a WHERE clause issue, so I'm checking the wineventlog index first with a standard search approach. I'll iterate through other indexes based on results.
-
-Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Investigate thoroughly until you find the answer or exhaust all reasonable options."""
-        
-        # Prepare messages
-        # Use the compact prompt only for custom/local providers; OpenAI-class providers keep the richer agent prompt above.
         if chat_runtime_profile["use_compact_prompt"]:
             system_prompt = build_compact_chat_prompt(
                 query_tool_name=query_tool_name,
@@ -18041,10 +18801,23 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 rag_context=rag_context,
                 memory_context=memory_context,
                 available_tools_text=available_tools_text,
-                discovery_age_warning=discovery_age_warning
+                discovery_age_warning=discovery_age_warning,
+                mission=mission,
             )
-            if chat_runtime_profile["reasoning_guard"]:
-                system_prompt = f"{system_prompt}\n{chat_runtime_profile['reasoning_guard']}"
+        else:
+            system_prompt = build_grounded_chat_prompt(
+                query_tool_name=query_tool_name,
+                available_tools_text=available_tools_text,
+                discovery_context=discovery_context,
+                rag_context=rag_context,
+                memory_context=memory_context,
+                discovery_age_warning=discovery_age_warning,
+                mission=mission,
+                blocked_commands=SPL_BLOCKED_COMMANDS,
+                max_tool_steps=max_iterations,
+            )
+        if chat_runtime_profile["reasoning_guard"]:
+            system_prompt = f"{system_prompt}\n{chat_runtime_profile['reasoning_guard']}"
 
         context_limit = chat_runtime_profile["context_history_limit"]
         continuity_context = build_llm_continuity_context(
@@ -18057,12 +18830,21 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
         requires_spl_explanation = user_requested_spl_explanation(user_message)
         spl_explanation_requirement = build_spl_explanation_requirement(requires_spl_explanation)
 
-        query_lower = user_message.lower().strip()
-        is_greeting = any(phrase in query_lower for phrase in ['hi', 'hello', 'hey', 'how are you', 'thanks', 'thank you', 'bye', 'goodbye'])
-        
-        if chat_runtime_profile["short_circuit_greetings"] and is_greeting and not has_session_context:
-            # Bare minimum for greetings - just the user message
-            messages = [{"role": "user", "content": user_message}]
+        if chat_runtime_profile["short_circuit_greetings"] and small_talk and not has_session_context:
+            # Small local models answer greetings faster and better without the full tool prompt.
+            greeting_prompt = (
+                "You are the DT4SMS Splunk assistant. Reply warmly in one or two sentences and offer to help "
+                "the user explore or troubleshoot their Splunk data."
+            )
+            mission_block = format_mission_context(mission)
+            if mission_block:
+                greeting_prompt = f"{greeting_prompt}\n{mission_block}"
+            if chat_runtime_profile["reasoning_guard"]:
+                greeting_prompt = f"{greeting_prompt}\n{chat_runtime_profile['reasoning_guard']}"
+            messages = [
+                {"role": "system", "content": greeting_prompt},
+                {"role": "user", "content": user_message},
+            ]
         else:
             # Always rebuild the prompt gate so the latest memory, discovery context, and continuity rules are fresh.
             has_role_history = bool(history and len(history) > 0 and isinstance(history[0], dict) and 'role' in history[0])
@@ -18077,6 +18859,8 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
                 normalized_history = history[-context_limit:] if context_limit > 0 else []
 
             for msg in normalized_history:
+                if not isinstance(msg, dict):
+                    continue
                 if has_role_history:
                     messages.append({"role": msg["role"], "content": msg["content"]})
                 elif msg.get('type') == 'user':
@@ -18087,1032 +18871,303 @@ Remember: You are AUTONOMOUS. Don't stop at the first error or empty result. Inv
             if query_plan_context:
                 messages.append({"role": "system", "content": query_plan_context})
 
-            # Add current user message
             messages.append({"role": "user", "content": user_message})
-        
-        # Get LLM response - use session max_tokens setting (with 15% limit for initial chat)
+
         status_timeline: List[Dict[str, Any]] = []
         await push_status(status_timeline, "🧠 Building investigation plan", 0)
-        chat_max_tokens = chat_runtime_profile["initial_max_tokens"]
-        print(f"🔵 [CHAT] Calling LLM with {len(messages)} messages, max_tokens={chat_max_tokens}")
-        print(f"🔵 [CHAT] Client type: {type(llm_client)}, has generate_response: {hasattr(llm_client, 'generate_response')}")
-        print(f"🔵 [CHAT] About to await generate_response...")
+        print(f"🔵 [CHAT] Calling LLM with {len(messages)} messages, max_tokens={chat_runtime_profile['initial_max_tokens']}")
         response = await llm_client.generate_response(
             messages=messages,
-            max_tokens=chat_max_tokens,
-            temperature=runtime_temperature
+            max_tokens=chat_runtime_profile["initial_max_tokens"],
+            temperature=runtime_temperature,
         )
+        response = response if isinstance(response, str) else str(response or "")
         print(f"🔵 [CHAT] Got response: {len(response)} chars")
-        
-        # Check if response contains tool call or SPL
-        tool_call = None
-        spl_in_text = None
+
+        default_earliest, default_latest = extract_time_range_from_message(user_message)
+        default_earliest = default_earliest or "-24h"
+        default_latest = default_latest or "now"
+
+        def _parse_tool_call(text: str, earliest: str, latest: str) -> Optional[Dict[str, Any]]:
+            try:
+                parsed = extract_recoverable_tool_call(
+                    text,
+                    query_tool_name,
+                    default_earliest=earliest,
+                    default_latest=latest,
+                )
+            except Exception as parse_error:
+                debug_log(f"Error parsing tool call: {parse_error}", "error")
+                return None
+            if isinstance(parsed, dict) and parsed.get("method") == "tools/call" and isinstance(parsed.get("params"), dict):
+                return parsed
+            return None
+
+        tool_call = _parse_tool_call(response, default_earliest, default_latest)
         clean_response = sanitize_llm_response_text(response)
-        
-        try:
-            # Extract context requests using <CONTEXT_REQUEST> tags
-            context_request_match = re.search(r'<CONTEXT_REQUEST>(.*?)</CONTEXT_REQUEST>', response, re.DOTALL)
-            if context_request_match:
-                requested_context_type = context_request_match.group(1).strip()
-                debug_log(f"LLM requested context: {requested_context_type}", "info")
-                
-                # Load the requested context
-                try:
-                    ctx_mgr = get_context_manager()
-                    specific_context = ctx_mgr.get_specific_context(requested_context_type)
-                    
-                    if specific_context:
-                        formatted_context = ctx_mgr.format_context_for_llm({requested_context_type: specific_context})
-                        
-                        # Inject context into conversation before next LLM call
-                        messages.append({
-                            "role": "system",
-                            "content": f"[Context loaded: {requested_context_type}]\n{formatted_context}"
-                        })
-                        
-                        # Remove context request from response
-                        clean_response = re.sub(r'<CONTEXT_REQUEST>.*?</CONTEXT_REQUEST>', '', clean_response, flags=re.DOTALL).strip()
-                        
-                        debug_log(f"Injected {requested_context_type} context into conversation", "info")
-                except Exception as e:
-                    debug_log(f"Error loading requested context: {e}", "error")
-            default_earliest, default_latest = extract_time_range_from_message(user_message)
-            default_earliest = default_earliest or "-24h"
-            default_latest = default_latest or "now"
 
-            tool_call = extract_recoverable_tool_call(
-                response,
-                query_tool_name,
-                default_earliest=default_earliest,
-                default_latest=default_latest,
-            )
-            if tool_call:
-                extracted_name = tool_call.get("params", {}).get("name")
-                extracted_args = tool_call.get("params", {}).get("arguments", {})
+        context_request_match = re.search(r'<CONTEXT_REQUEST>(.*?)</CONTEXT_REQUEST>', response, re.DOTALL)
+        if context_request_match and not tool_call:
+            requested_context_type = context_request_match.group(1).strip()
+            formatted_context = ""
+            try:
+                ctx_mgr = get_context_manager()
+                specific_context = ctx_mgr.get_specific_context(requested_context_type)
+                if specific_context:
+                    formatted_context = ctx_mgr.format_context_for_llm({requested_context_type: specific_context})
+            except Exception as context_error:
+                debug_log(f"Error loading requested context: {context_error}", "error")
+            if formatted_context:
+                await push_status(status_timeline, f"📚 Loading {requested_context_type} context", 0)
+                messages = messages + [
+                    {"role": "assistant", "content": f"<CONTEXT_REQUEST>{requested_context_type}</CONTEXT_REQUEST>"},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Context loaded: {requested_context_type}]\n{formatted_context}\n\n"
+                            "Use this context to answer my request, or make one TOOL_CALL if live data is still needed."
+                        ),
+                    },
+                ]
+                response = await llm_client.generate_response(
+                    messages=messages,
+                    max_tokens=followup_max_tokens,
+                    temperature=runtime_temperature,
+                )
+                response = response if isinstance(response, str) else str(response or "")
+                tool_call = _parse_tool_call(response, default_earliest, default_latest)
                 clean_response = sanitize_llm_response_text(response)
-                if extracted_name in {query_tool_name, "splunk_run_query", "run_splunk_query"}:
-                    spl_in_text = str(extracted_args.get("query", "")).strip() or None
-                debug_log(f"Recovered tool call - {extracted_name} with args: {extracted_args}", "query", extracted_args)
-                    
-        except Exception as e:
-            debug_log(f"Error parsing response: {e}", "error")
-            import traceback
-            traceback.print_exc()
-        
-        if tool_call and tool_call.get('method') == 'tools/call':
-            # ===== INTELLIGENT AGENTIC LOOP WITH QUALITY-DRIVEN STOPPING =====
-            import time as time_module
-            
+
+        if not tool_call and not small_talk and announces_unexecuted_search(clean_response):
+            # Models sometimes promise a search without emitting the TOOL_CALL; ask once for the call itself.
+            await push_status(status_timeline, "🔁 Asking the model for the search it described", 0)
+            nudge_messages = messages + [
+                {"role": "assistant", "content": clean_response},
+                {"role": "user", "content": UNEXECUTED_SEARCH_NUDGE},
+            ]
+            nudge_response = await llm_client.generate_response(
+                messages=nudge_messages,
+                max_tokens=chat_runtime_profile["retry_max_tokens"],
+                temperature=runtime_temperature,
+            )
+            nudge_response = nudge_response if isinstance(nudge_response, str) else str(nudge_response or "")
+            nudge_tool_call = _parse_tool_call(nudge_response, default_earliest, default_latest)
+            if nudge_tool_call:
+                tool_call = nudge_tool_call
+                messages = nudge_messages
+                clean_response = sanitize_llm_response_text(nudge_response)
+            elif sanitize_llm_response_text(nudge_response):
+                clean_response = sanitize_llm_response_text(nudge_response)
+
+        if tool_call:
             await push_status(status_timeline, "🛠 Tool plan created", 0)
-            start_time = request_started_at
-            # Use session settings (allow runtime tuning without restart)
-            max_execution_time = chat_session_settings["max_execution_time"]
-            max_iterations = chat_session_settings["max_iterations"]
-            quality_threshold = chat_session_settings["quality_threshold"]
-            convergence_threshold = chat_session_settings["convergence_detection"]
-            sample_size = chat_session_settings["query_sample_size"]
-            
+            conversation_history = list(messages)
+            all_tool_calls: List[Dict[str, Any]] = []
+            accumulated_insights: List[str] = []
+            seen_signatures: Dict[str, int] = {}
+            empty_sweeps: Dict[str, int] = {}
+            stalled_steps = 0
             iteration = 0
-            conversation_history = messages.copy()
-            all_tool_calls = []
-            accumulated_insights = []  # Track key findings across iterations
-            final_answer = None
-            user_intent = user_message  # Track refined understanding of user's goal
-            
-            # Helper function to summarize results for context efficiency
-            def summarize_result(result_data, tool_name):
-                """Extract key insights from results without full JSON dump"""
-                summary = {"type": tool_name, "findings": []}
-                is_query_tool = tool_name in {"run_splunk_query", "splunk_run_query"}
-                is_metadata_tool = tool_name in {
-                    "get_indexes", "splunk_get_indexes",
-                    "get_metadata", "splunk_get_metadata"
-                }
-                
-                if isinstance(result_data, dict):
-                    if 'error' in result_data:
-                        return {"type": "error", "message": result_data.get('error', 'Unknown error')}
-                    
-                    result = result_data.get('result', {})
-                    
-                    actual_results = None
-                    structured_status_code = None
-                    structured_error_message = ""
+            final_answer = ""
+            stop_reason = ""
+            fatal_message = ""
+            assistant_text = clean_response
+            loop_nudged = False
 
-                    # GA v1 shape: result.structuredContent.results
-                    if isinstance(result, dict):
-                        structured_content = result.get('structuredContent', {})
-                        if isinstance(structured_content, dict):
-                            structured_status_code = structured_content.get('status_code')
-                            if isinstance(structured_content.get('content'), str):
-                                structured_error_message = structured_content.get('content', '')
-                            if isinstance(structured_content.get('results'), list):
-                                actual_results = structured_content.get('results', [])
-
-                    if isinstance(structured_status_code, int) and structured_status_code >= 400:
-                        return {
-                            "type": "error",
-                            "message": structured_error_message or f"MCP tool execution failed with status_code={structured_status_code}"
-                        }
-
-                    # Legacy/direct shape: result.results
-                    if actual_results is None and isinstance(result, dict) and isinstance(result.get('results'), list):
-                        actual_results = result.get('results', [])
-
-                    # Legacy text-wrapper shape: result.content[0].text JSON
-                    if actual_results is None and isinstance(result, dict) and 'content' in result:
-                        content_items = result.get('content', [])
-                        if content_items and len(content_items) > 0:
-                            first_item = content_items[0]
-                            if isinstance(first_item, dict) and 'text' in first_item:
-                                try:
-                                    parsed_text = json.loads(first_item['text'])
-                                    if isinstance(parsed_text, dict) and isinstance(parsed_text.get('results'), list):
-                                        actual_results = parsed_text.get('results', [])
-                                    elif isinstance(parsed_text, list):
-                                        actual_results = parsed_text
-                                except json.JSONDecodeError as e:
-                                    print(f"⚠️  Failed to parse MCP content text as JSON: {e}")
-                    
-                    # Summarize based on tool type
-                    if is_query_tool:
-                        results_array = actual_results if isinstance(actual_results, list) else None
-                        
-                        if results_array is not None:
-                            result_count = len(results_array)
-                            summary['row_count'] = result_count  # Set for quality assessment
-                            summary['findings'].append(f"{result_count} results returned")
-                            
-                            if result_count > 0:
-                                # Extract key fields from first few results
-                                sample = results_array[:3]
-                                summary['sample_fields'] = list(sample[0].keys()) if sample else []
-                                summary['findings'].append(f"Sample fields: {', '.join(summary['sample_fields'][:5])}")
-                                
-                                # Check for specific interesting patterns
-                                if result_count > 100:
-                                    summary['findings'].append("⚠️ Large result set - may need filtering")
-                                
-                                # Store actual results for later use
-                                summary['actual_results'] = results_array[:5]  # First 5 for context
-                                row_analysis = analyze_result_rows(results_array)
-                                if row_analysis:
-                                    summary.update(row_analysis)
-                                    if row_analysis.get('query_shape'):
-                                        summary['findings'].append(f"Result shape: {row_analysis['query_shape']}")
-                                    if row_analysis.get('top_dimensions'):
-                                        top_dimension = row_analysis['top_dimensions'][0]
-                                        if isinstance(top_dimension, dict) and top_dimension.get('field') and top_dimension.get('values'):
-                                            summary['findings'].append(
-                                                f"Top {top_dimension['field']}: {', '.join(top_dimension['values'][:3])}"
-                                            )
-                                    if row_analysis.get('time_bounds'):
-                                        bounds = row_analysis['time_bounds']
-                                        if isinstance(bounds, dict) and bounds.get('field'):
-                                            summary['findings'].append(
-                                                f"Time bounds from {bounds.get('field')}: {bounds.get('first', 'unknown')} -> {bounds.get('last', 'unknown')}"
-                                            )
-                            else:
-                                summary['findings'].append("❌ No data found")
-                        elif 'fields' in result:
-                            summary['row_count'] = len(result['fields'])  # Metadata query
-                            summary['findings'].append(f"Metadata query: {len(result['fields'])} fields")
-                        else:
-                            summary['row_count'] = 0  # No results found
-                            summary['findings'].append("⚠️ No results field found in response")
-                    
-                    elif is_metadata_tool:
-                        results_array = actual_results if isinstance(actual_results, list) else None
-                        
-                        if results_array is not None:
-                            result_count = len(results_array)
-                            summary['row_count'] = result_count
-                            summary['findings'].append(f"Found {result_count} items")
-                            
-                            if result_count > 0:
-                                # Store actual results for LLM context
-                                summary['actual_results'] = results_array
-                                
-                                # Extract sample fields from first item
-                                sample = results_array[0] if results_array else {}
-                                if isinstance(sample, dict):
-                                    summary['sample_fields'] = list(sample.keys())
-                                    summary['findings'].append(f"Fields: {', '.join(list(sample.keys())[:5])}")
-                                row_analysis = analyze_result_rows(results_array)
-                                if row_analysis:
-                                    summary.update(row_analysis)
-                                    if row_analysis.get('top_dimensions'):
-                                        top_dimension = row_analysis['top_dimensions'][0]
-                                        if isinstance(top_dimension, dict) and top_dimension.get('field') and top_dimension.get('values'):
-                                            summary['findings'].append(
-                                                f"Top {top_dimension['field']}: {', '.join(top_dimension['values'][:3])}"
-                                            )
-                            else:
-                                summary['findings'].append("❌ No items found")
-                        else:
-                            summary['row_count'] = 0
-                            summary['findings'].append("⚠️ No results field found in response")
-                
-                return summary
-            
-            # Helper function to assess answer completeness (separate from investigation status)
-            def assess_answer_quality(response_text, results_summary, has_actionable_data):
-                """Determine if we have a complete, useful answer for the user"""
-                score = 0
-                reasons = []
-                
-                # HIGH VALUE: Did we get actionable data?
-                if has_actionable_data:
-                    score += 40
-                    reasons.append("✅ Retrieved actionable data")
-                else:
-                    score -= 10  # Less harsh penalty - investigation takes time
-                    reasons.append("❌ No actionable data yet")
-                
-                # MEDIUM VALUE: Is the response substantive?
-                if len(response_text) > 200:
-                    score += 15
-                    reasons.append("📝 Detailed explanation")
-                
-                # HIGH VALUE: Conclusive analysis provided?
-                conclusive_phrases = ['found that', 'shows that', 'indicates', 'based on', 'analysis reveals', 
-                                     'the answer is', 'results show', 'this means', 'conclusion:', 'summary:']
-                if any(phrase in response_text.lower() for phrase in conclusive_phrases):
-                    score += 25
-                    reasons.append("🎯 Conclusive analysis")
-                
-                # NEGATIVE: Contains errors or uncertainty
-                if 'error' in response_text.lower() or 'unable to' in response_text.lower():
-                    score -= 15
-                    reasons.append("⚠️ Contains errors/uncertainty")
-                
-                # CONTEXT: Check if we're making progress
-                if len(results_summary.get('findings', [])) > 0:
-                    score += 10
-                    reasons.append("📊 Investigation progressing")
-                
-                return max(0, min(100, score)), reasons  # Clamp to 0-100
-            
-            # Helper to detect if we're stuck in a loop
-            def detect_convergence(accumulated_insights, tool_history):
-                """Check if we're repeating similar queries without making progress"""
-                # Need minimum iterations before checking convergence (use session setting)
-                if len(tool_history) < convergence_threshold:
-                    return False
-                
-                # Check if data quality is IMPROVING - don't stop if getting better results
-                if len(tool_history) >= 2:
-                    last_two = tool_history[-2:]
-                    # Compare row counts from summaries
-                    last_count = last_two[-1].get('summary', {}).get('row_count', 0)
-                    prev_count = last_two[-2].get('summary', {}).get('row_count', 0)
-                    
-                    # If we're getting MORE data or BETTER fields, keep going
-                    if last_count > prev_count:
-                        return False  # Improving - don't stop
-                    
-                    # Check if field count is increasing (more detailed results)
-                    last_fields = len(last_two[-1].get('summary', {}).get('sample_fields', []))
-                    prev_fields = len(last_two[-2].get('summary', {}).get('sample_fields', []))
-                    if last_fields > prev_fields:
-                        return False  # Getting richer data - keep going
-                
-                # Check if last queries are TRULY identical (not just similar)
-                # Extract just the SPL query strings, normalize whitespace
-                recent_spl_queries = []
-                for call in tool_history[-convergence_threshold:]:
-                    params = call.get('args', {}) if isinstance(call.get('args', {}), dict) else call.get('params', {})
-                    if 'query' in params:
-                        # Normalize: remove whitespace differences, lowercase for comparison
-                        query = ' '.join(params['query'].lower().split())
-                        recent_spl_queries.append(query)
-                
-                # If all N queries are EXACTLY the same, it's true convergence
-                if len(recent_spl_queries) == convergence_threshold and len(set(recent_spl_queries)) == 1:
-                    return True  # Exact same query N times in a row
-                
-                return False
-            
-            while True:
+            while tool_call is not None:
                 iteration += 1
-                elapsed = time_module.time() - start_time
-
                 if iteration > max_iterations:
-                    print(f"🛑 Max iterations reached ({max_iterations})")
-                    final_answer = (
-                        f"I reached the configured limit of {max_iterations} investigation steps.\n\n"
-                        f"Key findings so far:\n" + "\n".join([f"• {insight}" for insight in accumulated_insights[-8:]])
-                    )
+                    stop_reason = "max_iterations"
                     break
-                
-                # Safety valve: timeout check
-                if elapsed > max_execution_time:
-                    print(f"⏱️ Timeout reached after {elapsed:.1f}s and {iteration} iterations")
-                    final_answer = f"I've spent {iteration} iterations investigating this query. Here's what I've found:\n\n" + "\n".join([f"• {insight}" for insight in accumulated_insights])
+                if time.time() - request_started_at > max_execution_time:
+                    stop_reason = "timeout"
                     break
-                
-                # Execute the current tool call
-                tool_name = tool_call['params']['name']
-                tool_args = tool_call['params'].get('arguments', {})
-                
-                print(f"🔄 [Iteration {iteration}] Executing: {tool_name}")
-                print(f"   Time elapsed: {elapsed:.1f}s")
-                
-                # Add status update (both to timeline and stream if callback provided)
-                action = "🔍 Querying Splunk" if tool_name in {'run_splunk_query', 'splunk_run_query'} else f"⚙️ Executing {tool_name}"
-                status_timeline.append({"iteration": iteration, "action": action, "time": elapsed})
-                if status_callback:
-                    await status_callback(action, iteration, elapsed)
-                
-                mcp_result = await execute_mcp_tool_call(tool_call, config)
-                
-                # Check for fatal errors - stop immediately, don't retry
-                if isinstance(mcp_result, dict) and mcp_result.get('fatal'):
-                    error_detail = mcp_result.get('detail', 'Fatal error occurred')
-                    status_code = mcp_result.get('status_code', 0)
-                    print(f"🛑 FATAL ERROR - Stopping discovery")
-                    print(f"   Status {status_code}: {error_detail}")
-                    
-                    # Provide helpful error messages based on status code
-                    if status_code == 401:
-                        error_type = "Authentication Failed"
-                        suggestions = """**Please check:**
-1. Your MCP Token is correct in the settings
-2. The token has not expired
-3. The token has proper permissions to access the Splunk instance"""
-                    elif status_code == 403:
-                        error_type = "Access Forbidden"
-                        suggestions = """**Please check:**
-1. Your MCP Token has proper permissions
-2. The Splunk user associated with the token has access to the required resources
-3. Network/firewall rules allow access"""
-                    elif status_code == 404:
-                        error_type = "MCP Endpoint Not Found"
-                        suggestions = """**Please check:**
-1. The MCP URL is correct in the settings
-2. The Splunk MCP server is running
-3. The endpoint path is correct (typically /services/mcp)"""
-                    else:
-                        error_type = "Connection Error"
-                        suggestions = """**Please check:**
-1. The MCP server is accessible
-2. Network connectivity is working
-3. Firewall/proxy settings allow the connection"""
-                    
-                    final_answer = f"""❌ **{error_type}**
 
-The Splunk MCP server returned a {status_code} error:
-
-```
-{error_detail}
-```
-
-{suggestions}
-
-Discovery has been stopped to avoid repeated failed attempts."""
-                    
-                    break  # Exit the main loop immediately
-                
-                # Get relevant context after tool execution to help LLM interpret results
-                try:
-                    ctx_mgr = get_context_manager()
-                    post_tool_context = ctx_mgr.get_context_after_tool_call(
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        tool_result=mcp_result
-                    )
-                    
-                    if post_tool_context:
-                        debug_log(f"Injecting post-tool context for {tool_name}", "info")
-                except Exception as e:
-                    debug_log(f"Error getting post-tool context: {e}", "error")
-                    post_tool_context = ""
-                
-                # Summarize result for efficient context
-                result_summary = summarize_result(mcp_result, tool_name)
-                result_analysis_brief = format_result_summary_for_llm(result_summary)
-                action = f"📊 Analyzing {result_summary.get('row_count', 0)} results"
-                elapsed = time_module.time() - start_time
-                status_timeline.append({"iteration": iteration, "action": action, "time": elapsed})
-                if status_callback:
-                    await status_callback(action, iteration, elapsed)
-                
-                # Track this tool call with summary
-                spl_query = None
-                if tool_name in {'run_splunk_query', 'splunk_run_query'} and 'query' in tool_args:
-                    spl_query = tool_args['query']
-                
-                all_tool_calls.append({
-                    "iteration": iteration,
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "spl_query": spl_query,
-                    "result": mcp_result,
-                    "summary": result_summary
+                params = tool_call.get("params") if isinstance(tool_call.get("params"), dict) else {}
+                tool_name = str(params.get("name") or query_tool_name).strip() or query_tool_name
+                tool_args = dict(params.get("arguments")) if isinstance(params.get("arguments"), dict) else {}
+                query_notes: List[str] = []
+                if tool_name in MCP_QUERY_TOOL_NAMES and scope_unscoped_chat_search(tool_args):
+                    query_notes.append(UNSCOPED_SEARCH_NOTE)
+                    tool_call = {**tool_call, "params": {**params, "name": tool_name, "arguments": tool_args}}
+                signature = tool_call_signature(tool_name, tool_args)
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": "\n".join(part for part in (assistant_text, format_tool_call_tag(tool_name, tool_args)) if part),
                 })
-                
-                # Extract insights for context building
-                for finding in result_summary.get('findings', []):
-                    accumulated_insights.append(f"[Iter {iteration}] {finding}")
-                
-                # Determine result status
-                has_error = result_summary.get('type') == 'error'
-                # Check for data in findings (works for both queries and metadata tools)
-                findings = result_summary.get('findings', [])
-                has_data = any(
-                    ('results returned' in f and '0 results' not in f) or 
-                    ('Found' in f and 'items' in f and '0 items' not in f)
-                    for f in findings
-                ) or (result_summary.get('row_count', 0) > 0)
-                
-                # Add assistant's reasoning to conversation
-                conversation_history.append({"role": "assistant", "content": clean_response})
-                
-                # Build intelligent feedback with accumulated context
-                insights_summary = "\n".join([f"  • {ins}" for ins in accumulated_insights[-5:]])  # Last 5 insights
-                analysis_section = f"\nRESULT ANALYSIS:\n{result_analysis_brief}" if result_analysis_brief else ""
-                
-                # Add post-tool context if available
-                context_section = f"\n\nRELEVANT CONTEXT:\n{post_tool_context}" if post_tool_context else ""
-                
-                if has_error:
-                    error_msg = result_summary.get('message', 'Unknown error')
-                    system_feedback = f"""🔴 ITERATION {iteration} RESULT: ERROR
 
-Error: {error_msg}
-
-ACCUMULATED INSIGHTS SO FAR:
-{insights_summary}{analysis_section}{context_section}{spl_explanation_requirement}
-
-REFINED USER INTENT: "{user_intent}"
-
-STRATEGIC OPTIONS:
-1. 🔧 Fix the query syntax and retry
-2. 🔄 Try a different approach (different index, time range, or tool)
-3. 🎯 Refine understanding of what the user actually wants
-4. ✅ Accept this error as meaningful (e.g., "no such index exists")
-
-If you can solve this, use <TOOL_CALL>...</TOOL_CALL> with your improved approach.
-If this error IS the answer (e.g., "that index doesn't exist"), provide final response WITHOUT tool calls.
-If you need to clarify the user's intent, ask a clarifying question WITHOUT tool calls."""
-                
-                elif has_data:
-                    # Build compact result context using properly parsed results from summary
-                    actual_results = result_summary.get('actual_results', [])
-                    
-                    # For metadata queries (indexes, sourcetypes), send full data
-                    # For large query results, send sample only
-                    if tool_name in {'get_indexes', 'splunk_get_indexes', 'get_metadata', 'splunk_get_metadata'}:
-                        sample_data = actual_results  # Send all metadata
-                        data_label = "Complete Data"
+                sweep_signature = index_agnostic_signature(tool_name, tool_args)
+                if signature in seen_signatures or sweep_signature in empty_sweeps:
+                    stalled_steps += 1
+                    remaining_steps = 0 if stalled_steps >= stall_limit else max(0, max_iterations - iteration)
+                    if signature in seen_signatures:
+                        skip_reason = (
+                            f"not run, because it repeats the tool call from step {seen_signatures[signature]}. "
+                            "That result is above."
+                        )
                     else:
-                        sample_data = actual_results[:sample_size]  # Use session setting
-                        data_label = f"Sample Data (first {sample_size} results)"
-                    
-                    result_snippet = {
+                        skip_reason = (
+                            f"not run, because it repeats the search from step {empty_sweeps[sweep_signature]} with only "
+                            "the index changed, and that search found nothing. To check other indexes, search them all in "
+                            "one step (index=* OR index=_*) or change the approach."
+                        )
+                    feedback_lines = [f"TOOL RESULT (step {iteration}): {skip_reason}"]
+                    if remaining_steps > 0:
+                        feedback_lines.append(
+                            f"Answer the user now from the evidence above, or make a different TOOL_CALL ({remaining_steps} tool steps left)."
+                        )
+                    else:
+                        feedback_lines.append("No tool steps are left. Reply to the user now from the evidence above, without a TOOL_CALL.")
+                    feedback = "\n".join(feedback_lines)
+                else:
+                    seen_signatures[signature] = iteration
+                    action = "🔍 Querying Splunk" if tool_name in MCP_QUERY_TOOL_NAMES else f"⚙️ Executing {tool_name}"
+                    await push_status(status_timeline, action, iteration)
+                    print(f"🔄 [Step {iteration}] Executing: {tool_name}")
+                    mcp_result = await execute_mcp_tool_call(tool_call, config)
+                    outcome = classify_tool_result(mcp_result)
+                    if outcome["status"] == "no_data" or outcome.get("zero_counts"):
+                        empty_sweeps.setdefault(sweep_signature, iteration)
+                    result_summary = summarize_tool_outcome(tool_name, outcome)
+                    query_text = tool_args.get("query") if isinstance(tool_args.get("query"), str) else None
+                    all_tool_calls.append({
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "spl_query": query_text if tool_name in MCP_QUERY_TOOL_NAMES or query_text else None,
+                        "result": mcp_result,
                         "summary": result_summary,
-                        "data": sample_data
-                    }
-                    
-                    system_feedback = f"""✅ ITERATION {iteration} RESULT: SUCCESS - DATA FOUND
+                    })
+                    for finding in result_summary.get("findings", []):
+                        accumulated_insights.append(f"[Step {iteration}] {finding}")
 
-{result_analysis_brief or result_summary.get('findings', [])}
+                    if outcome.get("fatal"):
+                        fatal_message = build_fatal_mcp_error_message(outcome.get("status_code"), outcome.get("error", ""))
+                        break
 
-ACCUMULATED INSIGHTS:
-{insights_summary}{context_section}{spl_explanation_requirement}
+                    if outcome["status"] == "error":
+                        await push_status(status_timeline, "⚠️ Tool returned an error", iteration)
+                    else:
+                        await push_status(status_timeline, f"📊 Analyzing {outcome['row_count']} results", iteration)
 
-{data_label}:
-{json.dumps(result_snippet.get('data'), indent=2)[:2000]}
+                    made_progress = outcome["status"] == "data" and not outcome.get("zero_counts")
+                    stalled_steps = 0 if made_progress else stalled_steps + 1
+                    remaining_steps = max(0, max_iterations - iteration)
+                    if stalled_steps >= stall_limit or time.time() - request_started_at > max_execution_time:
+                        remaining_steps = 0
 
-QUALITY CHECK:
-- Does this fully answer "{user_intent}"?
-- Should you cross-reference with other data sources?
-- Is there a deeper insight you can provide?
+                    post_tool_context = ""
+                    try:
+                        post_tool_context = get_context_manager().get_context_after_tool_call(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            tool_result=mcp_result,
+                        ) or ""
+                    except Exception as context_error:
+                        debug_log(f"Error getting post-tool context: {context_error}", "error")
 
-OPTIONS:
-1. ✅ Provide final answer if user's question is fully addressed
-2. 🔍 Execute additional query to enrich the answer
-3. 📊 Aggregate/analyze these results with another query
+                    feedback = build_tool_feedback(
+                        step=iteration,
+                        tool_name=tool_name,
+                        args=tool_args,
+                        outcome=outcome,
+                        evidence_rows=evidence_rows,
+                        evidence_chars=evidence_chars,
+                        analysis_brief=format_result_summary_for_llm(result_summary) if outcome["status"] == "data" else "",
+                        extra_context=str(post_tool_context or ""),
+                        explanation_requirement=spl_explanation_requirement,
+                        remaining_steps=remaining_steps,
+                        notes=query_notes,
+                    )
 
-⚠️ CRITICAL: If you want to investigate further, you MUST include a <TOOL_CALL> tag in your response.
-Do NOT say "I will execute" or "Let me try" without actually providing the <TOOL_CALL>.
-Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-between statements."""
-                
-                else:  # Success but no data
-                    system_feedback = f"""⚠️ ITERATION {iteration} RESULT: NO DATA
-
-The query executed successfully but returned no results.
-
-ACCUMULATED INSIGHTS:
-{insights_summary}{analysis_section}{context_section}{spl_explanation_requirement}
-
-STRATEGIC OPTIONS:
-1. 🔍 Try different index from discovery context
-2. ⏰ Broaden time range (e.g., -7d instead of -24h)
-3. 🎯 Simplify search criteria
-4. ✅ Accept "no data" as the legitimate answer
-
-Current user intent understanding: "{user_intent}"
-
-⚠️ CRITICAL: If you want to investigate further, you MUST include a <TOOL_CALL> tag in your response.
-Do NOT say "I will execute" or "Let me try" without actually providing the <TOOL_CALL>.
-Either provide the final answer OR provide <TOOL_CALL>...</TOOL_CALL> - no in-between statements."""
-                
-                conversation_history.append({"role": "system", "content": system_feedback})
-                
-                # Get LLM's next decision
-                print(f"🤔 [Iteration {iteration}] Asking LLM for quality assessment...")
-                action = "🧠 AI reasoning & quality assessment"
-                elapsed = time_module.time() - start_time
-                status_timeline.append({"iteration": iteration, "action": action, "time": elapsed})
-                if status_callback:
-                    await status_callback(action, iteration, elapsed)
-                
-                followup_max_tokens = chat_runtime_profile["followup_max_tokens"]
+                # Tool results go back as user turns: several providers hoist every system
+                # message into the instructions, which would detach results from their call.
+                conversation_history.append({"role": "user", "content": feedback})
+                await push_status(status_timeline, "🧠 Reviewing results", iteration)
                 next_response = await llm_client.generate_response(
                     messages=conversation_history,
                     max_tokens=followup_max_tokens,
-                    temperature=max(0.0, runtime_temperature * 0.9)  # Slightly lower temp for more focused decisions
+                    temperature=runtime_temperature,
                 )
-                
-                next_tool_call = extract_recoverable_tool_call(
+                next_response = next_response if isinstance(next_response, str) else str(next_response or "")
+                next_tool_call = _parse_tool_call(
                     next_response,
-                    query_tool_name,
-                    default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                    default_latest=str(tool_args.get('latest_time', '') or 'now'),
+                    str(tool_args.get("earliest_time") or default_earliest),
+                    str(tool_args.get("latest_time") or default_latest),
                 )
-                next_tool_match = bool(next_tool_call)
-                missing_spl_explanation = (
-                    requires_spl_explanation
-                    and not next_tool_match
-                    and not response_addresses_spl_explanation(next_response)
+                if next_tool_call is not None and remaining_steps > 0:
+                    tool_call = next_tool_call
+                    assistant_text = sanitize_llm_response_text(next_response)
+                    continue
+
+                final_answer = sanitize_llm_response_text(next_response)
+                if next_tool_call is None and remaining_steps > 0 and not loop_nudged and announces_unexecuted_search(final_answer):
+                    loop_nudged = True
+                    await push_status(status_timeline, "🔁 Asking the model for the search it described", iteration)
+                    conversation_history.append({"role": "assistant", "content": final_answer})
+                    conversation_history.append({"role": "user", "content": UNEXECUTED_SEARCH_NUDGE})
+                    nudge_response = await llm_client.generate_response(
+                        messages=conversation_history,
+                        max_tokens=chat_runtime_profile["retry_max_tokens"],
+                        temperature=runtime_temperature,
+                    )
+                    nudge_response = nudge_response if isinstance(nudge_response, str) else str(nudge_response or "")
+                    nudge_tool_call = _parse_tool_call(
+                        nudge_response,
+                        str(tool_args.get("earliest_time") or default_earliest),
+                        str(tool_args.get("latest_time") or default_latest),
+                    )
+                    if nudge_tool_call is not None:
+                        tool_call = nudge_tool_call
+                        assistant_text = sanitize_llm_response_text(nudge_response)
+                        continue
+                    final_answer = sanitize_llm_response_text(nudge_response) or final_answer
+                if next_tool_call is not None:
+                    stop_reason = "budget_exhausted"
+                tool_call = None
+
+            if fatal_message:
+                final_answer = fatal_message
+            else:
+                needs_final_pass = (
+                    not final_answer
+                    or announces_unexecuted_search(final_answer)
+                    or stop_reason in {"max_iterations", "timeout", "budget_exhausted"}
+                    or (requires_spl_explanation and not response_addresses_spl_explanation(final_answer))
                 )
-                
-                # Assess answer quality (independent of whether LLM wants to continue)
-                has_actionable_data = result_summary.get('row_count', 0) > 0 and 'No data' not in str(result_summary.get('findings', []))
-                quality_score, quality_reasons = assess_answer_quality(
-                    next_response,
-                    result_summary,
-                    has_actionable_data
-                )
-                
-                # Check if LLM is doing post-processing (formatting, conversion)
-                formatting_keywords = ['convert', 'format', 'human-readable', 'readable format', 
-                                      'timestamp', 'epoch', 'parse', 'translate', 'decode']
-                is_formatting = any(kw in next_response.lower() for kw in formatting_keywords)
-                
-                # Check for convergence (stuck in loop)
-                is_converged = detect_convergence(accumulated_insights, all_tool_calls)
-                
-                # Override convergence if we have data and LLM is formatting it
-                if is_converged and has_actionable_data and is_formatting and not next_tool_match:
-                    print(f"📝 Post-processing detected - allowing final formatting despite convergence")
-                    is_converged = False  # Let it complete the formatting
-                
-                print(f"📊 Answer Quality: {quality_score}/100 - {', '.join(quality_reasons)}")
-                if is_converged:
-                    print(f"🔄 Convergence detected - investigation patterns repeating")
-                
-                # SMART DECISION LOGIC (using session quality_threshold):
-                # 1. If high quality answer (>= threshold) - we're done regardless
-                # 2. If converged (stuck) BUT doing post-processing - allow one more response
-                # 3. If converged (stuck) - stop to avoid infinite loops  
-                # 4. If low quality (< threshold/2) AND LLM wants to continue - proceed
-                # 5. If low quality but LLM says done - try to force one more attempt
-                
-                if quality_score >= quality_threshold:
-                    # HIGH QUALITY - But check if it's a user-facing answer or just reasoning
-                    if has_actionable_data and not next_tool_match:
-                        # We have data and LLM stopped - but is the response user-facing?
-                        # Check if it's too short or contains internal reasoning keywords
-                        is_internal = (len(next_response.strip()) < 100 or 
-                                      any(kw in next_response.lower() for kw in 
-                                          ['iteration', 'i will', "i'll try", 'let me check', 'next step', 
-                                           'investigation', 'i should', 'perhaps i']))
-                        
-                        if is_internal or missing_spl_explanation:
-                            if missing_spl_explanation:
-                                print(f"📝 [Iteration {iteration}] High quality but missing required SPL explanation - requesting final user answer")
-                            else:
-                                print(f"📝 [Iteration {iteration}] High quality but internal reasoning - requesting final user answer")
-                            
-                            final_prompt = build_final_user_answer_prompt(
-                                user_message,
-                                insights_summary,
-                                require_spl_explanation=requires_spl_explanation,
-                            )
-                            
-                            conversation_history.append({"role": "system", "content": final_prompt})
-                            
-                            final_max_tokens = chat_runtime_profile["final_max_tokens"]
-                            final_response = await llm_client.generate_response(
-                                messages=conversation_history,
-                                max_tokens=final_max_tokens,
-                                temperature=runtime_temperature
-                            )
-                            final_answer = final_response
-                            print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
-                        else:
-                            # Response is already user-facing - but double-check for tool calls
-                            if '<TOOL_CALL>' in next_response:
-                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but primary parse missed it - retrying with recovery parser")
-                                try:
-                                    extracted_tool_call = extract_recoverable_tool_call(
-                                        next_response,
-                                        query_tool_name,
-                                        default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                        default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                                    )
-                                    if not extracted_tool_call:
-                                        raise ValueError("Malformed tool call payload")
-                                    tool_call = extracted_tool_call
-                                    clean_response = sanitize_llm_response_text(next_response)
-                                    continue  # Execute this tool call in next iteration
-                                except Exception as e:
-                                    print(f"❌ Failed to recover tool call (HIGH quality, first check): {e}")
-                                    # Strip the malformed tool call and use the text explanation
-                                    final_answer = sanitize_llm_response_text(next_response)
-                                    if not final_answer:
-                                        final_answer = "Investigation incomplete due to malformed query format."
-                                    break
-                            else:
-                                print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
-                                final_answer = next_response
-                    else:
-                        # Either no data or LLM wants to continue
-                        if next_tool_match:
-                            print(f"▶️  [Iteration {iteration}] High quality but continuing investigation")
-                            tool_call = next_tool_call
-                            clean_response = sanitize_llm_response_text(next_response)
-                            continue
-                        else:
-                            # Double-check for tool calls that regex might have missed
-                            if '<TOOL_CALL>' in next_response:
-                                print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> but primary parse missed it - retrying with recovery parser")
-                                try:
-                                    extracted_tool_call = extract_recoverable_tool_call(
-                                        next_response,
-                                        query_tool_name,
-                                        default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                        default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                                    )
-                                    if extracted_tool_call:
-                                        tool_call = extracted_tool_call
-                                        clean_response = sanitize_llm_response_text(next_response)
-                                        continue  # Execute this tool call in next iteration
-                                    raise ValueError("Malformed tool call payload")
-                                except Exception as e:
-                                    print(f"❌ Failed to recover tool call (HIGH quality, second check): {e}")
-                                    # Strip the malformed tool call and use the text explanation
-                                    final_answer = sanitize_llm_response_text(next_response)
-                                    if not final_answer:
-                                        final_answer = "Investigation incomplete due to malformed query format."
-                                    break
-                            else:
-                                if missing_spl_explanation:
-                                    print(f"📝 [Iteration {iteration}] High quality answer still missing SPL explanation - requesting final user answer")
-                                    final_prompt = build_final_user_answer_prompt(
-                                        user_message,
-                                        insights_summary,
-                                        require_spl_explanation=requires_spl_explanation,
-                                    )
+                if needs_final_pass:
+                    await push_status(status_timeline, "📝 Writing the final answer", len(all_tool_calls))
+                    insights_summary = "\n".join(f"  • {item}" for item in accumulated_insights[-8:]) or "  • No tool results were collected."
+                    final_prompt = build_final_user_answer_prompt(
+                        user_message,
+                        insights_summary,
+                        require_spl_explanation=requires_spl_explanation,
+                    )
+                    final_messages = list(conversation_history)
+                    if final_messages and final_messages[-1].get("role") == "assistant":
+                        final_messages.pop()
+                    final_messages.append({"role": "system", "content": final_prompt})
+                    final_response = await llm_client.generate_response(
+                        messages=final_messages,
+                        max_tokens=chat_runtime_profile["final_max_tokens"],
+                        temperature=runtime_temperature,
+                    )
+                    final_text = sanitize_llm_response_text(final_response if isinstance(final_response, str) else str(final_response or ""))
+                    if final_text:
+                        final_answer = final_text
 
-                                    conversation_history.append({"role": "system", "content": final_prompt})
-
-                                    final_max_tokens = chat_runtime_profile["final_max_tokens"]
-                                    final_response = await llm_client.generate_response(
-                                        messages=conversation_history,
-                                        max_tokens=final_max_tokens,
-                                        temperature=runtime_temperature
-                                    )
-                                    final_answer = final_response
-                                    print(f"✅ [Iteration {iteration}] Final user answer with SPL explanation generated ({len(final_response)} chars)")
-                                else:
-                                    print(f"✅ [Iteration {iteration}] High quality answer ({quality_score}/100) - investigation complete")
-                                    final_answer = sanitize_llm_response_text(next_response)
-                    
-                    if final_answer:
-                        break
-                
-                elif is_converged:
-                    # STUCK IN LOOP - Stop to avoid wasting resources
-                    print(f"🛑 [Iteration {iteration}] Convergence detected - stopping to avoid loops")
-                    final_answer = next_response + f"\n\n_Note: Investigation stopped after {iteration} iterations due to pattern convergence._"
-                    break
-                
-                elif quality_score < (quality_threshold / 2):  # Use half of threshold as "low quality"
-                    # LOW QUALITY - Need to continue
-                    if next_tool_match:
-                        # LLM wants to continue - excellent, let it
-                        print(f"▶️  [Iteration {iteration}] Low quality ({quality_score}/100), continuing as requested")
-                        # Fall through to tool execution
-                    else:
-                        # Low quality but LLM thinks it's done - force continuation
-                        print(f"⚠️  [Iteration {iteration}] Low quality ({quality_score}/100) but LLM stopped")
-                        print(f"    🔄 Forcing continuation...")
-                        
-                        # Check for continuation intent in natural language
-                        continuation_intent = has_continuation_intent(next_response)
-                        
-                        if continuation_intent or quality_score < (quality_threshold / 3):
-                            # Add strict format enforcement message
-                            format_enforcement = f"""❗ FORMAT ERROR: Your quality score is {quality_score}/100 (below threshold of {quality_threshold}).
-
-You MUST continue investigating using the exact <TOOL_CALL> format:
-
-<TOOL_CALL>
-{{"tool": "{query_tool_name}", "args": {{"query": "your SPL query here"}}}}
-</TOOL_CALL>
-
-Based on your previous response, provide your next investigation step NOW using the proper format above.
-Do not explain what you will do - DO IT with a tool call."""
-                            
-                            conversation_history.append({"role": "system", "content": format_enforcement})
-                            
-                            # Retry with format enforcement
-                            action = "🔄 Retrying with stricter format"
-                            elapsed = time_module.time() - start_time
-                            status_timeline.append({"iteration": iteration, "action": action, "time": elapsed})
-                            if status_callback:
-                                await status_callback(action, iteration, elapsed)
-                            
-                            retry_max_tokens = chat_runtime_profile["retry_max_tokens"]
-                            retry_response = await llm_client.generate_response(
-                                messages=conversation_history,
-                                max_tokens=retry_max_tokens,
-                                temperature=max(0.0, runtime_temperature * 0.7)  # Lower temp for stricter format
-                            )
-                            
-                            retry_tool_call = extract_recoverable_tool_call(
-                                retry_response,
-                                query_tool_name,
-                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                            )
-                            if retry_tool_call:
-                                print(f"✅ Retry successful - proper tool call format obtained")
-                                next_response = retry_response
-                                next_tool_call = retry_tool_call
-                                next_tool_match = True
-                                # Fall through to tool execution below
-                            else:
-                                print(f"⚠️  Retry failed - LLM still not providing tool call format")
-                                print(f"    Response fragment: {retry_response[:200]}")
-                                final_answer = f"Investigation incomplete. After {iteration} iterations, unable to determine next steps.\n\nLast findings:\n{insights_summary}\n\nSuggestion: Try a more specific query or different approach."
-                                break
-                        else:
-                            # No clear continuation intent - accept as final
-                            print(f"🏁 [Iteration {iteration}] No continuation intent detected despite low quality")
-                            final_answer = sanitize_llm_response_text(next_response)
-                            break
-                    
-                    # Has tool call (either original or from retry) - execute it
-                    if next_tool_match:
-                        try:
-                            extracted_tool_call = next_tool_call or extract_recoverable_tool_call(
-                                next_response,
-                                query_tool_name,
-                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                            )
-                            if not extracted_tool_call:
-                                raise ValueError("Malformed tool call payload")
-                            tool_call = extracted_tool_call
-                            
-                            clean_response = sanitize_llm_response_text(next_response)
-                            continue  # Execute this tool call in next iteration
-                        except Exception as e:
-                            print(f"❌ Failed to parse tool call: {e}")
-                            final_answer = sanitize_llm_response_text(next_response)
-                            break
-                
-                else:
-                    # MODERATE QUALITY (50-69) - Middle ground
-                    if next_tool_match:
-                        # Moderate quality but LLM wants to refine - allow it (up to 5 iterations)
-                        if iteration < 5:
-                            print(f"▶️  [Iteration {iteration}] Moderate quality ({quality_score}/100), allowing refinement")
-                            try:
-                                extracted_tool_call = next_tool_call or extract_recoverable_tool_call(
-                                    next_response,
-                                    query_tool_name,
-                                    default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                    default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                                )
-                                if not extracted_tool_call:
-                                    raise ValueError("Malformed tool call payload")
-                                tool_call = extracted_tool_call
-                                clean_response = sanitize_llm_response_text(next_response)
-                                continue  # Execute this tool call in next iteration
-                            except Exception as e:
-                                print(f"❌ Failed to parse tool call: {e}")
-                                final_answer = sanitize_llm_response_text(next_response)
-                                break
-                        else:
-                            # Too many iterations for moderate quality - accept current
-                            print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) after {iteration} iterations - accepting")
-                            final_answer = sanitize_llm_response_text(next_response)
-                            break
-                    else:
-                        # Moderate quality, no tool call - check for continuation intent
-                        continuation_intent = has_continuation_intent(next_response)
-                        
-                        if continuation_intent and iteration < 5:
-                            # LLM wants to continue but didn't provide tool call - force retry
-                            print(f"⚠️  [Iteration {iteration}] Moderate quality ({quality_score}/100) but continuation intent detected")
-                            print(f"    🔄 Forcing format retry...")
-                            
-                            format_enforcement = f"""❗ FORMAT ERROR: You indicated you will continue investigating, but did not provide a <TOOL_CALL>.
-
-Your quality score is {quality_score}/100 (moderate). To proceed, you MUST use the exact format:
-
-<TOOL_CALL>
-{{"tool": "{query_tool_name}", "args": {{"query": "your SPL query here"}}}}
-</TOOL_CALL>
-
-Based on your previous response, provide your next query NOW using the proper format above."""
-                            
-                            conversation_history.append({"role": "system", "content": format_enforcement})
-                            
-                            retry_max_tokens = chat_runtime_profile["retry_max_tokens"]
-                            retry_response = await llm_client.generate_response(
-                                messages=conversation_history,
-                                max_tokens=retry_max_tokens,
-                                temperature=max(0.0, runtime_temperature * 0.7)
-                            )
-                            
-                            retry_tool_call = extract_recoverable_tool_call(
-                                retry_response,
-                                query_tool_name,
-                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                            )
-                            if retry_tool_call:
-                                print(f"✅ Retry successful - proper tool call format obtained")
-                                next_response = retry_response
-                                next_tool_call = retry_tool_call
-                                next_tool_match = True
-                                # Fall through to tool execution
-                                try:
-                                    extracted_tool_call = next_tool_call or extract_recoverable_tool_call(
-                                        retry_response,
-                                        query_tool_name,
-                                        default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                        default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                                    )
-                                    if not extracted_tool_call:
-                                        raise ValueError("Malformed tool call payload")
-                                    tool_call = extracted_tool_call
-                                    clean_response = sanitize_llm_response_text(retry_response)
-                                    continue  # Execute this tool call in next iteration
-                                except Exception as e:
-                                    print(f"❌ Failed to parse tool call: {e}")
-                                    final_answer = sanitize_llm_response_text(next_response)
-                                    break
-                            else:
-                                print(f"⚠️  Retry failed - accepting current answer")
-                                final_answer = sanitize_llm_response_text(next_response)
-                                break
-                        else:
-                            # Moderate quality, no tool call, no continuation intent
-                            # Check if we have data and if response is user-facing
-                            if has_actionable_data:
-                                # We have data - check if response is internal reasoning
-                                is_internal = (len(next_response.strip()) < 100 or 
-                                              any(kw in next_response.lower() for kw in 
-                                                  ['iteration', 'i will', "i'll try", 'let me check', 'next step', 
-                                                   'i will adjust', 'i will refine', "i'll refine", 'i should']))
-                                
-                                if is_internal or missing_spl_explanation:
-                                    if missing_spl_explanation:
-                                        print(f"📝 [Iteration {iteration}] Moderate quality with data but missing SPL explanation - requesting final answer")
-                                    else:
-                                        print(f"📝 [Iteration {iteration}] Moderate quality with data but internal reasoning - requesting final answer")
-                                    
-                                    final_prompt = build_final_user_answer_prompt(
-                                        user_message,
-                                        insights_summary,
-                                        require_spl_explanation=requires_spl_explanation,
-                                    )
-                                    
-                                    conversation_history.append({"role": "system", "content": final_prompt})
-                                    
-                                    final_max_tokens = chat_runtime_profile["final_max_tokens"]
-                                    final_response = await llm_client.generate_response(
-                                        messages=conversation_history,
-                                        max_tokens=final_max_tokens,
-                                        temperature=runtime_temperature
-                                    )
-                                    final_answer = final_response
-                                    print(f"✅ [Iteration {iteration}] Final user answer generated ({len(final_response)} chars)")
-                                else:
-                                    # Response is already user-facing - but check for tool calls
-                                    if '<TOOL_CALL>' in next_response:
-                                        print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - retrying with recovery parser")
-                                        try:
-                                            extracted_tool_call = extract_recoverable_tool_call(
-                                                next_response,
-                                                query_tool_name,
-                                                default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                                default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                                            )
-                                            if not extracted_tool_call:
-                                                raise ValueError("Malformed tool call payload")
-                                            tool_call = extracted_tool_call
-                                            clean_response = sanitize_llm_response_text(next_response)
-                                            continue  # Execute this tool call in next iteration
-                                        except Exception as e:
-                                            print(f"❌ Failed to recover tool call: {e}")
-                                            # Strip the malformed tool call and use the text explanation
-                                            final_answer = sanitize_llm_response_text(next_response)
-                                            if not final_answer:
-                                                final_answer = "Investigation incomplete due to malformed query format."
-                                            break
-                                    else:
-                                        if missing_spl_explanation:
-                                            print(f"📝 [Iteration {iteration}] Moderate quality answer still missing SPL explanation - requesting final answer")
-                                            final_prompt = build_final_user_answer_prompt(
-                                                user_message,
-                                                insights_summary,
-                                                require_spl_explanation=requires_spl_explanation,
-                                            )
-
-                                            conversation_history.append({"role": "system", "content": final_prompt})
-
-                                            final_max_tokens = chat_runtime_profile["final_max_tokens"]
-                                            final_response = await llm_client.generate_response(
-                                                messages=conversation_history,
-                                                max_tokens=final_max_tokens,
-                                                temperature=runtime_temperature
-                                            )
-                                            final_answer = final_response
-                                            print(f"✅ [Iteration {iteration}] Final user answer with SPL explanation generated ({len(final_response)} chars)")
-                                        else:
-                                            print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                                            final_answer = sanitize_llm_response_text(next_response)
-                            else:
-                                # No data - accept response as-is, but check for tool calls
-                                if '<TOOL_CALL>' in next_response:
-                                    print(f"⚠️ [Iteration {iteration}] Response contains <TOOL_CALL> - retrying with recovery parser")
-                                    try:
-                                        extracted_tool_call = extract_recoverable_tool_call(
-                                            next_response,
-                                            query_tool_name,
-                                            default_earliest=str(tool_args.get('earliest_time', '') or '-24h'),
-                                            default_latest=str(tool_args.get('latest_time', '') or 'now'),
-                                        )
-                                        if not extracted_tool_call:
-                                            raise ValueError("Malformed tool call payload")
-                                        tool_call = extracted_tool_call
-                                        clean_response = sanitize_llm_response_text(next_response)
-                                        continue  # Execute this tool call in next iteration
-                                    except Exception as e:
-                                        print(f"❌ Failed to recover tool call: {e}")
-                                        # Strip the malformed tool call and use the text explanation
-                                        final_answer = sanitize_llm_response_text(next_response)
-                                        if not final_answer:
-                                            final_answer = "Investigation incomplete due to malformed query format."
-                                        break
-                                else:
-                                    if missing_spl_explanation:
-                                        print(f"📝 [Iteration {iteration}] Moderate quality no-data answer missing SPL explanation - requesting final answer")
-                                        final_prompt = build_final_user_answer_prompt(
-                                            user_message,
-                                            insights_summary,
-                                            require_spl_explanation=requires_spl_explanation,
-                                        )
-
-                                        conversation_history.append({"role": "system", "content": final_prompt})
-
-                                        final_max_tokens = chat_runtime_profile["final_max_tokens"]
-                                        final_response = await llm_client.generate_response(
-                                            messages=conversation_history,
-                                            max_tokens=final_max_tokens,
-                                            temperature=runtime_temperature
-                                        )
-                                        final_answer = final_response
-                                        print(f"✅ [Iteration {iteration}] Final no-data answer with SPL explanation generated ({len(final_response)} chars)")
-                                    else:
-                                        print(f"✅ [Iteration {iteration}] Moderate quality ({quality_score}/100) - accepting answer")
-                                        final_answer = sanitize_llm_response_text(next_response)
-                            break
-            
-            # CRITICAL SAFETY CHECK: If final_answer contains <TOOL_CALL>, the LLM isn't done
-            # This should never happen, but if it does, strip the tool call and force continuation
-            if final_answer and '<TOOL_CALL>' in final_answer:
-                print(f"⚠️ WARNING: final_answer contains <TOOL_CALL> tags - LLM finished prematurely!")
-                print(f"Response: {final_answer[:200]}...")
-                # Strip tool calls from response and return with warning
-                final_answer = sanitize_llm_response_text(final_answer)
-                if not final_answer:
-                    final_answer = "Investigation incomplete. The agent attempted to continue but reached response limits."
-            
-            # Return comprehensive response with status timeline
-            # Include conversation_history so follow-up queries maintain context
             user_facing_final_answer = finalize_user_facing_response_text(
                 final_answer,
                 DEFAULT_TOOL_INVESTIGATION_RESPONSE,
             )
+            if not fatal_message and stop_reason in {"max_iterations", "timeout"}:
+                if stop_reason == "max_iterations":
+                    limit_note = f"I stopped after {len(all_tool_calls)} tool steps (the limit is {max_iterations})."
+                else:
+                    limit_note = f"I stopped after {int(time.time() - request_started_at)} seconds (the limit is {max_execution_time}s)."
+                user_facing_final_answer = f"{user_facing_final_answer}\n\n_{limit_note} Ask me to continue if you need more detail._"
+
+            await push_status(status_timeline, "✅ Finalizing response", len(all_tool_calls))
             primary_spl_query = extract_primary_spl_query(all_tool_calls)
             visualization_spec, capability_usage = augment_capability_usage_with_visualization(all_tool_calls, capability_usage)
             user_facing_final_answer = apply_reusable_query_reference_to_response(
@@ -19133,26 +19188,28 @@ Based on your previous response, provide your next query NOW using the proper fo
                 all_tool_calls,
                 assistant_response=user_facing_final_answer,
             )
+            status_labels = {"error": "error", "data": "success", "no_data": "no_data"}
             return {
                 "response": user_facing_final_answer,
                 "initial_response": user_message,
                 "tool_calls": all_tool_calls,
                 "spl_query": primary_spl_query,
                 "visualization_spec": visualization_spec,
-                "iterations": iteration,
-                "execution_time": f"{time_module.time() - start_time:.2f}s",
+                "iterations": len(all_tool_calls),
+                "execution_time": f"{time.time() - request_started_at:.2f}s",
                 "insights": accumulated_insights,
-                "status_timeline": status_timeline,  # NEW: Real-time action log
+                "status_timeline": status_timeline,
                 "reasoning_chain": [
                     {
-                        "iteration": i, 
-                        "tool": tc["tool"], 
-                        "status": "error" if tc["summary"].get('type') == 'error' else ("success" if any('results returned' in f for f in tc["summary"].get('findings', [])) else "no_data"),
-                        "key_finding": tc["summary"].get('findings', [''])[0] if tc["summary"].get('findings') else ""
-                    } 
-                    for i, tc in enumerate(all_tool_calls, 1)
+                        "iteration": index,
+                        "tool": call["tool"],
+                        "status": status_labels.get(call["summary"].get("status"), "no_data"),
+                        "key_finding": (call["summary"].get("findings") or [""])[0],
+                    }
+                    for index, call in enumerate(all_tool_calls, 1)
                 ],
-                "conversation_history": conversation_history,  # FIX: Return full conversation for follow-up context
+                "stop_reason": stop_reason or ("fatal_error" if fatal_message else "answered"),
+                "conversation_history": _build_follow_up_conversation_history(history, user_message, user_facing_final_answer),
                 "discovery_age_warning": discovery_age_warning,
                 "chat_session_id": chat_session_id,
                 "chat_memory": updated_memory,
@@ -19160,14 +19217,14 @@ Based on your previous response, provide your next query NOW using the proper fo
                 "has_follow_on": len(follow_on_actions) > 0,
                 "follow_on_actions": follow_on_actions
             }
-        
-        # No tool call, return clean response with any SPL found
+
         await push_status(status_timeline, "✅ Returning direct answer", 0)
         direct_response = finalize_user_facing_response_text(
             clean_response,
             DEFAULT_DIRECT_CHAT_RESPONSE,
         )
         direct_response = apply_reusable_query_reference_to_response(direct_response, capability_usage)
+        spl_in_text = extract_suggested_spl_from_answer(direct_response)
         updated_memory = update_chat_memory(
             chat_session_id,
             user_message,
@@ -19193,7 +19250,6 @@ Based on your previous response, provide your next query NOW using the proper fo
             "has_follow_on": len(follow_on_actions) > 0,
             "follow_on_actions": follow_on_actions
         }
-        
     except Exception as e:
         # Log the full error to terminal for debugging
         print(f"ERROR in chat_with_splunk_logic: {str(e)}")
@@ -19209,52 +19265,55 @@ async def chat_with_splunk(http_request: Request, request: dict):
     return await chat_with_splunk_logic(request, status_callback=None, runtime_config=runtime_config)
 
 
+MCP_QUERY_TOOL_NAMES = frozenset({"splunk_run_query", "run_splunk_query"})
+MCP_UNKNOWN_TOOL_SIGNALS = ("tool not found", "unknown tool", "invalid tool", "no such tool", "method not found")
+
+
+def _looks_like_unknown_tool_error(message: str, code: Any = None) -> bool:
+    lowered = str(message or "").lower()
+    if code in (-32601, -32004):
+        return True
+    if any(signal in lowered for signal in MCP_UNKNOWN_TOOL_SIGNALS):
+        return True
+    return "tool" in lowered and "not found" in lowered
+
+
 async def execute_mcp_tool_call(tool_call, config):
-    """Execute a tool call against the MCP server."""
+    """Execute one tools/call request against the MCP server.
+
+    Every caller (the LLM loop, deterministic routes, follow-on actions) goes
+    through here, so the read-only SPL check and argument adaptation live here.
+    Failures come back as {"error", "detail", "status_code", "fatal"} dicts; tool
+    errors reported in-band (result.isError) are returned as-is for the caller
+    to classify.
+    """
+    executed_tool_name = ""
+    executed_args: Dict[str, Any] = {}
     try:
-        import httpx
-        
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json"
         }
-        if config.mcp.token:
-            headers["Authorization"] = f"Bearer {config.mcp.token}"
-            print(f"🔑 MCP Token present: {config.mcp.token[:20]}..." if len(config.mcp.token) > 20 else f"🔑 MCP Token: {config.mcp.token}")
+        token = getattr(config.mcp, "token", "") or ""
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         else:
-            print("⚠️ WARNING: No MCP token found in config!")
-        
-        print(f"🌐 MCP URL: {config.mcp.url}")
-        print(f"🔒 SSL Verify: {config.mcp.verify_ssl}")
-        
-        # Use MCP-specific SSL verification setting from config
-        verify_ssl = config.mcp.verify_ssl
-        ca_bundle = getattr(config.mcp, 'ca_bundle_path', None) if hasattr(config, 'mcp') else None
-        
-        # Determine SSL verification setting (match discovery engine behavior)
-        if ca_bundle and verify_ssl:
-            # Use custom CA bundle
-            ssl_verify = ca_bundle
-            print(f"INFO: SSL verification enabled with custom CA bundle: {ca_bundle}")
-        elif verify_ssl:
-            # Use system CA bundle (may fail with self-signed certs)
-            print("INFO: SSL verification enabled with system CA bundle")
-            ssl_verify = True
-        else:
-            # Disable SSL verification (for self-signed certs)
-            ssl_verify = False
-            print("INFO: SSL verification disabled for MCP calls (self-signed certificates)")
-        
-        requested_tool_name = tool_call.get('params', {}).get('name', 'unknown')
-        requested_args = tool_call.get('params', {}).get('arguments', {})
+            debug_log("No MCP token is configured; sending the tool call without Authorization", "warning")
+
+        verify_ssl = bool(getattr(config.mcp, "verify_ssl", False))
+        ca_bundle = getattr(config.mcp, "ca_bundle_path", None)
+        ssl_verify = ca_bundle if (ca_bundle and verify_ssl) else verify_ssl
+
+        params = tool_call.get("params", {}) if isinstance(tool_call, dict) else {}
+        requested_tool_name = str(params.get("name") or "unknown")
+        requested_args = params.get("arguments", {}) if isinstance(params.get("arguments"), dict) else {}
         available_tools = await discover_mcp_tools(config)
         resolved_tool_name = resolve_tool_name(requested_tool_name, available_tools)
         default_query_tool_name = resolve_tool_name("splunk_run_query", available_tools)
 
         if resolved_tool_name not in available_tools:
             if (
-                isinstance(requested_args, dict)
-                and isinstance(requested_args.get("query"), str)
+                isinstance(requested_args.get("query"), str)
                 and requested_args.get("query", "").strip()
                 and default_query_tool_name in available_tools
             ):
@@ -19276,160 +19335,128 @@ async def execute_mcp_tool_call(tool_call, config):
                     "fatal": False,
                 }
 
-        resolved_args = normalize_tool_arguments(resolved_tool_name, requested_args)
+        def _prepare_arguments(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+            prepared = normalize_tool_arguments(tool_name, args)
+            schema = get_cached_mcp_tool_metadata(config)["schemas"].get(tool_name)
+            if isinstance(schema, dict):
+                prepared, dropped = adapt_tool_arguments(prepared, schema)
+                if dropped:
+                    debug_log(f"Dropped arguments not accepted by {tool_name}: {', '.join(dropped)}", "info")
+            return prepared
 
-        resolved_tool_call = {
-            "method": "tools/call",
-            "params": {
-                "name": resolved_tool_name,
-                "arguments": resolved_args
-            }
-        }
         executed_tool_name = resolved_tool_name
-        executed_args = resolved_args
+        executed_args = _prepare_arguments(resolved_tool_name, requested_args)
 
-        # Debug: Log the tool call being sent
-        tool_name = resolved_tool_name
-        print(f"📤 Sending MCP tool call: {tool_name}")
-        print(f"   Requested tool: {requested_tool_name}")
-        print(f"   Method: {resolved_tool_call.get('method')}")
-        print(f"   Params: {resolved_tool_call.get('params', {}).keys()}")
-        print(f"   Arguments: {resolved_tool_call.get('params', {}).get('arguments', {})}")
-        print(f"   Headers: {list(headers.keys())}")
-        print(f"   Has Authorization: {'Authorization' in headers}")
-        print(f"   Full URL: {config.mcp.url}")
+        if executed_tool_name in MCP_QUERY_TOOL_NAMES:
+            query_text = executed_args.get("query")
+            if not isinstance(query_text, str) or not query_text.strip():
+                return {
+                    "error": "The search tool needs a non-empty SPL query.",
+                    "detail": "No query argument was provided.",
+                    "status_code": 400,
+                    "fatal": False,
+                }
+            safety = assess_spl_safety(query_text)
+            if not safety.get("allowed"):
+                debug_log(f"Blocked SPL before execution: {safety.get('reason')}", "warning")
+                return {
+                    "error": "Blocked a search that is not read-only",
+                    "detail": str(safety.get("reason") or "The query uses a blocked command."),
+                    "status_code": 400,
+                    "fatal": False,
+                    "blocked": True,
+                }
 
-        async def _post_tool_call(payload):
-            async with httpx.AsyncClient(verify=ssl_verify, timeout=30.0) as client:
-                print(f"📡 Posting to: {config.mcp.url}")
-                return await client.post(
-                    config.mcp.url,
-                    json=payload,
-                    headers=headers
-                )
+        async def _post_tool_call(tool_name: str, args: Dict[str, Any]):
+            payload = {
+                "jsonrpc": "2.0",
+                "id": _next_mcp_request_id(),
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": args},
+            }
+            async with httpx.AsyncClient(verify=ssl_verify, timeout=_mcp_call_timeout(tool_name)) as client:
+                return await client.post(config.mcp.url, json=payload, headers=headers)
 
-        unknown_tool_signals = ["tool not found", "unknown tool", "invalid tool", "no such tool", "method not found"]
-        should_retry_with_refresh = False
-        retry_reason = ""
+        def _decode(response) -> Any:
+            try:
+                return response.json()
+            except Exception:
+                return None
 
-        response = await _post_tool_call(resolved_tool_call)
-        print(f"📨 Response Status: {response.status_code}")
-        print(f"📨 Response Content-Type: {response.headers.get('content-type', 'unknown')}")
+        debug_log(f"MCP tools/call {executed_tool_name}", "query", {"tool": executed_tool_name, "arguments": executed_args})
+        response = await _post_tool_call(executed_tool_name, executed_args)
+        body = _decode(response)
+        rpc_error = parse_jsonrpc_error(body)
 
-        if response.status_code == 200:
-            mcp_response = response.json()
+        unknown_tool_text = ""
+        if rpc_error and _looks_like_unknown_tool_error(rpc_error.get("message", ""), rpc_error.get("code")):
+            unknown_tool_text = rpc_error.get("message", "")
+        elif response.status_code != 200 and body is None and _looks_like_unknown_tool_error(response.text or ""):
+            unknown_tool_text = (response.text or "")[:300]
 
-            if isinstance(mcp_response, dict) and mcp_response.get('error'):
-                error_text = str(mcp_response.get('error', '')).lower()
-                if any(signal in error_text for signal in unknown_tool_signals):
-                    should_retry_with_refresh = True
-                    retry_reason = str(mcp_response.get('error'))
-            elif isinstance(mcp_response, dict) and mcp_response.get('result'):
-                result_obj = mcp_response.get('result', {})
-                content = result_obj.get('content', []) if isinstance(result_obj, dict) else []
-                if isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and isinstance(item.get('text'), str):
-                            text = item.get('text', '').lower()
-                            if any(signal in text for signal in unknown_tool_signals):
-                                should_retry_with_refresh = True
-                                retry_reason = item.get('text', '')
-                                break
-        else:
-            error_detail = response.text[:500] if response.text else "No error details"
-            error_text = error_detail.lower()
-            if any(signal in error_text for signal in unknown_tool_signals):
-                should_retry_with_refresh = True
-                retry_reason = error_detail
-
-        if should_retry_with_refresh:
-            debug_log(f"Refreshing MCP tools after unknown-tool signal: {retry_reason}", "warning")
+        if unknown_tool_text:
+            debug_log(f"Refreshing MCP tools after unknown-tool signal: {unknown_tool_text}", "warning")
             refreshed_tools = await discover_mcp_tools(config, force_refresh=True)
             retried_tool_name = resolve_tool_name(requested_tool_name, refreshed_tools)
-            retried_args = normalize_tool_arguments(retried_tool_name, requested_args)
-            retried_payload = {
-                "method": "tools/call",
-                "params": {
-                    "name": retried_tool_name,
-                    "arguments": retried_args
-                }
-            }
-            response = await _post_tool_call(retried_payload)
-            executed_tool_name = retried_tool_name
-            executed_args = retried_args
-            print(f"🔁 Retry response status: {response.status_code}")
-        
-        if response.status_code == 200:
-            mcp_response = response.json()
+            if retried_tool_name != executed_tool_name and retried_tool_name in refreshed_tools:
+                executed_tool_name = retried_tool_name
+                executed_args = _prepare_arguments(retried_tool_name, requested_args)
+                response = await _post_tool_call(executed_tool_name, executed_args)
+                body = _decode(response)
+                rpc_error = parse_jsonrpc_error(body)
 
-            # Debug: Log the MCP response structure
-            debug_log(f"🔍 MCP Response from {tool_name}", "response", {
-                "tool": tool_name,
-                "status": response.status_code,
-                "response_type": str(type(mcp_response)),
-                "response_keys": list(mcp_response.keys()) if isinstance(mcp_response, dict) else None
-            })
-
-            # Check for 'result' field
-            if isinstance(mcp_response, dict) and 'result' in mcp_response:
-                result = mcp_response['result']
-
-                structured_content = result.get('structuredContent', {}) if isinstance(result, dict) else {}
-                structured_results = structured_content.get('results', []) if isinstance(structured_content, dict) else []
-                direct_results = result.get('results', []) if isinstance(result, dict) else []
-
-                # Check for results array (GA structuredContent first)
-                if isinstance(structured_results, list):
-                    results_count = len(structured_results)
-                    debug_log(f"📦 MCP returned {results_count} results (structuredContent)", "response", {
-                        "count": results_count,
-                        "first_result_sample": structured_results[0] if results_count > 0 else None
-                    })
-                elif isinstance(direct_results, list):
-                    results_count = len(direct_results)
-                    debug_log(f"📦 MCP returned {results_count} results", "response", {
-                        "count": results_count,
-                        "first_result_sample": direct_results[0] if results_count > 0 else None
-                    })
-                elif isinstance(result, dict):
-                    debug_log(f"📄 MCP result content (no results array)", "response", {
-                        "content_preview": str(result)[:200]
-                    })
-                else:
-                    debug_log(f"📄 MCP result value: {result}", "response")
+        if response.status_code == 200 and isinstance(body, dict) and rpc_error is None:
+            result_obj = body.get("result") if isinstance(body.get("result"), dict) else {}
+            if result_obj.get("isError"):
+                outcome = classify_tool_result(body)
+                maybe_record_rag_spl_query_feedback(
+                    executed_tool_name,
+                    executed_args,
+                    error_payload={"error": "tool error", "detail": outcome.get("error", "")},
+                )
             else:
-                debug_log(f"⚠️ MCP response missing 'result' field", "warning", {
-                    "response_preview": str(mcp_response)[:200]
-                })
+                maybe_record_rag_spl_query_feedback(executed_tool_name, executed_args, mcp_response=body)
+            return body
 
-            maybe_record_rag_spl_query_feedback(executed_tool_name, executed_args, mcp_response=mcp_response)
+        if rpc_error is not None:
+            error_payload = {
+                "error": rpc_error.get("message") or "MCP error",
+                "detail": f"JSON-RPC error code {rpc_error.get('code')}",
+                "status_code": response.status_code,
+                "fatal": response.status_code in {401, 403},
+            }
+            maybe_record_rag_spl_query_feedback(executed_tool_name, executed_args, error_payload=error_payload)
+            return error_payload
 
-            return mcp_response
-
-        error_detail = response.text[:200] if response.text else "No error details"
-        print(f"❌ MCP ERROR: Status {response.status_code} - {error_detail}")
-
-        # Mark fatal errors that won't be fixed by retrying
-        fatal_statuses = {401, 403, 404}  # Auth, forbidden, not found
-        is_fatal = response.status_code in fatal_statuses
-
+        error_detail = (response.text or "")[:300] if response.text else "No error details"
+        debug_log(f"MCP call failed with HTTP {response.status_code}: {error_detail[:200]}", "error")
+        # Auth problems and a missing endpoint will not be fixed by retrying.
         error_payload = {
             "error": f"MCP call failed: {response.status_code}",
             "detail": error_detail,
             "status_code": response.status_code,
-            "fatal": is_fatal  # Signal that retrying won't help
+            "fatal": response.status_code in {401, 403, 404},
         }
         maybe_record_rag_spl_query_feedback(executed_tool_name, executed_args, error_payload=error_payload)
         return error_payload
-                
+
+    except httpx.TimeoutException as e:
+        timeout_seconds = _mcp_call_timeout(executed_tool_name)
+        debug_log(f"MCP call timed out after {timeout_seconds:.0f}s: {type(e).__name__}", "error")
+        return {
+            "error": f"The MCP call timed out after {timeout_seconds:.0f} seconds",
+            "detail": "Narrow the time range or aggregate the search, then try again.",
+            "status_code": 504,
+            "fatal": False,
+        }
     except httpx.HTTPError as e:
-        print(f"❌ HTTP ERROR: {type(e).__name__} - {str(e)}")
-        return {"error": f"HTTP error: {type(e).__name__}", "detail": str(e)}
+        debug_log(f"MCP HTTP error: {type(e).__name__} - {e}", "error")
+        return {"error": f"HTTP error: {type(e).__name__}", "detail": str(e), "fatal": False}
     except Exception as e:
-        print(f"❌ EXCEPTION: {type(e).__name__} - {str(e)}")
+        debug_log(f"MCP tool call failed: {type(e).__name__} - {e}", "error")
         import traceback
         traceback.print_exc()
-        return {"error": f"Failed to execute tool call: {type(e).__name__}", "detail": str(e)}
+        return {"error": f"Failed to execute tool call: {type(e).__name__}", "detail": str(e), "fatal": False}
 
 
 @app.get("/status")

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rm, rmdir, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
@@ -62,19 +62,24 @@ function startServer(port) {
         },
     );
 
+    const handle = { child, spawnError: null };
     child.stdout.on('data', (chunk) => logs.stdout.push(chunk.toString()));
     child.stderr.on('data', (chunk) => logs.stderr.push(chunk.toString()));
+    // Without this listener a missing interpreter crashes the process before seeded output is restored.
+    child.on('error', (error) => {
+        handle.spawnError = error;
+        logs.stderr.push(`Failed to start server process: ${error.message}\n`);
+    });
 
-    return {
-        child,
+    return Object.assign(handle, {
         getLogs() {
             return `${logs.stdout.join('')}${logs.stderr.join('')}`.trim();
         },
-    };
+    });
 }
 
 async function stopServer(serverHandle) {
-    if (!serverHandle?.child || serverHandle.child.exitCode !== null) {
+    if (!serverHandle?.child || serverHandle.spawnError || serverHandle.child.exitCode !== null) {
         return;
     }
 
@@ -118,11 +123,14 @@ async function runPhase(label, action) {
     }
 }
 
-async function waitForServer(baseUrl, timeoutMs = 30000) {
+async function waitForServer(baseUrl, serverHandle = null, timeoutMs = 30000) {
     const deadline = Date.now() + timeoutMs;
     let lastError = null;
 
     while (Date.now() < deadline) {
+        if (serverHandle?.spawnError) {
+            throw new Error(`Server process failed to start: ${serverHandle.spawnError.message}. Set VISUALIZATION_BROWSER_TEST_PYTHON to the project interpreter.`);
+        }
         try {
             const response = await fetch(baseUrl, { redirect: 'manual' });
             if (response.ok) {
@@ -569,6 +577,7 @@ async function createOperatorFixtureSession() {
     const trackedFiles = new Map();
     const timestamp = OPERATOR_FIXTURE_TIMESTAMP;
     const createdAt = OPERATOR_FIXTURE_CREATED_AT;
+    const exportDirExisted = await pathExists(exportDir);
 
     await mkdir(outputDir, { recursive: true });
     await mkdir(exportDir, { recursive: true });
@@ -697,6 +706,9 @@ async function createOperatorFixtureSession() {
                 } else {
                     await writeFile(filePath, originalContent, 'utf8');
                 }
+            }
+            if (!exportDirExisted && (await readdir(exportDir).catch(() => ['?'])).length === 0) {
+                await rmdir(exportDir).catch(() => {});
             }
         },
     };
@@ -1444,7 +1456,7 @@ async function runOperatorWorkflowRegression(baseUrl, seededRuntimeState) {
         const buildResponse = await buildResponsePromise;
         assert(buildResponse.ok(), `Build Report Package returned HTTP ${buildResponse.status()}.`);
         const buildPayload = await buildResponse.json();
-        const exportDetails = buildPayload?.details || {};
+        const exportDetails = buildPayload?.details?.export || buildPayload?.details || {};
         const generatedFiles = Array.isArray(exportDetails.generated_files) ? exportDetails.generated_files : [];
         for (const fileName of generatedFiles) {
             generatedArtifacts.push(path.join(seededRuntimeState.exportDir, fileName));
@@ -1611,7 +1623,7 @@ async function main() {
         const port = await findFreePort();
         const baseUrl = `http://127.0.0.1:${port}`;
         serverHandle = startServer(port);
-        await waitForServer(baseUrl);
+        await waitForServer(baseUrl, serverHandle);
         await prepareOperatorExportCapability(baseUrl, seededRuntimeState);
 
         const visualizationResult = await runPhase('visualization regression', () => runBrowserRegression(baseUrl));

@@ -10,6 +10,10 @@ This reference is for developers repurposing the demo into production or custom 
   - Legacy: src/discovery/engine.py
    - Current primary pipeline: src/discovery/v2_pipeline.py
 - LLM abstraction: src/llm/factory.py
+  - Model profiles, ranking, and auto-tuning: src/llm/model_profiles.py, src/llm/runtime_tuning.py
+- Chat agent helpers (prompts, tool outcomes, evidence, loop guards): src/chat_agent.py
+- MCP argument adaptation to advertised tool schemas: src/mcp_tool_args.py
+- SPL safety, validation, and scoping helpers: src/spl/spl_utils.py
 - Config and encrypted credentials: src/config_manager.py
 
 ## 2) Discovery Flow (Current)
@@ -53,7 +57,10 @@ Chat strategy combines deterministic and agentic logic:
 3. Optional local RAG
    - build_lightweight_rag_context()
 4. LLM agentic loop fallback
-   - compact prompt + tool-call parser + iterative execution
+   - compact prompt (local/small-context models) or full grounded prompt (chat_agent.build_grounded_chat_prompt)
+   - plan hints from discovery, including facts for entities named in the request or mission (build_query_plan_brief)
+   - one tool call per step; repeats and empty index-by-index sweeps are skipped; unscoped searches get index=*
+   - each result goes back through chat_agent.build_tool_feedback with the SPL, time range, and analysis brief
 
 ### Add a new deterministic intent
 
@@ -68,8 +75,9 @@ Core contracts:
 
 - Tool discovery: discover_mcp_tools()
 - Tool alias resolution: resolve_tool_name()
-- Argument normalization: normalize_tool_arguments()
+- Argument normalization: normalize_tool_arguments(), then mcp_tool_args.adapt_tool_arguments() against the tool's input schema
 - Execution: execute_mcp_tool_call()
+- Outcome classification: chat_agent.classify_tool_result()
 
 ### Guidance
 
@@ -82,8 +90,9 @@ Core contracts:
 LLM flow:
 
 - get_or_create_llm_client() caches by config hash
-- Chat pipeline uses compact reliability-first prompt
-- Tool-call extraction supports JSON and python-like dict fallback
+- runtime_tuning.resolve_llm_tuning() resolves the model profile and tuned settings (auto_tune); build_chat_runtime_profile() turns them into per-step chat budgets
+- Chat pipeline uses the compact reliability-first prompt for local and small-context models
+- Tool-call extraction (extract_recoverable_tool_call) accepts tagged JSON, misspelled or missing closing tags, python-like dicts, and a tool-call JSON object that ends the reply (bare, backticked, or fenced)
 
 ### Guidance
 

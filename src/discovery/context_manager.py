@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from discovery.local_analyzer import metadata_recent_time_utc
+
 logger = logging.getLogger(__name__)
 
 
@@ -111,16 +113,21 @@ class DiscoveryContextManager:
     def _parse_notable_patterns(self) -> List[Dict[str, Any]]:
         overview = self._discovery_data.get("overview", {}) if isinstance(self._discovery_data, dict) else {}
         raw_patterns = overview.get("notable_patterns", []) if isinstance(overview.get("notable_patterns", []), list) else []
+        patterns: List[Dict[str, Any]] = []
         for item in raw_patterns:
             payload = item
             if isinstance(item, str):
                 try:
                     payload = json.loads(item)
                 except Exception:
+                    if item.strip() and item.strip()[0] not in "[{":
+                        patterns.append({"insight": item.strip()[:600]})
                     continue
             if isinstance(payload, dict) and isinstance(payload.get("patterns"), list):
-                return [pattern for pattern in payload.get("patterns", []) if isinstance(pattern, dict)]
-        return []
+                patterns.extend(pattern for pattern in payload.get("patterns", []) if isinstance(pattern, dict))
+            elif isinstance(payload, dict):
+                patterns.append(payload)
+        return patterns
 
     def get_metadata(self) -> Dict[str, Any]:
         """Get lightweight metadata about available discovery data."""
@@ -266,7 +273,7 @@ class DiscoveryContextManager:
             sourcetypes.append({
                 "name": name.strip(),
                 "events": self._safe_int(data.get("totalCount") or data.get("count") or data.get("eventCount")),
-                "recent_time": data.get("recentTimeIso") or data.get("lastTimeIso") or "",
+                "recent_time": metadata_recent_time_utc(data),
             })
 
         sourcetypes.sort(key=lambda item: item.get("events", 0), reverse=True)
@@ -540,16 +547,31 @@ class DiscoveryContextManager:
             return ""
 
         keyword_groups = [
-            (["wineventlog", "endpoint", "auth", "login", "security"], "windows security"),
+            (["wineventlog", "endpoint", "auth", "login", "security"], "security"),
             (["_internal", "_audit", "_introspection", "license", "scheduler", "ingestion"], "platform health"),
-            (["wmata", "api", "collector"], "wmata"),
-            (["ping", "netops", "interface", "latency", "packet"], "network"),
+            (["ping", "interface", "latency", "packet", "firewall", "network"], "network"),
         ]
         for keywords, hint in keyword_groups:
             if any(keyword in lowered for keyword in keywords):
                 for item in recommendations[:10]:
                     if isinstance(item, dict) and hint in str(item.get("title", "")).lower():
                         return str(item.get("title", ""))
+
+        # Environment-specific names (custom indexes, sourcetypes) are matched against
+        # recommendation titles directly instead of hardcoding them as keyword groups.
+        text_tokens = set()
+        for value in re.findall(r"\b(?:index|sourcetype)\s*=\s*\"?([^\s\"|)]+)", lowered):
+            for token in re.split(r"[^a-z0-9_]+", value.strip("*")):
+                if len(token) >= 3 and token not in {"main", "win", "log", "logs"}:
+                    text_tokens.add(token)
+        if text_tokens:
+            for item in recommendations[:10]:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", ""))
+                title_tokens = {token for token in re.split(r"[^a-z0-9_]+", title.lower()) if len(token) >= 4}
+                if text_tokens & title_tokens:
+                    return title
         return ""
 
     def get_context_after_tool_call(self, tool_name: str, tool_args: Dict, tool_result: Dict) -> str:

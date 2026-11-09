@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.1.0] - TBD (In Development)
 
+### 🤖 Grounded Chat Agent, Reliable Discovery & LLM Auto-Tuning
+
+#### Added
+- **Model profiles, ranking, and auto-tuning** (`src/llm/model_profiles.py`, `src/llm/runtime_tuning.py`)
+  - Builds a capability profile per model from endpoint metadata (Ollama `/api/tags` and `/api/show`; the `/models` extensions of vLLM, LM Studio, llama.cpp, OpenRouter, Groq, Mistral, Together; the Gemini model list), a curated hosted-model catalog, and open-weight size/family heuristics
+  - Ranks models by balanced quality (45%), speed (30%), and cost (25%); `/api/llm/list-models` now returns `ranked`, `recommended`, and `recommended_model`
+  - Auto-tune (on by default) derives the output budget, temperature, context window, request timeout, reasoning effort, and per-step chat budgets from the profile; newer GPT generations (for example `gpt-6.1-*`) map onto the closest catalog profile
+  - `/api/llm/test-connection` probes with the tuned settings and returns recommended runtime settings with a short rationale
+  - New LLM settings: `auto_tune`, `context_window`, `request_timeout`, `reasoning_effort` (also stored on saved credentials)
+  - Settings UI: auto-tune toggle, recommended model, and optional context/timeout/reasoning overrides
+- **Grounded chat agent helpers** (`src/chat_agent.py`): system prompts built from the live MCP tool catalog, normalized tool outcomes (`error` / `no_data` / `data`), evidence rendering within the tuned budget, and tool feedback that always shows the SPL and time range that ran
+- **Chat mission**: a mission field in the chat panel (kept when chat history is cleared) is sent with each request, stored in chat memory, shapes the prompts, and adds a "Next step for the mission" follow-on
+- **MCP argument adaptation** (`src/mcp_tool_args.py`): maps tool arguments onto each tool's advertised input schema (for example `index_name`, knowledge-object `type` enums) and parses JSON-RPC errors
+- **SPL utilities** (`src/spl/spl_utils.py`): read-only safety checks, entity extraction, validation against discovered indexes/sourcetypes/hosts, index scoping, time bounds, and JSON extraction from LLM output
+- **Discovery facts in chat**: when the request or mission names an index, sourcetype, source, or host, the plan hints include what discovery recorded about it (event totals, last event time, stale-data findings)
+- Unit suites: `tests/test_chat_agent.py`, `tests/test_discovery_pipeline.py`, `tests/test_model_profiles.py`, `tests/test_spl_utils.py`
+
+#### Changed
+- **Chat tool loop**: one tool call per step; skips exact repeats and index-by-index sweeps after an empty result; asks once for the missing tool call when a model promises a search; recovers misspelled, unterminated, bare, backticked, or fenced tool-call JSON; stops on fatal MCP errors; returns tool results as user turns so providers keep them attached to the call
+- **Unscoped searches**: chat searches that name no index run with `index=*` (Splunk otherwise searches only the role's default indexes), and the model is told that the index was added
+- **Answer grounding**: prompts state that zero results are not proof of health or failure, that event totals and index sizes do not show recency, and that more searches should be offered rather than promised
+- **Result analysis and follow-on actions**: aggregated results are ranked by their count column, Splunk internal fields (`_cd`, `_bkt`, `date_*`, `punct`, ...) are never used as pivots, index metadata without a latest-event time is flagged as totals-only, and failed searches offer a repair action
+- **Discovery engine and v2 pipeline**: schema-aware knowledge-object discovery, per-step status for unsupported or failed steps, de-duplicated MCP calls, readable data-volume formatting, a discovery quality record, freshness computed from metadata timestamps, and one shared JSON-only analysis prompt for all providers that forbids invented entities
+- **LLM health monitor**: response-time thresholds and timeouts follow the tuned runtime (local models are slower); slow but successful responses degrade the status instead of marking the endpoint unhealthy
+- Chat memory writes are atomic and the latest report knowledge is memoized per report file set
+
+#### Fixed
+- Discovery patterns, recommendations, and use cases came back empty or from the wrong list when the model's JSON was truncated or wrapped; truncated arrays are now salvaged
+- Source and host freshness read the MCP metadata tool's `*TimeIso` fields, which carry a `Z` suffix but were observed in the Splunk server's local time; epoch fields now take priority (sources in a UTC-5 environment were reported 5 hours staler than they were)
+- "Top" values in result summaries and follow-on actions followed the row order instead of the counts
+- Follow-on actions suggested filters on Splunk internal fields such as `_cd`
+- Local models leaked chat-template tokens and a leading `assistant` role label into answers
+- Saved-credential details in Settings are HTML-escaped
+- The browser regression harness reports a missing Python interpreter instead of crashing, restores seeded output, and removes the export directory it created
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added
