@@ -26,10 +26,11 @@ import signal
 import time
 import sys
 import socket
+import ssl
 import subprocess
 import threading
 from urllib.parse import quote, urlencode
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, Tuple
@@ -38,10 +39,11 @@ import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, padding, rsa, utils
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 # DT4SMS: Use encrypted config manager instead of YAML
 from config_manager import MASKED_SECRET, ConfigManager, is_unset_secret
+from troubleshooting import capture_startup_state, run_llm_diagnostics, run_mcp_diagnostics, server_code_status
 from capabilities import CapabilityManager, CapabilityRegistry
 from discovery.engine import DiscoveryEngine
 from discovery.m26_14_advisor import (
@@ -2758,6 +2760,9 @@ app = FastAPI(
 
 FRONTEND_STATIC_DIR = Path(__file__).with_name("static")
 FRONTEND_INDEX_PATH = FRONTEND_STATIC_DIR / "index.html"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Compared against the files on disk to spot a server that kept running through an update.
+SERVER_STARTUP_STATE = capture_startup_state(PROJECT_ROOT)
 
 app.mount("/static", StaticFiles(directory=str(FRONTEND_STATIC_DIR), check_dir=False), name="static")
 
@@ -12985,6 +12990,31 @@ def _config_save_failure_detail(kind: str) -> str:
     return f"Failed to save {kind}: {reason}" if reason else f"Failed to save {kind}"
 
 
+def _credential_activates(name: str, requested: Optional[bool]) -> bool:
+    if requested is not None:
+        return bool(requested)
+    return config_manager.get().active_credential_name == name
+
+
+def _mcp_profile_activates(name: str, requested: Optional[bool]) -> bool:
+    if requested is not None:
+        return bool(requested)
+    current = config_manager.get()
+    return current.active_mcp_config_name == name or (
+        not current.active_mcp_config_name and is_unset_secret(current.mcp.token)
+    )
+
+
+def _refresh_after_activation(payload: Dict[str, Any]) -> None:
+    # The settings are already saved; a refresh failure must not turn the save into an error.
+    try:
+        capability_manager.refresh()
+    except Exception as exc:
+        print(f"Warning: capability refresh after save failed: {exc}")
+        payload["warning"] = f"Saved, but refreshing capabilities failed: {exc}"
+    payload["config"] = config_manager.export_safe()
+
+
 class CredentialCreate(BaseModel):
     """Request model for creating/updating a credential"""
     name: str
@@ -13030,9 +13060,7 @@ async def save_credential(request: Request, credential: CredentialCreate):
     """Save a new credential"""
     require_admin_user(request)
     name = _normalize_profile_name(credential.name, "Credential")
-    activate = credential.activate
-    if activate is None:
-        activate = config_manager.get().active_credential_name == name
+    activate = _credential_activates(name, credential.activate)
     try:
         success = config_manager.save_credential(
             name=name,
@@ -13059,8 +13087,7 @@ async def save_credential(request: Request, credential: CredentialCreate):
         "activated": bool(activate),
     }
     if activate:
-        capability_manager.refresh()
-        payload["config"] = config_manager.export_safe()
+        _refresh_after_activation(payload)
     return payload
 
 # Profile names may contain "/", so the name segment uses the path convertor.
@@ -13141,12 +13168,7 @@ async def save_mcp_config(request: Request, mcp_config: MCPConfigCreate):
     url = str(mcp_config.url or "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="MCP URL is required")
-    current = config_manager.get()
-    activate = mcp_config.activate
-    if activate is None:
-        activate = current.active_mcp_config_name == name or (
-            not current.active_mcp_config_name and is_unset_secret(current.mcp.token)
-        )
+    activate = _mcp_profile_activates(name, mcp_config.activate)
     description = str(mcp_config.description or "").strip() or None
     try:
         success = config_manager.save_mcp_config(
@@ -13171,8 +13193,7 @@ async def save_mcp_config(request: Request, mcp_config: MCPConfigCreate):
         "token_configured": bool(saved and not is_unset_secret(saved.token)),
     }
     if activate:
-        capability_manager.refresh()
-        payload["config"] = config_manager.export_safe()
+        _refresh_after_activation(payload)
     return payload
 
 @app.get("/api/mcp-configs/{name:path}")
@@ -13228,7 +13249,8 @@ async def test_mcp_connection(request: Request, request_payload: dict):
         
         url = str(request_payload.get('url') or '').strip()
         token = request_payload.get('token')
-        verify_ssl = request_payload.get('verify_ssl', False)
+        verify_ssl = bool(request_payload.get('verify_ssl', False))
+        ca_bundle = str(request_payload.get('ca_bundle_path') or '').strip()
         
         if not url:
             raise HTTPException(status_code=400, detail="URL is required")
@@ -13243,14 +13265,29 @@ async def test_mcp_connection(request: Request, request_payload: dict):
         if token:
             headers["Authorization"] = f"Bearer {token}"
         
-        # Simple test payload - just check if server responds
+        # Same JSON-RPC request the discovery engine and chat send; strict servers reject bare method calls
         test_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
             "method": "tools/list",
             "params": {}
         }
         
-        # Determine SSL verification
-        ssl_verify = False if not verify_ssl else True
+        ssl_verify: Any = False
+        if verify_ssl and ca_bundle:
+            bundle_path = Path(ca_bundle).expanduser()
+            try:
+                ssl_verify = ssl.create_default_context(cafile=str(bundle_path))
+            except (OSError, ssl.SSLError) as bundle_error:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"The CA bundle file {bundle_path} could not be used ({bundle_error}). "
+                        "Check the path on the app server, or clear the CA Bundle field to use the system certificates."
+                    ),
+                }
+        elif verify_ssl:
+            ssl_verify = True
         
         # Make the test request
         async with httpx.AsyncClient(verify=ssl_verify, timeout=10.0) as client:
@@ -13285,7 +13322,15 @@ async def test_mcp_connection(request: Request, request_payload: dict):
                     "server_response": response.status_code
                 }
                 
-    except httpx.ConnectError:
+    except httpx.ConnectError as connect_error:
+        if "CERTIFICATE_VERIFY_FAILED" in str(connect_error):
+            return {
+                "status": "error",
+                "message": (
+                    "The server's SSL certificate isn't trusted. Add its CA bundle file, or turn off Verify SSL "
+                    "for a self-signed lab server. Use Troubleshoot for details."
+                ),
+            }
         return {
             "status": "error",
             "message": "Cannot connect to server. Check URL and network connectivity."
@@ -13318,7 +13363,8 @@ async def test_saved_mcp_connection(request: Request, name: str):
     return await test_mcp_connection(request, {
         'url': mcp_config.url,
         'token': mcp_config.token,
-        'verify_ssl': mcp_config.verify_ssl
+        'verify_ssl': mcp_config.verify_ssl,
+        'ca_bundle_path': mcp_config.ca_bundle_path,
     })
 
 # ==================== Chat Settings API (Session-based) ====================
@@ -13950,14 +13996,14 @@ async def assess_max_tokens(request: Request):
 async def test_llm_connection(request: Request):
     """Test provider-specific LLM connectivity and generation, then report auto-tuned settings."""
     try:
+        payload = await request.json()
+    except Exception:
         payload = {}
-        try:
-            payload = await request.json()
-            if not isinstance(payload, dict):
-                payload = {}
-        except Exception:
-            payload = {}
+    return await _run_llm_connection_test(payload if isinstance(payload, dict) else {})
 
+
+async def _run_llm_connection_test(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
         current_config = config_manager.get()
         llm_payload = payload.get("llm", {}) if isinstance(payload.get("llm"), dict) else payload
 
@@ -14272,6 +14318,114 @@ async def test_llm_connection(request: Request):
             "error": str(e),
             "message": f"Test failed: {str(e)}"
         }
+
+# ==================== Settings Troubleshooting API ====================
+
+_LLM_DEFAULT_ENDPOINTS = {
+    "openai": "https://api.openai.com",
+    "anthropic": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com",
+}
+
+
+def _llm_effective_endpoint(provider: str, endpoint_url: Optional[str]) -> str:
+    if provider == "ollama":
+        return normalize_ollama_endpoint_url(endpoint_url)
+    if endpoint_url:
+        return str(endpoint_url).strip()
+    return _LLM_DEFAULT_ENDPOINTS.get(provider, "")
+
+
+def _validation_messages(model_cls: Any, data: Dict[str, Any]) -> List[str]:
+    """Run the save endpoint's request model so troubleshooting reports the same rejections."""
+    try:
+        model_cls(**data)
+    except ValidationError as exc:
+        return [
+            f"{'.'.join(str(part) for part in error.get('loc', ())) or 'request'}: {error.get('msg')}"
+            for error in exc.errors()
+        ]
+    return []
+
+
+def _troubleshoot_account(request: Request) -> Dict[str, Any]:
+    if not is_auth_enabled():
+        return {"auth_enabled": False, "username": None, "role": None, "can_manage": True}
+    user = require_authenticated_user(request) or {}
+    role = str(user.get("role") or "").strip().lower()
+    return {"auth_enabled": True, "username": user.get("username"), "role": role or None, "can_manage": role == "admin"}
+
+
+def _request_port(request: Request) -> Optional[int]:
+    return request.url.port or (443 if request.url.scheme == "https" else 80)
+
+
+def _profile_name_errors(name: str, kind: str) -> List[str]:
+    if not name:
+        return []
+    try:
+        _normalize_profile_name(name, kind)
+    except HTTPException as exc:
+        return [f"name: {exc.detail}"]
+    return []
+
+
+@app.get("/api/troubleshoot/server-status")
+async def troubleshoot_server_status():
+    """Tell the browser whether the server still runs the code it started with (a git pull without a restart)."""
+    status = server_code_status(PROJECT_ROOT, SERVER_STARTUP_STATE)
+    status["started_at"] = datetime.fromtimestamp(status["started_at"], timezone.utc).isoformat()
+    return status
+
+
+@app.post("/api/troubleshoot/mcp")
+async def troubleshoot_mcp_settings(request: Request, request_payload: dict):
+    """Explain why an MCP configuration can't connect or can't be saved. Nothing is saved."""
+    account = _troubleshoot_account(request)
+    name = str(request_payload.get("name") or "").strip()
+    fields = {key: request_payload[key] for key in ("url", "token", "verify_ssl", "ca_bundle_path", "description") if key in request_payload}
+    errors = _validation_messages(MCPConfigCreate, {"name": name, "url": "", **fields})
+    errors += _profile_name_errors(name, "MCP configuration")
+    activate = _mcp_profile_activates(name, request_payload.get("activate")) if name else False
+    return await run_mcp_diagnostics(
+        request_payload,
+        config_manager=config_manager,
+        project_root=PROJECT_ROOT,
+        startup=SERVER_STARTUP_STATE,
+        own_port=_request_port(request),
+        account=account,
+        activate=activate,
+        validation_errors=errors,
+    )
+
+
+@app.post("/api/troubleshoot/llm")
+async def troubleshoot_llm_settings(request: Request, request_payload: dict):
+    """Explain why an AI provider credential can't connect or can't be saved. Nothing is saved."""
+    account = _troubleshoot_account(request)
+    name = str(request_payload.get("name") or "").strip()
+    credential_fields = (
+        "provider", "api_key", "model", "endpoint_url", "max_tokens", "temperature",
+        "auto_tune", "context_window", "request_timeout", "reasoning_effort",
+    )
+    fields = {key: request_payload[key] for key in credential_fields if key in request_payload}
+    errors = _validation_messages(CredentialCreate, {"name": name, "provider": "openai", "model": "", **fields})
+    errors += _profile_name_errors(name, "Credential")
+    activate = _credential_activates(name, request_payload.get("activate")) if name else False
+    return await run_llm_diagnostics(
+        request_payload,
+        config_manager=config_manager,
+        project_root=PROJECT_ROOT,
+        startup=SERVER_STARTUP_STATE,
+        own_port=_request_port(request),
+        account=account,
+        activate=activate,
+        validation_errors=errors,
+        normalize_provider=normalize_provider_name,
+        effective_endpoint=_llm_effective_endpoint,
+        runner=_run_llm_connection_test,
+    )
+
 
 @app.get("/summarize-progress/{session_id}")
 async def get_summarize_progress(session_id: str, request: Request):

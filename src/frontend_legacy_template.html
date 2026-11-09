@@ -1432,6 +1432,29 @@
             return JSON.stringify(detail);
         };
 
+        // Read a response body once and keep the raw text, so errors that aren't JSON (proxy pages, crashes) stay readable.
+        const readApiResponse = async (response) => {
+            const text = await response.text().catch(() => '');
+            let data = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch (parseError) {
+                data = null;
+            }
+            return { data, text };
+        };
+
+        const describeApiFailure = (response, data, text) => {
+            const status = response ? `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}` : 'No response';
+            if (data && data.detail !== undefined && data.detail !== null && data.detail !== '') {
+                return `${formatApiErrorDetail(data.detail)} (${status})`;
+            }
+            const snippet = String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+            return snippet ? `${status}: ${snippet}` : status;
+        };
+
+        const TROUBLESHOOT_RESTART_HINT = 'Restart the app in its install folder: ./install.sh --restart (macOS/Linux) or .\\install.ps1 -Restart (Windows). Then reload this page.';
+
         const readLlmTuningFormValues = (fallback = {}) => {
             const toPositiveInt = (element, fallbackValue) => {
                 if (!element) return Number(fallbackValue) > 0 ? Number(fallbackValue) : 0;
@@ -2285,6 +2308,13 @@
             // Settings modal state
             const [isSettingsOpen, setIsSettingsOpen] = useState(false);
             const [activeSettingsTab, setActiveSettingsTab] = useState('connections');
+            const [troubleshootKind, setTroubleshootKind] = useState('mcp');
+            const [troubleshootDrafts, setTroubleshootDrafts] = useState({ mcp: null, llm: null });
+            const [troubleshootOptions, setTroubleshootOptions] = useState({ check_save: true, check_connection: true });
+            const [troubleshootRunning, setTroubleshootRunning] = useState(false);
+            const [troubleshootResult, setTroubleshootResult] = useState(null);
+            const [troubleshootCopied, setTroubleshootCopied] = useState('');
+            const [serverCodeStatus, setServerCodeStatus] = useState(null); // Whether the server still runs the code it started with
             const [config, setConfig] = useState(null);
             const [authStatus, setAuthStatus] = useState(null);
             const [securityUsers, setSecurityUsers] = useState([]);
@@ -3654,6 +3684,7 @@
                 { id: 'connections', label: 'Connections', icon: 'fa-plug' },
                 { id: 'users', label: 'Users', icon: 'fa-users' },
                 { id: 'access', label: 'MCP/API & Tokens', icon: 'fa-key' },
+                { id: 'troubleshoot', label: 'Troubleshoot', icon: 'fa-stethoscope' },
             ];
 
             const escapeSettingsToastHtml = (value) => String(value || '')
@@ -9059,6 +9090,7 @@
                     loadCredentials();
                     loadMCPConfigs();
                     loadSecurityControlPlane();
+                    checkServerCodeStatus();
                 }, 100);
             };
 
@@ -9640,12 +9672,14 @@
                 const urlEl = document.getElementById('mcp-url');
                 const tokenEl = document.getElementById('mcp-token');
                 const verifySslEl = document.getElementById('mcp-verify-ssl');
+                const caBundleEl = document.getElementById('mcp-ca-bundle');
                 const name = String(profileName || '');
                 setMCPSaveDraft({
                     mode: name ? 'update' : 'new',
                     url: String(urlEl?.value || config?.mcp?.url || '').trim(),
                     token: tokenEl?.value || '',
                     verify_ssl: verifySslEl ? verifySslEl.checked : Boolean(config?.mcp?.verify_ssl),
+                    ca_bundle_path: String(caBundleEl ? caBundleEl.value : (config?.mcp?.ca_bundle_path || '')).trim(),
                 });
                 setMCPConfigName(name);
                 setMCPConfigDescription(name ? (savedMCPConfigs?.[name]?.description || '') : '');
@@ -9782,8 +9816,10 @@
                             const mcpUrlInput = document.getElementById('mcp-url');
                             const mcpTokenInput = document.getElementById('mcp-token');
 
+                            const mcpCaBundleInput = document.getElementById('mcp-ca-bundle');
                             if (mcpUrlInput) mcpUrlInput.value = newConfig.mcp.url;
                             if (mcpTokenInput) mcpTokenInput.value = ''; // Clear token field (masked in backend)
+                            if (mcpCaBundleInput) mcpCaBundleInput.value = newConfig.mcp.ca_bundle_path || '';
                             // verify_ssl checkbox is now controlled by React state
                         }, 50);
 
@@ -9953,11 +9989,546 @@
                 }
             };
 
+            const TROUBLESHOOT_STATUS_STYLES = {
+                pass: { icon: 'fa-check-circle', tone: 'text-green-700', badge: 'bg-green-50 text-green-800 border-green-300', label: 'Passed' },
+                warn: { icon: 'fa-exclamation-triangle', tone: 'text-amber-700', badge: 'bg-amber-50 text-amber-900 border-amber-300', label: 'Warning' },
+                fail: { icon: 'fa-times-circle', tone: 'text-red-700', badge: 'bg-red-50 text-red-800 border-red-300', label: 'Problem found' },
+                info: { icon: 'fa-info-circle', tone: 'text-blue-700', badge: 'bg-blue-50 text-blue-800 border-blue-300', label: 'Info' },
+                skip: { icon: 'fa-minus-circle', tone: 'text-gray-500', badge: 'bg-gray-50 text-gray-600 border-gray-300', label: 'Skipped' },
+            };
+
+            const buildTroubleshootDraftFromSettings = (kind) => {
+                if (kind === 'mcp') {
+                    return {
+                        name: loadedMCPConfigName || config?.active_mcp_config_name || '',
+                        url: config?.mcp?.url || '',
+                        token: '',
+                        verify_ssl: Boolean(config?.mcp?.verify_ssl),
+                        ca_bundle_path: config?.mcp?.ca_bundle_path || '',
+                    };
+                }
+                return {
+                    name: loadedCredentialName || config?.active_credential_name || '',
+                    provider: normalizeProvider(config?.llm?.provider, config?.llm?.endpoint_url),
+                    endpoint_url: config?.llm?.endpoint_url || '',
+                    api_key: '',
+                    model: config?.llm?.model || '',
+                };
+            };
+
+            // Prefer the values typed into the Connections forms (kept mounted while hidden), falling back to the active settings.
+            const readTroubleshootDraftFromForm = (kind) => {
+                const base = buildTroubleshootDraftFromSettings(kind);
+                const field = (id) => document.getElementById(id);
+                if (kind === 'mcp') {
+                    const urlEl = field('mcp-url');
+                    if (!urlEl) return base;
+                    const verifyEl = field('mcp-verify-ssl');
+                    return {
+                        ...base,
+                        name: loadedMCPConfigName || '',
+                        url: String(urlEl.value || '').trim(),
+                        token: field('mcp-token')?.value || '',
+                        verify_ssl: verifyEl ? verifyEl.checked : base.verify_ssl,
+                        ca_bundle_path: String(field('mcp-ca-bundle')?.value ?? base.ca_bundle_path).trim(),
+                    };
+                }
+                const providerEl = field('llm-provider');
+                if (!providerEl) return base;
+                const provider = providerEl.value || base.provider;
+                const endpointEl = field('llm-endpoint-url');
+                const draft = {
+                    ...base,
+                    name: loadedCredentialName || '',
+                    provider,
+                    endpoint_url: provider !== 'openai' && endpointEl ? endpointEl.value : '',
+                    api_key: field('llm-api-key')?.value || '',
+                    model: field('llm-model')?.value ?? base.model,
+                    ...readLlmTuningFormValues(config?.llm || {}),
+                };
+                const maxTokens = parseInt(field('llm-max-tokens')?.value || '', 10);
+                const temperature = parseFloat(field('llm-temperature')?.value || '');
+                if (Number.isFinite(maxTokens)) draft.max_tokens = maxTokens;
+                if (Number.isFinite(temperature)) draft.temperature = temperature;
+                return draft;
+            };
+
+            const updateTroubleshootDraft = (kind, key, value) => {
+                setTroubleshootDrafts((current) => ({
+                    ...current,
+                    [kind]: { ...(current[kind] || buildTroubleshootDraftFromSettings(kind)), [key]: value },
+                }));
+            };
+
+            const hideUrlCredentials = (value) => String(value || '').replace(/\/\/[^/@\s]+@/, '//[hidden]@');
+
+            // Same shape as the server's report, for failures where the server never ran the checks.
+            const buildBrowserTroubleshootResult = (kind, draft, response, data, text) => {
+                let title;
+                let detail;
+                let fix;
+                if (!response) {
+                    title = "Couldn't reach the app server";
+                    detail = text ? `The browser reported: ${text}` : '';
+                    fix = 'Check that the app is still running (./install.sh --status or .\\install.ps1 -Status) and that this page uses the address the app printed when it started.';
+                } else if (response.status === 404 || response.status === 405) {
+                    title = 'The running app is older than this page';
+                    detail = `The server doesn't know the troubleshooting request (${describeApiFailure(response, data, text)}). This happens when the files were updated, for example with git pull, but the app wasn't restarted. The old server code can also make saves fail in ways the update already fixes.`;
+                    fix = TROUBLESHOOT_RESTART_HINT;
+                } else if (response.status === 401) {
+                    title = 'You are signed out';
+                    detail = describeApiFailure(response, data, text);
+                    fix = 'Sign in again, then run the checks again.';
+                } else {
+                    title = `The troubleshooting request failed (HTTP ${response.status})`;
+                    detail = describeApiFailure(response, data, text);
+                    fix = response.status >= 500 ? 'Look for the error in the app log (dt4sms.log in the install folder).' : '';
+                }
+                const target = kind === 'mcp'
+                    ? hideUrlCredentials(draft?.url)
+                    : [draft?.provider, draft?.model].filter(Boolean).join(' ');
+                const checkedAt = new Date();
+                const lines = [
+                    `DT4SMS troubleshooting report: ${kind === 'mcp' ? 'MCP server' : 'AI provider'}`,
+                    `Checked: ${checkedAt.toLocaleString()}`,
+                    `Target: ${target || '(none entered)'}`,
+                    `Result: FAIL - ${title}`,
+                    `Browser: ${navigator.userAgent}`,
+                    '',
+                    'Browser and app server: FAIL',
+                    `  [fail] ${title}`,
+                ];
+                if (detail) lines.push(`         ${detail}`);
+                if (fix) lines.push(`         Fix: ${fix}`);
+                return {
+                    kind,
+                    target,
+                    status: 'fail',
+                    summary: title,
+                    summary_fix: fix,
+                    checked_at: checkedAt.toISOString(),
+                    stages: [{ id: 'browser', title: 'Browser and app server', status: 'fail', checks: [{ id: 'request', title, status: 'fail', detail, fix }] }],
+                    report: lines.join('\n'),
+                };
+            };
+
+            const runSettingsTroubleshooter = async (kind, draftOverride) => {
+                const draft = draftOverride || troubleshootDrafts[kind] || buildTroubleshootDraftFromSettings(kind);
+                setTroubleshootRunning(true);
+                setTroubleshootResult(null);
+                setTroubleshootCopied('');
+                try {
+                    const response = await fetch(`/api/troubleshoot/${kind}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ...draft, ...troubleshootOptions }),
+                    });
+                    const { data, text } = await readApiResponse(response);
+                    if (response.ok && data && Array.isArray(data.stages)) {
+                        setTroubleshootResult(data);
+                    } else {
+                        setTroubleshootResult(buildBrowserTroubleshootResult(kind, draft, response, data, text));
+                    }
+                } catch (error) {
+                    setTroubleshootResult(buildBrowserTroubleshootResult(kind, draft, null, null, error?.message || String(error)));
+                } finally {
+                    setTroubleshootRunning(false);
+                }
+            };
+
+            const openSettingsTroubleshooter = (kind, draft, options = {}) => {
+                const nextDraft = draft || buildTroubleshootDraftFromSettings(kind);
+                setTroubleshootKind(kind);
+                setTroubleshootDrafts((current) => ({ ...current, [kind]: nextDraft }));
+                setTroubleshootResult(null);
+                setTroubleshootCopied('');
+                setActiveSettingsTab('troubleshoot');
+                if (options.autoRun) {
+                    runSettingsTroubleshooter(kind, nextDraft);
+                }
+            };
+
+            const offerTroubleshootAfterSaveFailure = (kind, message, draft, closeSaveDialog) => {
+                if (!confirm(`${message}\n\nOpen Troubleshoot to find out why it can't be saved?`)) {
+                    return;
+                }
+                if (closeSaveDialog) closeSaveDialog();
+                openSettingsTroubleshooter(kind, draft, { autoRun: true });
+            };
+
+            const copyTroubleshootReport = async (reportText) => {
+                let copied = false;
+                try {
+                    if (navigator.clipboard && window.isSecureContext) {
+                        await navigator.clipboard.writeText(reportText);
+                        copied = true;
+                    }
+                } catch (clipboardError) {
+                    copied = false;
+                }
+                if (!copied) {
+                    // Plain-http pages on another host have no clipboard API.
+                    const area = document.createElement('textarea');
+                    area.value = reportText;
+                    area.setAttribute('readonly', '');
+                    area.style.position = 'fixed';
+                    area.style.opacity = '0';
+                    document.body.appendChild(area);
+                    area.select();
+                    try {
+                        copied = document.execCommand('copy');
+                    } catch (copyError) {
+                        copied = false;
+                    }
+                    area.remove();
+                }
+                setTroubleshootCopied(copied ? 'copied' : 'failed');
+            };
+
+            const checkServerCodeStatus = async () => {
+                try {
+                    const response = await fetch('/api/troubleshoot/server-status');
+                    if (response.status === 404) {
+                        // Only a server older than this page lacks the endpoint.
+                        setServerCodeStatus({ stale: true, outdated_server: true, restart_hint: TROUBLESHOOT_RESTART_HINT });
+                        return;
+                    }
+                    if (!response.ok) {
+                        setServerCodeStatus(null);
+                        return;
+                    }
+                    const data = await response.json();
+                    setServerCodeStatus(data && typeof data === 'object' ? data : null);
+                } catch (error) {
+                    setServerCodeStatus(null);
+                }
+            };
+
+            const renderServerCodeBanner = () => {
+                if (!serverCodeStatus?.stale) {
+                    return null;
+                }
+                return (
+                    <div data-testid="settings-server-stale-banner" className="rounded-lg border-2 border-amber-400 bg-amber-50 p-4 text-sm text-amber-900">
+                        <div className="font-semibold">
+                            <i className="fas fa-exclamation-triangle mr-2"></i>
+                            The app was updated, but the server is still running the old version
+                        </div>
+                        <div className="mt-1">
+                            Until the app restarts, saving and testing can fail in ways the update already fixes. {serverCodeStatus.restart_hint || TROUBLESHOOT_RESTART_HINT}
+                        </div>
+                        <button type="button" onClick={checkServerCodeStatus} className="mt-2 text-xs font-medium underline">
+                            Check again
+                        </button>
+                    </div>
+                );
+            };
+
+            const renderTroubleshootResult = (result, panelClass) => {
+                const overall = TROUBLESHOOT_STATUS_STYLES[result.status] || TROUBLESHOOT_STATUS_STYLES.info;
+                const passText = result.kind === 'mcp'
+                    ? 'These MCP settings should save and connect.'
+                    : 'These AI provider settings should save and connect.';
+                return (
+                    <div data-testid="troubleshoot-results" data-status={result.status} className="mt-4 space-y-3">
+                        <div data-testid="troubleshoot-summary" className={`rounded-lg border-2 p-4 ${overall.badge}`}>
+                            <div className="font-semibold">
+                                <i className={`fas ${overall.icon} mr-2`}></i>
+                                {result.status === 'pass' ? 'All checks passed' : result.summary}
+                            </div>
+                            {result.status === 'pass' && <div className="mt-1 text-sm">{passText}</div>}
+                            {result.status !== 'pass' && result.summary_fix && (
+                                <div className="mt-1 text-sm"><span className="font-semibold">What to do:</span> {result.summary_fix}</div>
+                            )}
+                        </div>
+                        {(result.stages || []).map((stage) => {
+                            const stageStyle = TROUBLESHOOT_STATUS_STYLES[stage.status] || TROUBLESHOOT_STATUS_STYLES.info;
+                            return (
+                                <div key={`troubleshoot-stage-${stage.id}`} data-testid={`troubleshoot-stage-${stage.id}`} data-status={stage.status} className={panelClass}>
+                                    <div className="flex items-center justify-between gap-2 mb-2">
+                                        <h4 className="text-sm font-semibold text-gray-900">{stage.title}</h4>
+                                        <span className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${stageStyle.badge}`}>{stageStyle.label}</span>
+                                    </div>
+                                    <ul className="space-y-2">
+                                        {(stage.checks || []).map((check, index) => {
+                                            const checkStyle = TROUBLESHOOT_STATUS_STYLES[check.status] || TROUBLESHOOT_STATUS_STYLES.info;
+                                            return (
+                                                <li key={`troubleshoot-check-${stage.id}-${check.id}-${index}`} data-testid={`troubleshoot-check-${check.id}`} data-status={check.status} className="text-sm">
+                                                    <div className={`font-medium ${checkStyle.tone}`}>
+                                                        <i className={`fas ${checkStyle.icon} mr-2`}></i>
+                                                        {check.title}
+                                                    </div>
+                                                    {check.detail && <div className="ml-6 text-xs text-gray-600 whitespace-pre-wrap break-words">{check.detail}</div>}
+                                                    {check.fix && <div className="ml-6 mt-1 text-xs text-gray-800 break-words"><span className="font-semibold">Fix:</span> {check.fix}</div>}
+                                                </li>
+                                            );
+                                        })}
+                                    </ul>
+                                </div>
+                            );
+                        })}
+                        <div className="flex flex-wrap items-center gap-3">
+                            <button
+                                type="button"
+                                data-testid="troubleshoot-copy-report"
+                                onClick={() => copyTroubleshootReport(result.report || '')}
+                                className={`rounded-lg px-3 py-2 text-xs font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-100 border border-gray-700 hover:bg-gray-700' : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50'}`}
+                            >
+                                <i className="fas fa-copy mr-2"></i>
+                                Copy Report
+                            </button>
+                            {troubleshootCopied === 'copied' && (
+                                <span data-testid="troubleshoot-copy-status" className="text-xs text-green-700">Copied. Tokens and keys are hidden, so the report is safe to share with support.</span>
+                            )}
+                            {troubleshootCopied === 'failed' && (
+                                <span data-testid="troubleshoot-copy-status" className="text-xs text-amber-700">Couldn't copy automatically. Open the report text below and copy it.</span>
+                            )}
+                        </div>
+                        <details className="text-xs">
+                            <summary className="cursor-pointer font-medium text-gray-700">Show report text</summary>
+                            <pre data-testid="troubleshoot-report-text" className={`mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-950 border-gray-700 text-gray-200' : 'bg-gray-50 border-gray-200 text-gray-800'}`}>{result.report}</pre>
+                        </details>
+                    </div>
+                );
+            };
+
+            const renderSettingsTroubleshooter = () => {
+                if (activeSettingsTab !== 'troubleshoot') {
+                    return null;
+                }
+                const kind = troubleshootKind;
+                const draft = troubleshootDrafts[kind] || buildTroubleshootDraftFromSettings(kind);
+                const panelClass = `rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`;
+                const inputClass = 'w-full px-3 py-2 border border-gray-300 rounded-md';
+                const labelClass = 'block text-sm font-medium text-gray-700 mb-1';
+                const savedNames = Object.keys((kind === 'mcp' ? savedMCPConfigs : savedCredentials) || {}).sort();
+                const secretLabel = kind === 'mcp' ? 'token' : 'API key';
+                const nothingToCheck = !troubleshootOptions.check_save && !troubleshootOptions.check_connection;
+                const kindButton = (value, label, icon) => (
+                    <button
+                        key={`troubleshoot-kind-${value}`}
+                        type="button"
+                        data-testid={`troubleshoot-kind-${value}`}
+                        onClick={() => {
+                            setTroubleshootKind(value);
+                            setTroubleshootResult(null);
+                            setTroubleshootCopied('');
+                        }}
+                        className={`flex-1 rounded-lg px-4 py-2 text-sm font-medium ${kind === value ? 'bg-amber-600 text-white shadow-sm' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700' : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-100')}`}
+                        aria-pressed={kind === value}
+                    >
+                        <i className={`fas ${icon} mr-2`}></i>
+                        {label}
+                    </button>
+                );
+                return (
+                    <div data-testid="settings-troubleshooter">
+                        <div className={`rounded-lg p-6 border-2 ${isDarkTheme ? 'bg-gray-800 border-amber-700' : 'bg-gradient-to-r from-amber-50 to-orange-50 border-amber-200'}`}>
+                            <div className="mb-4">
+                                <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                                    <i className="fas fa-stethoscope mr-2 text-amber-600"></i>
+                                    Troubleshoot a Connection
+                                </h3>
+                                <p className="text-sm text-gray-600">
+                                    Enter the settings that won't connect or won't save. The checks look at the app itself, the values you entered, saving, the network, and the server's reply, and explain what to fix. Nothing is saved.
+                                </p>
+                            </div>
+                            <div className="flex gap-2 mb-4">
+                                {kindButton('mcp', 'MCP Server', 'fa-server')}
+                                {kindButton('llm', 'AI Provider', 'fa-brain')}
+                            </div>
+                            <div className={panelClass}>
+                                <div className="space-y-3">
+                                    <div>
+                                        <label className={labelClass} htmlFor="troubleshoot-name">
+                                            {kind === 'mcp' ? 'Configuration name' : 'Credential name'}
+                                            <span className="ml-2 text-xs text-gray-500">(optional; a blank {secretLabel} uses the one saved under this name)</span>
+                                        </label>
+                                        <input
+                                            id="troubleshoot-name"
+                                            data-testid="troubleshoot-name"
+                                            type="text"
+                                            list="troubleshoot-saved-names"
+                                            className={inputClass}
+                                            value={draft.name || ''}
+                                            onChange={(e) => updateTroubleshootDraft(kind, 'name', e.target.value)}
+                                        />
+                                        <datalist id="troubleshoot-saved-names">
+                                            {savedNames.map((savedName) => <option key={`troubleshoot-saved-${savedName}`} value={savedName} />)}
+                                        </datalist>
+                                    </div>
+                                    {kind === 'mcp' ? (
+                                        <>
+                                            <div>
+                                                <label className={labelClass} htmlFor="troubleshoot-mcp-url">MCP URL</label>
+                                                <input
+                                                    id="troubleshoot-mcp-url"
+                                                    data-testid="troubleshoot-mcp-url"
+                                                    type="text"
+                                                    placeholder="https://splunk.example.com:8089/services/mcp"
+                                                    className={inputClass}
+                                                    value={draft.url || ''}
+                                                    onChange={(e) => updateTroubleshootDraft('mcp', 'url', e.target.value)}
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className={labelClass} htmlFor="troubleshoot-mcp-token">Token</label>
+                                                <input
+                                                    id="troubleshoot-mcp-token"
+                                                    data-testid="troubleshoot-mcp-token"
+                                                    type="password"
+                                                    autoComplete="off"
+                                                    placeholder="Leave blank to use the saved token"
+                                                    className={inputClass}
+                                                    value={draft.token || ''}
+                                                    onChange={(e) => updateTroubleshootDraft('mcp', 'token', e.target.value)}
+                                                />
+                                            </div>
+                                            <div className="flex items-center">
+                                                <input
+                                                    id="troubleshoot-mcp-verify-ssl"
+                                                    data-testid="troubleshoot-mcp-verify-ssl"
+                                                    type="checkbox"
+                                                    className="mr-2"
+                                                    checked={Boolean(draft.verify_ssl)}
+                                                    onChange={(e) => updateTroubleshootDraft('mcp', 'verify_ssl', e.target.checked)}
+                                                />
+                                                <label htmlFor="troubleshoot-mcp-verify-ssl" className="text-sm text-gray-700">Verify SSL Certificate</label>
+                                            </div>
+                                            <div>
+                                                <label className={labelClass} htmlFor="troubleshoot-mcp-ca-bundle">
+                                                    CA bundle file
+                                                    <span className="ml-2 text-xs text-gray-500">(optional; a .pem file on the app server that trusts your Splunk certificate)</span>
+                                                </label>
+                                                <input
+                                                    id="troubleshoot-mcp-ca-bundle"
+                                                    data-testid="troubleshoot-mcp-ca-bundle"
+                                                    type="text"
+                                                    className={inputClass}
+                                                    value={draft.ca_bundle_path || ''}
+                                                    onChange={(e) => updateTroubleshootDraft('mcp', 'ca_bundle_path', e.target.value)}
+                                                />
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <div>
+                                                <label className={labelClass} htmlFor="troubleshoot-llm-provider">Provider</label>
+                                                <select
+                                                    id="troubleshoot-llm-provider"
+                                                    data-testid="troubleshoot-llm-provider"
+                                                    className={inputClass}
+                                                    value={draft.provider || 'openai'}
+                                                    onChange={(e) => updateTroubleshootDraft('llm', 'provider', e.target.value)}
+                                                >
+                                                    <option value="openai">OpenAI</option>
+                                                    <option value="azure">Azure OpenAI</option>
+                                                    <option value="anthropic">Anthropic (Claude)</option>
+                                                    <option value="gemini">Google Gemini</option>
+                                                    <option value="ollama">Ollama</option>
+                                                    <option value="custom">Custom Endpoint</option>
+                                                </select>
+                                            </div>
+                                            {draft.provider !== 'openai' && (
+                                                <div>
+                                                    <label className={labelClass} htmlFor="troubleshoot-llm-endpoint">Endpoint URL</label>
+                                                    <input
+                                                        id="troubleshoot-llm-endpoint"
+                                                        data-testid="troubleshoot-llm-endpoint"
+                                                        type="text"
+                                                        placeholder={draft.provider === 'ollama' ? 'http://localhost:11434' : 'Leave blank for the provider default'}
+                                                        className={inputClass}
+                                                        value={draft.endpoint_url || ''}
+                                                        onChange={(e) => updateTroubleshootDraft('llm', 'endpoint_url', e.target.value)}
+                                                    />
+                                                </div>
+                                            )}
+                                            <div>
+                                                <label className={labelClass} htmlFor="troubleshoot-llm-api-key">API Key</label>
+                                                <input
+                                                    id="troubleshoot-llm-api-key"
+                                                    data-testid="troubleshoot-llm-api-key"
+                                                    type="password"
+                                                    autoComplete="off"
+                                                    placeholder="Leave blank to use the saved key"
+                                                    className={inputClass}
+                                                    value={draft.api_key || ''}
+                                                    onChange={(e) => updateTroubleshootDraft('llm', 'api_key', e.target.value)}
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className={labelClass} htmlFor="troubleshoot-llm-model">Model</label>
+                                                <input
+                                                    id="troubleshoot-llm-model"
+                                                    data-testid="troubleshoot-llm-model"
+                                                    type="text"
+                                                    className={inputClass}
+                                                    value={draft.model || ''}
+                                                    onChange={(e) => updateTroubleshootDraft('llm', 'model', e.target.value)}
+                                                />
+                                            </div>
+                                        </>
+                                    )}
+                                    <div className="flex flex-wrap gap-4 pt-1">
+                                        <label className="flex items-center text-sm text-gray-700">
+                                            <input
+                                                type="checkbox"
+                                                data-testid="troubleshoot-check-save"
+                                                className="mr-2"
+                                                checked={troubleshootOptions.check_save}
+                                                onChange={(e) => setTroubleshootOptions((current) => ({ ...current, check_save: e.target.checked }))}
+                                            />
+                                            Check that it can be saved
+                                        </label>
+                                        <label className="flex items-center text-sm text-gray-700">
+                                            <input
+                                                type="checkbox"
+                                                data-testid="troubleshoot-check-connection"
+                                                className="mr-2"
+                                                checked={troubleshootOptions.check_connection}
+                                                onChange={(e) => setTroubleshootOptions((current) => ({ ...current, check_connection: e.target.checked }))}
+                                            />
+                                            Test the connection
+                                        </label>
+                                    </div>
+                                    <div className="flex flex-wrap gap-2 pt-3 border-t border-gray-200">
+                                        <button
+                                            type="button"
+                                            data-testid="troubleshoot-run"
+                                            disabled={troubleshootRunning || nothingToCheck}
+                                            onClick={() => runSettingsTroubleshooter(kind, draft)}
+                                            className="flex-1 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium shadow-md transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                                        >
+                                            {troubleshootRunning
+                                                ? <><i className="fas fa-spinner fa-spin mr-2"></i>Running checks...</>
+                                                : <><i className="fas fa-stethoscope mr-2"></i>Run Checks</>}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            data-testid="troubleshoot-use-current"
+                                            onClick={() => {
+                                                setTroubleshootDrafts((current) => ({ ...current, [kind]: readTroubleshootDraftFromForm(kind) }));
+                                                setTroubleshootResult(null);
+                                            }}
+                                            className={`px-4 py-2 rounded-lg text-sm font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-100 border border-gray-700 hover:bg-gray-700' : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50'}`}
+                                        >
+                                            <i className="fas fa-rotate-left mr-2"></i>
+                                            Use Values from Connections
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                            {troubleshootResult && troubleshootResult.kind === kind && renderTroubleshootResult(troubleshootResult, panelClass)}
+                        </div>
+                    </div>
+                );
+            };
+
             const renderSecurityAccessSettings = () => {
                 if (!config) {
                     return null;
                 }
-                if (activeSettingsTab === 'connections') {
+                if (activeSettingsTab !== 'users' && activeSettingsTab !== 'access') {
                     return null;
                 }
 
@@ -19053,13 +19624,14 @@ ${query.spl}`,
                                 {/* Scrollable Content */}
                                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
                                     <div className={`rounded-xl border p-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                        <div className="grid gap-2 md:grid-cols-3">
+                                        <div className="grid gap-2 md:grid-cols-4">
                                             {SETTINGS_MODAL_TABS.map((tab) => {
                                                 const isActive = activeSettingsTab === tab.id;
                                                 return (
                                                     <button
                                                         key={`settings-tab-${tab.id}`}
                                                         type="button"
+                                                        data-testid={`settings-tab-${tab.id}`}
                                                         onClick={() => setActiveSettingsTab(tab.id)}
                                                         className={`flex items-center justify-center gap-2 rounded-lg px-4 py-3 text-sm font-medium transition-colors ${isActive ? 'bg-indigo-600 text-white shadow-sm' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
                                                         aria-pressed={isActive}
@@ -19072,10 +19644,14 @@ ${query.spl}`,
                                         </div>
                                     </div>
 
+                                    {renderServerCodeBanner()}
+
                                     {renderSecurityAccessSettings()}
 
-                                    {activeSettingsTab === 'connections' && (
-                                    <>
+                                    {renderSettingsTroubleshooter()}
+
+                                    {/* Kept mounted while hidden so typed values and the saved lists survive tab switches */}
+                                    <div data-testid="settings-connections-panel" className="space-y-6" hidden={activeSettingsTab !== 'connections'}>
                                     {/* MCP Configuration Vault */}
                                     <div>
                                         <div className={`rounded-lg p-6 border-2 ${isDarkTheme ? 'bg-gray-800 border-green-700' : 'bg-gradient-to-r from-green-50 to-emerald-50 border-green-200'}`}>
@@ -19184,6 +19760,19 @@ ${query.spl}`,
                                                     />
                                                     <label htmlFor="mcp-verify-ssl" className="text-sm text-gray-700">Verify SSL Certificate</label>
                                                 </div>
+                                                <div>
+                                                    <label htmlFor="mcp-ca-bundle" className="block text-sm font-medium text-gray-700 mb-1">
+                                                        CA Bundle File
+                                                        <span className="ml-2 text-xs text-gray-500">(optional; a .pem file on the app server, used when Verify SSL is on)</span>
+                                                    </label>
+                                                    <input
+                                                        type="text"
+                                                        defaultValue={config.mcp.ca_bundle_path || ''}
+                                                        placeholder="/path/to/splunk-ca.pem"
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                                        id="mcp-ca-bundle"
+                                                    />
+                                                </div>
 
                                                 {/* Test & Save Buttons */}
                                                 <div className="pt-3 border-t border-gray-200 space-y-2">
@@ -19216,16 +19805,21 @@ ${query.spl}`,
                                                                         url: testUrl,
                                                                         token: testToken,
                                                                         verify_ssl: testVerifySsl,
+                                                                        ca_bundle_path: String(document.getElementById('mcp-ca-bundle')?.value || '').trim() || undefined,
                                                                         name: loadedMCPConfigName || undefined
                                                                     })
                                                                 });
 
-                                                                const result = await response.json();
+                                                                const { data, text } = await readApiResponse(response);
+                                                                const result = data || {};
 
-                                                                if (result.status === 'success') {
+                                                                if (response.ok && result.status === 'success') {
                                                                     alert('✅ ' + result.message);
                                                                 } else {
-                                                                    alert('⚠️ ' + result.message);
+                                                                    const message = (response.ok && result.message) ? result.message : describeApiFailure(response, data, text);
+                                                                    if (confirm('⚠️ ' + message + '\n\nRun Troubleshoot to find out why?')) {
+                                                                        openSettingsTroubleshooter('mcp', readTroubleshootDraftFromForm('mcp'), { autoRun: true });
+                                                                    }
                                                                 }
                                                             } catch (error) {
                                                                 alert('❌ Test failed: ' + error.message);
@@ -19237,6 +19831,14 @@ ${query.spl}`,
                                                         className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
                                                     >
                                                         <i className="fas fa-network-wired mr-2"></i>Test Connection
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        data-testid="mcp-troubleshoot"
+                                                        onClick={() => openSettingsTroubleshooter('mcp', readTroubleshootDraftFromForm('mcp'), { autoRun: true })}
+                                                        className="w-full px-4 py-2 bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 rounded-lg font-medium transition-all"
+                                                    >
+                                                        <i className="fas fa-stethoscope mr-2"></i>Troubleshoot
                                                     </button>
 
                                                     {/* Save Buttons */}
@@ -19759,7 +20361,8 @@ ${query.spl}`,
                                                                     }
                                                                 })
                                                             });
-                                                            const result = await response.json();
+                                                            const { data, text } = await readApiResponse(response);
+                                                            const result = (response.ok && data) ? data : { status: 'error', message: describeApiFailure(response, data, text) };
                                                             const esc = escapeSettingsHtml;
 
                                                             let html = '<div class="space-y-2">';
@@ -19793,6 +20396,7 @@ ${query.spl}`,
                                                                 html += '<div class="bg-red-100 border border-red-300 rounded-lg p-3 mb-2">';
                                                                 html += '<div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2"></i>Test Failed</div>';
                                                                 html += '<div class="text-sm text-red-700 mt-1">' + esc(result.message || result.error || 'Unknown error') + '</div>';
+                                                                html += '<div class="text-xs text-red-700 mt-1">Click Troubleshoot below to find out why.</div>';
                                                                 html += '</div>';
                                                             }
 
@@ -19829,6 +20433,14 @@ ${query.spl}`,
                                                     className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
                                                 >
                                                     <i className="fas fa-plug mr-2"></i> Test Connection & Auto-Configure
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    data-testid="llm-troubleshoot"
+                                                    onClick={() => openSettingsTroubleshooter('llm', readTroubleshootDraftFromForm('llm'), { autoRun: true })}
+                                                    className="mt-2 w-full px-4 py-2 bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 rounded-lg font-medium transition-all"
+                                                >
+                                                    <i className="fas fa-stethoscope mr-2"></i>Troubleshoot
                                                 </button>
                                                 <div id="llm-test-results" className="mt-3" style={{display: 'none'}}></div>
 
@@ -19874,8 +20486,7 @@ ${query.spl}`,
                                             </div>
                                         </div>
                                     )}
-                                    </>
-                                    )}
+                                    </div>
                                 </div>
 
                                 {/* Footer */}
@@ -19930,6 +20541,7 @@ ${query.spl}`,
                                                 const mcpUrlEl = document.getElementById('mcp-url');
                                                 const mcpTokenEl = document.getElementById('mcp-token');
                                                 const mcpVerifyEl = document.getElementById('mcp-verify-ssl');
+                                                const mcpCaBundleEl = document.getElementById('mcp-ca-bundle');
 
                                                 const provider = providerEl ? providerEl.value : selectedProvider;
 
@@ -19939,6 +20551,9 @@ ${query.spl}`,
                                                     url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
                                                     verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
                                                 };
+                                                if (mcpCaBundleEl) {
+                                                    mcpSettings.ca_bundle_path = mcpCaBundleEl.value.trim() || null;
+                                                }
                                                 // Only include token if user entered a new one
                                                 if (mcpToken && mcpToken.trim()) {
                                                     mcpSettings.token = mcpToken;
@@ -20109,7 +20724,8 @@ This action cannot be undone.`);
                                                         })
                                                     });
 
-                                                    const result = await response.json().catch(() => ({}));
+                                                    const { data: savedData, text: savedText } = await readApiResponse(response);
+                                                    const result = savedData || {};
 
                                                     if (response.ok) {
                                                         // Close modal
@@ -20133,6 +20749,7 @@ This action cannot be undone.`);
                                                                 <div>
                                                                     <p class="font-bold text-base">Credential ${wasUpdate ? 'Updated' : 'Saved'}!</p>
                                                                     <p class="text-sm ${wasUpdate ? 'opacity-80' : 'opacity-90'}">${escapeSettingsHtml(credentialName)}</p>
+                                                                    ${result.warning ? `<p class="text-xs opacity-80">${escapeSettingsHtml(result.warning)}</p>` : ''}
                                                                 </div>
                                                             </div>
                                                         `;
@@ -20142,12 +20759,22 @@ This action cannot be undone.`);
                                                             successDiv.style.opacity = '0';
                                                             successDiv.style.transition = 'opacity 0.3s';
                                                             setTimeout(() => successDiv.remove(), 300);
-                                                        }, 2500);
+                                                        }, result.warning ? 8000 : 2500);
                                                     } else {
-                                                        alert('Failed to save credential: ' + formatApiErrorDetail(result.detail));
+                                                        offerTroubleshootAfterSaveFailure(
+                                                            'llm',
+                                                            'Failed to save credential: ' + describeApiFailure(response, savedData, savedText),
+                                                            { ...readTroubleshootDraftFromForm('llm'), name: credentialName.trim() },
+                                                            () => setIsCredentialModalOpen(false),
+                                                        );
                                                     }
                                                 } catch (error) {
-                                                    alert('Error saving credential: ' + error.message);
+                                                    offerTroubleshootAfterSaveFailure(
+                                                        'llm',
+                                                        'Error saving credential: ' + error.message,
+                                                        { ...readTroubleshootDraftFromForm('llm'), name: credentialName.trim() },
+                                                        () => setIsCredentialModalOpen(false),
+                                                    );
                                                 }
                                             }}
                                             disabled={!credentialName.trim()}
@@ -20246,6 +20873,9 @@ This action cannot be undone.`);
                                             <div><span className="font-medium">URL:</span> {mcpSaveDraft?.url || 'N/A'}</div>
                                             <div><span className="font-medium">Token:</span> {describeMCPDraftToken(mcpSaveDraft, mcpConfigName)}</div>
                                             <div><span className="font-medium">Verify SSL:</span> {mcpSaveDraft?.verify_ssl ? 'Yes' : 'No'}</div>
+                                            {mcpSaveDraft?.ca_bundle_path && (
+                                                <div className="break-all"><span className="font-medium">CA Bundle:</span> {mcpSaveDraft.ca_bundle_path}</div>
+                                            )}
                                         </div>
                                     </div>
 
@@ -20303,10 +20933,12 @@ This action cannot be undone.`);
                                                             url: draft.url,
                                                             token: draft.token || '',
                                                             verify_ssl: Boolean(draft.verify_ssl),
+                                                            ca_bundle_path: draft.ca_bundle_path || null,
                                                             description: mcpConfigDescription.trim() || null
                                                         })
                                                     });
-                                                    const result = await response.json().catch(() => ({}));
+                                                    const { data: savedData, text: savedText } = await readApiResponse(response);
+                                                    const result = savedData || {};
 
                                                     if (response.ok) {
                                                         setIsMCPSaveModalOpen(false);
@@ -20327,9 +20959,12 @@ This action cannot be undone.`);
                                                         }
                                                         await loadMCPConfigs();
 
-                                                        const detailLine = result.activated
-                                                            ? 'Active MCP connection updated'
-                                                            : (result.token_configured === false ? 'Saved without a token' : '');
+                                                        const detailLine = [
+                                                            result.activated
+                                                                ? 'Active MCP connection updated'
+                                                                : (result.token_configured === false ? 'Saved without a token' : ''),
+                                                            result.warning || '',
+                                                        ].filter(Boolean).join('. ');
                                                         const successDiv = document.createElement('div');
                                                         successDiv.className = `fixed top-6 right-6 ${isUpdate ? 'bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600' : 'bg-green-600 text-white'} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
                                                         successDiv.innerHTML = `
@@ -20348,12 +20983,22 @@ This action cannot be undone.`);
                                                             successDiv.style.opacity = '0';
                                                             successDiv.style.transition = 'opacity 0.3s';
                                                             setTimeout(() => successDiv.remove(), 300);
-                                                        }, 2500);
+                                                        }, result.warning ? 8000 : 2500);
                                                     } else {
-                                                        alert('Failed to save configuration: ' + formatApiErrorDetail(result.detail));
+                                                        offerTroubleshootAfterSaveFailure(
+                                                            'mcp',
+                                                            'Failed to save configuration: ' + describeApiFailure(response, savedData, savedText),
+                                                            { name: savedName, url: draft.url, token: draft.token || '', verify_ssl: Boolean(draft.verify_ssl), ca_bundle_path: draft.ca_bundle_path || '' },
+                                                            () => setIsMCPSaveModalOpen(false),
+                                                        );
                                                     }
                                                 } catch (error) {
-                                                    alert('Error saving configuration: ' + error.message);
+                                                    offerTroubleshootAfterSaveFailure(
+                                                        'mcp',
+                                                        'Error saving configuration: ' + error.message,
+                                                        { name: savedName, url: draft.url, token: draft.token || '', verify_ssl: Boolean(draft.verify_ssl), ca_bundle_path: draft.ca_bundle_path || '' },
+                                                        () => setIsMCPSaveModalOpen(false),
+                                                    );
                                                 }
                                             }}
                                             disabled={!mcpConfigName.trim()}

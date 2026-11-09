@@ -58,6 +58,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Saved configurations without a token show a NO TOKEN badge, and saving over an existing name asks for confirmation
 - Regression suites: `tests/test_settings_profiles.py` and `tools/test_settings_profiles_browser.mjs` (`npm run test:settings-profiles-browser`, also run in CI)
 
+### 🩺 Settings Troubleshooting
+
+#### Added
+- **Troubleshoot tab in Settings** (`src/troubleshooting.py`, `POST /api/troubleshoot/mcp`, `POST /api/troubleshoot/llm`): checks an MCP configuration or AI provider credential without saving it and explains why it can't connect or can't be saved, in five stages: app and server, values entered, saving, network, and the server's response. Reports redact tokens and keys and can be copied as plain text
+  - App and server: running code vs. the install folder, missing or outdated packages from `requirements.txt`, the Python environment, other copies of the app on nearby ports, and whether the signed-in account may save
+  - Values entered: the save endpoint's own validation, URL mistakes (Splunk Web port, `http` on the management port, missing `/services/mcp`), pasted `Bearer ` prefixes and whitespace, JWT expiry, CA bundle files, and provider-specific key and endpoint checks
+  - Saving: settings location vs. the install folder, folder permissions (including root-owned files and macOS protected folders), disk space, key/settings file mismatches, the last save error, and a test save to a temporary copy
+  - Network: proxy, DNS, TCP, and TLS trust with certificate details and Splunk self-signed certificate advice
+  - Response: MCP `tools/list` (redirects, 401/403/404/405, HTML pages, event streams, JSON-RPC errors, tool count) and AI provider errors classified into plain-language causes
+- `GET /api/troubleshoot/server-status`: Settings shows a banner when the server runs older code than the install folder (for example after `git pull` without a restart), or when the server is too old to have the endpoint
+- Troubleshoot buttons next to Test Connection in the MCP and AI provider forms; failed saves and MCP tests offer to open the troubleshooter with the same values
+- **CA Bundle File** field in the MCP form, saved with the configuration and used by Test Connection
+- Regression suites: `tests/test_troubleshooting.py` and `tools/test_settings_troubleshoot_browser.mjs` (`npm run test:settings-troubleshoot-browser`, also run in CI); CI also checks `install.sh` and `install.ps1` syntax
+
+#### Changed
+- `install.sh` and `install.ps1` start the app from the install folder, reinstall Python packages when `requirements.txt` changes (also on restart), warn when the running service started before the code changed, and print the port the app actually uses
+- Save errors that aren't JSON (proxy pages, crashes) show the HTTP status and the start of the response instead of "Unknown error"; a save that worked but couldn't refresh capabilities shows the warning
+- Settings tabs keep the Connections forms mounted, so typed values and the saved lists survive switching tabs
+
+#### Fixed
+- Tokens and API keys pasted with a `Bearer ` prefix or surrounding whitespace were saved as-is and then rejected by the server
+- A capability refresh error after a successful save turned the save into an HTTP 500
+- `./install.sh` reported port 8003 even when the app had moved to another port, and launching it from another folder stored settings in that folder
+- Saving an MCP configuration from the form dropped its CA bundle path, and Test Connection ignored the CA bundle and sent a request without the JSON-RPC `jsonrpc`/`id` fields that strict MCP servers require
+
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added

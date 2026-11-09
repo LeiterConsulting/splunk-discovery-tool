@@ -16,10 +16,14 @@ NC='\033[0m' # No Color
 VERSION="1.0.0"
 APP_NAME="Discovery Tool for Splunk MCP Server"
 APP_SHORT="DT4SMS"
+LAUNCH_DIR="$(pwd)"
 INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_FILE="$INSTALL_DIR/.install_manifest.json"
 PID_FILE="$INSTALL_DIR/.dt4sms.pid"
 VENV_DIR="$INSTALL_DIR/.venv"
+LOG_FILE="$INSTALL_DIR/dt4sms.log"
+REQUIREMENTS_FILE="$INSTALL_DIR/requirements.txt"
+DEFAULT_PORT="8003"
 PYPI_INDEX_URL="https://pypi.org/simple"
 PUBLIC_ONLY="no"
 SELECTED_COMMAND=""
@@ -135,14 +139,23 @@ ${BLUE}SUPPORT:${NC}
 EOF
 }
 
+# SHA-256 of requirements.txt, so a git pull that changes dependencies triggers a reinstall
+requirements_hash() {
+    local python_cmd=$1
+    "$python_cmd" -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$REQUIREMENTS_FILE" 2>/dev/null || echo ""
+}
+
 # Create manifest of installed dependencies
 create_manifest() {
     local python_version=$1
     local pip_version=$2
+    local requirements_sha256
+    requirements_sha256=$(requirements_hash python)
     
     cat > "$MANIFEST_FILE" << EOF
 {
   "version": "${VERSION}",
+  "requirements_sha256": "${requirements_sha256}",
   "installed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "os": "$(detect_os)",
   "python": {
@@ -178,8 +191,14 @@ quick_check() {
     # Check if manifest version matches
     if command -v python3 &> /dev/null || command -v python &> /dev/null; then
         PYTHON_CMD=$(command -v python3 || command -v python)
-        manifest_version=$($PYTHON_CMD -c "import json; print(json.load(open('$MANIFEST_FILE'))['version'])" 2>/dev/null || echo "")
+        manifest_version=$("$PYTHON_CMD" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("version", ""))' "$MANIFEST_FILE" 2>/dev/null || echo "")
+        manifest_requirements=$("$PYTHON_CMD" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("requirements_sha256", ""))' "$MANIFEST_FILE" 2>/dev/null || echo "")
+        current_requirements=$(requirements_hash "$PYTHON_CMD")
         if [[ "$manifest_version" == "$VERSION" ]] && [[ -d "$VENV_DIR" ]]; then
+            if [[ -n "$current_requirements" ]] && [[ "$manifest_requirements" != "$current_requirements" ]]; then
+                print_msg "$YELLOW" "⚠ requirements.txt changed since the last install (for example after git pull). Updating Python packages..."
+                return 1
+            fi
             print_msg "$GREEN" "✓ Installation up-to-date (v${VERSION})"
             return 0
         fi
@@ -225,7 +244,7 @@ install_deps() {
     
     # Install requirements
     print_msg "$BLUE" "Installing Python packages..."
-    run_pip_with_fallback "dependency installation" install -q -r requirements.txt
+    run_pip_with_fallback "dependency installation" install -q -r "$REQUIREMENTS_FILE"
     print_msg "$GREEN" "✓ All dependencies installed"
     
     # Create manifest
@@ -245,6 +264,46 @@ check_frontend_bundle_sync() {
     fi
 }
 
+# Port the running app reported in its log (it moves to the next free port when 8003 is busy)
+running_port() {
+    local port=""
+    if [[ -f "$LOG_FILE" ]]; then
+        port=$(grep -Eo 'Web Interface: http://localhost:[0-9]+' "$LOG_FILE" 2>/dev/null | tail -1 | grep -Eo '[0-9]+$' || true)
+    fi
+    echo "${port:-$DEFAULT_PORT}"
+}
+
+# Prints the first code file changed after the running service started (empty when none)
+code_changed_since_start() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        return 0
+    fi
+    find "$INSTALL_DIR/src" "$REQUIREMENTS_FILE" -newer "$PID_FILE" -type f \
+        \( -name '*.py' -o -name '*.html' -o -name '*.js' -o -name '*.css' -o -name 'requirements.txt' \) \
+        -not -path '*/__pycache__/*' -not -path '*/node_modules/*' -print -quit 2>/dev/null || true
+}
+
+warn_if_running_old_code() {
+    local changed
+    changed=$(code_changed_since_start)
+    if [[ -n "$changed" ]]; then
+        print_msg "$YELLOW" "⚠ The code changed after the service started (${changed#"$INSTALL_DIR"/} is newer)."
+        print_msg "$YELLOW" "  The running service still uses the old version until it restarts."
+        print_msg "$BLUE" "  Run: ./install.sh --restart"
+    fi
+}
+
+# Warn when an earlier launch from another folder left settings there; the app reads them from the folder it starts in
+warn_about_settings_elsewhere() {
+    if [[ "$LAUNCH_DIR" == "$INSTALL_DIR" ]]; then
+        return 0
+    fi
+    if [[ -f "$LAUNCH_DIR/config.encrypted" ]] && [[ ! -f "$INSTALL_DIR/config.encrypted" ]]; then
+        print_msg "$YELLOW" "⚠ Found saved settings in $LAUNCH_DIR, but the app now always runs from $INSTALL_DIR."
+        print_msg "$YELLOW" "  To keep them, stop the app and move config.encrypted, .config.key and security.db into $INSTALL_DIR."
+    fi
+}
+
 # Start service
 start_service() {
     # Check if already running
@@ -252,9 +311,13 @@ start_service() {
         PID=$(cat "$PID_FILE")
         if ps -p "$PID" > /dev/null 2>&1; then
             print_msg "$YELLOW" "⚠ Service already running (PID: $PID)"
+            print_msg "$BLUE" "📡 Web interface: http://localhost:$(running_port)"
+            warn_if_running_old_code
             return 0
         fi
     fi
+
+    warn_about_settings_elsewhere
     
     print_msg "$BLUE" "🚀 Starting ${APP_SHORT}..."
     
@@ -267,19 +330,35 @@ start_service() {
 
     check_frontend_bundle_sync
     
-    # Start in background
-    nohup python "$INSTALL_DIR/src/main.py" > "$INSTALL_DIR/dt4sms.log" 2>&1 &
+    # main() has already changed to the install folder: settings, keys and output are stored relative to it
+    PYTHONUNBUFFERED=1 nohup python "$INSTALL_DIR/src/main.py" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     
-    sleep 2
+    # Wait for the app to report its port (it moves to the next free port when 8003 is busy)
+    local started_port=""
+    for _ in {1..40}; do
+        if ! ps -p "$(cat "$PID_FILE")" > /dev/null 2>&1; then
+            break
+        fi
+        started_port=$(grep -Eo 'Web Interface: http://localhost:[0-9]+' "$LOG_FILE" 2>/dev/null | tail -1 | grep -Eo '[0-9]+$' || true)
+        if [[ -n "$started_port" ]]; then
+            break
+        fi
+        sleep 0.5
+    done
     
     # Verify it started
-    if ps -p $(cat "$PID_FILE") > /dev/null 2>&1; then
+    if ps -p "$(cat "$PID_FILE")" > /dev/null 2>&1; then
         print_msg "$GREEN" "✓ Service started successfully"
-        print_msg "$BLUE" "📡 Web interface: http://localhost:8003"
-        print_msg "$BLUE" "📋 Logs: tail -f $INSTALL_DIR/dt4sms.log"
+        if [[ -n "$started_port" ]] && [[ "$started_port" != "$DEFAULT_PORT" ]]; then
+            print_msg "$YELLOW" "⚠ Port $DEFAULT_PORT is in use (possibly by another copy of the app), so this copy uses port $started_port."
+        fi
+        print_msg "$BLUE" "📡 Web interface: http://localhost:${started_port:-$DEFAULT_PORT}"
+        print_msg "$BLUE" "📋 Logs: tail -f $LOG_FILE"
     else
-        print_msg "$RED" "✗ Failed to start service. Check logs: $INSTALL_DIR/dt4sms.log"
+        print_msg "$RED" "✗ Failed to start service. Last lines of $LOG_FILE:"
+        tail -n 20 "$LOG_FILE" 2>/dev/null || true
+        rm -f "$PID_FILE"
         exit 1
     fi
 }
@@ -329,7 +408,8 @@ check_status() {
     PID=$(cat "$PID_FILE")
     if ps -p "$PID" > /dev/null 2>&1; then
         print_msg "$GREEN" "✓ Service running (PID: $PID)"
-        print_msg "$BLUE" "📡 Web interface: http://localhost:8003"
+        print_msg "$BLUE" "📡 Web interface: http://localhost:$(running_port)"
+        warn_if_running_old_code
         return 0
     else
         print_msg "$YELLOW" "⚠ Service not running (stale PID file)"
@@ -366,7 +446,7 @@ uninstall() {
     rm -f "$MANIFEST_FILE"
     
     # Remove logs
-    rm -f "$INSTALL_DIR/dt4sms.log"
+    rm -f "$LOG_FILE"
     
     # Remove encrypted config
     rm -f "$INSTALL_DIR/config.encrypted"
@@ -378,6 +458,7 @@ uninstall() {
 # Main logic
 main() {
     parse_args "$@"
+    cd "$INSTALL_DIR"
 
     case "${SELECTED_COMMAND:-}" in
         --help|-h)
@@ -400,6 +481,9 @@ main() {
             sleep 2
             # Force a fresh start by removing PID file if it exists
             rm -f "$PID_FILE"
+            if ! quick_check; then
+                install_deps
+            fi
             start_service
             ;;
         --status)
@@ -422,7 +506,7 @@ main() {
             if quick_check; then
                 start_service
             else
-                print_msg "$BLUE" "First run detected. Installing dependencies..."
+                print_msg "$BLUE" "Installing dependencies..."
                 install_deps
                 start_service
             fi

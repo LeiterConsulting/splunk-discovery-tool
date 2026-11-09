@@ -107,6 +107,11 @@ Requirement: preserve MCP + LLM settings behavior.
 - Existing settings API endpoints should remain stable
 - Existing credential load/save/update semantics should remain stable
 - Visual refresh is allowed; function contract should not change
+- Troubleshooting (`src/troubleshooting.py`) has no FastAPI dependency; `web_app.py` passes in the config manager, the startup state, the account, and the save endpoint's validation errors
+  - `POST /api/troubleshoot/mcp` and `POST /api/troubleshoot/llm` take the same fields as the save endpoints plus `check_save` and `check_connection`, never save, and return `status`, `summary`, `summary_fix`, `stages[].checks[]` (`pass`/`warn`/`fail`/`info`/`skip`), and a redacted plain-text `report`
+  - `GET /api/troubleshoot/server-status` compares the code fingerprint captured at startup with the install folder; a 404 tells the browser the server predates the page
+  - The saving stage uses `ConfigManager.probe_save`, which writes, reads back, and deletes a temporary copy next to the settings file
+  - When a save path gains a new failure mode, add a check with a plain-language title and fix, plus a case in `tests/test_troubleshooting.py`
 
 ## 7) Frontend Feedback Principle
 
@@ -164,6 +169,7 @@ Every button should communicate purpose:
    - `python tools/check_frontend_sync.py`
    - `npm run test:browser`
    - `npm run test:settings-profiles-browser`
+   - `npm run test:settings-troubleshoot-browser`
    - `npm run test:auth-browser`
    - `npm run test:account-functions`
    - `python -m ruff check src tests`

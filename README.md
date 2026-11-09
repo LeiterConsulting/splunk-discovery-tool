@@ -168,6 +168,7 @@ npm run build:frontend
 python tools/check_frontend_sync.py
 npm run test:browser
 npm run test:settings-profiles-browser
+npm run test:settings-troubleshoot-browser
 npm run test:auth-browser
 npm run test:account-functions
 python -m ruff check src tests
@@ -190,9 +191,35 @@ python -m unittest discover -v
 
 ## 🐛 Troubleshooting
 
+### Saving or connecting fails: use Settings > Troubleshoot
+
+Open **Settings > Troubleshoot**, pick **MCP Server** or **AI Provider**, enter the values that fail, and click **Run Checks**. Nothing is saved. The checks run in stages and explain what to fix:
+
+- **App and server**: whether the running server still uses the code in the install folder, missing Python packages, other copies of the app on ports 8003-8023, and whether your account may save settings
+- **Values entered**: the same validation the save uses, URL mistakes (Splunk Web port 8000 instead of 8089, `http` on 8089, missing `/services/mcp`), pasted `Bearer ` prefixes or spaces, expired tokens, and CA bundle files
+- **Saving**: where settings are stored, folder permissions and disk space, whether the settings file opens with its key, and a test save to a temporary copy
+- **Network**: proxy, DNS, TCP, and TLS certificate trust (including Splunk's self-signed certificate)
+- **Response**: what the MCP server or AI provider answered (401, 403, 404, web pages instead of MCP, tool count, model errors)
+
+The **Troubleshoot** buttons next to **Test Connection** carry the values from the form, and a failed save or test offers to open the troubleshooter. **Copy Report** copies a plain-text report with tokens and keys hidden, which you can send with a support request.
+
+### Saves still fail after `git pull`
+
+The browser loads the new pages as soon as the files change, but the server keeps running the old code until it restarts, so fixes don't take effect and new pages can fail against the old server. Settings shows a banner when this happens. Restart from the install folder:
+
+```bash
+./install.sh --restart
+```
+
+```powershell
+.\install.ps1 -Restart
+```
+
+The installers reinstall Python packages when `requirements.txt` changes, warn when the running service is older than the files, always start the app from the install folder (settings, keys, and output are stored there), and print the port the app actually uses.
+
 ### Port 8003 is already in use
 
-The app now attempts safe port reclamation/fallback automatically. If needed, restart with installer commands:
+The app moves to the next free port automatically, and the installer prints the address it uses. If another copy of the app holds the port, stop it or restart with the installer:
 
 ```powershell
 .\install.ps1 -Restart
@@ -206,8 +233,8 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 ### MCP connection errors
 
-- Verify URL/token in Settings
-- Toggle SSL verification or set CA bundle for private cert chains
+- Run **Settings > Troubleshoot** with the URL and token
+- For private certificate chains, turn on **Verify SSL Certificate** and enter the path of a `.pem` file on the app server in **CA Bundle File**, or turn verification off for a self-signed lab server
 
 ### pip install timeout / `repo.splunkdev.net` unreachable
 
@@ -252,10 +279,11 @@ npx playwright install chromium
 npm run test:browser
 ```
 
-- To check saving, loading, testing, and deleting MCP configurations in Settings (including names with quotes, slashes, and `#`), run:
+- To check saving, loading, testing, and deleting MCP configurations in Settings (including names with quotes, slashes, and `#`), and the Troubleshoot tab, run:
 
 ```bash
 npm run test:settings-profiles-browser
+npm run test:settings-troubleshoot-browser
 ```
 
 - To validate auth-enabled flows and the account-function matrix, run:
