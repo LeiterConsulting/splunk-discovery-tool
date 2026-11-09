@@ -20,7 +20,8 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
+          # Playwright's Chromium install does not support ubuntu-latest (26.04) yet.
+          - ubuntu-24.04
           - windows-latest
     env:
       FRONTEND_BUILD_PYTHON: python
