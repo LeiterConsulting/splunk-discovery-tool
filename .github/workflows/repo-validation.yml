@@ -48,6 +48,18 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
+      - name: Check installer script syntax (bash)
+        if: runner.os == 'Linux'
+        run: bash -n install.sh
+
+      - name: Check installer script syntax (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | Format-List; exit 1 }
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
@@ -75,6 +87,9 @@ jobs:
 
       - name: Run settings profile browser regression
         run: npm run test:settings-profiles-browser
+
+      - name: Run settings troubleshooting browser regression
+        run: npm run test:settings-troubleshoot-browser
 
       - name: Run Ruff
         run: python -m ruff check src tests

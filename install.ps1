@@ -77,6 +77,8 @@ $PID_FILE = Join-Path $INSTALL_DIR ".dt4sms.pid"
 $VENV_DIR = Join-Path $INSTALL_DIR ".venv"
 $LOG_FILE = Join-Path $INSTALL_DIR "dt4sms.log"
 $ERR_LOG_FILE = Join-Path $INSTALL_DIR "dt4sms.err.log"
+$REQUIREMENTS_FILE = Join-Path $INSTALL_DIR "requirements.txt"
+$DEFAULT_PORT = "8003"
 $PYPI_INDEX_URL = "https://pypi.org/simple"
 
 # Colors
@@ -165,12 +167,21 @@ function Show-Help {
     Write-Host "    Version: $VERSION"
 }
 
+# SHA-256 of requirements.txt, so a git pull that changes dependencies triggers a reinstall
+function Get-RequirementsHash {
+    if (-not (Test-Path $REQUIREMENTS_FILE)) {
+        return ""
+    }
+    return (Get-FileHash -Path $REQUIREMENTS_FILE -Algorithm SHA256).Hash.ToLower()
+}
+
 # Create manifest
 function New-Manifest {
     param([string]$PythonVersion, [string]$PipVersion)
     
     $manifest = @{
         version = $VERSION
+        requirements_sha256 = Get-RequirementsHash
         installed_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         os = "Windows"
         python = @{
@@ -207,6 +218,11 @@ function Test-Installation {
     try {
         $manifest = Get-Content $MANIFEST_FILE | ConvertFrom-Json
         if ($manifest.version -eq $VERSION -and (Test-Path $VENV_DIR)) {
+            $currentHash = Get-RequirementsHash
+            if ($currentHash -and ($manifest.requirements_sha256 -ne $currentHash)) {
+                Write-ColorMsg $ColorYellow "⚠ requirements.txt changed since the last install (for example after git pull). Updating Python packages..."
+                return $false
+            }
             Write-ColorMsg $ColorGreen "✓ Installation up-to-date (v$VERSION)"
             return $true
         }
@@ -245,7 +261,7 @@ function Install-Dependencies {
     
     # Install requirements
     Write-ColorMsg $ColorBlue "Installing Python packages..."
-    Invoke-PipInstallWithFallback "dependency installation" @("-q", "-r", "requirements.txt")
+    Invoke-PipInstallWithFallback "dependency installation" @("-q", "-r", $REQUIREMENTS_FILE)
     Write-ColorMsg $ColorGreen "✓ All dependencies installed"
     
     # Create manifest
@@ -268,6 +284,43 @@ function Test-FrontendBundleSync {
     }
 }
 
+# Port the running app reported in its log (it moves to the next free port when 8003 is busy)
+function Get-RunningPort {
+    if (Test-Path $LOG_FILE) {
+        $match = Select-String -Path $LOG_FILE -Pattern 'Web Interface: http://localhost:(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($match) {
+            return $match.Matches[0].Groups[1].Value
+        }
+    }
+    return $DEFAULT_PORT
+}
+
+# First code file changed after the running service started, or $null
+function Get-CodeChangedSinceStart {
+    if (-not (Test-Path $PID_FILE)) {
+        return $null
+    }
+    $startedAt = (Get-Item $PID_FILE).LastWriteTime
+    $srcDir = Join-Path $INSTALL_DIR "src"
+    $changed = Get-ChildItem -Path $srcDir -Recurse -File -Include *.py, *.html, *.js, *.css -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '[\\/](__pycache__|node_modules)[\\/]' -and $_.LastWriteTime -gt $startedAt } |
+        Select-Object -First 1
+    if (-not $changed -and (Test-Path $REQUIREMENTS_FILE) -and ((Get-Item $REQUIREMENTS_FILE).LastWriteTime -gt $startedAt)) {
+        $changed = Get-Item $REQUIREMENTS_FILE
+    }
+    return $changed
+}
+
+function Write-StaleCodeWarning {
+    $changed = Get-CodeChangedSinceStart
+    if ($changed) {
+        $relative = $changed.FullName.Substring($INSTALL_DIR.Length).TrimStart('\', '/')
+        Write-ColorMsg $ColorYellow "⚠ The code changed after the service started ($relative is newer)."
+        Write-ColorMsg $ColorYellow "  The running service still uses the old version until it restarts."
+        Write-ColorMsg $ColorBlue "  Run: .\install.ps1 -Restart"
+    }
+}
+
 # Start service
 function Start-DT4SMSService {
     # Check if already running
@@ -275,6 +328,8 @@ function Start-DT4SMSService {
         $processId = Get-Content $PID_FILE
         if ($processId -and (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
             Write-ColorMsg $ColorYellow "⚠ Service already running (PID: $processId)"
+            Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:$(Get-RunningPort)"
+            Write-StaleCodeWarning
             return
         }
     }
@@ -299,11 +354,12 @@ function Start-DT4SMSService {
         New-Item -Path $ERR_LOG_FILE -ItemType File -Force | Out-Null
     }
 
-    # Start in background with log redirection
+    # Start in background with log redirection, from the install folder: settings, keys and output are stored relative to it
     $mainScript = Join-Path $INSTALL_DIR "src\main.py"
+    $env:PYTHONUNBUFFERED = "1"
     try {
         $process = Start-Process -FilePath $venvPython -ArgumentList "`"$mainScript`"" `
-            -WindowStyle Hidden -PassThru `
+            -WorkingDirectory $INSTALL_DIR -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $LOG_FILE -RedirectStandardError $ERR_LOG_FILE `
             -ErrorAction Stop
     } catch {
@@ -321,12 +377,30 @@ function Start-DT4SMSService {
     }
     $process.Id | Out-File -FilePath $PID_FILE -Encoding UTF8
     
-    Start-Sleep -Seconds 2
+    # Wait for the app to report its port (it moves to the next free port when 8003 is busy)
+    $startedPort = $null
+    for ($i = 0; $i -lt 40; $i++) {
+        if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+            break
+        }
+        $match = Select-String -Path $LOG_FILE -Pattern 'Web Interface: http://localhost:(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($match) {
+            $startedPort = $match.Matches[0].Groups[1].Value
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
     
     # Verify it started
     if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
         Write-ColorMsg $ColorGreen "✓ Service started successfully"
-        Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:8003"
+        if ($startedPort -and ($startedPort -ne $DEFAULT_PORT)) {
+            Write-ColorMsg $ColorYellow "⚠ Port $DEFAULT_PORT is in use (possibly by another copy of the app), so this copy uses port $startedPort."
+        }
+        if (-not $startedPort) {
+            $startedPort = $DEFAULT_PORT
+        }
+        Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:$startedPort"
         Write-ColorMsg $ColorBlue "📋 Logs: Get-Content $LOG_FILE -Wait"
         Write-ColorMsg $ColorBlue "📋 Errors: Get-Content $ERR_LOG_FILE -Wait"
     } else {
@@ -370,7 +444,8 @@ function Get-ServiceStatus {
     $processId = Get-Content $PID_FILE
     if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
         Write-ColorMsg $ColorGreen "✓ Service running (PID: $processId)"
-        Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:8003"
+        Write-ColorMsg $ColorBlue "📡 Web interface: http://localhost:$(Get-RunningPort)"
+        Write-StaleCodeWarning
         return $true
     } else {
         Write-ColorMsg $ColorYellow "⚠ Service not running (stale PID file)"
@@ -433,6 +508,9 @@ if ($Help) {
     Start-Sleep -Seconds 2
     # Force a fresh start by removing PID file if it exists
     Remove-Item $PID_FILE -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Installation)) {
+        Install-Dependencies
+    }
     Start-DT4SMSService
 } elseif ($Status) {
     Get-ServiceStatus
@@ -449,7 +527,7 @@ if ($Help) {
     if (Test-Installation) {
         Start-DT4SMSService
     } else {
-        Write-ColorMsg $ColorBlue "First run detected. Installing dependencies..."
+        Write-ColorMsg $ColorBlue "Installing dependencies..."
         Install-Dependencies
         Start-DT4SMSService
     }

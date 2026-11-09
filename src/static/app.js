@@ -454,6 +454,25 @@
     if (Array.isArray(detail)) return detail.map((item) => (item == null ? void 0 : item.msg) || JSON.stringify(item)).join("; ");
     return JSON.stringify(detail);
   };
+  const readApiResponse = async (response) => {
+    const text = await response.text().catch(() => "");
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (parseError) {
+      data = null;
+    }
+    return { data, text };
+  };
+  const describeApiFailure = (response, data, text) => {
+    const status = response ? `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}` : "No response";
+    if (data && data.detail !== void 0 && data.detail !== null && data.detail !== "") {
+      return `${formatApiErrorDetail(data.detail)} (${status})`;
+    }
+    const snippet = String(text || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+    return snippet ? `${status}: ${snippet}` : status;
+  };
+  const TROUBLESHOOT_RESTART_HINT = "Restart the app in its install folder: ./install.sh --restart (macOS/Linux) or .\\install.ps1 -Restart (Windows). Then reload this page.";
   const readLlmTuningFormValues = (fallback = {}) => {
     const toPositiveInt = (element, fallbackValue) => {
       if (!element) return Number(fallbackValue) > 0 ? Number(fallbackValue) : 0;
@@ -1102,6 +1121,13 @@
     const [isAbortingSummary, setIsAbortingSummary] = useState(false);
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
     const [activeSettingsTab, setActiveSettingsTab] = useState("connections");
+    const [troubleshootKind, setTroubleshootKind] = useState("mcp");
+    const [troubleshootDrafts, setTroubleshootDrafts] = useState({ mcp: null, llm: null });
+    const [troubleshootOptions, setTroubleshootOptions] = useState({ check_save: true, check_connection: true });
+    const [troubleshootRunning, setTroubleshootRunning] = useState(false);
+    const [troubleshootResult, setTroubleshootResult] = useState(null);
+    const [troubleshootCopied, setTroubleshootCopied] = useState("");
+    const [serverCodeStatus, setServerCodeStatus] = useState(null);
     const [config, setConfig] = useState(null);
     const [authStatus, setAuthStatus] = useState(null);
     const [securityUsers, setSecurityUsers] = useState([]);
@@ -2217,7 +2243,8 @@
     const SETTINGS_MODAL_TABS = [
       { id: "connections", label: "Connections", icon: "fa-plug" },
       { id: "users", label: "Users", icon: "fa-users" },
-      { id: "access", label: "MCP/API & Tokens", icon: "fa-key" }
+      { id: "access", label: "MCP/API & Tokens", icon: "fa-key" },
+      { id: "troubleshoot", label: "Troubleshoot", icon: "fa-stethoscope" }
     ];
     const escapeSettingsToastHtml = (value) => String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     const getDefaultSecurityScopes = (tokenType) => {
@@ -5484,6 +5511,7 @@
         loadCredentials();
         loadMCPConfigs();
         loadSecurityControlPlane();
+        checkServerCodeStatus();
       }, 100);
     };
     const closeSettings = () => {
@@ -5990,19 +6018,21 @@ This action cannot be undone.`);
       }
     };
     const openMCPSaveModal = (profileName) => {
-      var _a2, _b2, _c2;
+      var _a2, _b2, _c2, _d2;
       const urlEl = document.getElementById("mcp-url");
       const tokenEl = document.getElementById("mcp-token");
       const verifySslEl = document.getElementById("mcp-verify-ssl");
+      const caBundleEl = document.getElementById("mcp-ca-bundle");
       const name = String(profileName || "");
       setMCPSaveDraft({
         mode: name ? "update" : "new",
         url: String((urlEl == null ? void 0 : urlEl.value) || ((_a2 = config == null ? void 0 : config.mcp) == null ? void 0 : _a2.url) || "").trim(),
         token: (tokenEl == null ? void 0 : tokenEl.value) || "",
-        verify_ssl: verifySslEl ? verifySslEl.checked : Boolean((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.verify_ssl)
+        verify_ssl: verifySslEl ? verifySslEl.checked : Boolean((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.verify_ssl),
+        ca_bundle_path: String(caBundleEl ? caBundleEl.value : ((_c2 = config == null ? void 0 : config.mcp) == null ? void 0 : _c2.ca_bundle_path) || "").trim()
       });
       setMCPConfigName(name);
-      setMCPConfigDescription(name ? ((_c2 = savedMCPConfigs == null ? void 0 : savedMCPConfigs[name]) == null ? void 0 : _c2.description) || "" : "");
+      setMCPConfigDescription(name ? ((_d2 = savedMCPConfigs == null ? void 0 : savedMCPConfigs[name]) == null ? void 0 : _d2.description) || "" : "");
       setIsMCPSaveModalOpen(true);
     };
     const describeMCPDraftToken = (draft, profileName) => {
@@ -6123,8 +6153,10 @@ This action cannot be undone.`);
           setTimeout(() => {
             const mcpUrlInput = document.getElementById("mcp-url");
             const mcpTokenInput = document.getElementById("mcp-token");
+            const mcpCaBundleInput = document.getElementById("mcp-ca-bundle");
             if (mcpUrlInput) mcpUrlInput.value = newConfig.mcp.url;
             if (mcpTokenInput) mcpTokenInput.value = "";
+            if (mcpCaBundleInput) mcpCaBundleInput.value = newConfig.mcp.ca_bundle_path || "";
           }, 50);
           await loadConfig();
           await loadMCPConfigs();
@@ -6276,12 +6308,415 @@ This action cannot be undone.`);
         alert(`Error: ${error.message}`);
       }
     };
+    const TROUBLESHOOT_STATUS_STYLES = {
+      pass: { icon: "fa-check-circle", tone: "text-green-700", badge: "bg-green-50 text-green-800 border-green-300", label: "Passed" },
+      warn: { icon: "fa-exclamation-triangle", tone: "text-amber-700", badge: "bg-amber-50 text-amber-900 border-amber-300", label: "Warning" },
+      fail: { icon: "fa-times-circle", tone: "text-red-700", badge: "bg-red-50 text-red-800 border-red-300", label: "Problem found" },
+      info: { icon: "fa-info-circle", tone: "text-blue-700", badge: "bg-blue-50 text-blue-800 border-blue-300", label: "Info" },
+      skip: { icon: "fa-minus-circle", tone: "text-gray-500", badge: "bg-gray-50 text-gray-600 border-gray-300", label: "Skipped" }
+    };
+    const buildTroubleshootDraftFromSettings = (kind) => {
+      var _a2, _b2, _c2, _d2, _e2, _f2, _g2;
+      if (kind === "mcp") {
+        return {
+          name: loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name) || "",
+          url: ((_a2 = config == null ? void 0 : config.mcp) == null ? void 0 : _a2.url) || "",
+          token: "",
+          verify_ssl: Boolean((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.verify_ssl),
+          ca_bundle_path: ((_c2 = config == null ? void 0 : config.mcp) == null ? void 0 : _c2.ca_bundle_path) || ""
+        };
+      }
+      return {
+        name: loadedCredentialName || (config == null ? void 0 : config.active_credential_name) || "",
+        provider: normalizeProvider((_d2 = config == null ? void 0 : config.llm) == null ? void 0 : _d2.provider, (_e2 = config == null ? void 0 : config.llm) == null ? void 0 : _e2.endpoint_url),
+        endpoint_url: ((_f2 = config == null ? void 0 : config.llm) == null ? void 0 : _f2.endpoint_url) || "",
+        api_key: "",
+        model: ((_g2 = config == null ? void 0 : config.llm) == null ? void 0 : _g2.model) || ""
+      };
+    };
+    const readTroubleshootDraftFromForm = (kind) => {
+      var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2;
+      const base = buildTroubleshootDraftFromSettings(kind);
+      const field = (id) => document.getElementById(id);
+      if (kind === "mcp") {
+        const urlEl = field("mcp-url");
+        if (!urlEl) return base;
+        const verifyEl = field("mcp-verify-ssl");
+        return {
+          ...base,
+          name: loadedMCPConfigName || "",
+          url: String(urlEl.value || "").trim(),
+          token: ((_a2 = field("mcp-token")) == null ? void 0 : _a2.value) || "",
+          verify_ssl: verifyEl ? verifyEl.checked : base.verify_ssl,
+          ca_bundle_path: String((_c2 = (_b2 = field("mcp-ca-bundle")) == null ? void 0 : _b2.value) != null ? _c2 : base.ca_bundle_path).trim()
+        };
+      }
+      const providerEl = field("llm-provider");
+      if (!providerEl) return base;
+      const provider = providerEl.value || base.provider;
+      const endpointEl = field("llm-endpoint-url");
+      const draft = {
+        ...base,
+        name: loadedCredentialName || "",
+        provider,
+        endpoint_url: provider !== "openai" && endpointEl ? endpointEl.value : "",
+        api_key: ((_d2 = field("llm-api-key")) == null ? void 0 : _d2.value) || "",
+        model: (_f2 = (_e2 = field("llm-model")) == null ? void 0 : _e2.value) != null ? _f2 : base.model,
+        ...readLlmTuningFormValues((config == null ? void 0 : config.llm) || {})
+      };
+      const maxTokens = parseInt(((_g2 = field("llm-max-tokens")) == null ? void 0 : _g2.value) || "", 10);
+      const temperature = parseFloat(((_h2 = field("llm-temperature")) == null ? void 0 : _h2.value) || "");
+      if (Number.isFinite(maxTokens)) draft.max_tokens = maxTokens;
+      if (Number.isFinite(temperature)) draft.temperature = temperature;
+      return draft;
+    };
+    const updateTroubleshootDraft = (kind, key, value) => {
+      setTroubleshootDrafts((current) => ({
+        ...current,
+        [kind]: { ...current[kind] || buildTroubleshootDraftFromSettings(kind), [key]: value }
+      }));
+    };
+    const hideUrlCredentials = (value) => String(value || "").replace(/\/\/[^/@\s]+@/, "//[hidden]@");
+    const buildBrowserTroubleshootResult = (kind, draft, response, data, text) => {
+      let title;
+      let detail;
+      let fix;
+      if (!response) {
+        title = "Couldn't reach the app server";
+        detail = text ? `The browser reported: ${text}` : "";
+        fix = "Check that the app is still running (./install.sh --status or .\\install.ps1 -Status) and that this page uses the address the app printed when it started.";
+      } else if (response.status === 404 || response.status === 405) {
+        title = "The running app is older than this page";
+        detail = `The server doesn't know the troubleshooting request (${describeApiFailure(response, data, text)}). This happens when the files were updated, for example with git pull, but the app wasn't restarted. The old server code can also make saves fail in ways the update already fixes.`;
+        fix = TROUBLESHOOT_RESTART_HINT;
+      } else if (response.status === 401) {
+        title = "You are signed out";
+        detail = describeApiFailure(response, data, text);
+        fix = "Sign in again, then run the checks again.";
+      } else {
+        title = `The troubleshooting request failed (HTTP ${response.status})`;
+        detail = describeApiFailure(response, data, text);
+        fix = response.status >= 500 ? "Look for the error in the app log (dt4sms.log in the install folder)." : "";
+      }
+      const target = kind === "mcp" ? hideUrlCredentials(draft == null ? void 0 : draft.url) : [draft == null ? void 0 : draft.provider, draft == null ? void 0 : draft.model].filter(Boolean).join(" ");
+      const checkedAt = /* @__PURE__ */ new Date();
+      const lines = [
+        `DT4SMS troubleshooting report: ${kind === "mcp" ? "MCP server" : "AI provider"}`,
+        `Checked: ${checkedAt.toLocaleString()}`,
+        `Target: ${target || "(none entered)"}`,
+        `Result: FAIL - ${title}`,
+        `Browser: ${navigator.userAgent}`,
+        "",
+        "Browser and app server: FAIL",
+        `  [fail] ${title}`
+      ];
+      if (detail) lines.push(`         ${detail}`);
+      if (fix) lines.push(`         Fix: ${fix}`);
+      return {
+        kind,
+        target,
+        status: "fail",
+        summary: title,
+        summary_fix: fix,
+        checked_at: checkedAt.toISOString(),
+        stages: [{ id: "browser", title: "Browser and app server", status: "fail", checks: [{ id: "request", title, status: "fail", detail, fix }] }],
+        report: lines.join("\n")
+      };
+    };
+    const runSettingsTroubleshooter = async (kind, draftOverride) => {
+      const draft = draftOverride || troubleshootDrafts[kind] || buildTroubleshootDraftFromSettings(kind);
+      setTroubleshootRunning(true);
+      setTroubleshootResult(null);
+      setTroubleshootCopied("");
+      try {
+        const response = await fetch(`/api/troubleshoot/${kind}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...draft, ...troubleshootOptions })
+        });
+        const { data, text } = await readApiResponse(response);
+        if (response.ok && data && Array.isArray(data.stages)) {
+          setTroubleshootResult(data);
+        } else {
+          setTroubleshootResult(buildBrowserTroubleshootResult(kind, draft, response, data, text));
+        }
+      } catch (error) {
+        setTroubleshootResult(buildBrowserTroubleshootResult(kind, draft, null, null, (error == null ? void 0 : error.message) || String(error)));
+      } finally {
+        setTroubleshootRunning(false);
+      }
+    };
+    const openSettingsTroubleshooter = (kind, draft, options = {}) => {
+      const nextDraft = draft || buildTroubleshootDraftFromSettings(kind);
+      setTroubleshootKind(kind);
+      setTroubleshootDrafts((current) => ({ ...current, [kind]: nextDraft }));
+      setTroubleshootResult(null);
+      setTroubleshootCopied("");
+      setActiveSettingsTab("troubleshoot");
+      if (options.autoRun) {
+        runSettingsTroubleshooter(kind, nextDraft);
+      }
+    };
+    const offerTroubleshootAfterSaveFailure = (kind, message, draft, closeSaveDialog) => {
+      if (!confirm(`${message}
+
+Open Troubleshoot to find out why it can't be saved?`)) {
+        return;
+      }
+      if (closeSaveDialog) closeSaveDialog();
+      openSettingsTroubleshooter(kind, draft, { autoRun: true });
+    };
+    const copyTroubleshootReport = async (reportText) => {
+      let copied = false;
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(reportText);
+          copied = true;
+        }
+      } catch (clipboardError) {
+        copied = false;
+      }
+      if (!copied) {
+        const area = document.createElement("textarea");
+        area.value = reportText;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        try {
+          copied = document.execCommand("copy");
+        } catch (copyError) {
+          copied = false;
+        }
+        area.remove();
+      }
+      setTroubleshootCopied(copied ? "copied" : "failed");
+    };
+    const checkServerCodeStatus = async () => {
+      try {
+        const response = await fetch("/api/troubleshoot/server-status");
+        if (response.status === 404) {
+          setServerCodeStatus({ stale: true, outdated_server: true, restart_hint: TROUBLESHOOT_RESTART_HINT });
+          return;
+        }
+        if (!response.ok) {
+          setServerCodeStatus(null);
+          return;
+        }
+        const data = await response.json();
+        setServerCodeStatus(data && typeof data === "object" ? data : null);
+      } catch (error) {
+        setServerCodeStatus(null);
+      }
+    };
+    const renderServerCodeBanner = () => {
+      if (!(serverCodeStatus == null ? void 0 : serverCodeStatus.stale)) {
+        return null;
+      }
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-server-stale-banner", className: "rounded-lg border-2 border-amber-400 bg-amber-50 p-4 text-sm text-amber-900" }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-2" }), "The app was updated, but the server is still running the old version"), /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, "Until the app restarts, saving and testing can fail in ways the update already fixes. ", serverCodeStatus.restart_hint || TROUBLESHOOT_RESTART_HINT), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: checkServerCodeStatus, className: "mt-2 text-xs font-medium underline" }, "Check again"));
+    };
+    const renderTroubleshootResult = (result, panelClass2) => {
+      const overall = TROUBLESHOOT_STATUS_STYLES[result.status] || TROUBLESHOOT_STATUS_STYLES.info;
+      const passText = result.kind === "mcp" ? "These MCP settings should save and connect." : "These AI provider settings should save and connect.";
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": "troubleshoot-results", "data-status": result.status, className: "mt-4 space-y-3" }, /* @__PURE__ */ React.createElement("div", { "data-testid": "troubleshoot-summary", className: `rounded-lg border-2 p-4 ${overall.badge}` }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold" }, /* @__PURE__ */ React.createElement("i", { className: `fas ${overall.icon} mr-2` }), result.status === "pass" ? "All checks passed" : result.summary), result.status === "pass" && /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm" }, passText), result.status !== "pass" && result.summary_fix && /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "What to do:"), " ", result.summary_fix)), (result.stages || []).map((stage) => {
+        const stageStyle = TROUBLESHOOT_STATUS_STYLES[stage.status] || TROUBLESHOOT_STATUS_STYLES.info;
+        return /* @__PURE__ */ React.createElement("div", { key: `troubleshoot-stage-${stage.id}`, "data-testid": `troubleshoot-stage-${stage.id}`, "data-status": stage.status, className: panelClass2 }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2 mb-2" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-semibold text-gray-900" }, stage.title), /* @__PURE__ */ React.createElement("span", { className: `rounded-full border px-2 py-0.5 text-[11px] font-medium ${stageStyle.badge}` }, stageStyle.label)), /* @__PURE__ */ React.createElement("ul", { className: "space-y-2" }, (stage.checks || []).map((check, index) => {
+          const checkStyle = TROUBLESHOOT_STATUS_STYLES[check.status] || TROUBLESHOOT_STATUS_STYLES.info;
+          return /* @__PURE__ */ React.createElement("li", { key: `troubleshoot-check-${stage.id}-${check.id}-${index}`, "data-testid": `troubleshoot-check-${check.id}`, "data-status": check.status, className: "text-sm" }, /* @__PURE__ */ React.createElement("div", { className: `font-medium ${checkStyle.tone}` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${checkStyle.icon} mr-2` }), check.title), check.detail && /* @__PURE__ */ React.createElement("div", { className: "ml-6 text-xs text-gray-600 whitespace-pre-wrap break-words" }, check.detail), check.fix && /* @__PURE__ */ React.createElement("div", { className: "ml-6 mt-1 text-xs text-gray-800 break-words" }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Fix:"), " ", check.fix));
+        })));
+      }), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-3" }, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "troubleshoot-copy-report",
+          onClick: () => copyTroubleshootReport(result.report || ""),
+          className: `rounded-lg px-3 py-2 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-100 border border-gray-700 hover:bg-gray-700" : "bg-white text-gray-700 border border-gray-300 hover:bg-gray-50"}`
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy mr-2" }),
+        "Copy Report"
+      ), troubleshootCopied === "copied" && /* @__PURE__ */ React.createElement("span", { "data-testid": "troubleshoot-copy-status", className: "text-xs text-green-700" }, "Copied. Tokens and keys are hidden, so the report is safe to share with support."), troubleshootCopied === "failed" && /* @__PURE__ */ React.createElement("span", { "data-testid": "troubleshoot-copy-status", className: "text-xs text-amber-700" }, "Couldn't copy automatically. Open the report text below and copy it.")), /* @__PURE__ */ React.createElement("details", { className: "text-xs" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer font-medium text-gray-700" }, "Show report text"), /* @__PURE__ */ React.createElement("pre", { "data-testid": "troubleshoot-report-text", className: `mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border p-3 ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-800"}` }, result.report)));
+    };
+    const renderSettingsTroubleshooter = () => {
+      if (activeSettingsTab !== "troubleshoot") {
+        return null;
+      }
+      const kind = troubleshootKind;
+      const draft = troubleshootDrafts[kind] || buildTroubleshootDraftFromSettings(kind);
+      const panelClass2 = `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}`;
+      const inputClass = "w-full px-3 py-2 border border-gray-300 rounded-md";
+      const labelClass = "block text-sm font-medium text-gray-700 mb-1";
+      const savedNames = Object.keys((kind === "mcp" ? savedMCPConfigs : savedCredentials) || {}).sort();
+      const secretLabel = kind === "mcp" ? "token" : "API key";
+      const nothingToCheck = !troubleshootOptions.check_save && !troubleshootOptions.check_connection;
+      const kindButton = (value, label, icon) => /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          key: `troubleshoot-kind-${value}`,
+          type: "button",
+          "data-testid": `troubleshoot-kind-${value}`,
+          onClick: () => {
+            setTroubleshootKind(value);
+            setTroubleshootResult(null);
+            setTroubleshootCopied("");
+          },
+          className: `flex-1 rounded-lg px-4 py-2 text-sm font-medium ${kind === value ? "bg-amber-600 text-white shadow-sm" : isDarkTheme ? "bg-gray-800 text-gray-200 hover:bg-gray-700" : "bg-white text-gray-700 border border-gray-200 hover:bg-gray-100"}`,
+          "aria-pressed": kind === value
+        },
+        /* @__PURE__ */ React.createElement("i", { className: `fas ${icon} mr-2` }),
+        label
+      );
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-troubleshooter" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border-2 ${isDarkTheme ? "bg-gray-800 border-amber-700" : "bg-gradient-to-r from-amber-50 to-orange-50 border-amber-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2 text-amber-600" }), "Troubleshoot a Connection"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Enter the settings that won't connect or won't save. The checks look at the app itself, the values you entered, saving, the network, and the server's reply, and explain what to fix. Nothing is saved.")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mb-4" }, kindButton("mcp", "MCP Server", "fa-server"), kindButton("llm", "AI Provider", "fa-brain")), /* @__PURE__ */ React.createElement("div", { className: panelClass2 }, /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-name" }, kind === "mcp" ? "Configuration name" : "Credential name", /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(optional; a blank ", secretLabel, " uses the one saved under this name)")), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-name",
+          "data-testid": "troubleshoot-name",
+          type: "text",
+          list: "troubleshoot-saved-names",
+          className: inputClass,
+          value: draft.name || "",
+          onChange: (e) => updateTroubleshootDraft(kind, "name", e.target.value)
+        }
+      ), /* @__PURE__ */ React.createElement("datalist", { id: "troubleshoot-saved-names" }, savedNames.map((savedName) => /* @__PURE__ */ React.createElement("option", { key: `troubleshoot-saved-${savedName}`, value: savedName })))), kind === "mcp" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-mcp-url" }, "MCP URL"), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-mcp-url",
+          "data-testid": "troubleshoot-mcp-url",
+          type: "text",
+          placeholder: "https://splunk.example.com:8089/services/mcp",
+          className: inputClass,
+          value: draft.url || "",
+          onChange: (e) => updateTroubleshootDraft("mcp", "url", e.target.value)
+        }
+      )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-mcp-token" }, "Token"), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-mcp-token",
+          "data-testid": "troubleshoot-mcp-token",
+          type: "password",
+          autoComplete: "off",
+          placeholder: "Leave blank to use the saved token",
+          className: inputClass,
+          value: draft.token || "",
+          onChange: (e) => updateTroubleshootDraft("mcp", "token", e.target.value)
+        }
+      )), /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-mcp-verify-ssl",
+          "data-testid": "troubleshoot-mcp-verify-ssl",
+          type: "checkbox",
+          className: "mr-2",
+          checked: Boolean(draft.verify_ssl),
+          onChange: (e) => updateTroubleshootDraft("mcp", "verify_ssl", e.target.checked)
+        }
+      ), /* @__PURE__ */ React.createElement("label", { htmlFor: "troubleshoot-mcp-verify-ssl", className: "text-sm text-gray-700" }, "Verify SSL Certificate")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-mcp-ca-bundle" }, "CA bundle file", /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(optional; a .pem file on the app server that trusts your Splunk certificate)")), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-mcp-ca-bundle",
+          "data-testid": "troubleshoot-mcp-ca-bundle",
+          type: "text",
+          className: inputClass,
+          value: draft.ca_bundle_path || "",
+          onChange: (e) => updateTroubleshootDraft("mcp", "ca_bundle_path", e.target.value)
+        }
+      ))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-llm-provider" }, "Provider"), /* @__PURE__ */ React.createElement(
+        "select",
+        {
+          id: "troubleshoot-llm-provider",
+          "data-testid": "troubleshoot-llm-provider",
+          className: inputClass,
+          value: draft.provider || "openai",
+          onChange: (e) => updateTroubleshootDraft("llm", "provider", e.target.value)
+        },
+        /* @__PURE__ */ React.createElement("option", { value: "openai" }, "OpenAI"),
+        /* @__PURE__ */ React.createElement("option", { value: "azure" }, "Azure OpenAI"),
+        /* @__PURE__ */ React.createElement("option", { value: "anthropic" }, "Anthropic (Claude)"),
+        /* @__PURE__ */ React.createElement("option", { value: "gemini" }, "Google Gemini"),
+        /* @__PURE__ */ React.createElement("option", { value: "ollama" }, "Ollama"),
+        /* @__PURE__ */ React.createElement("option", { value: "custom" }, "Custom Endpoint")
+      )), draft.provider !== "openai" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-llm-endpoint" }, "Endpoint URL"), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-llm-endpoint",
+          "data-testid": "troubleshoot-llm-endpoint",
+          type: "text",
+          placeholder: draft.provider === "ollama" ? "http://localhost:11434" : "Leave blank for the provider default",
+          className: inputClass,
+          value: draft.endpoint_url || "",
+          onChange: (e) => updateTroubleshootDraft("llm", "endpoint_url", e.target.value)
+        }
+      )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-llm-api-key" }, "API Key"), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-llm-api-key",
+          "data-testid": "troubleshoot-llm-api-key",
+          type: "password",
+          autoComplete: "off",
+          placeholder: "Leave blank to use the saved key",
+          className: inputClass,
+          value: draft.api_key || "",
+          onChange: (e) => updateTroubleshootDraft("llm", "api_key", e.target.value)
+        }
+      )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-llm-model" }, "Model"), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "troubleshoot-llm-model",
+          "data-testid": "troubleshoot-llm-model",
+          type: "text",
+          className: inputClass,
+          value: draft.model || "",
+          onChange: (e) => updateTroubleshootDraft("llm", "model", e.target.value)
+        }
+      ))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-4 pt-1" }, /* @__PURE__ */ React.createElement("label", { className: "flex items-center text-sm text-gray-700" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "checkbox",
+          "data-testid": "troubleshoot-check-save",
+          className: "mr-2",
+          checked: troubleshootOptions.check_save,
+          onChange: (e) => setTroubleshootOptions((current) => ({ ...current, check_save: e.target.checked }))
+        }
+      ), "Check that it can be saved"), /* @__PURE__ */ React.createElement("label", { className: "flex items-center text-sm text-gray-700" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "checkbox",
+          "data-testid": "troubleshoot-check-connection",
+          className: "mr-2",
+          checked: troubleshootOptions.check_connection,
+          onChange: (e) => setTroubleshootOptions((current) => ({ ...current, check_connection: e.target.checked }))
+        }
+      ), "Test the connection")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 pt-3 border-t border-gray-200" }, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "troubleshoot-run",
+          disabled: troubleshootRunning || nothingToCheck,
+          onClick: () => runSettingsTroubleshooter(kind, draft),
+          className: "flex-1 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium shadow-md transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+        },
+        troubleshootRunning ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-2" }), "Running checks...") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2" }), "Run Checks")
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "troubleshoot-use-current",
+          onClick: () => {
+            setTroubleshootDrafts((current) => ({ ...current, [kind]: readTroubleshootDraftFromForm(kind) }));
+            setTroubleshootResult(null);
+          },
+          className: `px-4 py-2 rounded-lg text-sm font-medium ${isDarkTheme ? "bg-gray-800 text-gray-100 border border-gray-700 hover:bg-gray-700" : "bg-white text-gray-700 border border-gray-300 hover:bg-gray-50"}`
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-rotate-left mr-2" }),
+        "Use Values from Connections"
+      )))), troubleshootResult && troubleshootResult.kind === kind && renderTroubleshootResult(troubleshootResult, panelClass2)));
+    };
     const renderSecurityAccessSettings = () => {
       var _a2, _b2;
       if (!config) {
         return null;
       }
-      if (activeSettingsTab === "connections") {
+      if (activeSettingsTab !== "users" && activeSettingsTab !== "access") {
         return null;
       }
       const securityConfig2 = config.security || {};
@@ -10547,13 +10982,14 @@ ${query.spl}`,
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-rotate-left mr-2" }),
       "Reset for Demo"
-    )), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Reset clears the local preference so the welcome screen appears again the next time this browser opens the DT4SMS interface."))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 overflow-y-auto p-6 space-y-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "grid gap-2 md:grid-cols-3" }, SETTINGS_MODAL_TABS.map((tab) => {
+    )), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Reset clears the local preference so the welcome screen appears again the next time this browser opens the DT4SMS interface."))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 overflow-y-auto p-6 space-y-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "grid gap-2 md:grid-cols-4" }, SETTINGS_MODAL_TABS.map((tab) => {
       const isActive = activeSettingsTab === tab.id;
       return /* @__PURE__ */ React.createElement(
         "button",
         {
           key: `settings-tab-${tab.id}`,
           type: "button",
+          "data-testid": `settings-tab-${tab.id}`,
           onClick: () => setActiveSettingsTab(tab.id),
           className: `flex items-center justify-center gap-2 rounded-lg px-4 py-3 text-sm font-medium transition-colors ${isActive ? "bg-indigo-600 text-white shadow-sm" : isDarkTheme ? "bg-gray-800 text-gray-200 hover:bg-gray-700" : "bg-white text-gray-700 hover:bg-gray-100"}`,
           "aria-pressed": isActive
@@ -10561,7 +10997,7 @@ ${query.spl}`,
         /* @__PURE__ */ React.createElement("i", { className: `fas ${tab.icon}` }),
         /* @__PURE__ */ React.createElement("span", null, tab.label)
       );
-    }))), renderSecurityAccessSettings(), activeSettingsTab === "connections" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border-2 ${isDarkTheme ? "bg-gray-800 border-green-700" : "bg-gradient-to-r from-green-50 to-emerald-50 border-green-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-green-600" }), "MCP Server Configurations"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Manage your Splunk MCP server connections")), (loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)) && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-emerald-600" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, "Active Configuration:"), /* @__PURE__ */ React.createElement("p", { className: "text-base font-bold text-gray-800" }, loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)))), /* @__PURE__ */ React.createElement(
+    }))), renderServerCodeBanner(), renderSecurityAccessSettings(), renderSettingsTroubleshooter(), /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-connections-panel", className: "space-y-6", hidden: activeSettingsTab !== "connections" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border-2 ${isDarkTheme ? "bg-gray-800 border-green-700" : "bg-gradient-to-r from-green-50 to-emerald-50 border-green-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-green-600" }), "MCP Server Configurations"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Manage your Splunk MCP server connections")), (loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)) && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-emerald-600" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, "Active Configuration:"), /* @__PURE__ */ React.createElement("p", { className: "text-base font-bold text-gray-800" }, loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)))), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -10622,12 +11058,21 @@ ${query.spl}`,
         className: "mr-2",
         id: "mcp-verify-ssl"
       }
-    ), /* @__PURE__ */ React.createElement("label", { htmlFor: "mcp-verify-ssl", className: "text-sm text-gray-700" }, "Verify SSL Certificate")), /* @__PURE__ */ React.createElement("div", { className: "pt-3 border-t border-gray-200 space-y-2" }, /* @__PURE__ */ React.createElement(
+    ), /* @__PURE__ */ React.createElement("label", { htmlFor: "mcp-verify-ssl", className: "text-sm text-gray-700" }, "Verify SSL Certificate")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "mcp-ca-bundle", className: "block text-sm font-medium text-gray-700 mb-1" }, "CA Bundle File", /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(optional; a .pem file on the app server, used when Verify SSL is on)")), /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "text",
+        defaultValue: config.mcp.ca_bundle_path || "",
+        placeholder: "/path/to/splunk-ca.pem",
+        className: "w-full px-3 py-2 border border-gray-300 rounded-md",
+        id: "mcp-ca-bundle"
+      }
+    )), /* @__PURE__ */ React.createElement("div", { className: "pt-3 border-t border-gray-200 space-y-2" }, /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
         onClick: async (event) => {
-          var _a2;
+          var _a2, _b2;
           const urlEl = document.getElementById("mcp-url");
           const tokenEl = document.getElementById("mcp-token");
           const verifySslEl = document.getElementById("mcp-verify-ssl");
@@ -10650,14 +11095,19 @@ ${query.spl}`,
                 url: testUrl,
                 token: testToken,
                 verify_ssl: testVerifySsl,
+                ca_bundle_path: String(((_b2 = document.getElementById("mcp-ca-bundle")) == null ? void 0 : _b2.value) || "").trim() || void 0,
                 name: loadedMCPConfigName || void 0
               })
             });
-            const result = await response.json();
-            if (result.status === "success") {
+            const { data, text } = await readApiResponse(response);
+            const result = data || {};
+            if (response.ok && result.status === "success") {
               alert("✅ " + result.message);
             } else {
-              alert("⚠️ " + result.message);
+              const message = response.ok && result.message ? result.message : describeApiFailure(response, data, text);
+              if (confirm("⚠️ " + message + "\n\nRun Troubleshoot to find out why?")) {
+                openSettingsTroubleshooter("mcp", readTroubleshootDraftFromForm("mcp"), { autoRun: true });
+              }
             }
           } catch (error) {
             alert("❌ Test failed: " + error.message);
@@ -10670,6 +11120,16 @@ ${query.spl}`,
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-network-wired mr-2" }),
       "Test Connection"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        "data-testid": "mcp-troubleshoot",
+        onClick: () => openSettingsTroubleshooter("mcp", readTroubleshootDraftFromForm("mcp"), { autoRun: true }),
+        className: "w-full px-4 py-2 bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 rounded-lg font-medium transition-all"
+      },
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2" }),
+      "Troubleshoot"
     ), loadedMCPConfigName ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
       "button",
       {
@@ -11021,7 +11481,8 @@ ${query.spl}`,
                 }
               })
             });
-            const result = await response.json();
+            const { data, text } = await readApiResponse(response);
+            const result = response.ok && data ? data : { status: "error", message: describeApiFailure(response, data, text) };
             const esc = escapeSettingsHtml;
             let html = '<div class="space-y-2">';
             if (result.status === "success") {
@@ -11053,6 +11514,7 @@ ${query.spl}`,
               html += '<div class="bg-red-100 border border-red-300 rounded-lg p-3 mb-2">';
               html += '<div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2"></i>Test Failed</div>';
               html += '<div class="text-sm text-red-700 mt-1">' + esc(result.message || result.error || "Unknown error") + "</div>";
+              html += '<div class="text-xs text-red-700 mt-1">Click Troubleshoot below to find out why.</div>';
               html += "</div>";
             }
             html += '<div class="text-xs font-semibold text-gray-700 mb-1">Test Details:</div>';
@@ -11086,6 +11548,16 @@ ${query.spl}`,
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-plug mr-2" }),
       " Test Connection & Auto-Configure"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        "data-testid": "llm-troubleshoot",
+        onClick: () => openSettingsTroubleshooter("llm", readTroubleshootDraftFromForm("llm"), { autoRun: true }),
+        className: "mt-2 w-full px-4 py-2 bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 rounded-lg font-medium transition-all"
+      },
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2" }),
+      "Troubleshoot"
     ), /* @__PURE__ */ React.createElement("div", { id: "llm-test-results", className: "mt-3", style: { display: "none" } }), /* @__PURE__ */ React.createElement("div", { className: "mt-3 pt-3 border-t border-gray-200 space-y-2" }, loadedCredentialName ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
       "button",
       {
@@ -11171,12 +11643,16 @@ ${query.spl}`,
           const mcpUrlEl = document.getElementById("mcp-url");
           const mcpTokenEl = document.getElementById("mcp-token");
           const mcpVerifyEl = document.getElementById("mcp-verify-ssl");
+          const mcpCaBundleEl = document.getElementById("mcp-ca-bundle");
           const provider = providerEl ? providerEl.value : selectedProvider;
           const mcpToken = mcpTokenEl ? mcpTokenEl.value : "";
           const mcpSettings = {
             url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
             verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
           };
+          if (mcpCaBundleEl) {
+            mcpSettings.ca_bundle_path = mcpCaBundleEl.value.trim() || null;
+          }
           if (mcpToken && mcpToken.trim()) {
             mcpSettings.token = mcpToken;
           }
@@ -11281,7 +11757,8 @@ Overwrite it?`);
                 ...readLlmTuningFormValues(config.llm)
               })
             });
-            const result = await response.json().catch(() => ({}));
+            const { data: savedData, text: savedText } = await readApiResponse(response);
+            const result = savedData || {};
             if (response.ok) {
               setIsCredentialModalOpen(false);
               setCredentialName("");
@@ -11299,6 +11776,7 @@ Overwrite it?`);
                                                                 <div>
                                                                     <p class="font-bold text-base">Credential ${wasUpdate ? "Updated" : "Saved"}!</p>
                                                                     <p class="text-sm ${wasUpdate ? "opacity-80" : "opacity-90"}">${escapeSettingsHtml(credentialName)}</p>
+                                                                    ${result.warning ? `<p class="text-xs opacity-80">${escapeSettingsHtml(result.warning)}</p>` : ""}
                                                                 </div>
                                                             </div>
                                                         `;
@@ -11308,12 +11786,22 @@ Overwrite it?`);
                 successDiv.style.opacity = "0";
                 successDiv.style.transition = "opacity 0.3s";
                 setTimeout(() => successDiv.remove(), 300);
-              }, 2500);
+              }, result.warning ? 8e3 : 2500);
             } else {
-              alert("Failed to save credential: " + formatApiErrorDetail(result.detail));
+              offerTroubleshootAfterSaveFailure(
+                "llm",
+                "Failed to save credential: " + describeApiFailure(response, savedData, savedText),
+                { ...readTroubleshootDraftFromForm("llm"), name: credentialName.trim() },
+                () => setIsCredentialModalOpen(false)
+              );
             }
           } catch (error) {
-            alert("Error saving credential: " + error.message);
+            offerTroubleshootAfterSaveFailure(
+              "llm",
+              "Error saving credential: " + error.message,
+              { ...readTroubleshootDraftFromForm("llm"), name: credentialName.trim() },
+              () => setIsCredentialModalOpen(false)
+            );
           }
         },
         disabled: !credentialName.trim(),
@@ -11353,7 +11841,7 @@ Overwrite it?`);
         placeholder: "e.g., Main production Splunk server",
         className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500" : "bg-white border-gray-300 text-gray-900 placeholder-gray-400"}`
       }
-    )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("div", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "URL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.url) || "N/A"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Token:"), " ", describeMCPDraftToken(mcpSaveDraft, mcpConfigName)), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Verify SSL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.verify_ssl) ? "Yes" : "No"))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("div", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "URL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.url) || "N/A"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Token:"), " ", describeMCPDraftToken(mcpSaveDraft, mcpConfigName)), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Verify SSL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.verify_ssl) ? "Yes" : "No"), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.ca_bundle_path) && /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "CA Bundle:"), " ", mcpSaveDraft.ca_bundle_path))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -11408,10 +11896,12 @@ Overwrite it?`);
                 url: draft.url,
                 token: draft.token || "",
                 verify_ssl: Boolean(draft.verify_ssl),
+                ca_bundle_path: draft.ca_bundle_path || null,
                 description: mcpConfigDescription.trim() || null
               })
             });
-            const result = await response.json().catch(() => ({}));
+            const { data: savedData, text: savedText } = await readApiResponse(response);
+            const result = savedData || {};
             if (response.ok) {
               setIsMCPSaveModalOpen(false);
               setMCPSaveDraft(null);
@@ -11429,7 +11919,10 @@ Overwrite it?`);
                 await loadConfig();
               }
               await loadMCPConfigs();
-              const detailLine = result.activated ? "Active MCP connection updated" : result.token_configured === false ? "Saved without a token" : "";
+              const detailLine = [
+                result.activated ? "Active MCP connection updated" : result.token_configured === false ? "Saved without a token" : "",
+                result.warning || ""
+              ].filter(Boolean).join(". ");
               const successDiv = document.createElement("div");
               successDiv.className = `fixed top-6 right-6 ${isUpdate ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600" : "bg-green-600 text-white"} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
               successDiv.innerHTML = `
@@ -11448,12 +11941,22 @@ Overwrite it?`);
                 successDiv.style.opacity = "0";
                 successDiv.style.transition = "opacity 0.3s";
                 setTimeout(() => successDiv.remove(), 300);
-              }, 2500);
+              }, result.warning ? 8e3 : 2500);
             } else {
-              alert("Failed to save configuration: " + formatApiErrorDetail(result.detail));
+              offerTroubleshootAfterSaveFailure(
+                "mcp",
+                "Failed to save configuration: " + describeApiFailure(response, savedData, savedText),
+                { name: savedName, url: draft.url, token: draft.token || "", verify_ssl: Boolean(draft.verify_ssl), ca_bundle_path: draft.ca_bundle_path || "" },
+                () => setIsMCPSaveModalOpen(false)
+              );
             }
           } catch (error) {
-            alert("Error saving configuration: " + error.message);
+            offerTroubleshootAfterSaveFailure(
+              "mcp",
+              "Error saving configuration: " + error.message,
+              { name: savedName, url: draft.url, token: draft.token || "", verify_ssl: Boolean(draft.verify_ssl), ca_bundle_path: draft.ca_bundle_path || "" },
+              () => setIsMCPSaveModalOpen(false)
+            );
           }
         },
         disabled: !mcpConfigName.trim(),

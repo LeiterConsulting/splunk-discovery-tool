@@ -3,13 +3,14 @@ Encrypted Configuration Manager
 Handles secure storage of MCP and LLM credentials using Fernet encryption
 """
 
+import copy
 import json
 import os
 import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, Tuple
 from cryptography.fernet import Fernet
 from dataclasses import dataclass, asdict, field
 
@@ -22,6 +23,14 @@ MASKED_SECRET = "***"
 def is_unset_secret(value: Any) -> bool:
     """Blank values and the mask the API hands to the browser both mean "keep the stored secret"."""
     return str(value or "").strip() in {"", MASKED_SECRET}
+
+
+def clean_secret(value: Any) -> str:
+    """Drop whitespace and a pasted "Bearer " prefix; HTTP clients reject header values with stray whitespace."""
+    cleaned = str(value or "").strip()
+    if cleaned[:7].lower() == "bearer ":
+        cleaned = cleaned[7:].strip()
+    return cleaned
 
 
 def _same_endpoint(left: Any, right: Any) -> bool:
@@ -307,40 +316,54 @@ class ConfigManager:
                 except OSError:
                     pass
     
+    @staticmethod
+    def _config_to_dict(config: AppConfig) -> Dict[str, Any]:
+        return {
+            'mcp': asdict(config.mcp),
+            'llm': asdict(config.llm),
+            'server': asdict(config.server),
+            'security': asdict(config.security),
+            'saved_credentials': {name: asdict(cred) for name, cred in config.saved_credentials.items()},
+            'saved_mcp_configs': {name: asdict(mcp_config) for name, mcp_config in config.saved_mcp_configs.items()},
+            'capabilities': {name: asdict(capability) for name, capability in config.capabilities.items()},
+            'active_credential_name': config.active_credential_name,
+            'active_mcp_config_name': config.active_mcp_config_name,
+            'version': config.version
+        }
+
+    def probe_save(self, apply: Optional[Callable[[AppConfig], None]] = None) -> Dict[str, Any]:
+        """Run the save pipeline on a copy of the config without replacing the config file.
+
+        The encrypted result goes to a temporary file next to the config file, is read back
+        and decrypted, then removed. Raises whatever a real save would raise.
+        """
+        candidate = copy.deepcopy(self._config)
+        if apply is not None:
+            apply(candidate)
+        config_dict = self._config_to_dict(candidate)
+        encrypted_data = self._encrypt(config_dict)
+        directory = self.config_path.parent if str(self.config_path.parent) else Path(".")
+        fd, temp_name = tempfile.mkstemp(prefix=f".{self.config_path.name}.probe.", suffix=".tmp", dir=str(directory))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(encrypted_data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            with open(temp_name, "rb") as handle:
+                round_trip = self._decrypt(handle.read())
+            if round_trip != json.loads(json.dumps(config_dict)):
+                raise ValueError("The settings read back from the test file did not match what was written")
+        finally:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        return {"bytes": len(encrypted_data), "directory": str(directory.resolve())}
+
     def save(self, config: AppConfig):
         """Encrypt and save configuration"""
         try:
-            # Convert to dict
-            saved_creds_dict = {
-                name: asdict(cred) 
-                for name, cred in config.saved_credentials.items()
-            }
-            
-            saved_mcp_dict = {
-                name: asdict(mcp_config)
-                for name, mcp_config in config.saved_mcp_configs.items()
-            }
-
-            saved_capabilities_dict = {
-                name: asdict(capability)
-                for name, capability in config.capabilities.items()
-            }
-            
-            config_dict = {
-                'mcp': asdict(config.mcp),
-                'llm': asdict(config.llm),
-                'server': asdict(config.server),
-                'security': asdict(config.security),
-                'saved_credentials': saved_creds_dict,
-                'saved_mcp_configs': saved_mcp_dict,
-                'capabilities': saved_capabilities_dict,
-                'active_credential_name': config.active_credential_name,
-                'active_mcp_config_name': config.active_mcp_config_name,
-                'version': config.version
-            }
-            
-            # Encrypt and save
-            encrypted_data = self._encrypt(config_dict)
+            encrypted_data = self._encrypt(self._config_to_dict(config))
             self._write_config_bytes(encrypted_data)
             
             # Secure the config file (Unix only)
@@ -367,8 +390,10 @@ class ConfigManager:
     def update_mcp(self, **kwargs) -> bool:
         """Update MCP configuration"""
         for key, value in kwargs.items():
-            if key == 'token' and str(value or '').strip() == MASKED_SECRET:
-                continue
+            if key == 'token':
+                if str(value or '').strip() == MASKED_SECRET:
+                    continue
+                value = clean_secret(value)
             if hasattr(self._config.mcp, key):
                 setattr(self._config.mcp, key, value)
         return self.save(self._config)
@@ -376,8 +401,10 @@ class ConfigManager:
     def update_llm(self, **kwargs) -> bool:
         """Update LLM configuration"""
         for key, value in kwargs.items():
-            if key == 'api_key' and str(value or '').strip() == MASKED_SECRET:
-                continue
+            if key == 'api_key':
+                if str(value or '').strip() == MASKED_SECRET:
+                    continue
+                value = clean_secret(value)
             if hasattr(self._config.llm, key):
                 setattr(self._config.llm, key, value)
         return self.save(self._config)
@@ -455,6 +482,7 @@ class ConfigManager:
             return False
         if is_unset_secret(api_key):
             api_key = self.resolve_llm_api_key(name, provider, endpoint_url)
+        api_key = clean_secret(api_key)
         credential = LLMCredential(
             name=name,
             provider=provider,
@@ -474,17 +502,21 @@ class ConfigManager:
         return self.save(self._config)
 
     def resolve_llm_api_key(self, name: Optional[str], provider: Any, endpoint_url: Any) -> str:
+        return self.resolve_llm_api_key_with_source(name, provider, endpoint_url)[0]
+
+    def resolve_llm_api_key_with_source(self, name: Optional[str], provider: Any, endpoint_url: Any) -> Tuple[str, str]:
+        """Return the key to use for a blank/masked entry and where it came from ("saved", "active", or "")."""
         existing = self._config.saved_credentials.get(str(name or "").strip())
         if existing is not None and not is_unset_secret(existing.api_key):
-            return existing.api_key
+            return existing.api_key, "saved"
         active = self._config.llm
         if (
             str(provider or "").strip().lower() == str(active.provider or "").strip().lower()
             and _same_endpoint(endpoint_url, active.endpoint_url)
             and not is_unset_secret(active.api_key)
         ):
-            return active.api_key
-        return ""
+            return active.api_key, "active"
+        return "", ""
 
     def _apply_llm_credential(self, name: str, credential: LLMCredential) -> None:
         self._config.llm.provider = credential.provider
@@ -638,6 +670,7 @@ class ConfigManager:
             return False
         if is_unset_secret(token):
             token = self.resolve_mcp_token(name, url)
+        token = clean_secret(token)
         mcp_config = MCPCredential(
             name=name,
             url=url,
@@ -652,13 +685,17 @@ class ConfigManager:
         return self.save(self._config)
 
     def resolve_mcp_token(self, name: Optional[str], url: Any) -> str:
+        return self.resolve_mcp_token_with_source(name, url)[0]
+
+    def resolve_mcp_token_with_source(self, name: Optional[str], url: Any) -> Tuple[str, str]:
+        """Return the token to use for a blank/masked entry and where it came from ("saved", "active", or "")."""
         existing = self._config.saved_mcp_configs.get(str(name or "").strip())
         if existing is not None and not is_unset_secret(existing.token):
-            return existing.token
+            return existing.token, "saved"
         active = self._config.mcp
         if _same_endpoint(url, active.url) and not is_unset_secret(active.token):
-            return active.token
-        return ""
+            return active.token, "active"
+        return "", ""
 
     def _apply_mcp_profile(self, name: str, mcp_config: MCPCredential) -> None:
         self._config.mcp.url = mcp_config.url
