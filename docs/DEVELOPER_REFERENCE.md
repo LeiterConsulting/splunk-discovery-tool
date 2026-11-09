@@ -163,6 +163,7 @@ Every button should communicate purpose:
    - `npm run build:frontend`
    - `python tools/check_frontend_sync.py`
    - `npm run test:browser`
+   - `npm run test:settings-profiles-browser`
    - `npm run test:auth-browser`
    - `npm run test:account-functions`
    - `python -m ruff check src tests`

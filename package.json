@@ -6,6 +6,7 @@
     "check:frontend-sync": "python tools/check_frontend_sync.py",
     "test:browser": "node tools/test_visualization_browser.mjs",
     "test:auth-browser": "node tools/test_auth_browser.mjs",
+    "test:settings-profiles-browser": "node tools/test_settings_profiles_browser.mjs",
     "test:account-functions": "node tools/run_account_function_tests.mjs"
   },
   "devDependencies": {

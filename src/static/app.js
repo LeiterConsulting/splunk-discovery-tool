@@ -448,6 +448,12 @@
     return value;
   };
   const escapeSettingsHtml = (value) => String(value != null ? value : "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const formatApiErrorDetail = (detail) => {
+    if (!detail) return "Unknown error";
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) return detail.map((item) => (item == null ? void 0 : item.msg) || JSON.stringify(item)).join("; ");
+    return JSON.stringify(detail);
+  };
   const readLlmTuningFormValues = (fallback = {}) => {
     const toPositiveInt = (element, fallbackValue) => {
       if (!element) return Number(fallbackValue) > 0 ? Number(fallbackValue) : 0;
@@ -982,7 +988,7 @@
     )))));
   }
   function App() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa, _ya, _za, _Aa, _Ba, _Ca, _Da, _Ea, _Fa, _Ga, _Ha, _Ia, _Ja, _Ka, _La, _Ma, _Na, _Oa, _Pa, _Qa, _Ra, _Sa, _Ta, _Ua, _Va, _Wa, _Xa, _Ya, _Za, __a, _$a, _ab, _bb, _ub, _vb, _wb, _xb, _yb, _zb, _Ab, _Bb, _Cb, _Db, _Eb;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa, _ya, _za, _Aa, _Ba, _Ca, _Da, _Ea, _Fa, _Ga, _Ha, _Ia, _Ja, _Ka, _La, _Ma, _Na, _Oa, _Pa, _Qa, _Ra, _Sa, _Ta, _Ua, _Va, _Wa, _Xa, _Ya, _Za, __a, _$a, _ab, _bb, _ub, _vb, _wb, _xb, _yb, _zb, _Ab, _Bb;
     const THEME_PREFERENCE_KEY = "dt4sms_theme_preference";
     const OPERATOR_VOICE_PREFERENCE_KEY = "dt4sms_operator_voice";
     const OPERATOR_VOICE_OPTIONS = [
@@ -1202,6 +1208,7 @@
     const [isMCPSaveModalOpen, setIsMCPSaveModalOpen] = useState(false);
     const [mcpConfigName, setMCPConfigName] = useState("");
     const [mcpConfigDescription, setMCPConfigDescription] = useState("");
+    const [mcpSaveDraft, setMCPSaveDraft] = useState(null);
     const [showMCPConfigForm, setShowMCPConfigForm] = useState(false);
     const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState("Enter token");
     const [showSuggestedQueries, setShowSuggestedQueries] = useState(false);
@@ -5828,14 +5835,14 @@ This permanently deletes the token record from DT4SMS.`);
                                     </div>
                                     <div class="flex flex-col gap-2 shrink-0">
                                         <button
-                                            onclick="loadCredentialIntoSettings('${cred.name.replace(/'/g, "'")}')"
+                                            data-credential-name="${escapeSettingsHtml(cred.name)}" onclick="loadCredentialIntoSettings(this.dataset.credentialName)"
                                             class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                             title="Load this credential into the settings form above"
                                         >
                                             <i class="fas fa-download mr-2"></i>Load
                                         </button>
                                         <button
-                                            onclick="deleteCredential('${cred.name.replace(/'/g, "'")}')"
+                                            data-credential-name="${escapeSettingsHtml(cred.name)}" onclick="deleteCredential(this.dataset.credentialName)"
                                             class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                             title="Permanently delete this saved credential"
                                         >
@@ -5871,11 +5878,11 @@ This permanently deletes the token record from DT4SMS.`);
                             <div class="text-center py-10">
                                 <i class="fas fa-spinner fa-spin text-purple-600 text-4xl mb-4"></i>
                                 <p class="text-base font-semibold text-gray-700">Loading credential...</p>
-                                <p class="text-sm text-gray-500 mt-2">${name}</p>
+                                <p class="text-sm text-gray-500 mt-2">${escapeSettingsHtml(name)}</p>
                             </div>
                         `;
         }
-        const response = await fetch(`/api/credentials/${name}/load`, { method: "POST" });
+        const response = await fetch(`/api/credentials/${encodeURIComponent(name)}/load`, { method: "POST" });
         const result = await response.json();
         if (response.ok) {
           const newConfig = result.config;
@@ -5954,7 +5961,7 @@ Are you sure you want to delete '${name}'?
 This action cannot be undone.`);
       if (!confirmed) return;
       try {
-        const response = await fetch(`/api/credentials/${name}`, { method: "DELETE" });
+        const response = await fetch(`/api/credentials/${encodeURIComponent(name)}`, { method: "DELETE" });
         if (response.ok) {
           await loadCredentials();
           const successDiv = document.createElement("div");
@@ -5964,7 +5971,7 @@ This action cannot be undone.`);
                                 <i class="fas fa-trash-alt text-2xl"></i>
                                 <div>
                                     <p class="font-bold text-base">Credential Deleted</p>
-                                    <p class="text-sm opacity-90">${name}</p>
+                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                                 </div>
                             </div>
                         `;
@@ -5981,6 +5988,31 @@ This action cannot be undone.`);
       } catch (error) {
         alert(`Error: ${error.message}`);
       }
+    };
+    const openMCPSaveModal = (profileName) => {
+      var _a2, _b2, _c2;
+      const urlEl = document.getElementById("mcp-url");
+      const tokenEl = document.getElementById("mcp-token");
+      const verifySslEl = document.getElementById("mcp-verify-ssl");
+      const name = String(profileName || "");
+      setMCPSaveDraft({
+        mode: name ? "update" : "new",
+        url: String((urlEl == null ? void 0 : urlEl.value) || ((_a2 = config == null ? void 0 : config.mcp) == null ? void 0 : _a2.url) || "").trim(),
+        token: (tokenEl == null ? void 0 : tokenEl.value) || "",
+        verify_ssl: verifySslEl ? verifySslEl.checked : Boolean((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.verify_ssl)
+      });
+      setMCPConfigName(name);
+      setMCPConfigDescription(name ? ((_c2 = savedMCPConfigs == null ? void 0 : savedMCPConfigs[name]) == null ? void 0 : _c2.description) || "" : "");
+      setIsMCPSaveModalOpen(true);
+    };
+    const describeMCPDraftToken = (draft, profileName) => {
+      var _a2, _b2, _c2;
+      if (!draft) return "Not set";
+      if (draft.token) return "New token entered";
+      if ((_a2 = savedMCPConfigs == null ? void 0 : savedMCPConfigs[String(profileName || "").trim()]) == null ? void 0 : _a2.token) return "Keep saved token";
+      const normalizeUrl = (value) => String(value || "").trim().replace(/\/+$/, "").toLowerCase();
+      if (((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.token) && normalizeUrl(draft.url) === normalizeUrl((_c2 = config == null ? void 0 : config.mcp) == null ? void 0 : _c2.url)) return "Use current token";
+      return "Not set";
     };
     const loadMCPConfigs = async () => {
       try {
@@ -6012,14 +6044,15 @@ This action cannot be undone.`);
                                 <div class="flex-1 min-w-0">
                                     <div class="flex items-center gap-2 mb-2">
                                         <i class="fas fa-server text-green-600 text-lg"></i>
-                                        <h5 class="text-base font-bold text-gray-900 truncate">${mcp.name}</h5>
+                                        <h5 class="text-base font-bold text-gray-900 truncate">${escapeSettingsHtml(mcp.name)}</h5>
                                         ${mcp.name === activeMCPName ? '<span class="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-bold rounded-full">ACTIVE</span>' : ""}
+                                        ${mcp.token ? "" : '<span class="px-2 py-0.5 bg-amber-100 text-amber-800 text-xs font-bold rounded-full" title="Load this configuration, enter the token, and update it">NO TOKEN</span>'}
                                     </div>
-                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${mcp.description}</p>` : ""}
+                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${escapeSettingsHtml(mcp.description)}</p>` : ""}
                                     <div class="text-sm text-gray-600 space-y-1.5 pl-1">
                                         <div class="flex items-center gap-2">
                                             <i class="fas fa-link w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">URL:</span> ${mcp.url}</span>
+                                            <span><span class="font-semibold text-gray-700">URL:</span> ${escapeSettingsHtml(mcp.url)}</span>
                                         </div>
                                         <div class="flex items-center gap-2">
                                             <i class="fas fa-shield-alt w-4 text-gray-400"></i>
@@ -6029,21 +6062,21 @@ This action cannot be undone.`);
                                 </div>
                                 <div class="flex flex-col gap-2 shrink-0">
                                     <button
-                                        onclick="testMCPConfig('${mcp.name}')"
+                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="testMCPConfig(this.dataset.mcpName)"
                                         class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                         title="Test connection to this MCP server"
                                     >
                                         <i class="fas fa-network-wired mr-2"></i>Test
                                     </button>
                                     <button
-                                        onclick="loadMCPConfigIntoSettings('${mcp.name}')"
+                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="loadMCPConfigIntoSettings(this.dataset.mcpName)"
                                         class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                         title="Load this configuration into active settings"
                                     >
                                         <i class="fas fa-download mr-2"></i>Load
                                     </button>
                                     <button
-                                        onclick="deleteMCPConfig('${mcp.name}')"
+                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="deleteMCPConfig(this.dataset.mcpName)"
                                         class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
                                         title="Permanently delete this saved configuration"
                                     >
@@ -6068,6 +6101,7 @@ This action cannot be undone.`);
       }
     };
     window.loadMCPConfigIntoSettings = async (name) => {
+      var _a2;
       try {
         const mcpList = document.getElementById("mcp-configs-list");
         const originalHTML2 = mcpList.innerHTML;
@@ -6075,17 +6109,17 @@ This action cannot be undone.`);
                         <div class="text-center py-10">
                             <i class="fas fa-spinner fa-spin text-green-600 text-4xl mb-4"></i>
                             <p class="text-base font-semibold text-gray-700">Loading configuration...</p>
-                            <p class="text-sm text-gray-500 mt-2">${name}</p>
+                            <p class="text-sm text-gray-500 mt-2">${escapeSettingsHtml(name)}</p>
                         </div>
                     `;
-        const response = await fetch(`/api/mcp-configs/${name}/load`, { method: "POST" });
+        const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/load`, { method: "POST" });
         if (response.ok) {
           const result = await response.json();
           const newConfig = result.config;
           setConfig(newConfig);
           setLoadedMCPConfigName(name);
           setShowMCPConfigForm(true);
-          setMCPTokenPlaceholder("(Already Configured)");
+          setMCPTokenPlaceholder(((_a2 = newConfig == null ? void 0 : newConfig.mcp) == null ? void 0 : _a2.token) === "***" ? "(Already Configured)" : "Enter token");
           setTimeout(() => {
             const mcpUrlInput = document.getElementById("mcp-url");
             const mcpTokenInput = document.getElementById("mcp-token");
@@ -6101,7 +6135,7 @@ This action cannot be undone.`);
                                 <i class="fas fa-check-circle text-2xl"></i>
                                 <div>
                                     <p class="font-bold text-base">Configuration Loaded!</p>
-                                    <p class="text-sm opacity-90">${name}</p>
+                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                                 </div>
                             </div>
                         `;
@@ -6115,7 +6149,7 @@ This action cannot be undone.`);
         } else {
           mcpList.innerHTML = originalHTML2;
           const result = await response.json();
-          alert(`Failed to load configuration: ${result.detail}`);
+          alert(`Failed to load configuration: ${formatApiErrorDetail(result.detail)}`);
         }
       } catch (error) {
         alert(`Error loading configuration: ${error.message}`);
@@ -6130,7 +6164,7 @@ Are you sure you want to delete '${name}'?
 This action cannot be undone.`);
       if (!confirmed) return;
       try {
-        const response = await fetch(`/api/mcp-configs/${name}`, { method: "DELETE" });
+        const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}`, { method: "DELETE" });
         if (response.ok) {
           await loadMCPConfigs();
           const successDiv = document.createElement("div");
@@ -6140,7 +6174,7 @@ This action cannot be undone.`);
                                 <i class="fas fa-trash-alt text-2xl"></i>
                                 <div>
                                     <p class="font-bold text-base">Configuration Deleted</p>
-                                    <p class="text-sm opacity-90">${name}</p>
+                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                                 </div>
                             </div>
                         `;
@@ -6169,12 +6203,12 @@ This action cannot be undone.`);
                             <i class="fas fa-spinner fa-spin text-2xl"></i>
                             <div>
                                 <p class="font-bold text-base">Testing Connection...</p>
-                                <p class="text-sm opacity-90">${name}</p>
+                                <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
                             </div>
                         </div>
                     `;
         document.body.appendChild(testingDiv);
-        const response = await fetch(`/api/mcp-configs/${name}/test`, { method: "POST" });
+        const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/test`, { method: "POST" });
         const result = await response.json();
         testingDiv.remove();
         const resultDiv = document.createElement("div");
@@ -6193,7 +6227,7 @@ This action cannot be undone.`);
                             <i class="fas ${icon} text-2xl"></i>
                             <div>
                                 <p class="font-bold text-base">${result.status === "success" ? "Connection Successful!" : result.status === "warning" ? "Connection Warning" : "Connection Failed"}</p>
-                                <p class="text-sm opacity-90">${result.message}</p>
+                                <p class="text-sm opacity-90">${escapeSettingsHtml(result.message)}</p>
                             </div>
                         </div>
                     `;
@@ -10598,7 +10632,7 @@ ${query.spl}`,
           const tokenEl = document.getElementById("mcp-token");
           const verifySslEl = document.getElementById("mcp-verify-ssl");
           const testUrl = (urlEl == null ? void 0 : urlEl.value) || config.mcp.url;
-          const testToken = (tokenEl == null ? void 0 : tokenEl.value) || config.mcp.token;
+          const testToken = (tokenEl == null ? void 0 : tokenEl.value) || "";
           const testVerifySsl = (_a2 = verifySslEl == null ? void 0 : verifySslEl.checked) != null ? _a2 : config.mcp.verify_ssl;
           if (!testUrl) {
             alert("Please enter an MCP URL");
@@ -10615,7 +10649,8 @@ ${query.spl}`,
               body: JSON.stringify({
                 url: testUrl,
                 token: testToken,
-                verify_ssl: testVerifySsl
+                verify_ssl: testVerifySsl,
+                name: loadedMCPConfigName || void 0
               })
             });
             const result = await response.json();
@@ -10638,10 +10673,7 @@ ${query.spl}`,
     ), loadedMCPConfigName ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
       "button",
       {
-        onClick: () => {
-          setMCPConfigName("");
-          setIsMCPSaveModalOpen(true);
-        },
+        onClick: () => openMCPSaveModal(""),
         className: "w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2" }),
@@ -10649,10 +10681,7 @@ ${query.spl}`,
     ), /* @__PURE__ */ React.createElement(
       "button",
       {
-        onClick: () => {
-          setMCPConfigName(loadedMCPConfigName);
-          setIsMCPSaveModalOpen(true);
-        },
+        onClick: () => openMCPSaveModal(loadedMCPConfigName),
         className: "w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync-alt mr-2" }),
@@ -10660,10 +10689,7 @@ ${query.spl}`,
     )) : /* @__PURE__ */ React.createElement(
       "button",
       {
-        onClick: () => {
-          setMCPConfigName("");
-          setIsMCPSaveModalOpen(true);
-        },
+        onClick: () => openMCPSaveModal(""),
         className: "w-full px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all"
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2" }),
@@ -11232,6 +11258,11 @@ This will replace:
 
 This action cannot be undone.`);
             if (!confirmed) return;
+          } else if (savedCredentials == null ? void 0 : savedCredentials[credentialName.trim()]) {
+            const confirmed = confirm(`A credential named "${credentialName.trim()}" already exists.
+
+Overwrite it?`);
+            if (!confirmed) return;
           }
           try {
             const provider = document.getElementById("llm-provider").value;
@@ -11250,12 +11281,16 @@ This action cannot be undone.`);
                 ...readLlmTuningFormValues(config.llm)
               })
             });
+            const result = await response.json().catch(() => ({}));
             if (response.ok) {
               setIsCredentialModalOpen(false);
               setCredentialName("");
               const wasUpdate = isUpdateMode;
               setIsUpdateMode(false);
               await loadCredentials();
+              if (result.activated) {
+                await loadConfig();
+              }
               const successDiv = document.createElement("div");
               successDiv.className = `fixed top-6 right-6 ${wasUpdate ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600" : "bg-green-600 text-white"} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
               successDiv.innerHTML = `
@@ -11263,7 +11298,7 @@ This action cannot be undone.`);
                                                                 <i class="fas ${wasUpdate ? "fa-sync-alt" : "fa-check-circle"} text-2xl"></i>
                                                                 <div>
                                                                     <p class="font-bold text-base">Credential ${wasUpdate ? "Updated" : "Saved"}!</p>
-                                                                    <p class="text-sm ${wasUpdate ? "opacity-80" : "opacity-90"}">${credentialName}</p>
+                                                                    <p class="text-sm ${wasUpdate ? "opacity-80" : "opacity-90"}">${escapeSettingsHtml(credentialName)}</p>
                                                                 </div>
                                                             </div>
                                                         `;
@@ -11275,8 +11310,7 @@ This action cannot be undone.`);
                 setTimeout(() => successDiv.remove(), 300);
               }, 2500);
             } else {
-              const error = await response.json();
-              alert("Failed to save credential: " + (error.detail || "Unknown error"));
+              alert("Failed to save credential: " + formatApiErrorDetail(result.detail));
             }
           } catch (error) {
             alert("Error saving credential: " + error.message);
@@ -11287,18 +11321,19 @@ This action cannot be undone.`);
       },
       /* @__PURE__ */ React.createElement("i", { className: `mr-2 ${isUpdateMode ? "fas fa-sync-alt" : "fas fa-save"}` }),
       isUpdateMode ? "Update Credential" : "Save Credential"
-    ))))), isMCPSaveModalOpen && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 rounded-t-xl ${loadedMCPConfigName ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600" : "bg-gradient-to-r from-green-600 to-emerald-600 text-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("i", { className: `text-2xl ${loadedMCPConfigName ? "fas fa-sync-alt" : "fas fa-save"}` }), /* @__PURE__ */ React.createElement("h2", { className: "text-xl font-bold" }, loadedMCPConfigName ? "Update" : "Save", " MCP Configuration")), /* @__PURE__ */ React.createElement(
+    ))))), isMCPSaveModalOpen && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 rounded-t-xl ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600" : "bg-gradient-to-r from-green-600 to-emerald-600 text-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("i", { className: `text-2xl ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "fas fa-sync-alt" : "fas fa-save"}` }), /* @__PURE__ */ React.createElement("h2", { className: "text-xl font-bold" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "Update" : "Save", " MCP Configuration")), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
           setIsMCPSaveModalOpen(false);
           setMCPConfigName("");
           setMCPConfigDescription("");
+          setMCPSaveDraft(null);
         },
-        className: `transition-colors ${loadedMCPConfigName ? "text-gray-900 hover:text-gray-600" : "text-white hover:text-gray-200"}`
+        className: `transition-colors ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "text-gray-900 hover:text-gray-600" : "text-white hover:text-gray-200"}`
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl" })
-    ))), /* @__PURE__ */ React.createElement("div", { className: "p-6" }, loadedMCPConfigName ? /* @__PURE__ */ React.createElement("div", { className: "bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-bold text-gray-900 mb-1" }, "⚠️ Update Warning"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-800" }, 'You are about to overwrite the existing configuration "', /* @__PURE__ */ React.createElement("strong", { className: "text-gray-900" }, mcpConfigName), '". This will replace all settings with your current configuration. This action cannot be undone.')))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-4 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Save your current MCP server settings as a named configuration for quick access later."), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("label", { className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Configuration Name ", /* @__PURE__ */ React.createElement("span", { className: "text-red-500" }, "*")), /* @__PURE__ */ React.createElement(
+    ))), /* @__PURE__ */ React.createElement("div", { className: "p-6" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? /* @__PURE__ */ React.createElement("div", { className: "bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-bold text-gray-900 mb-1" }, "⚠️ Update Warning"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-800" }, 'You are about to overwrite the existing configuration "', /* @__PURE__ */ React.createElement("strong", { className: "text-gray-900" }, mcpConfigName), '". This will replace all settings with your current configuration. This action cannot be undone.')))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-4 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Save your current MCP server settings as a named configuration for quick access later."), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("label", { className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Configuration Name ", /* @__PURE__ */ React.createElement("span", { className: "text-red-500" }, "*")), /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "text",
@@ -11306,10 +11341,10 @@ This action cannot be undone.`);
         onChange: (e) => setMCPConfigName(e.target.value),
         placeholder: "e.g., Production Splunk, Dev Environment",
         className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500" : "bg-white border-gray-300 text-gray-900 placeholder-gray-400"}`,
-        disabled: loadedMCPConfigName,
-        autoFocus: !loadedMCPConfigName
+        disabled: (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update",
+        autoFocus: !((mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update")
       }
-    ), loadedMCPConfigName && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 italic ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Configuration name cannot be changed when updating")), /* @__PURE__ */ React.createElement("div", { className: "mb-6" }, /* @__PURE__ */ React.createElement("label", { className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Description (Optional)"), /* @__PURE__ */ React.createElement(
+    ), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 italic ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Configuration name cannot be changed when updating")), /* @__PURE__ */ React.createElement("div", { className: "mb-6" }, /* @__PURE__ */ React.createElement("label", { className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Description (Optional)"), /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "text",
@@ -11318,13 +11353,14 @@ This action cannot be undone.`);
         placeholder: "e.g., Main production Splunk server",
         className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100 placeholder-gray-500" : "bg-white border-gray-300 text-gray-900 placeholder-gray-400"}`
       }
-    )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Current Settings Preview"), /* @__PURE__ */ React.createElement("div", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "URL:"), " ", ((_Cb = config == null ? void 0 : config.mcp) == null ? void 0 : _Cb.url) || "N/A"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Token:"), " ", ((_Db = config == null ? void 0 : config.mcp) == null ? void 0 : _Db.token) ? "***" : "Not set"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Verify SSL:"), " ", ((_Eb = config == null ? void 0 : config.mcp) == null ? void 0 : _Eb.verify_ssl) ? "Yes" : "No"))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("div", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "URL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.url) || "N/A"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Token:"), " ", describeMCPDraftToken(mcpSaveDraft, mcpConfigName)), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Verify SSL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.verify_ssl) ? "Yes" : "No"))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
           setIsMCPSaveModalOpen(false);
           setMCPConfigName("");
           setMCPConfigDescription("");
+          setMCPSaveDraft(null);
         },
         className: `flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-200 hover:bg-gray-300 text-gray-700"}`
       },
@@ -11333,22 +11369,34 @@ This action cannot be undone.`);
       "button",
       {
         onClick: async () => {
-          if (!mcpConfigName.trim()) {
+          const savedName = mcpConfigName.trim();
+          const isUpdate = (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update";
+          const draft = mcpSaveDraft || {};
+          if (!savedName) {
             alert("Please enter a configuration name");
             return;
           }
-          if (loadedMCPConfigName) {
+          if (!draft.url) {
+            alert("Please enter an MCP URL");
+            return;
+          }
+          if (isUpdate) {
             const confirmed = confirm(`⚠️ Confirm Update
 
-Are you sure you want to overwrite "${mcpConfigName}"?
+Are you sure you want to overwrite "${savedName}"?
 
 This will replace:
 • MCP URL
-• Token
+• Token (a blank token keeps the saved one)
 • SSL Settings
 • Description
 
 This action cannot be undone.`);
+            if (!confirmed) return;
+          } else if (savedMCPConfigs == null ? void 0 : savedMCPConfigs[savedName]) {
+            const confirmed = confirm(`A configuration named "${savedName}" already exists.
+
+Overwrite it?`);
             if (!confirmed) return;
           }
           try {
@@ -11356,28 +11404,41 @@ This action cannot be undone.`);
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                name: mcpConfigName.trim(),
-                url: document.getElementById("mcp-url").value,
-                token: document.getElementById("mcp-token").value || config.mcp.token,
-                verify_ssl: document.getElementById("mcp-verify-ssl").checked,
+                name: savedName,
+                url: draft.url,
+                token: draft.token || "",
+                verify_ssl: Boolean(draft.verify_ssl),
                 description: mcpConfigDescription.trim() || null
               })
             });
+            const result = await response.json().catch(() => ({}));
             if (response.ok) {
               setIsMCPSaveModalOpen(false);
-              const savedName = mcpConfigName.trim();
-              const wasUpdate = loadedMCPConfigName;
+              setMCPSaveDraft(null);
               setMCPConfigName("");
               setMCPConfigDescription("");
+              if (result.activated) {
+                if (result.config) {
+                  setConfig(result.config);
+                }
+                setLoadedMCPConfigName(savedName);
+                const tokenInput = document.getElementById("mcp-token");
+                if (tokenInput) {
+                  tokenInput.value = "";
+                }
+                await loadConfig();
+              }
               await loadMCPConfigs();
+              const detailLine = result.activated ? "Active MCP connection updated" : result.token_configured === false ? "Saved without a token" : "";
               const successDiv = document.createElement("div");
-              successDiv.className = `fixed top-6 right-6 ${wasUpdate ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600" : "bg-green-600 text-white"} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
+              successDiv.className = `fixed top-6 right-6 ${isUpdate ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600" : "bg-green-600 text-white"} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
               successDiv.innerHTML = `
                                                             <div class="flex items-center gap-3">
-                                                                <i class="fas ${wasUpdate ? "fa-sync-alt" : "fa-check-circle"} text-2xl"></i>
+                                                                <i class="fas ${isUpdate ? "fa-sync-alt" : "fa-check-circle"} text-2xl"></i>
                                                                 <div>
-                                                                    <p class="font-bold text-base">Configuration ${wasUpdate ? "Updated" : "Saved"}!</p>
-                                                                    <p class="text-sm ${wasUpdate ? "opacity-80" : "opacity-90"}">${savedName}</p>
+                                                                    <p class="font-bold text-base">Configuration ${isUpdate ? "Updated" : "Saved"}!</p>
+                                                                    <p class="text-sm ${isUpdate ? "opacity-80" : "opacity-90"}">${escapeSettingsHtml(savedName)}</p>
+                                                                    ${detailLine ? `<p class="text-xs opacity-80">${escapeSettingsHtml(detailLine)}</p>` : ""}
                                                                 </div>
                                                             </div>
                                                         `;
@@ -11389,18 +11450,17 @@ This action cannot be undone.`);
                 setTimeout(() => successDiv.remove(), 300);
               }, 2500);
             } else {
-              const error = await response.json();
-              alert("Failed to save configuration: " + (error.detail || "Unknown error"));
+              alert("Failed to save configuration: " + formatApiErrorDetail(result.detail));
             }
           } catch (error) {
             alert("Error saving configuration: " + error.message);
           }
         },
         disabled: !mcpConfigName.trim(),
-        className: `flex-1 px-4 py-2 ${loadedMCPConfigName ? "bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600" : "bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white"} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`
+        className: `flex-1 px-4 py-2 ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600" : "bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white"} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`
       },
-      /* @__PURE__ */ React.createElement("i", { className: `mr-2 ${loadedMCPConfigName ? "fas fa-sync-alt" : "fas fa-save"}` }),
-      loadedMCPConfigName ? "Update Configuration" : "Save Configuration"
+      /* @__PURE__ */ React.createElement("i", { className: `mr-2 ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "fas fa-sync-alt" : "fas fa-save"}` }),
+      (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "Update Configuration" : "Save Configuration"
     ))))));
   }
   window.addEventListener("error", (event) => {

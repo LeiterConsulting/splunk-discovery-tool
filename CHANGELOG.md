@@ -41,6 +41,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local models leaked chat-template tokens and a leading `assistant` role label into answers
 - Saved-credential details in Settings are HTML-escaped
 - The browser regression harness reports a missing Python interpreter instead of crashing, restores seeded output, and removes the export directory it created
+
+### 🔐 Saved MCP Configurations & Credentials
+
+#### Fixed
+- Updating a saved MCP configuration without retyping its token stored the `***` mask as the token, so loading it later failed authentication; updating an LLM credential without retyping its key erased the key. A blank or masked secret now keeps the saved value, and a new configuration for the active server (or a new credential for the active provider and endpoint) reuses the active secret
+- Profile names containing `'`, `/`, `#`, `?`, or `%` broke Test, Load, and Delete; the routes accept any name, and the Settings lists pass names through data attributes and encoded URLs
+- "Save as New" after loading an MCP configuration opened a dialog with a locked, empty name field
+- The save dialog previewed the active settings (old URL, "Token: Not set") instead of the values typed in the form
+- Updating the active MCP configuration or LLM credential did not update the live connection, and the first MCP configuration saved on a fresh install was not made active
+- Test Connection on the MCP form sent `***` as the bearer token after a configuration was loaded; it now uses the saved token, and testing a saved configuration with no token reports that instead of calling the server
+- Save failures now report the reason and the config file path; config writes are atomic, and a config file that cannot be decrypted is kept as `config.encrypted.corrupted-<time>` instead of being overwritten with defaults
+- On macOS a second server could bind `0.0.0.0:8003` while another listened on `127.0.0.1:8003`; startup now detects the local listener and moves to the next free port
+
+#### Added
+- Saved configurations without a token show a NO TOKEN badge, and saving over an existing name asks for confirmation
+- Regression suites: `tests/test_settings_profiles.py` and `tools/test_settings_profiles_browser.mjs` (`npm run test:settings-profiles-browser`, also run in CI)
+
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added

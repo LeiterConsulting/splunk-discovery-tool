@@ -167,6 +167,7 @@ From an activated virtual environment, the main local release checks are:
 npm run build:frontend
 python tools/check_frontend_sync.py
 npm run test:browser
+npm run test:settings-profiles-browser
 npm run test:auth-browser
 npm run test:account-functions
 python -m ruff check src tests
@@ -249,6 +250,12 @@ python tools/check_frontend_sync.py
 ```bash
 npx playwright install chromium
 npm run test:browser
+```
+
+- To check saving, loading, testing, and deleting MCP configurations in Settings (including names with quotes, slashes, and `#`), run:
+
+```bash
+npm run test:settings-profiles-browser
 ```
 
 - To validate auth-enabled flows and the account-function matrix, run:

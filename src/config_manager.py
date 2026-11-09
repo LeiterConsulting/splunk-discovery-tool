@@ -5,12 +5,27 @@ Handles secure storage of MCP and LLM credentials using Fernet encryption
 
 import json
 import os
+import shutil
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 from cryptography.fernet import Fernet
 from dataclasses import dataclass, asdict, field
 
 from capabilities.models import CapabilityConfig
+
+
+MASKED_SECRET = "***"
+
+
+def is_unset_secret(value: Any) -> bool:
+    """Blank values and the mask the API hands to the browser both mean "keep the stored secret"."""
+    return str(value or "").strip() in {"", MASKED_SECRET}
+
+
+def _same_endpoint(left: Any, right: Any) -> bool:
+    return str(left or "").strip().rstrip("/").lower() == str(right or "").strip().rstrip("/").lower()
 
 
 def _known_fields(dataclass_type, values: Any) -> Dict[str, Any]:
@@ -156,6 +171,7 @@ class ConfigManager:
         self.key_path = Path(".config.key")
         self._key = None
         self._config = None
+        self.last_save_error: Optional[str] = None
         
         # Initialize encryption key
         self._init_key()
@@ -252,7 +268,44 @@ class ConfigManager:
             )
         except Exception as e:
             print(f"Error loading config: {e}")
+            self._preserve_unreadable_config()
             return self._create_default_config()
+
+    def _preserve_unreadable_config(self) -> None:
+        """Keep a copy of a config that cannot be decrypted so the next save does not destroy it."""
+        try:
+            if not self.config_path.exists():
+                return
+            stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+            backup_path = self.config_path.with_name(f"{self.config_path.name}.corrupted-{stamp}")
+            if not backup_path.exists():
+                shutil.copy2(self.config_path, backup_path)
+                print(f"Unreadable config preserved at {backup_path} (check that {self.key_path} matches it)")
+        except Exception as backup_error:
+            print(f"Warning: Could not preserve unreadable config: {backup_error}")
+
+    def _write_config_bytes(self, data: bytes) -> None:
+        target = self.config_path
+        directory = target.parent if str(target.parent) else Path(".")
+        fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(directory))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.replace(temp_name, target)
+                return
+            except OSError:
+                # Windows can refuse the rename while another process holds the file open.
+                with open(target, "wb") as handle:
+                    handle.write(data)
+        finally:
+            if os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
     
     def save(self, config: AppConfig):
         """Encrypt and save configuration"""
@@ -288,8 +341,7 @@ class ConfigManager:
             
             # Encrypt and save
             encrypted_data = self._encrypt(config_dict)
-            with open(self.config_path, 'wb') as f:
-                f.write(encrypted_data)
+            self._write_config_bytes(encrypted_data)
             
             # Secure the config file (Unix only)
             try:
@@ -299,8 +351,10 @@ class ConfigManager:
                 print(f"Warning: Could not set file permissions: {chmod_error}")
             
             self._config = config
+            self.last_save_error = None
             return True
         except Exception as e:
+            self.last_save_error = f"{type(e).__name__}: {e} (config file: {self.config_path.resolve()})"
             print(f"Error saving config: {e}")
             import traceback
             traceback.print_exc()
@@ -313,6 +367,8 @@ class ConfigManager:
     def update_mcp(self, **kwargs) -> bool:
         """Update MCP configuration"""
         for key, value in kwargs.items():
+            if key == 'token' and str(value or '').strip() == MASKED_SECRET:
+                continue
             if hasattr(self._config.mcp, key):
                 setattr(self._config.mcp, key, value)
         return self.save(self._config)
@@ -320,6 +376,8 @@ class ConfigManager:
     def update_llm(self, **kwargs) -> bool:
         """Update LLM configuration"""
         for key, value in kwargs.items():
+            if key == 'api_key' and str(value or '').strip() == MASKED_SECRET:
+                continue
             if hasattr(self._config.llm, key):
                 setattr(self._config.llm, key, value)
         return self.save(self._config)
@@ -385,8 +443,18 @@ class ConfigManager:
                        endpoint_url: Optional[str] = None, max_tokens: int = 16000, 
                        temperature: float = 0.7, auto_tune: bool = True,
                        context_window: int = 0, request_timeout: int = 0,
-                       reasoning_effort: str = "") -> bool:
-        """Save a named LLM credential"""
+                       reasoning_effort: str = "", activate: bool = False) -> bool:
+        """Save a named LLM credential.
+
+        A blank or masked api_key keeps the key already stored under this name, or the
+        active key when the credential points at the same provider and endpoint.
+        """
+        name = str(name or "").strip()
+        if not name:
+            self.last_save_error = "Credential name is required"
+            return False
+        if is_unset_secret(api_key):
+            api_key = self.resolve_llm_api_key(name, provider, endpoint_url)
         credential = LLMCredential(
             name=name,
             provider=provider,
@@ -401,7 +469,35 @@ class ConfigManager:
             reasoning_effort=str(reasoning_effort or ""),
         )
         self._config.saved_credentials[name] = credential
+        if activate:
+            self._apply_llm_credential(name, credential)
         return self.save(self._config)
+
+    def resolve_llm_api_key(self, name: Optional[str], provider: Any, endpoint_url: Any) -> str:
+        existing = self._config.saved_credentials.get(str(name or "").strip())
+        if existing is not None and not is_unset_secret(existing.api_key):
+            return existing.api_key
+        active = self._config.llm
+        if (
+            str(provider or "").strip().lower() == str(active.provider or "").strip().lower()
+            and _same_endpoint(endpoint_url, active.endpoint_url)
+            and not is_unset_secret(active.api_key)
+        ):
+            return active.api_key
+        return ""
+
+    def _apply_llm_credential(self, name: str, credential: LLMCredential) -> None:
+        self._config.llm.provider = credential.provider
+        self._config.llm.api_key = "" if is_unset_secret(credential.api_key) else credential.api_key
+        self._config.llm.model = credential.model
+        self._config.llm.endpoint_url = credential.endpoint_url
+        self._config.llm.max_tokens = credential.max_tokens
+        self._config.llm.temperature = credential.temperature
+        self._config.llm.auto_tune = credential.auto_tune
+        self._config.llm.context_window = credential.context_window
+        self._config.llm.request_timeout = credential.request_timeout
+        self._config.llm.reasoning_effort = credential.reasoning_effort
+        self._config.active_credential_name = name
     
     def get_credential(self, name: str) -> Optional[LLMCredential]:
         """Get a saved credential by name"""
@@ -425,17 +521,7 @@ class ConfigManager:
         """Load a saved credential into active LLM config"""
         credential = self.get_credential(name)
         if credential:
-            self._config.llm.provider = credential.provider
-            self._config.llm.api_key = credential.api_key
-            self._config.llm.model = credential.model
-            self._config.llm.endpoint_url = credential.endpoint_url
-            self._config.llm.max_tokens = credential.max_tokens
-            self._config.llm.temperature = credential.temperature
-            self._config.llm.auto_tune = credential.auto_tune
-            self._config.llm.context_window = credential.context_window
-            self._config.llm.request_timeout = credential.request_timeout
-            self._config.llm.reasoning_effort = credential.reasoning_effort
-            self._config.active_credential_name = name  # Track active credential
+            self._apply_llm_credential(name, credential)
             return self.save(self._config)
         return False
     
@@ -449,7 +535,7 @@ class ConfigManager:
             safe_creds[name] = {
                 'name': cred.name,
                 'provider': cred.provider,
-                'api_key': '***' if cred.api_key else '',
+                'api_key': '' if is_unset_secret(cred.api_key) else MASKED_SECRET,
                 'model': cred.model,
                 'endpoint_url': cred.endpoint_url,
                 'max_tokens': cred.max_tokens,
@@ -466,7 +552,7 @@ class ConfigManager:
             safe_mcp_configs[name] = {
                 'name': mcp_config.name,
                 'url': mcp_config.url,
-                'token': '***' if mcp_config.token else '',
+                'token': '' if is_unset_secret(mcp_config.token) else MASKED_SECRET,
                 'verify_ssl': mcp_config.verify_ssl,
                 'ca_bundle_path': mcp_config.ca_bundle_path,
                 'description': mcp_config.description
@@ -480,13 +566,13 @@ class ConfigManager:
         return {
             'mcp': {
                 'url': config.mcp.url,
-                'token': '***' if config.mcp.token else '',
+                'token': '' if is_unset_secret(config.mcp.token) else MASKED_SECRET,
                 'verify_ssl': config.mcp.verify_ssl,
                 'ca_bundle_path': config.mcp.ca_bundle_path
             },
             'llm': {
                 'provider': config.llm.provider,
-                'api_key': '***' if config.llm.api_key else '',
+                'api_key': '' if is_unset_secret(config.llm.api_key) else MASKED_SECRET,
                 'model': config.llm.model,
                 'endpoint_url': config.llm.endpoint_url,
                 'max_tokens': config.llm.max_tokens,
@@ -540,8 +626,18 @@ class ConfigManager:
     # MCP Configuration Vault Management
     def save_mcp_config(self, name: str, url: str, token: str, 
                        verify_ssl: bool = False, ca_bundle_path: Optional[str] = None,
-                       description: Optional[str] = None) -> bool:
-        """Save a named MCP configuration"""
+                       description: Optional[str] = None, activate: bool = False) -> bool:
+        """Save a named MCP configuration.
+
+        A blank or masked token keeps the token already stored under this name, or the
+        active token when the profile points at the active server URL.
+        """
+        name = str(name or "").strip()
+        if not name:
+            self.last_save_error = "MCP configuration name is required"
+            return False
+        if is_unset_secret(token):
+            token = self.resolve_mcp_token(name, url)
         mcp_config = MCPCredential(
             name=name,
             url=url,
@@ -551,7 +647,25 @@ class ConfigManager:
             description=description
         )
         self._config.saved_mcp_configs[name] = mcp_config
+        if activate:
+            self._apply_mcp_profile(name, mcp_config)
         return self.save(self._config)
+
+    def resolve_mcp_token(self, name: Optional[str], url: Any) -> str:
+        existing = self._config.saved_mcp_configs.get(str(name or "").strip())
+        if existing is not None and not is_unset_secret(existing.token):
+            return existing.token
+        active = self._config.mcp
+        if _same_endpoint(url, active.url) and not is_unset_secret(active.token):
+            return active.token
+        return ""
+
+    def _apply_mcp_profile(self, name: str, mcp_config: MCPCredential) -> None:
+        self._config.mcp.url = mcp_config.url
+        self._config.mcp.token = "" if is_unset_secret(mcp_config.token) else mcp_config.token
+        self._config.mcp.verify_ssl = mcp_config.verify_ssl
+        self._config.mcp.ca_bundle_path = mcp_config.ca_bundle_path
+        self._config.active_mcp_config_name = name
     
     def get_mcp_config(self, name: str) -> Optional[MCPCredential]:
         """Get a saved MCP configuration by name"""
@@ -575,10 +689,6 @@ class ConfigManager:
         """Load a saved MCP configuration into active MCP config"""
         mcp_config = self.get_mcp_config(name)
         if mcp_config:
-            self._config.mcp.url = mcp_config.url
-            self._config.mcp.token = mcp_config.token
-            self._config.mcp.verify_ssl = mcp_config.verify_ssl
-            self._config.mcp.ca_bundle_path = mcp_config.ca_bundle_path
-            self._config.active_mcp_config_name = name  # Track active config
+            self._apply_mcp_profile(name, mcp_config)
             return self.save(self._config)
         return False

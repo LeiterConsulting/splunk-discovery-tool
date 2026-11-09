@@ -41,7 +41,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, paddin
 from pydantic import BaseModel, Field
 
 # DT4SMS: Use encrypted config manager instead of YAML
-from config_manager import ConfigManager
+from config_manager import MASKED_SECRET, ConfigManager, is_unset_secret
 from capabilities import CapabilityManager, CapabilityRegistry
 from discovery.engine import DiscoveryEngine
 from discovery.m26_14_advisor import (
@@ -12058,7 +12058,7 @@ async def update_config(request: Request, config_update: ConfigUpdate):
         if config_update.mcp:
             try:
                 update_data = config_update.mcp.dict(exclude_unset=True)
-                if 'token' in update_data and not update_data['token']:
+                if 'token' in update_data and is_unset_secret(update_data['token']):
                     update_data.pop('token')
                 if update_data:
                     success = config_manager.update_mcp(**update_data)
@@ -12075,7 +12075,7 @@ async def update_config(request: Request, config_update: ConfigUpdate):
         if config_update.llm:
             try:
                 update_data = config_update.llm.dict(exclude_unset=True)
-                if 'api_key' in update_data and not update_data['api_key']:
+                if 'api_key' in update_data and is_unset_secret(update_data['api_key']):
                     update_data.pop('api_key')
                 if update_data:
                     success = config_manager.update_llm(**update_data)
@@ -12965,11 +12965,32 @@ async def download_capability_export(filename: str):
 
 # ==================== Credential Vault API ====================
 
+PROFILE_NAME_MAX_LENGTH = 128
+
+
+def _normalize_profile_name(raw_name: Any, kind: str) -> str:
+    name = str(raw_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail=f"{kind} name is required")
+    if len(name) > PROFILE_NAME_MAX_LENGTH or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{kind} name must be 1-{PROFILE_NAME_MAX_LENGTH} printable characters",
+        )
+    return name
+
+
+def _config_save_failure_detail(kind: str) -> str:
+    reason = str(getattr(config_manager, "last_save_error", "") or "").strip()
+    return f"Failed to save {kind}: {reason}" if reason else f"Failed to save {kind}"
+
+
 class CredentialCreate(BaseModel):
     """Request model for creating/updating a credential"""
     name: str
     provider: str
-    api_key: str
+    # Blank or "***" keeps the key already stored for this credential.
+    api_key: str = ""
     model: str
     endpoint_url: Optional[str] = None
     max_tokens: int = 16000
@@ -12978,13 +12999,15 @@ class CredentialCreate(BaseModel):
     context_window: int = Field(default=0, ge=0, le=10_000_000)
     request_timeout: int = Field(default=0, ge=0, le=3600)
     reasoning_effort: str = Field(default="", pattern="^(|minimal|low|medium|high)$")
+    # None: update the active LLM settings only when this is the active credential.
+    activate: Optional[bool] = None
 
 
 def _credential_public_view(cred: Any) -> Dict[str, Any]:
     return {
         'name': cred.name,
         'provider': cred.provider,
-        'api_key': '***' if cred.api_key else '',
+        'api_key': '' if is_unset_secret(cred.api_key) else MASKED_SECRET,
         'model': cred.model,
         'endpoint_url': cred.endpoint_url,
         'max_tokens': cred.max_tokens,
@@ -13006,9 +13029,13 @@ async def list_credentials(request: Request):
 async def save_credential(request: Request, credential: CredentialCreate):
     """Save a new credential"""
     require_admin_user(request)
+    name = _normalize_profile_name(credential.name, "Credential")
+    activate = credential.activate
+    if activate is None:
+        activate = config_manager.get().active_credential_name == name
     try:
         success = config_manager.save_credential(
-            name=credential.name,
+            name=name,
             provider=credential.provider,
             api_key=credential.api_key,
             model=credential.model,
@@ -13019,15 +13046,25 @@ async def save_credential(request: Request, credential: CredentialCreate):
             context_window=credential.context_window,
             request_timeout=credential.request_timeout,
             reasoning_effort=credential.reasoning_effort,
+            activate=bool(activate),
         )
-        if success:
-            return {"status": "success", "message": f"Credential '{credential.name}' saved"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save credential")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to save credential: {e}")
+    if not success:
+        raise HTTPException(status_code=500, detail=_config_save_failure_detail("credential"))
+    payload: Dict[str, Any] = {
+        "status": "success",
+        "message": f"Credential '{name}' saved",
+        "name": name,
+        "activated": bool(activate),
+    }
+    if activate:
+        capability_manager.refresh()
+        payload["config"] = config_manager.export_safe()
+    return payload
 
-@app.get("/api/credentials/{name}")
+# Profile names may contain "/", so the name segment uses the path convertor.
+@app.get("/api/credentials/{name:path}")
 async def get_credential(request: Request, name: str):
     """Get a specific credential (with masked API key)"""
     require_admin_user(request)
@@ -13037,7 +13074,7 @@ async def get_credential(request: Request, name: str):
 
     return _credential_public_view(cred)
 
-@app.delete("/api/credentials/{name}")
+@app.delete("/api/credentials/{name:path}")
 async def delete_credential(request: Request, name: str):
     """Delete a saved credential"""
     require_admin_user(request)
@@ -13047,7 +13084,7 @@ async def delete_credential(request: Request, name: str):
     else:
         raise HTTPException(status_code=404, detail=f"Credential '{name}' not found")
 
-@app.post("/api/credentials/{name}/load")
+@app.post("/api/credentials/{name:path}/load")
 async def load_credential(request: Request, name: str):
     """Load a saved credential into active configuration"""
     require_admin_user(request)
@@ -13070,10 +13107,14 @@ class MCPConfigCreate(BaseModel):
     """Request model for creating/updating an MCP configuration"""
     name: str
     url: str
-    token: str
+    # Blank or "***" keeps the token already stored for this profile (or the active
+    # token when the URL matches the active server).
+    token: str = ""
     verify_ssl: bool = False
     ca_bundle_path: Optional[str] = None
     description: Optional[str] = None
+    # None: activate when updating the active profile, or when no MCP connection is set up yet.
+    activate: Optional[bool] = None
 
 @app.get("/api/mcp-configs")
 async def list_mcp_configs(request: Request):
@@ -13084,7 +13125,7 @@ async def list_mcp_configs(request: Request):
         name: {
             'name': mcp_config.name,
             'url': mcp_config.url,
-            'token': '***' if mcp_config.token else '',
+            'token': '' if is_unset_secret(mcp_config.token) else MASKED_SECRET,
             'verify_ssl': mcp_config.verify_ssl,
             'ca_bundle_path': mcp_config.ca_bundle_path,
             'description': mcp_config.description
@@ -13096,23 +13137,45 @@ async def list_mcp_configs(request: Request):
 async def save_mcp_config(request: Request, mcp_config: MCPConfigCreate):
     """Save a new MCP configuration"""
     require_admin_user(request)
+    name = _normalize_profile_name(mcp_config.name, "MCP configuration")
+    url = str(mcp_config.url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="MCP URL is required")
+    current = config_manager.get()
+    activate = mcp_config.activate
+    if activate is None:
+        activate = current.active_mcp_config_name == name or (
+            not current.active_mcp_config_name and is_unset_secret(current.mcp.token)
+        )
+    description = str(mcp_config.description or "").strip() or None
     try:
         success = config_manager.save_mcp_config(
-            name=mcp_config.name,
-            url=mcp_config.url,
+            name=name,
+            url=url,
             token=mcp_config.token,
             verify_ssl=mcp_config.verify_ssl,
             ca_bundle_path=mcp_config.ca_bundle_path,
-            description=mcp_config.description
+            description=description,
+            activate=bool(activate),
         )
-        if success:
-            return {"status": "success", "message": f"MCP configuration '{mcp_config.name}' saved"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save MCP configuration")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to save MCP configuration: {e}")
+    if not success:
+        raise HTTPException(status_code=500, detail=_config_save_failure_detail("MCP configuration"))
+    saved = config_manager.get_mcp_config(name)
+    payload: Dict[str, Any] = {
+        "status": "success",
+        "message": f"MCP configuration '{name}' saved",
+        "name": name,
+        "activated": bool(activate),
+        "token_configured": bool(saved and not is_unset_secret(saved.token)),
+    }
+    if activate:
+        capability_manager.refresh()
+        payload["config"] = config_manager.export_safe()
+    return payload
 
-@app.get("/api/mcp-configs/{name}")
+@app.get("/api/mcp-configs/{name:path}")
 async def get_mcp_config(request: Request, name: str):
     """Get a specific MCP configuration (with masked token)"""
     require_admin_user(request)
@@ -13123,13 +13186,13 @@ async def get_mcp_config(request: Request, name: str):
     return {
         'name': mcp_config.name,
         'url': mcp_config.url,
-        'token': '***' if mcp_config.token else '',
+        'token': '' if is_unset_secret(mcp_config.token) else MASKED_SECRET,
         'verify_ssl': mcp_config.verify_ssl,
         'ca_bundle_path': mcp_config.ca_bundle_path,
         'description': mcp_config.description
     }
 
-@app.delete("/api/mcp-configs/{name}")
+@app.delete("/api/mcp-configs/{name:path}")
 async def delete_mcp_config(request: Request, name: str):
     """Delete a saved MCP configuration"""
     require_admin_user(request)
@@ -13139,7 +13202,7 @@ async def delete_mcp_config(request: Request, name: str):
     else:
         raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
 
-@app.post("/api/mcp-configs/{name}/load")
+@app.post("/api/mcp-configs/{name:path}/load")
 async def load_mcp_config(request: Request, name: str):
     """Load a saved MCP configuration into active configuration"""
     require_admin_user(request)
@@ -13163,12 +13226,14 @@ async def test_mcp_connection(request: Request, request_payload: dict):
     try:
         import httpx
         
-        url = request_payload.get('url')
+        url = str(request_payload.get('url') or '').strip()
         token = request_payload.get('token')
         verify_ssl = request_payload.get('verify_ssl', False)
         
         if not url:
             raise HTTPException(status_code=400, detail="URL is required")
+        if is_unset_secret(token):
+            token = config_manager.resolve_mcp_token(request_payload.get('name'), url)
         
         # Prepare headers
         headers = {
@@ -13236,12 +13301,18 @@ async def test_mcp_connection(request: Request, request_payload: dict):
             "message": f"Connection test failed: {str(e)}"
         }
 
-@app.post("/api/mcp-configs/{name}/test")
+@app.post("/api/mcp-configs/{name:path}/test")
 async def test_saved_mcp_connection(request: Request, name: str):
     """Test a saved MCP configuration"""
+    require_admin_user(request)
     mcp_config = config_manager.get_mcp_config(name)
     if not mcp_config:
         raise HTTPException(status_code=404, detail=f"MCP configuration '{name}' not found")
+    if is_unset_secret(mcp_config.token):
+        return {
+            "status": "error",
+            "message": f"'{name}' has no saved token. Load it, enter the token, and update the configuration.",
+        }
     
     # Use the test endpoint with saved credentials
     return await test_mcp_connection(request, {
