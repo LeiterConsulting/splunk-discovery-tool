@@ -2,7 +2,7 @@
 
 ## Intent
 
-This document explores an optional capabilities model for DT4SMS that adds:
+This document explores an optional capabilities model for Splunk Discovery Tool that adds:
 
 - an installable RAG subsystem, potentially backed by ChromaDB
 - optional enhancement tool packs for visuals, exports, and Splunk deep links
@@ -333,7 +333,7 @@ This should be a strong force multiplier because it shortens the distance from r
 There are two ways to interpret `MCP enhancements`:
 
 1. Additional external MCP servers or tools
-2. Local DT4SMS-native tool packs surfaced through the same reasoning/tooling model
+2. Local tool packs, built into Splunk Discovery Tool, that use the same reasoning/tooling model
 
 Recommendation:
 

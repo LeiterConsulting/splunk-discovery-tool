@@ -135,7 +135,7 @@ def build_report(kind: str, target: str, stages: List[Stage], secrets: Iterable[
     checked_at = datetime.now(timezone.utc)
     label = "MCP server" if kind == "mcp" else "AI provider"
     lines = [
-        f"DT4SMS troubleshooting report: {label}",
+        f"Splunk Discovery Tool troubleshooting report: {label}",
         f"Checked: {checked_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
         f"Target: {target or '(none entered)'}",
         f"Result: {status.upper()} - {summary}",
@@ -380,7 +380,7 @@ async def _looks_like_this_app(client: httpx.AsyncClient, port: int) -> bool:
     try:
         response = await client.get(f"{base}/")
         page = response.text[:5000]
-        return "Splunk MCP Discovery Tool" in page or "DT4SMS" in page
+        return any(marker in page for marker in ("Splunk Discovery Tool", "Splunk MCP Discovery Tool", "DT4SMS"))
     except Exception:
         return False
 
@@ -578,7 +578,7 @@ async def check_other_instances(
 
 def check_account(stage: Stage, account: Dict[str, Any]) -> None:
     if not account.get("auth_enabled"):
-        stage.add("account", "Saving is allowed", PASS, "Sign-in is off (demo mode), so anyone who opens this page can save settings.")
+        stage.add("account", "Saving is allowed", PASS, "Sign-in is off, so anyone who opens this page can save settings.")
         return
     username = account.get("username") or "unknown user"
     role = account.get("role") or "no role"

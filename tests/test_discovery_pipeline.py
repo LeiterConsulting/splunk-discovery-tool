@@ -745,7 +745,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         titles = [rec["title"] for rec in blueprint["recommendations"]]
         self.assertIn("Investigate indexes that stopped receiving data", titles)
         self.assertTrue(all(rec.get("generated_by") == "local_analysis" for rec in blueprint["recommendations"]))
-        self.assertTrue(any(level == "warning" and "AI enrichment incomplete" in message for level, message in display.messages))
+        self.assertTrue(any(level == "warning" and "The AI step did not finish" in message for level, message in display.messages))
         self.assertEqual(result["llm_status"], blueprint["llm_status"])
 
     async def test_pipeline_with_unstructured_llm_replies(self):

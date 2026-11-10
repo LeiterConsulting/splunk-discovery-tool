@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expose the DT4SMS external HTTP MCP surface over stdio framing."""
+"""Expose the Splunk Discovery Tool external HTTP MCP surface over stdio framing."""
 
 from __future__ import annotations
 
@@ -124,8 +124,8 @@ def run_stdio_bridge_session(input_stream: BinaryIO, output_stream: BinaryIO, tr
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DT4SMS external MCP stdio bridge")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="DT4SMS base URL")
+    parser = argparse.ArgumentParser(description="Splunk Discovery Tool external MCP stdio bridge")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Splunk Discovery Tool base URL")
     parser.add_argument("--token", default=DEFAULT_TOKEN, help="Inbound MCP token")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP request timeout in seconds")
     return parser

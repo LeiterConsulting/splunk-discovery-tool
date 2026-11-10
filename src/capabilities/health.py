@@ -352,7 +352,7 @@ class CapabilityHealthService:
             return CapabilityHealthReport(
                 name=definition.name,
                 status="degraded",
-                message="Export runtime is ready, but there are no discovery sessions to package yet.",
+                message="Report Packages is ready. Run discovery to have something to package.",
                 checked_at=checked_at,
                 details=summary,
             )

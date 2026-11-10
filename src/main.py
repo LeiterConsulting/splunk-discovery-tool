@@ -1,5 +1,5 @@
 """
-Discovery Tool for Splunk MCP Server (DT4SMS)
+Splunk Discovery Tool
 Main application entry point
 Version: 1.0.0
 """
@@ -164,7 +164,7 @@ def main():
         print(f" Preferred port {config.server.port} unavailable; using fallback port {startup_port}")
     
     print("=" * 60)
-    print(" Discovery Tool for Splunk MCP Server (DT4SMS)")
+    print(" Splunk Discovery Tool")
     print(f" Version: {config.version}")
     print("=" * 60)
     print(f" Web Interface: http://localhost:{startup_port}")

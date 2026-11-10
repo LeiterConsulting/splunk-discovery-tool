@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small CLI for DT4SMS inbound MCP bootstrapping and usage."""
+"""Small CLI for Splunk Discovery Tool inbound MCP setup and usage."""
 
 from __future__ import annotations
 
@@ -258,8 +258,8 @@ def _parse_arguments_json(value: str) -> Dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DT4SMS external MCP helper")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="DT4SMS base URL")
+    parser = argparse.ArgumentParser(description="Splunk Discovery Tool external MCP helper")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Splunk Discovery Tool base URL")
     parser.add_argument("--admin-user", default=None, help="Admin username for auth-enabled installs")
     parser.add_argument("--admin-password", default=None, help="Admin password for auth-enabled installs")
 

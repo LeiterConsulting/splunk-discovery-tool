@@ -1,4 +1,4 @@
-"""Local security store and auth/session helpers for DT4SMS."""
+"""Local security store and auth/session helpers for Splunk Discovery Tool."""
 
 import hashlib
 import json

@@ -205,7 +205,7 @@ def build_grounded_chat_prompt(
     ]
     environment_context = "\n\n".join(context_sections) or "No discovery context is loaded yet. Use tools to look things up, and suggest running a discovery for a full environment picture."
 
-    return f"""You are the DT4SMS Splunk assistant. You help the user understand and work with their own Splunk data through the Splunk MCP server. Be supportive and practical: explain clearly, show your evidence, and suggest the next useful step.
+    return f"""You are the Splunk Discovery Tool assistant. You help the user understand and work with their own Splunk data through the Splunk MCP server. Be supportive and practical: explain clearly, show your evidence, and suggest the next useful step.
 {chr(10) + mission_block + chr(10) if mission_block else ''}
 HOW TO WORK
 1. Decide whether the request needs live Splunk data. Concept questions, SPL help, and general questions can be answered directly without tools.

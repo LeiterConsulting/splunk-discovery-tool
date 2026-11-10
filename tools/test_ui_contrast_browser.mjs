@@ -1,6 +1,7 @@
 // Opens every workspace view and dialog in each theme against seeded discovery output and fails when
 // any visible text or placeholder falls below WCAG AA contrast (4.5:1, or 3:1 for large text) or
-// renders smaller than 12px. It also checks that choosing a theme in Settings applies and persists it.
+// renders smaller than 12px, or when visible text breaks the plain-language rules below. It also
+// checks that choosing a theme in Settings applies and persists it.
 // Set UI_CONTRAST_OUT to keep screenshots and a JSON report; UI_CONTRAST_THEMES limits the themes.
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -52,6 +53,35 @@ const REQUIRED_SURFACES = [
     'chat-settings',
     'settings-connections',
 ];
+// Visible text must not show raw identifiers, broken plurals, or retired names and jargon.
+const LANGUAGE_RULES = [
+    { label: 'old product name', pattern: /\bDT4SMS\b|Splunk MCP Discovery Tool/ },
+    { label: 'old theme name', pattern: /\bConstruct\b/ },
+    { label: 'raw session timestamp', pattern: /(?<![\w.])\d{8}_\d{6}(?![\w.])/ },
+    { label: 'raw ISO timestamp', pattern: /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/ },
+    { label: '"(s)" plural', pattern: /[a-z]\((?:s|es)\)/i },
+    { label: 'doubled word', pattern: /\b([A-Za-z]{2,})\s+\1\b/i, perPiece: true },
+    { label: 'placeholder value', pattern: /\bundefined\b|\bNaN\b|\[object Object\]/ },
+    { label: 'jargon', pattern: /header monitor|control surface|asset plane|exec-control|operator-ready|non-authoritative|deterministic|\brecursive\b|\(demo\)|lorem ipsum/i },
+];
+
+// Rules marked perPiece run on one text node at a time, so a label next to a value that repeats it
+// (an "Indexes" eyebrow above "Indexes added or removed.") is not read as a doubled word.
+function languageProblems(pieces) {
+    const found = [];
+    const joined = pieces.join('\n');
+    for (const rule of LANGUAGE_RULES) {
+        for (const text of rule.perPiece ? pieces : [joined]) {
+            const match = text.match(rule.pattern);
+            if (match) {
+                const start = Math.max(0, match.index - 40);
+                found.push(`${rule.label}: "${text.slice(start, match.index + match[0].length + 40).replace(/\s+/g, ' ').trim()}"`);
+                break;
+            }
+        }
+    }
+    return found;
+}
 
 function resolvePython() {
     return process.env.UI_CONTRAST_TEST_PYTHON
@@ -136,7 +166,7 @@ async function seedOutput(outputDir) {
             report_count: reportPaths.length,
             error: null,
             current_phase_key: 'artifact_packaging',
-            current_phase_title: 'Artifact Packaging',
+            current_phase_title: 'Save reports',
             phase_plan: buildCompletedDiscoveryPhasePlan(completedAt),
             activity_log: activity,
             last_run_outcome: {
@@ -146,7 +176,7 @@ async function seedOutput(outputDir) {
                 completed_at: completedAt,
                 result_timestamp: timestamp,
                 report_count: reportPaths.length,
-                phase_title: 'Artifact Packaging',
+                phase_title: 'Save reports',
                 error: null,
             },
             progress: { percentage: 100, current_step: 100, total_steps: 100, description: 'Complete.', eta_seconds: 0 },
@@ -283,7 +313,18 @@ function auditContrast(rootSelector) {
         if (field.value || !visible(field)) continue;
         check(field, `placeholder: ${field.placeholder}`, getComputedStyle(field, '::placeholder').color, { placeholder: true });
     }
-    return { checked, failures, small };
+    // Report bodies and code blocks show saved data as written, so only app copy is checked for wording.
+    const copy = [];
+    const copyWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (copyWalker.nextNode()) {
+        const node = copyWalker.currentNode;
+        const element = node.parentElement;
+        const piece = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!piece || !element || element.closest('pre, code, textarea, script, style, noscript')) continue;
+        if (!visible(element.closest('select') || element)) continue;
+        copy.push(piece);
+    }
+    return { checked, failures, small, copy, text: (root.innerText || '').replace(/\n{3,}/g, '\n\n').trim() };
 }
 
 async function settle(page, ms = 700) {
@@ -336,7 +377,7 @@ async function auditTheme(browser, baseUrl, themeName) {
         await settle(page);
         if (await splash.isVisible().catch(() => false)) {
             await capture('welcome', '[data-testid="welcome-splash-modal"]');
-            await splash.getByRole('button', { name: 'Enter Workspace' }).click();
+            await splash.getByRole('button', { name: 'Get Started' }).click();
             await splash.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => {});
         }
 
@@ -437,7 +478,7 @@ async function checkThemeSwitching(browser, baseUrl) {
         const splash = page.locator('[data-testid="welcome-splash-modal"]');
         await splash.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
         if (await splash.isVisible().catch(() => false)) {
-            await splash.getByRole('button', { name: 'Enter Workspace' }).click();
+            await splash.getByRole('button', { name: 'Get Started' }).click();
             await splash.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => {});
         }
     };
@@ -508,6 +549,9 @@ async function main() {
                 }
                 for (const item of entry.small) {
                     problems.push(`${themeName}/${entry.surface}: ${item.size}px text "${item.text}" at ${item.where}`);
+                }
+                for (const issue of languageProblems(entry.copy || [])) {
+                    problems.push(`${themeName}/${entry.surface}: ${issue}`);
                 }
             }
         }

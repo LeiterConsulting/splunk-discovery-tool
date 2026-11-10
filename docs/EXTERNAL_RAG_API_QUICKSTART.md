@@ -2,7 +2,7 @@
 
 This phase adds a read-only external RAG API under `/api/external/*`.
 
-The goal is to let another tool, script, analyst workflow, or future agent client query the DT4SMS RAG asset plane without using the operator UI.
+The goal is to let another tool, script, analyst workflow, or future agent client query the Splunk Discovery Tool RAG knowledge assets without using the web interface.
 
 ## What Ships In This Slice
 
@@ -15,7 +15,7 @@ The goal is to let another tool, script, analyst workflow, or future agent clien
 
 ## Required Setup
 
-1. Start DT4SMS.
+1. Start Splunk Discovery Tool.
 2. Enable the external API.
 3. Issue an `external_api` token with the scopes your client needs.
 4. If you want useful RAG search results, make sure `rag_chromadb` is installed, enabled, and indexed.
@@ -140,4 +140,4 @@ DT4SMS_ADMIN_PASSWORD=BetterPassword123!
 
 This guide is REST-only.
 
-The inbound MCP surface now ships separately under `/api/external/mcp` and uses the same read-only posture plus DT4SMS-issued scoped tokens. See `docs/EXTERNAL_MCP_QUICKSTART.md` for MCP setup, helper-client usage, and the stdio bridge launcher shape.
+The inbound MCP surface now ships separately under `/api/external/mcp` and uses the same read-only posture plus scoped tokens issued by Splunk Discovery Tool. See `docs/EXTERNAL_MCP_QUICKSTART.md` for MCP setup, helper-client usage, and the stdio bridge launcher shape.

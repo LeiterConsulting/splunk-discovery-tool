@@ -1,6 +1,6 @@
 # Account Function Testing
 
-Use `npm run test:account-functions` to run the current DT4SMS account-function matrix end to end.
+Use `npm run test:account-functions` to run the current Splunk Discovery Tool account-function matrix end to end.
 
 The command covers:
 
@@ -16,7 +16,7 @@ Useful variants:
 - `node tools/run_account_function_tests.mjs --browser-only`
 - `npm run test:auth-browser`
 
-The browser harness does not require an external identity provider. It starts a minimal in-process OIDC server that exposes discovery, authorization, token, userinfo, JWKS, and end-session endpoints so the real DT4SMS browser flow can execute end to end.
+The browser harness does not require an external identity provider. It starts a minimal in-process OIDC server that exposes discovery, authorization, token, userinfo, JWKS, and end-session endpoints so the real Splunk Discovery Tool browser flow can execute end to end.
 
 Optional external sandbox
 

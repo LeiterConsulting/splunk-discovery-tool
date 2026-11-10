@@ -1,8 +1,8 @@
 # External MCP Quickstart
 
-This phase adds a read-only inbound MCP surface for DT4SMS under `/api/external/mcp`.
+This phase adds a read-only inbound MCP surface for Splunk Discovery Tool under `/api/external/mcp`.
 
-It is intended for agent clients or lightweight automation that want MCP-style tool access to DT4SMS retrieval, artifact, capability, and runtime-summary context without needing bespoke REST integration.
+It is intended for agent clients or lightweight automation that want MCP-style tool access to Splunk Discovery Tool retrieval, artifact, capability, and runtime-summary context without needing bespoke REST integration.
 
 ## What Ships In This Slice
 
@@ -27,11 +27,11 @@ It is intended for agent clients or lightweight automation that want MCP-style t
 
 ## Required Setup
 
-1. Start DT4SMS.
+1. Start Splunk Discovery Tool.
 2. Enable the external MCP surface.
 3. Issue an `inbound_mcp` token with the `mcp:tools:read` scope.
 4. If you want useful search/context results, make sure `rag_chromadb` is installed, enabled, and indexed.
-5. If you want artifact and discovery coverage, make sure DT4SMS has generated output under `output/`.
+5. If you want artifact and discovery coverage, make sure Splunk Discovery Tool has generated output under `output/`.
 
 ## Transport Notes
 
@@ -48,7 +48,7 @@ This is a practical read-only inbound MCP surface for scripted clients and HTTP-
 
 If a third-party MCP client only supports stdio or a different transport launcher shape, use the helper client or a thin bridge until a richer transport layer is added later.
 
-The repo now ships a thin stdio bridge that forwards framed MCP requests to the same HTTP endpoint. This lets command-launch MCP clients point at DT4SMS without writing their own adapter layer.
+The repo now ships a thin stdio bridge that forwards framed MCP requests to the same HTTP endpoint. This lets command-launch MCP clients point at Splunk Discovery Tool without writing their own adapter layer.
 
 Example bridge launch:
 
@@ -229,7 +229,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 - `system_get_runtime_summary`: returns sanitized install/runtime posture and coverage summary without secrets
 - `capabilities_list`: returns sanitized capability inventory and health state
 - `capabilities_get_detail`: returns sanitized detail for one capability, including safe capability-specific readiness fields
-- `artifacts_list`: returns sanitized generated-artifact metadata from the DT4SMS output catalog
+- `artifacts_list`: returns sanitized generated-artifact metadata from the Splunk Discovery Tool output catalog
 - `artifacts_get_detail`: returns sanitized metadata plus a bounded preview for one artifact
 - `discovery_get_dashboard`: returns a compact discovery dashboard with KPIs, trends, and recent session summaries
 - `discovery_get_latest_intelligence`: returns the latest intelligence blueprint with sanitized artifact metadata

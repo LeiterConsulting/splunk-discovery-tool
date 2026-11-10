@@ -84,7 +84,7 @@ After startup, open the URL printed in the console (typically **http://localhost
 
 ### First-run splash and workspace shell
 
-![Current DT4SMS welcome splash and workspace shell](docs/screenshots/welcome-splash-current.png)
+![Current Splunk Discovery Tool welcome screen and workspace](docs/screenshots/welcome-splash-current.png)
 
 ### Mission workspace
 

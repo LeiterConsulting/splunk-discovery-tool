@@ -1,4 +1,4 @@
-"""Deterministic export bundle generation for DT4SMS discovery artifacts."""
+"""Deterministic export bundle generation for Splunk Discovery Tool discovery artifacts."""
 
 import json
 import re
@@ -31,8 +31,8 @@ def _operator_voice_label(value: Any) -> str:
     if voice == "evidence":
         return "Evidence-led"
     if voice == "executive":
-        return "Executive Brief"
-    return "Direct Ops"
+        return "Executive"
+    return "Direct"
 
 
 class DeterministicExportProvider:
@@ -373,7 +373,7 @@ class DeterministicExportProvider:
             "capability": "export_tools",
             "bundle_type": "discovery_bundle",
             "generated_at": _utc_now_iso(),
-            "title": str(title or f"DT4SMS Report Package {timestamp}").strip(),
+            "title": str(title or f"Splunk Discovery Tool Report Package {timestamp}").strip(),
             "session_timestamp": timestamp,
             "persona": persona,
             "operator_voice": voice,
@@ -412,13 +412,13 @@ class DeterministicExportProvider:
         ]
         return "\n".join(
             [
-                "# DT4SMS Report Package",
+                "# Splunk Discovery Tool Report Package",
                 "",
                 f"- Generated: {manifest.get('generated_at', '')}",
                 f"- Session: {manifest.get('session_timestamp', 'unknown')}",
-                f"- Persona: {str(manifest.get('persona', 'admin')).title()}",
-                f"- Operator Voice: {manifest.get('operator_voice_label', _operator_voice_label(manifest.get('operator_voice')))}",
-                f"- Artifact Count: {manifest.get('artifact_count', 0)}",
+                f"- Audience: {str(manifest.get('persona', 'admin')).title()}",
+                f"- Style: {manifest.get('operator_voice_label', _operator_voice_label(manifest.get('operator_voice')))}",
+                f"- Files included: {manifest.get('artifact_count', 0)}",
                 "",
                 "## Environment Snapshot",
                 "",

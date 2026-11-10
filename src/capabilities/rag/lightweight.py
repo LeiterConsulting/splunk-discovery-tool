@@ -1,4 +1,4 @@
-"""Lightweight local retrieval over DT4SMS artifact output."""
+"""Lightweight local retrieval over Splunk Discovery Tool artifact output."""
 
 import re
 from pathlib import Path

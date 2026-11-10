@@ -1,4 +1,4 @@
-# DT4SMS Developer Reference
+# Splunk Discovery Tool Developer Reference
 
 This reference is for developers repurposing the demo into production or custom projects.
 
@@ -18,17 +18,17 @@ This reference is for developers repurposing the demo into production or custom 
 
 ## 2) Discovery Flow (Current)
 
-The current discovery pipeline executes in these phases:
+The current discovery pipeline runs these stages (the labels match what the UI shows):
 
-1. Signal capture
+1. Survey the environment
    - get_quick_overview()
-2. Evidence collection
+2. Collect details
    - discover_environment() yields step-level findings
-3. Intelligence synthesis
+3. Classify data, recommend actions, and suggest use cases
    - classify_data()
    - generate_recommendations()
    - generate_suggested_use_cases()
-4. Artifact packaging
+4. Assemble results and save reports
    - v2_intelligence_blueprint_<ts>.json
    - v2_insights_brief_<ts>.md
    - v2_operator_runbook_<ts>.md

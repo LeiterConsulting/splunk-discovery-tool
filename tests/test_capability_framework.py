@@ -1855,7 +1855,7 @@ class CapabilityFrameworkTests(unittest.TestCase):
             summary_markdown = (output_dir / "exports" / export_result["summary_name"]).read_text(encoding="utf-8")
             self.assertEqual(manifest["operator_voice"], "evidence")
             self.assertEqual(manifest["operator_voice_label"], "Evidence-led")
-            self.assertIn("- Operator Voice: Evidence-led", summary_markdown)
+            self.assertIn("- Style: Evidence-led", summary_markdown)
 
             with zipfile.ZipFile(zip_path, "r") as archive:
                 names = set(archive.namelist())
@@ -1936,7 +1936,7 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 self.assertEqual(export_payload["session_timestamp"], timestamp)
                 self.assertEqual(export_payload["persona"], "executive")
                 self.assertEqual(export_payload["operator_voice"], "executive")
-                self.assertEqual(export_payload["operator_voice_label"], "Executive Brief")
+                self.assertEqual(export_payload["operator_voice_label"], "Executive")
                 self.assertIn("_executive_executive", export_payload["bundle_name"])
                 self.assertTrue(Path(export_payload["bundle_path"]).exists())
             finally:

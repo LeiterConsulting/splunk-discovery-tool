@@ -1,4 +1,4 @@
-# DT4SMS Discovery Architecture Guide
+# Splunk Discovery Tool: Discovery Architecture Guide
 
 This document describes the current architecture direction for the demo-first project.
 
