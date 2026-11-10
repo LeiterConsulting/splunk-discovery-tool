@@ -497,6 +497,25 @@ class WebAppLocalAuthTests(unittest.TestCase):
         self.assertEqual(config_response.status_code, 200)
         self.assertIn("security", config_response.json())
 
+    def test_capability_uninstall_route_marks_capability_not_installed(self):
+        self._enable_m26_14_advisor()
+
+        response = self.client.post("/api/capabilities/m26_14_advisor/uninstall")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["action"], "uninstall")
+        self.assertFalse(payload["state"]["installed"])
+        self.assertFalse(payload["state"]["enabled"])
+        self.assertEqual(payload["state"]["health_status"], "not_installed")
+
+        listing = self.client.get("/api/capabilities")
+        self.assertEqual(listing.status_code, 200)
+        self.assertFalse(listing.json()["capabilities"]["m26_14_advisor"]["installed"])
+
+        missing = self.client.post("/api/capabilities/not_a_capability/uninstall")
+        self.assertEqual(missing.status_code, 404)
+
     def test_connection_info_hides_unconfigured_default_placeholders(self):
         connection_response = self.client.get("/connection-info")
         self.assertEqual(connection_response.status_code, 200)
@@ -5240,7 +5259,8 @@ Environment summary.
             self.assertEqual(result["title"], "Executive runbook (Executive style)")
             self.assertIn("**Style:** Executive", result["markdown"])
             self.assertIn("Quarter priority 1", result["markdown"])
-            self.assertIn("Assign an owner and carry this into the next planning cycle.", result["markdown"])
+            self.assertIn("- Summary: Assign a single owner for onboarding missing high-value data sources.", result["markdown"])
+            self.assertIn("### Board theme 1\n- Summary: Telemetry alignment reduces investigative delay.\n\n", result["markdown"])
         finally:
             web_app.load_discovery_sessions = original_load_discovery_sessions
             web_app.hydrate_discovery_session = original_hydrate_discovery_session

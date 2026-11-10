@@ -1809,78 +1809,69 @@ def _operator_voice_label(value: Any) -> str:
     return "Direct"
 
 
+def _first_text_line(value: Any) -> str:
+    entries = value if isinstance(value, list) else [value]
+    for entry in entries:
+        if isinstance(entry, dict):
+            entry = entry.get("action") or entry.get("step") or entry.get("title") or entry.get("description")
+        text = " ".join(str(entry or "").split())
+        if text:
+            return text
+    return ""
+
+
+# Voice items leave a field empty when discovery recorded nothing for it, so
+# runbooks never pad every step with the same generic advice.
 def _build_operator_voice_admin_item(action: Dict[str, Any], voice: str) -> Dict[str, str]:
     title = str(action.get("title") or "Admin follow-up").strip() or "Admin follow-up"
-    why = str(action.get("why") or "This needs an owner and a plan.").strip()
-    next_step = str(action.get("next_step") or "See the runbook for the order of steps.").strip()
-    effort = str(action.get("effort") or "unknown").strip() or "unknown"
+    why = str(action.get("why") or "").strip()
+    next_step = str(action.get("next_step") or "").strip()
+    effort = str(action.get("effort") or "").strip()
+    if effort.lower() == "unknown":
+        effort = ""
 
     if voice == "evidence":
-        return {
-            "title": title,
-            "summary": why,
-            "meta": f"How to verify: {next_step}",
-            "badge": f"Effort: {effort}",
-        }
-    if voice == "executive":
-        return {
-            "title": title,
-            "summary": f"Risk if ignored: {why}",
-            "meta": f"Decision needed: {next_step}",
-            "badge": f"Effort: {effort}",
-        }
+        summary_prefix, meta_prefix = "", "How to verify: "
+    elif voice == "executive":
+        summary_prefix, meta_prefix = "Risk if ignored: ", "Decision needed: "
+    else:
+        summary_prefix, meta_prefix = "", "Next step: "
     return {
         "title": title,
-        "summary": why,
-        "meta": f"Next step: {next_step}",
-        "badge": f"Effort: {effort}",
+        "summary": f"{summary_prefix}{why}" if why else "",
+        "meta": f"{meta_prefix}{next_step}" if next_step else "",
+        "badge": f"Effort: {effort}" if effort else "",
     }
 
 
 def _build_operator_voice_analyst_item(track: Dict[str, Any], voice: str) -> Dict[str, str]:
     title = str(track.get("title") or "Investigation track").strip() or "Investigation track"
-    question = str(track.get("question") or "Decide what to look for, then check it against current data.").strip()
-    success_metric = str(track.get("success_metric") or "Decide how you will measure success.").strip()
+    question = str(track.get("question") or "").strip()
+    success_metric = str(track.get("success_metric") or "").strip()
 
     if voice == "evidence":
-        return {
-            "title": title,
-            "summary": question,
-            "meta": f"Proof: {success_metric}",
-        }
-    if voice == "executive":
-        return {
-            "title": title,
-            "summary": f"If confirmed: {question}",
-            "meta": f"Why it matters: {success_metric}",
-        }
+        summary_prefix, meta_prefix = "", "Proof: "
+    elif voice == "executive":
+        summary_prefix, meta_prefix = "If confirmed: ", "Why it matters: "
+    else:
+        summary_prefix, meta_prefix = "Check: ", "Done when: "
     return {
         "title": title,
-        "summary": f"Check: {question}",
-        "meta": f"Done when: {success_metric}",
+        "summary": f"{summary_prefix}{question}" if question else "",
+        "meta": f"{meta_prefix}{success_metric}" if success_metric else "",
     }
 
 
 def _build_operator_voice_executive_item(item: Any, voice: str, index: int, item_type: str = "theme") -> Dict[str, str]:
-    summary = str(item or "No executive summary was recorded.").strip() or "No executive summary was recorded."
+    summary = str(item or "").strip()
 
     if voice == "evidence":
-        return {
-            "title": f"{'Evidence theme' if item_type == 'theme' else '90-day check'} {index}",
-            "summary": summary,
-            "meta": "Use this to justify spending on data and monitoring." if item_type == "theme" else "Use this to set measurable checkpoints for leadership.",
-        }
-    if voice == "executive":
-        return {
-            "title": f"{'Board theme' if item_type == 'theme' else 'Quarter priority'} {index}",
-            "summary": summary,
-            "meta": "Present this as business risk and the benefit of fixing it." if item_type == "theme" else "Assign an owner and carry this into the next planning cycle.",
-        }
-    return {
-        "title": f"{'Theme' if item_type == 'theme' else '90-day action'} {index}",
-        "summary": summary,
-        "meta": "Use this to decide what to hand off next." if item_type == "theme" else "Schedule this as a recurring task.",
-    }
+        title = f"{'Evidence theme' if item_type == 'theme' else '90-day check'} {index}"
+    elif voice == "executive":
+        title = f"{'Board theme' if item_type == 'theme' else 'Quarter priority'} {index}"
+    else:
+        title = f"{'Theme' if item_type == 'theme' else '90-day action'} {index}"
+    return {"title": title, "summary": summary, "meta": ""}
 
 
 def _build_external_runtime_summary_payload() -> Dict[str, Any]:
@@ -9003,13 +8994,12 @@ def build_persona_playbooks(
     admin_actions = []
     for rec in top_recs:
         title = rec.get("title", "Recommendation")
-        complexity = rec.get("complexity", "unknown")
         admin_actions.append({
             "title": title,
-            "why": rec.get("description", "No description"),
-            "effort": complexity,
+            "why": _first_text_line(rec.get("description")),
+            "effort": _first_text_line(rec.get("complexity")),
             "owner": "Splunk Admin",
-            "next_step": f"Create implementation task for: {title}"
+            "next_step": _first_text_line(rec.get("suggested_actions") or rec.get("next_steps")),
         })
 
     analyst_hypotheses = []
@@ -9018,24 +9008,18 @@ def build_persona_playbooks(
             "title": use_case.get("title", "Use Case"),
             "question": use_case.get("description", ""),
             "data_sources": use_case.get("data_sources", []),
-            "success_metric": (use_case.get("success_metrics", ["Actionable detection uplift"]) or ["Actionable detection uplift"])[0]
+            "success_metric": _first_text_line(use_case.get("success_metrics")),
         })
 
     if not isinstance(readiness_score, int) or isinstance(readiness_score, bool):
         readiness_score = compute_discovery_readiness_score(overview, recs, use_cases, mcp_capabilities)
+    business_value_themes = [_first_text_line(use_case.get("business_value")) for use_case in use_cases]
+    next_90_day_focus = [_first_text_line(rec.get("title")) for rec in top_recs]
     exec_brief = {
         "platform_readiness_score": readiness_score,
         "headline": _readiness_headline(readiness_score),
-        "business_value_themes": [
-            "Risk reduction through improved coverage and detection fidelity",
-            "Operational efficiency via standardization and automation",
-            "Faster decision-making with cross-functional analytics"
-        ],
-        "next_90_day_focus": [
-            "Execute top high-priority recommendations",
-            "Productize at least 2 cross-functional use cases",
-            "Track measurable KPIs for detection quality and MTTR"
-        ],
+        "business_value_themes": [theme for theme in business_value_themes if theme][:3],
+        "next_90_day_focus": [item for item in next_90_day_focus if item][:3],
         "environment_snapshot": {
             "indexes": _safe_int(getattr(overview, "total_indexes", 0)),
             "sourcetypes": _safe_int(getattr(overview, "total_sourcetypes", 0)),
@@ -9838,10 +9822,10 @@ def build_session_runbook_payload(
             })
             markdown_lines.extend([
                 f"## {idx}. {voice_item['title']}",
-                f"- Owner: Splunk Admin",
-                f"- {voice_item['badge']}",
-                f"- Summary: {voice_item['summary']}",
-                f"- {voice_item['meta']}",
+                "- Owner: Splunk Admin",
+                *([f"- {voice_item['badge']}"] if voice_item["badge"] else []),
+                *([f"- Summary: {voice_item['summary']}"] if voice_item["summary"] else []),
+                *([f"- {voice_item['meta']}"] if voice_item["meta"] else []),
                 ""
             ])
 
@@ -9863,10 +9847,10 @@ def build_session_runbook_payload(
             })
             markdown_lines.extend([
                 f"## {idx}. {voice_item['title']}",
-                f"- Owner: Security Analyst",
-                f"- Summary: {voice_item['summary']}",
-                f"- {voice_item['meta']}",
-                f"- Data Sources: {source_text}",
+                "- Owner: Security Analyst",
+                *([f"- Summary: {voice_item['summary']}"] if voice_item["summary"] else []),
+                *([f"- {voice_item['meta']}"] if voice_item["meta"] else []),
+                *([f"- Data Sources: {source_text}"] if source_text else []),
                 ""
             ])
 
@@ -9874,7 +9858,9 @@ def build_session_runbook_payload(
         executive = personas.get("executive", {}) if isinstance(personas.get("executive", {}), dict) else {}
         headline = executive.get("headline", "")
         themes = executive.get("business_value_themes", []) if isinstance(executive.get("business_value_themes", []), list) else []
+        themes = [theme for theme in themes if str(theme or "").strip()]
         focus_items = executive.get("next_90_day_focus", []) if isinstance(executive.get("next_90_day_focus", []), list) else []
+        focus_items = [item for item in focus_items if str(item or "").strip()]
 
         for idx, item in enumerate(focus_items[:8], 1):
             voice_item = _build_operator_voice_executive_item(item, voice_key, idx, "focus")
@@ -9891,23 +9877,23 @@ def build_session_runbook_payload(
             "## Executive Headline",
             f"{headline}",
             "",
-            "## Business Value Themes"
         ])
+        if themes:
+            markdown_lines.append("## Business Value Themes")
         for idx, theme in enumerate(themes[:6], 1):
             theme_item = _build_operator_voice_executive_item(theme, voice_key, idx, "theme")
             markdown_lines.extend([
                 f"### {theme_item['title']}",
                 f"- Summary: {theme_item['summary']}",
-                f"- {theme_item['meta']}",
                 "",
             ])
-        markdown_lines.extend(["", "## Next 90 Days"])
+        if focus_items:
+            markdown_lines.extend(["", "## Next 90 Days"])
         for idx, item in enumerate(focus_items[:8], 1):
             focus_item = _build_operator_voice_executive_item(item, voice_key, idx, "focus")
             markdown_lines.extend([
                 f"### {focus_item['title']}",
                 f"- Summary: {focus_item['summary']}",
-                f"- {focus_item['meta']}",
                 "",
             ])
         markdown_lines.append("")
@@ -11025,15 +11011,17 @@ async def run_discovery(
                 f.write("## Admin Action Queue\n\n")
                 for idx, action in enumerate(admin_actions[:6], 1):
                     f.write(f"{idx}. **{action.get('title', 'Action')}**\n")
-                    f.write(f"   - Why: {action.get('why', '')}\n")
-                    f.write(f"   - Effort: {action.get('effort', 'unknown')}\n")
-                    f.write(f"   - Next Step: {action.get('next_step', '')}\n\n")
+                    for label, key in (("Why", "why"), ("Effort", "effort"), ("Next Step", "next_step")):
+                        if action.get(key):
+                            f.write(f"   - {label}: {action[key]}\n")
+                    f.write("\n")
 
                 f.write("## Analyst Investigation Tracks\n\n")
                 for idx, hypothesis in enumerate(analyst_hypotheses[:6], 1):
                     f.write(f"{idx}. **{hypothesis.get('title', 'Track')}**\n")
-                    f.write(f"   - Question: {hypothesis.get('question', '')}\n")
-                    f.write(f"   - Metric: {hypothesis.get('success_metric', '')}\n")
+                    for label, key in (("Question", "question"), ("Metric", "success_metric")):
+                        if hypothesis.get(key):
+                            f.write(f"   - {label}: {hypothesis[key]}\n")
                     data_sources = hypothesis.get('data_sources', [])
                     if isinstance(data_sources, list) and data_sources:
                         f.write(f"   - Data Sources: {', '.join(str(s) for s in data_sources[:6])}\n")
@@ -11045,7 +11033,8 @@ async def run_discovery(
                 for theme in executive.get('business_value_themes', []):
                     f.write(f"  - Value Theme: {theme}\n")
                 f.write("\n")
-                f.write("### Next 90 Days\n\n")
+                if executive.get('next_90_day_focus'):
+                    f.write("### Next 90 Days\n\n")
                 for item in executive.get('next_90_day_focus', []):
                     f.write(f"- {item}\n")
             report_paths.append(str(persona_md_path.name))
@@ -12888,6 +12877,14 @@ async def enable_capability(name: str):
 async def disable_capability(name: str):
     """Disable an optional capability without uninstalling it."""
     result = capability_manager.disable_capability(name).to_dict()
+    _raise_for_capability_result(result)
+    return result
+
+
+@app.post("/api/capabilities/{name}/uninstall")
+async def uninstall_capability(name: str):
+    """Turn off an optional capability and mark it not installed, keeping its settings and data."""
+    result = capability_manager.uninstall_capability(name).to_dict()
     _raise_for_capability_result(result)
     return result
 

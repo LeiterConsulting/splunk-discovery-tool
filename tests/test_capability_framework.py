@@ -1800,6 +1800,55 @@ class CapabilityFrameworkTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
 
+    def test_uninstall_turns_capability_off_and_keeps_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "config.encrypted"
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+
+                self.assertTrue(manager.install_capability("visualization_tools").ok)
+                self.assertTrue(manager.enable_capability("visualization_tools").ok)
+                self.assertTrue(manager.update_capability_config("visualization_tools", {"max_preview_points": 12}).ok)
+
+                uninstall_result = manager.uninstall_capability("visualization_tools")
+                self.assertTrue(uninstall_result.ok)
+                self.assertEqual(uninstall_result.action, "uninstall")
+                self.assertEqual(uninstall_result.message, "Capability removed.")
+                self.assertFalse(uninstall_result.state["installed"])
+                self.assertFalse(uninstall_result.state["enabled"])
+                self.assertEqual(uninstall_result.state["health_status"], "not_installed")
+                self.assertIsNone(uninstall_result.state["version"])
+                self.assertIsNone(uninstall_result.state["installed_at"])
+                self.assertEqual(uninstall_result.state["config"]["max_preview_points"], 12)
+
+                reloaded = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+                reloaded_state = reloaded.get_capability_state("visualization_tools", refresh_health=True)
+                self.assertFalse(reloaded_state["installed"])
+                self.assertFalse(reloaded_state["enabled"])
+                self.assertEqual(reloaded_state["health_status"], "not_installed")
+                self.assertEqual(reloaded_state["config"]["max_preview_points"], 12)
+                self.assertFalse(reloaded.enable_capability("visualization_tools").ok)
+
+                repeat_result = reloaded.uninstall_capability("visualization_tools")
+                self.assertTrue(repeat_result.ok)
+                self.assertEqual(repeat_result.message, "Capability is not installed.")
+
+                reinstall_result = reloaded.install_capability("visualization_tools")
+                self.assertTrue(reinstall_result.ok)
+                self.assertTrue(reinstall_result.state["installed"])
+                self.assertFalse(reinstall_result.state["enabled"])
+                self.assertEqual(reinstall_result.state["config"]["max_preview_points"], 12)
+
+                unknown_result = reloaded.uninstall_capability("not_a_capability")
+                self.assertFalse(unknown_result.ok)
+                self.assertEqual(unknown_result.message, "Unknown capability.")
+            finally:
+                os.chdir(original_cwd)
+
     def test_export_provider_builds_bundle_and_manifest(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             temp_path = Path(temp_dir)

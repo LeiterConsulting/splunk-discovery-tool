@@ -288,6 +288,7 @@ async function main() {
 
         // The corrected token passes the connection and save checks; nothing is saved.
         await page.getByTestId('settings-tab-troubleshoot').click();
+        assert(await page.getByRole('button', { name: 'Save Settings' }).count() === 0, 'Troubleshoot only tests settings, so it should not show Save Settings.');
         await page.getByTestId('troubleshoot-mcp-token').fill(GOOD_TOKEN);
         await page.getByTestId('troubleshoot-run').click();
         results = await waitForResults(page);

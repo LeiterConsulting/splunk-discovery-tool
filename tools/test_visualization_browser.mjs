@@ -698,6 +698,7 @@ async function runWelcomeSplashRegression(baseUrl) {
 
         const splashCheckbox = welcomeSplash.locator('[data-testid="welcome-splash-dismiss-checkbox"]');
         assert(!(await splashCheckbox.isChecked()), 'Welcome splash do-not-show checkbox should be off by default.');
+        assert(await welcomeSplash.getByTestId('welcome-splash-steps').locator('li').count() === 3, 'The welcome screen should list three getting-started steps.');
 
         await welcomeSplash.getByRole('button', { name: 'Get Started' }).click();
         await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
@@ -734,7 +735,7 @@ async function runWelcomeSplashRegression(baseUrl) {
 
 async function runWorkspaceSmoke(baseUrl) {
     const reportFilename = 'spl_library_report_20260514_120000.md';
-    const reportLabel = 'spl_library_report.md';
+    const reportLabel = 'SPL library report';
     const reportQuery = 'search index=reports | stats count by source';
     const libraryQuery = 'search index=_internal | stats count by sourcetype';
     const libraryAssetId = 'spl-library-asset-1';
@@ -794,8 +795,8 @@ async function runWorkspaceSmoke(baseUrl) {
 
     const capabilitiesPayload = {
         summary: {
-            total: 2,
-            installed: 2,
+            total: 4,
+            installed: 3,
             enabled: 2,
             ready: 2,
             restart_required: 0,
@@ -873,6 +874,37 @@ async function runWorkspaceSmoke(baseUrl) {
                     default_earliest: '-24h',
                     default_latest: 'now',
                 },
+            },
+            export_tools: {
+                name: 'export_tools',
+                title: 'Export Tools',
+                description: 'Package reports for download.',
+                category: 'tool_pack',
+                install_method: 'internal',
+                runtime_available: true,
+                installed: true,
+                enabled: false,
+                restart_required: false,
+                health_status: 'disabled',
+                health_message: '',
+                version: '1.0.0',
+                dependency_packages: [],
+                config: {},
+            },
+            visualization_tools: {
+                name: 'visualization_tools',
+                title: 'Charts',
+                description: 'Draw charts from search results.',
+                category: 'tool_pack',
+                install_method: 'internal',
+                runtime_available: true,
+                installed: false,
+                enabled: false,
+                restart_required: false,
+                health_status: 'not_installed',
+                health_message: '',
+                dependency_packages: [],
+                config: {},
             },
         },
     };
@@ -1025,12 +1057,23 @@ async function runWorkspaceSmoke(baseUrl) {
         assert(pageErrors.length === 0, `Workspace smoke encountered page errors: ${pageErrors.join(' | ')}`);
 
         await page.getByTestId('workspace-tab-discovery').click({ force: true });
-        await expandDiscoveryReportHierarchy(page, reportLabel);
         const firstReportRow = page.getByTestId('discovery-report-row').first();
+        // The newest run opens on its own, so its reports show without expanding anything.
         await firstReportRow.waitFor({ state: 'visible' });
         const reportRowLabel = ((await firstReportRow.textContent()) || '').trim();
-        assert(reportRowLabel.includes(reportLabel), `Expected the discovery report row to include ${reportLabel}, but received: ${reportRowLabel}`);
+        assert(
+            reportRowLabel.includes(reportLabel) && reportRowLabel.includes(reportFilename),
+            `Expected the discovery report row to show "${reportLabel}" and ${reportFilename}, but received: ${reportRowLabel}`,
+        );
         await firstReportRow.click({ force: true });
+
+        const markdownViewer = page.getByTestId('report-viewer-markdown');
+        await markdownViewer.waitFor({ state: 'visible' });
+        const markdownHeading = ((await markdownViewer.locator('h3').first().textContent()) || '').trim();
+        assert(markdownHeading === 'SPL Library Report', `Markdown reports should render headings, but the first heading was: ${markdownHeading}`);
+        const markdownText = (await markdownViewer.textContent()) || '';
+        assert(!markdownText.includes('# SPL Library Report'), 'Markdown reports should not show raw heading markers.');
+        assert(await markdownViewer.locator('pre').count() === 1, 'Markdown reports should render fenced code as a code block.');
 
         await page.getByTestId('report-viewer-spl-blocks').waitFor({ state: 'visible' });
         const reportSplCardCount = await page.getByTestId('report-viewer-spl-card').count();
@@ -1042,6 +1085,25 @@ async function runWorkspaceSmoke(baseUrl) {
         await page.getByTestId('workspace-tab-knowledge-base').click({ force: true });
         const knowledgeBaseTabSelected = await page.getByTestId('workspace-tab-knowledge-base').getAttribute('aria-selected');
         assert(knowledgeBaseTabSelected === 'true', 'Knowledge Base workspace tab did not become active.');
+
+        // Each capability offers only the actions that fit its state.
+        const readCapabilityActions = (name) => page.getByTestId(`capability-actions-${name}`).first()
+            .locator('[data-capability-action]')
+            .evaluateAll((buttons) => buttons.map((button) => button.getAttribute('data-capability-action')).join(','));
+        await page.getByTestId('capability-actions-rag_chromadb').first().waitFor({ state: 'visible' });
+        const ragActions = await readCapabilityActions('rag_chromadb');
+        assert(ragActions === 'test,disable', `A ready Knowledge Base should offer Test and Turn Off only, got: ${ragActions}`);
+        await page.getByTestId('workspace-tab-capabilities').click({ force: true });
+        for (const [name, expected, state] of [
+            ['splunk_deeplink_tools', 'test,disable', 'on'],
+            ['export_tools', 'enable,uninstall', 'installed but off'],
+            ['visualization_tools', 'install', 'not installed'],
+        ]) {
+            await page.getByTestId(`capability-actions-${name}`).first().waitFor({ state: 'visible' });
+            const actions = await readCapabilityActions(name);
+            assert(actions === expected, `A capability that is ${state} (${name}) should offer ${expected}, got: ${actions}`);
+        }
+        await page.getByTestId('workspace-tab-knowledge-base').click({ force: true });
 
         await page.getByTestId('context-library-filter-spl_library').waitFor({ state: 'visible' });
         await page.getByTestId('context-library-filter-spl_library').click();
@@ -1167,14 +1229,27 @@ async function runOperatorWorkflowRegression(baseUrl, seededRuntimeState) {
         await page.getByText(/^Contents: .+ reports, .+ runbook, .+ style$/).waitFor({ state: 'visible' });
 
         await page.getByTestId('workspace-tab-discovery').click({ force: true });
-        await page.getByText('Discovery stages', { exact: true }).waitFor({ state: 'visible' });
+        await page.getByTestId('discovery-status-card').waitFor({ state: 'visible' });
 
         const summaryAction = page.getByTestId('discovery-ledger-summary-action');
         await summaryAction.waitFor({ state: 'visible' });
         const summaryActionLabel = ((await summaryAction.textContent()) || '').trim();
-        assert(summaryActionLabel.length > 0, 'Discovery ledger summary action did not render a usable label.');
+        assert(summaryActionLabel === 'View Summary', `The Discovery status card should offer View Summary for a run with a saved summary, but showed "${summaryActionLabel}".`);
+
+        // A finished run keeps stages and the log folded under Run details.
+        const runDetails = page.getByTestId('discovery-run-details');
+        assert(!(await runDetails.evaluate((element) => element.open)), 'Run details should start folded once discovery has finished.');
+        await runDetails.locator('summary').click();
+        await page.getByText('Discovery stages', { exact: true }).waitFor({ state: 'visible' });
+        assert(await runDetails.getByTestId('discovery-stage').count() > 0, 'Run details did not list the discovery stages.');
+        await runDetails.locator('summary').click();
 
         await expandDiscoveryReportHierarchy(page, 'cached summary session');
+        const reportRowTitles = (await page.getByTestId('discovery-report-row-title').allInnerTexts()).map((title) => title.trim());
+        assert(
+            reportRowTitles.length > 0 && reportRowTitles.every((title) => title && !title.includes('_')),
+            `Report library rows should show plain report names, but showed: ${reportRowTitles.join(', ')}`,
+        );
         const cachedSummaryButtons = page.getByTestId('discovery-report-session-toggle').locator('button').filter({ hasText: 'View Summary' });
         assert(await cachedSummaryButtons.count() > 0, `Expected at least one cached summary path in Discovery, but ledger action was "${summaryActionLabel}" and no View Summary buttons were available.`);
         const summaryResponsePromise = page.waitForResponse((response) => {
@@ -1272,7 +1347,7 @@ async function runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState) {
         await page.goto(baseUrl, { waitUntil: 'networkidle' });
         await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
         await page.getByTestId('workspace-tab-discovery').click({ force: true });
-        await page.getByText('Discovery stages', { exact: true }).waitFor({ state: 'visible' });
+        await page.getByTestId('discovery-status-card').waitFor({ state: 'visible' });
 
         await expandDiscoveryReportHierarchy(page, 'active summary worker session');
         const cachedSummaryButtons = page.getByTestId('discovery-report-session-toggle').locator('button').filter({ hasText: 'View Summary' });
@@ -1294,7 +1369,7 @@ async function runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState) {
         await abortSummaryButton.waitFor({ state: 'visible' });
         await abortSummaryButton.click();
 
-        await page.getByText('Discovery stages', { exact: true }).waitFor({ state: 'visible' });
+        await page.getByTestId('discovery-status-card').waitFor({ state: 'visible' });
         await page.getByText('Reconnect to the summary in progress?').waitFor({ state: 'hidden' });
         assert(summarizeSessionRequestCount === 1, `Expected exactly one summarize-session request, received ${summarizeSessionRequestCount}.`);
         assert(abortSummaryRequestCount === 1, `Expected exactly one abort-summary request, received ${abortSummaryRequestCount}.`);
