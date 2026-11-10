@@ -1,7 +1,7 @@
 // Opens every workspace view and dialog in each theme against seeded discovery output and fails when
 // any visible text or placeholder falls below WCAG AA contrast (4.5:1, or 3:1 for large text) or
-// renders smaller than 12px, or when visible text breaks the plain-language rules below. It also
-// checks that choosing a theme in Settings applies and persists it.
+// renders smaller than 12px, when visible text breaks the plain-language rules below, or when a
+// button sits inside a label. It also checks that choosing a theme in Settings applies and persists it.
 // Set UI_CONTRAST_OUT to keep screenshots and a JSON report; UI_CONTRAST_THEMES limits the themes.
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -54,6 +54,9 @@ const REQUIRED_SURFACES = [
     'chat-settings',
     'connection-details',
     'settings-connections',
+    'settings-connection-forms',
+    'settings-save-mcp',
+    'settings-save-llm',
     'settings-appearance',
 ];
 // Visible text must not show raw identifiers, broken plurals, or retired names and jargon.
@@ -327,7 +330,9 @@ function auditContrast(rootSelector) {
         if (!visible(element.closest('select') || element)) continue;
         copy.push(piece);
     }
-    return { checked, failures, small, copy, text: (root.innerText || '').replace(/\n{3,}/g, '\n\n').trim() };
+    // A label that wraps a button gives the button the label's name and clicks it when the label is clicked.
+    const nestedControls = [...root.querySelectorAll('label button, label a[href]')].filter(visible).map(describe);
+    return { checked, failures, small, copy, nestedControls, text: (root.innerText || '').replace(/\n{3,}/g, '\n\n').trim() };
 }
 
 async function settle(page, ms = 700) {
@@ -445,6 +450,25 @@ async function auditTheme(browser, baseUrl, themeName) {
                 if (await clickIfPresent(page.getByTestId(`settings-tab-${tab}`))) {
                     await settle(page, 800);
                     await capture(`settings-${tab}`, '.settings-modal-shell');
+                }
+            }
+            if (await clickIfPresent(page.getByTestId('settings-tab-connections'))) {
+                await settle(page, 600);
+                await clickIfPresent(page.getByRole('button', { name: 'Add MCP Server' }));
+                await clickIfPresent(page.getByRole('button', { name: 'Add AI Model' }));
+                await settle(page, 600);
+                await capture('settings-connection-forms', '.settings-modal-shell');
+                await page.locator('#mcp-url').fill('https://splunk.example.com:8089/services/mcp').catch(() => {});
+                for (const [surface, button, titleId] of [
+                    ['settings-save-mcp', 'Save as New Configuration', 'mcp-save-title'],
+                    ['settings-save-llm', 'Save Connection', 'credential-save-title'],
+                ]) {
+                    if (await clickIfPresent(page.getByRole('button', { name: button, exact: true }))) {
+                        await settle(page, 500);
+                        await capture(surface, `[aria-labelledby="${titleId}"]`);
+                        await clickIfPresent(page.locator(`[aria-labelledby="${titleId}"] button[aria-label="Close"]`));
+                        await delay(250);
+                    }
                 }
             }
             await closeDialogs(page);
@@ -566,6 +590,9 @@ async function main() {
                 }
                 for (const issue of languageProblems(entry.copy || [])) {
                     problems.push(`${themeName}/${entry.surface}: ${issue}`);
+                }
+                for (const where of entry.nestedControls || []) {
+                    problems.push(`${themeName}/${entry.surface}: control inside a label at ${where}`);
                 }
             }
         }

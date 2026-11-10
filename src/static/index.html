@@ -85,18 +85,6 @@
             --ui-scrollbar-track: var(--c-gray-900);
         }
 
-        .animated-gradient {
-            background: linear-gradient(-45deg, #667eea, #764ba2, #667eea, #764ba2);
-            background-size: 400% 400%;
-            animation: gradientShift 3s ease infinite;
-        }
-
-        @keyframes gradientShift {
-            0% { background-position: 0% 50%; }
-            50% { background-position: 100% 50%; }
-            100% { background-position: 0% 50%; }
-        }
-
         .pulse-ring {
             animation: pulse-ring 1.25s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
         }
@@ -206,7 +194,6 @@
         }
 
         @media (prefers-reduced-motion: reduce) {
-            .animated-gradient,
             .pulse-ring,
             .fade-in,
             .slide-in {
@@ -375,34 +362,12 @@
         [data-color-scheme='dark'] .chat-settings-modal-shell .bg-gray-50 { background-color: rgb(var(--c-gray-900)); }
         [data-color-scheme='dark'] .settings-modal-shell .bg-amber-50 { background-color: rgba(var(--c-amber-950), 0.75); }
         [data-color-scheme='dark'] .settings-modal-shell .bg-emerald-50 { background-color: rgba(var(--c-emerald-950), 0.75); }
-
-        [data-color-scheme='dark'] .settings-modal-shell .from-green-50,
-        [data-color-scheme='dark'] .settings-modal-shell .to-emerald-50,
-        [data-color-scheme='dark'] .settings-modal-shell .from-purple-50,
-        [data-color-scheme='dark'] .settings-modal-shell .to-indigo-50 {
-            background-image: none;
-            background-color: rgb(var(--c-gray-800));
-        }
-
-        [data-color-scheme='dark'] .connection-popover .from-purple-50,
-        [data-color-scheme='dark'] .connection-popover .to-indigo-50,
-        [data-color-scheme='dark'] .connection-popover .from-green-50,
-        [data-color-scheme='dark'] .connection-popover .to-emerald-50,
-        [data-color-scheme='dark'] .connection-popover .from-blue-50,
-        [data-color-scheme='dark'] .connection-popover .to-cyan-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .from-green-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .to-emerald-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .from-purple-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .to-indigo-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .from-amber-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .to-yellow-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .from-blue-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .to-cyan-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .from-indigo-50,
-        [data-color-scheme='dark'] .chat-settings-modal-shell .to-violet-50 {
-            background-image: none;
-            background-color: rgb(var(--c-gray-900));
-        }
+        [data-color-scheme='dark'] .settings-modal-shell .bg-indigo-50 { background-color: rgba(var(--c-indigo-950), 0.6); }
+        [data-color-scheme='dark'] .settings-modal-shell .hover\:bg-gray-100:hover { background-color: rgb(var(--c-gray-700)); }
+        [data-color-scheme='dark'] .settings-modal-shell .text-indigo-900 { color: rgb(var(--c-indigo-100)); }
+        [data-color-scheme='dark'] .settings-modal-shell .text-emerald-900 { color: rgb(var(--c-emerald-100)); }
+        [data-color-scheme='dark'] .settings-modal-shell .border-indigo-200 { border-color: rgb(var(--c-indigo-800)); }
+        [data-color-scheme='dark'] .settings-modal-shell .border-emerald-200 { border-color: rgb(var(--c-emerald-800)); }
 
         [data-color-scheme='dark'] .settings-modal-shell .border-gray-100,
         [data-color-scheme='dark'] .settings-modal-shell .border-gray-200,
@@ -421,10 +386,7 @@
         }
 
         [data-color-scheme='dark'] .connection-popover .border-gray-200,
-        [data-color-scheme='dark'] .connection-popover .border-gray-100,
-        [data-color-scheme='dark'] .connection-popover .border-indigo-100,
-        [data-color-scheme='dark'] .connection-popover .border-green-100,
-        [data-color-scheme='dark'] .connection-popover .border-blue-100 { border-color: rgb(var(--c-gray-700)); }
+        [data-color-scheme='dark'] .connection-popover .border-gray-100 { border-color: rgb(var(--c-gray-700)); }
 
         [data-color-scheme='dark'] .settings-modal-shell input,
         [data-color-scheme='dark'] .settings-modal-shell select,

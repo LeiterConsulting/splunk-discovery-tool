@@ -9517,11 +9517,11 @@ def _is_llm_available_for_m26_14_advisory(config: Any) -> Tuple[bool, str]:
     api_key = str(getattr(getattr(config, "llm", None), "api_key", "") or "").strip()
 
     if not provider or not model:
-        return False, "Configured LLM provider or model is missing."
+        return False, "No AI model is set up. Add one in Settings to get an AI review."
     if provider in {"azure", "custom"} and not endpoint_url:
-        return False, f"Provider '{provider}' requires an endpoint URL."
+        return False, f"The {provider} AI provider needs an endpoint URL. Add it in Settings."
     if provider in {"openai", "azure", "anthropic", "gemini"} and not api_key:
-        return False, f"Provider '{provider}' requires an API key."
+        return False, f"The {provider} AI provider needs an API key. Add it in Settings."
     return True, ""
 
 
@@ -9537,7 +9537,7 @@ async def _build_m26_14_llm_analysis_payload(
     if not bool(capability_config.get("allow_bespoke_follow_up", True)):
         return {
             "status": "disabled",
-            "message": "LLM-grounded bespoke follow-up is disabled for the M-26-14 advisor capability.",
+            "message": "AI review is turned off in the M-26-14 capability settings.",
         }
 
     config = config_manager.get()
@@ -9553,7 +9553,7 @@ async def _build_m26_14_llm_analysis_payload(
     except Exception as exc:
         return {
             "status": "error",
-            "message": f"Failed to initialize the configured LLM client: {exc}",
+            "message": f"Could not start the AI model: {exc}",
         }
 
     pack_payload = {
@@ -9705,7 +9705,7 @@ def build_m26_14_profile_payload(
     if not blueprint:
         return {
             "has_data": False,
-            "message": "No M-26-14 profile could be built because the selected V2 blueprint is unavailable.",
+            "message": "Could not build a readiness estimate because the selected discovery results are missing.",
             "validation_packs": list_m26_14_validation_packs(),
             "sessions": sessions[:20],
         }
@@ -9737,7 +9737,7 @@ def build_m26_14_compare_payload(
     if not current.get("has_data") or not baseline.get("has_data"):
         return {
             "has_data": False,
-            "message": "Unable to build both M-26-14 profiles for compare.",
+            "message": "Could not build readiness estimates for both runs.",
             "current": current,
             "baseline": baseline,
             "sessions": sessions[:20],
@@ -11517,11 +11517,11 @@ async def run_m26_14_validation(request: Request, validation_request: M2614Valid
 
     validation_pack = get_m26_14_validation_pack(validation_request.pack_id)
     if validation_pack is None:
-        raise HTTPException(status_code=404, detail=f"Unknown M-26-14 validation pack '{validation_request.pack_id}'")
+        raise HTTPException(status_code=404, detail=f"There is no M-26-14 check named '{validation_request.pack_id}'.")
 
     runtime_config = resolve_effective_runtime_config(request=request)
     if not str(getattr(runtime_config.mcp, "url", "") or "").strip():
-        raise HTTPException(status_code=503, detail="Live validation requires an active runtime MCP connection")
+        raise HTTPException(status_code=503, detail="Live checks need a Splunk MCP server. Add one in Settings, then try again.")
 
     scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
     cache_key = _build_m26_14_validation_cache_key(
@@ -11557,7 +11557,7 @@ async def run_m26_14_validation(request: Request, validation_request: M2614Valid
             content={
                 "status": "error",
                 "pack": validation_pack,
-                "message": str(tool_result.get("error") or "M-26-14 live validation failed"),
+                "message": str(tool_result.get("error") or "The M-26-14 check could not run."),
                 "detail": tool_result.get("detail"),
             },
         )

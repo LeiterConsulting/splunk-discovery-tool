@@ -23,7 +23,7 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
         "priority_objective": "thirf",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Approximate retention coverage from Splunk index settings and flag indexes that appear short for M-26-14 expectations.",
+        "description": "Reads index retention settings and flags indexes that may not keep data as long as M-26-14 requires.",
         "query": (
             "| rest /services/data/indexes splunk_server=local "
             "| eval retention_days=round(frozenTimePeriodInSecs/86400,1) "
@@ -46,7 +46,7 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
         "priority_objective": "cem",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Check for live audit visibility into authentication and administrative actions.",
+        "description": "Checks the Splunk audit log for sign-ins and admin changes.",
         "query": (
             "search index=_audit earliest=-30d "
             "| eval action_group=case(match(action, \"login|logout|authentication\"), \"auth\", match(action, \"edit|create|delete|update|enable|disable\"), \"config_change\", 1=1, \"other\") "
@@ -68,7 +68,7 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
         "priority_objective": "cem",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Look for common network, firewall, proxy, and flow-oriented sourcetypes to estimate source and destination visibility.",
+        "description": "Looks for network, firewall, proxy, and flow data to estimate how much network traffic Splunk can see.",
         "query": (
             "| metadata type=sourcetypes index=* "
             "| eval network_hint=if(match(lower(sourcetype), \"netflow|zeek|suricata|firewall|proxy|pan:traffic|stream:http|stream:tcp|ids|ips\"), 1, 0) "
@@ -91,7 +91,7 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
         "priority_objective": "cem",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Look for Splunk-side role and privilege administration events that indicate change visibility around elevated access.",
+        "description": "Looks for Splunk role and permission changes to see whether changes to elevated access are logged.",
         "query": (
             "search index=_audit earliest=-30d (action=edit_* OR action=create_* OR action=grant_* OR action=remove_*) "
             "| eval privilege_hint=if(match(lower(info), \"role|capab|permission|sharing|owner\"), \"privilege_related\", \"other\") "
@@ -112,7 +112,7 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
         "priority_objective": "thirf",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Check for recent host and source churn to support endpoint addition, removal, and modification review.",
+        "description": "Lists recently active hosts so you can review hosts that were added, removed, or changed.",
         "query": (
             "| metadata type=hosts index=* "
             "| eval last_seen_hours=round((now()-lastTime)/3600,2) "
@@ -129,12 +129,12 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
     },
     {
         "id": "alert_and_detection_posture",
-        "title": "Alert and Detection Posture",
+        "title": "Alert and Detection Coverage",
         "control_area": "collection_operations",
         "priority_objective": "cem",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Inspect enabled saved searches and notable-alert style content as a proxy for actionable alert coverage.",
+        "description": "Reviews enabled alerts and scheduled searches to estimate how much alert coverage exists.",
         "query": (
             "| rest /servicesNS/-/-/saved/searches splunk_server=local "
             "| eval is_alert=if(alert_type!=\"always\" OR is_scheduled=1, 1, 0) "
@@ -156,7 +156,7 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
         "priority_objective": "thirf",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Estimate whether stored detections reference IOC, anomaly, or hunting language that aligns with M-26-14 objectives.",
+        "description": "Checks whether saved searches look for indicators of compromise (IOCs), anomalies, or threat hunting patterns.",
         "query": (
             "| rest /servicesNS/-/-/saved/searches splunk_server=local "
             "| search disabled=0 "
@@ -172,12 +172,12 @@ _CURATED_VALIDATION_PACKS: List[Dict[str, Any]] = [
     },
     {
         "id": "timestamp_freshness_sanity",
-        "title": "Timestamp and Freshness Sanity",
+        "title": "Timestamp and Data Freshness",
         "control_area": "log_management",
         "priority_objective": "cem",
         "required_role": "analyst",
         "execution_mode": "mcp_search",
-        "description": "Use recent host activity as a basic freshness check to flag potential time drift or stale ingest paths.",
+        "description": "Uses the last time each host sent data to flag stale data or possible clock problems.",
         "query": (
             "| metadata type=hosts index=* "
             "| eval last_seen_minutes=round((now()-lastTime)/60,1) "
@@ -241,7 +241,7 @@ def build_latest_profile_preview(output_dir: Optional[Path | str] = None) -> Dic
     if latest_blueprint is None:
         return {
             "has_data": False,
-            "message": "No discovery blueprint available for M-26-14 profiling.",
+            "message": "No discovery results yet. Run discovery to create a readiness estimate.",
         }
 
     try:
@@ -249,7 +249,7 @@ def build_latest_profile_preview(output_dir: Optional[Path | str] = None) -> Dic
     except Exception as exc:
         return {
             "has_data": False,
-            "message": f"Failed to read discovery blueprint: {exc}",
+            "message": f"Could not read the latest discovery results: {exc}",
             "artifact": {"name": latest_blueprint.name},
         }
 
@@ -263,7 +263,7 @@ def build_profile_from_blueprint(blueprint: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(blueprint, dict):
         return {
             "has_data": False,
-            "message": "M-26-14 profile generation requires a dictionary-like V2 blueprint.",
+            "message": "The latest discovery results could not be read. Run discovery again to create a readiness estimate.",
         }
 
     overview = blueprint.get("overview", {}) if isinstance(blueprint.get("overview"), dict) else {}
@@ -347,7 +347,7 @@ def summarize_validation_results(pack: Dict[str, Any], rows: List[Dict[str, Any]
     summary = {
         "status": "observed" if normalized_rows else "warn",
         "row_count": len(normalized_rows),
-        "headline": f"Returned {len(normalized_rows)} result row(s)." if normalized_rows else "No result rows returned.",
+        "headline": f"The search returned {_count_label(len(normalized_rows), 'row')}." if normalized_rows else "The search returned no rows.",
         "findings": [],
         "sample_rows": normalized_rows[:5],
         "sample_fields": sorted(list(normalized_rows[0].keys()))[:8] if normalized_rows else [],
@@ -361,42 +361,42 @@ def summarize_validation_results(pack: Dict[str, Any], rows: List[Dict[str, Any]
         ]
         if below_floor:
             summary["status"] = "gap"
-            summary["headline"] = f"{len(below_floor)} index entries appear below the one-year retrievable floor."
-            summary["findings"].append("Configured index retention suggests at least some data sets may fall short of the M-26-14 retrievable baseline.")
+            summary["headline"] = f"{_count_label(len(below_floor), 'index', 'indexes')} keep data for less than 1 year."
+            summary["findings"].append("Some indexes may not keep data long enough to meet the M-26-14 requirement that logs stay retrievable for 1 year.")
         elif normalized_rows:
-            summary["findings"].append("Observed index settings meet or approximate the one-year retrievable floor for the returned rows.")
+            summary["findings"].append("The returned indexes keep data for about 1 year or longer.")
 
     elif pack_id == "audit_and_admin_activity":
         has_admin_activity = any(str(row.get("action_group") or "") == "config_change" for row in normalized_rows)
         summary["findings"].append(
-            "Audit rows include configuration or identity activity." if has_admin_activity else "Returned audit rows did not clearly show configuration-change activity."
+            "The audit log shows configuration or account changes." if has_admin_activity else "The audit results did not clearly show configuration changes."
         )
         if not has_admin_activity:
             summary["status"] = "warn"
 
     elif pack_id == "network_visibility_coverage":
         if normalized_rows:
-            summary["findings"].append("Network-oriented sourcetypes were observed in recent metadata.")
+            summary["findings"].append("Recent network data was found.")
         else:
             summary["status"] = "gap"
-            summary["headline"] = "No network-oriented sourcetypes matched the curated coverage probe."
+            summary["headline"] = "No network data was found."
 
     elif pack_id == "alert_and_detection_posture":
         security_alert_rows = [
             row for row in normalized_rows if str(row.get("detection_hint") or "").strip().lower() == "security_or_compliance"
         ]
         if security_alert_rows:
-            summary["findings"].append("Enabled security or compliance-oriented alert definitions were observed.")
+            summary["findings"].append("Enabled security or compliance alerts were found.")
         else:
             summary["status"] = "warn"
-            summary["headline"] = "No clearly security-oriented alert definitions were returned by the curated probe."
+            summary["headline"] = "No clearly security-related alerts were found."
 
     elif pack_id == "ioc_and_anomaly_signals":
         matched_rows = [
             row for row in normalized_rows if str(row.get("signal_hint") or "").strip().lower() in {"matching_logic", "matching_title"}
         ]
         if matched_rows:
-            summary["findings"].append("Saved search content includes IOC or anomaly-related hints.")
+            summary["findings"].append("Some saved searches look for IOCs or anomalies.")
         else:
             summary["status"] = "warn"
 
@@ -408,12 +408,12 @@ def summarize_validation_results(pack: Dict[str, Any], rows: List[Dict[str, Any]
         ]
         if stale_rows:
             summary["status"] = "warn"
-            summary["headline"] = f"{len(stale_rows)} hosts were last seen more than 24 hours ago in the sampled result."
+            summary["headline"] = f"{_count_label(len(stale_rows), 'host')} last sent data more than 24 hours ago."
         elif normalized_rows:
-            summary["findings"].append("Sampled host metadata appears reasonably fresh.")
+            summary["findings"].append("The sampled hosts sent data recently.")
 
     if not summary["findings"]:
-        summary["findings"].append("Use the returned rows to inspect field coverage and confirm whether the observed evidence is representative.")
+        summary["findings"].append("Review the returned rows to see which fields are present and whether the results are typical for this environment.")
 
     return summary
 
@@ -470,21 +470,21 @@ def _build_inventory_visibility_signal(overview: Dict[str, Any], text_corpus: st
     source_count = _safe_int(overview.get("total_sources"))
     evidence = []
     unknowns = [
-        "Discovery results do not currently include HWAM, SWAM, or CDM coverage percentages required for formal M-26-14 inventory maturity scoring.",
+        "Discovery does not measure hardware and software asset coverage (HWAM, SWAM, or CDM), which formal M-26-14 inventory scoring needs.",
     ]
     if host_count > 0:
-        evidence.append(f"Discovery observed {host_count} hosts across the current telemetry footprint.")
+        evidence.append(f"Discovery saw {_count_label(host_count, 'host')} sending data.")
     if source_count > 0:
-        evidence.append(f"Discovery observed {source_count} source paths, which helps bound visible telemetry sources.")
+        evidence.append(f"Discovery saw {_count_label(source_count, 'data source')}, which shows what data Splunk can see.")
     return _build_signal(
         "inventory_visibility",
         status="unknown" if evidence else "gap",
         confidence="low",
         estimated_level=None,
         evidence=evidence,
-        gaps=[] if evidence else ["No telemetry-backed asset footprint was visible in the current discovery artifact."],
+        gaps=[] if evidence else ["Discovery did not find any hosts sending data."],
         unknowns=unknowns,
-        remediation=["Add centralized HWAM or SWAM evidence or a live validation path that approximates asset coverage."],
+        remediation=["Add asset inventory data (HWAM or SWAM), or run a live check that estimates asset coverage."],
     )
 
 
@@ -495,13 +495,13 @@ def _build_collection_coverage_signal(overview: Dict[str, Any], classifications:
     evidence = []
     gaps = []
     if total_indexes > 0:
-        evidence.append(f"Discovery observed {total_indexes} indexes that can contribute telemetry to M-26-14-aligned controls.")
+        evidence.append(f"Discovery found {_count_label(total_indexes, 'index', 'indexes')} that hold data relevant to M-26-14.")
     if security_source_count > 0:
-        evidence.append(f"Discovery classified {security_source_count} security-oriented data sources.")
+        evidence.append(f"Discovery classified {_count_label(security_source_count, 'data source')} as security data.")
     if compliance_source_count > 0:
-        evidence.append(f"Discovery classified {compliance_source_count} compliance-oriented data sources.")
+        evidence.append(f"Discovery classified {_count_label(compliance_source_count, 'data source')} as compliance data.")
     if security_source_count <= 0:
-        gaps.append("No discovery-classified security sources were observed in the current blueprint.")
+        gaps.append("Discovery did not classify any data sources as security data.")
     status = "partial" if evidence and not gaps else "gap" if gaps and not evidence else "unknown"
     if evidence and gaps:
         status = "partial"
@@ -513,10 +513,10 @@ def _build_collection_coverage_signal(overview: Dict[str, Any], classifications:
         evidence=evidence,
         gaps=gaps,
         unknowns=[
-            "Discovery does not prove what percentage of all assets have searchable and retrievable logging coverage.",
+            "Discovery cannot show what share of all assets send logs you can search and retrieve.",
         ],
         remediation=[
-            "Run curated network, audit, and infrastructure validation packs to replace source-presence heuristics with fresher evidence.",
+            "Run the network, audit, and infrastructure live checks to confirm coverage with current data.",
         ],
     )
 
@@ -527,13 +527,13 @@ def _build_collection_operations_signal(trend_signals: Dict[str, Any], recommend
     security_recommendations = _safe_int((trend_signals.get("recommendation_by_domain") or {}).get("security"))
     compliance_recommendations = _safe_int((trend_signals.get("recommendation_by_domain") or {}).get("compliance"))
     if any(term in text_corpus for term in ["alert", "anomal", "ioc", "threat", "hunt"]):
-        evidence.append("Discovery findings reference alerting, anomaly, IOC, or hunting-oriented language.")
+        evidence.append("Discovery findings mention alerts, anomalies, IOCs, or threat hunting.")
     if security_recommendations > 0 or compliance_recommendations > 0:
         evidence.append(
-            f"Discovery produced {security_recommendations + compliance_recommendations} security or compliance recommendations that can be turned into detection and validation tracks."
+            f"Discovery made {_count_label(security_recommendations + compliance_recommendations, 'security or compliance recommendation')} you can turn into detections and checks."
         )
     if not any(term in text_corpus for term in ["alert", "anomal", "ioc", "threat", "hunt"]):
-        gaps.append("Discovery artifacts do not yet show strong detection-language evidence for M-26-14 collection operations.")
+        gaps.append("Discovery found little evidence of detection work, such as alerts or threat hunting searches.")
     status = "partial" if evidence else "gap"
     return _build_signal(
         "collection_operations",
@@ -543,10 +543,10 @@ def _build_collection_operations_signal(trend_signals: Dict[str, Any], recommend
         evidence=evidence,
         gaps=gaps,
         unknowns=[
-            "Detection quality, tuned alert coverage percentages, and SOC investigation reuse are not directly measured in the current blueprint.",
+            "Discovery does not measure detection quality, alert tuning, or how often the SOC reuses searches in investigations.",
         ],
         remediation=[
-            "Run curated alert, IOC, and privilege-change validation packs to confirm that operational controls exist beyond narrative hints.",
+            "Run the alert, IOC, and privilege change live checks to confirm detections are in place.",
         ],
     )
 
@@ -555,11 +555,11 @@ def _build_data_retention_signal(text_corpus: str, coverage_gaps: List[Dict[str,
     evidence = []
     gaps = []
     if "long retention" in text_corpus:
-        evidence.append("Discovery findings include at least one index with longer retention settings.")
+        evidence.append("Discovery found at least one index with long retention.")
     if any(term in text_corpus for term in ["short retention", "retention policy", "retention_optimization", "compliance risk"]):
-        gaps.append("Discovery findings already suggest retention settings may not satisfy the M-26-14 baseline for all data sets.")
+        gaps.append("Discovery findings suggest some indexes may not keep data as long as M-26-14 requires.")
     if not evidence and not gaps:
-        gaps.append("No direct discovery evidence yet proves six months searchable and one year retrievable retention coverage.")
+        gaps.append("Discovery has no direct evidence that logs stay searchable for 6 months and retrievable for 1 year.")
     status = "gap" if gaps else "partial"
     return _build_signal(
         "data_retention",
@@ -569,10 +569,10 @@ def _build_data_retention_signal(text_corpus: str, coverage_gaps: List[Dict[str,
         evidence=evidence,
         gaps=gaps,
         unknowns=[
-            "Searchable-versus-retrievable retention tiers are not fully inferable from the current discovery artifact alone.",
+            "Discovery results alone cannot tell which data stays searchable and which can only be restored from archive.",
         ],
         remediation=[
-            "Run the curated retention and searchability validation pack before assigning an implementation maturity level.",
+            "Run the Retention and Searchability live check before you assign a maturity level.",
         ],
     )
 
@@ -581,8 +581,8 @@ def _build_log_management_signal(text_corpus: str) -> Dict[str, Any]:
     evidence = []
     gaps = []
     if any(term in text_corpus for term in ["audit", "security monitoring", "compliance monitoring"]):
-        evidence.append("Discovery artifacts indicate that some audit or compliance-oriented telemetry is already being ingested.")
-    gaps.append("The current blueprint does not prove encryption-at-rest, encryption-in-transit, hash veracity, or privileged access workflows for logs.")
+        evidence.append("Discovery shows that some audit or compliance data is already collected.")
+    gaps.append("Discovery cannot confirm that logs are encrypted at rest and in transit, protected by hashes, or limited to authorized users.")
     return _build_signal(
         "log_management",
         status="unknown" if evidence else "gap",
@@ -591,10 +591,10 @@ def _build_log_management_signal(text_corpus: str) -> Dict[str, Any]:
         evidence=evidence,
         gaps=gaps,
         unknowns=[
-            "Formal log-management maturity requires storage, encryption, and access-control evidence not present in current discovery artifacts.",
+            "Formal log management scoring needs evidence about storage, encryption, and access control that discovery does not collect.",
         ],
         remediation=[
-            "Use curated live validation plus architecture review to verify transport security, storage controls, and SOC access design.",
+            "Run the live checks and review the architecture to confirm transport security, storage controls, and SOC access.",
         ],
     )
 
@@ -610,16 +610,16 @@ def _build_priority_objective_signal(
         status = "gap" if status != "partial" else "partial"
     evidence = []
     if objective == "cem" and any(term in text_corpus for term in ["alert", "anomal", "threat", "network"]):
-        evidence.append("Discovery findings suggest some real-time monitoring and threat-detection signal is present.")
+        evidence.append("Discovery findings show some real-time monitoring and threat detection.")
     if objective == "thirf" and any(term in text_corpus for term in ["investigat", "retention", "ioc", "lateral", "forensic"]):
-        evidence.append("Discovery findings suggest some investigative and retention-oriented capability signal is present.")
+        evidence.append("Discovery findings show some investigation and retention capability.")
     return {
         "objective": objective.upper(),
         "status": status,
         "confidence": "low",
         "evidence": evidence,
         "notes": [
-            "Priority-objective status is derived from discovery evidence and should be strengthened with explicit live validation.",
+            "This status comes from discovery results. Run live checks to confirm it.",
         ],
     }
 
@@ -654,13 +654,13 @@ def _derive_maturity_floor(maturity_elements: List[Dict[str, Any]]) -> Dict[str,
         return {
             "status": "unknown",
             "level": None,
-            "explanation": "Discovery evidence alone does not yet prove a defensible M-26-14 maturity floor.",
+            "explanation": "Discovery results alone are not enough to set a maturity level.",
         }
     level_floor = min(int(level) for level in known_levels)
     return {
         "status": f"level_{level_floor}",
         "level": level_floor,
-        "explanation": "Lowest evidentiary maturity floor across currently scored elements.",
+        "explanation": "The lowest maturity level across the scored areas.",
     }
 
 
@@ -688,6 +688,10 @@ def _build_recommended_pack_ids(maturity_elements: List[Dict[str, Any]]) -> List
         if pack_id not in deduped:
             deduped.append(pack_id)
     return deduped[:6]
+
+
+def _count_label(count: int, singular: str, plural: Optional[str] = None) -> str:
+    return f"{count} {singular if count == 1 else (plural or f'{singular}s')}"
 
 
 def _safe_int(value: Any) -> int:
