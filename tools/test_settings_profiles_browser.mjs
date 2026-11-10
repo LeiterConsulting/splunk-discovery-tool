@@ -240,13 +240,11 @@ async function main() {
         });
 
         await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
+        // On a fresh install the welcome screen links straight to the connection settings.
         const splash = page.locator('[data-testid="welcome-splash-modal"]');
-        await splash.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
-        if (await splash.isVisible().catch(() => false)) {
-            await splash.getByRole('button', { name: 'Get Started' }).click();
-            await splash.waitFor({ state: 'hidden', timeout: 15000 });
-        }
-        await page.getByRole('button', { name: 'Open settings' }).click();
+        await splash.waitFor({ state: 'visible', timeout: 15000 });
+        await splash.getByRole('button', { name: 'Set Up Connections' }).click();
+        await splash.waitFor({ state: 'hidden', timeout: 15000 });
         await page.getByRole('heading', { name: 'Settings' }).waitFor({ timeout: 30000 });
 
         // First profile on a fresh install: the dialog previews the typed values and the profile becomes active.

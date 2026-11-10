@@ -129,7 +129,7 @@ async function seedOutput(outputDir) {
         [`v2_intelligence_blueprint_${timestamp}.json`]: JSON.stringify(blueprint, null, 2),
         [`v2_insights_brief_${timestamp}.md`]: '# Intelligence Brief\n\n## Highest Value Gaps\n- Admin login failures are not tied to an explicit alert.\n',
         [`v2_operator_runbook_${timestamp}.md`]: '# Operator Runbook\n\n## Action Queue\n1. Validate authentication monitoring coverage (high)\n',
-        [`v2_developer_handoff_${timestamp}.md`]: '# Developer Handoff\n\n## What this bundle contains\n- `intelligence_blueprint.json`\n',
+        [`v2_developer_handoff_${timestamp}.md`]: '# Developer Handoff\n\n## What this bundle contains\n- `intelligence_blueprint.json`\n  - **Readiness:** 78 of 100\n\n| Area | Status |\n| --- | --- |\n| Authentication | Needs an alert |\n\n> Advisory only.\n\n```spl\nindex=_internal | stats count by sourcetype\n```\n',
         [`v2_ai_summary_${timestamp}.json`]: JSON.stringify(buildOperatorFixtureSummary(timestamp), null, 2),
     };
     await mkdir(path.join(outputDir, 'exports'), { recursive: true });
@@ -401,6 +401,10 @@ async function auditTheme(browser, baseUrl, themeName) {
         if (await clickIfPresent(page.getByTestId('discovery-report-row'))) {
             await settle(page, 1200);
             await capture('discovery-report-open', null, true);
+        }
+        if (await clickIfPresent(page.getByTestId('discovery-report-row').filter({ hasText: 'Developer handoff' }))) {
+            await settle(page, 1200);
+            await capture('discovery-report-markdown', null, true);
         }
 
         if (await clickIfPresent(page.locator('button', { hasText: 'View Summary' }))) {

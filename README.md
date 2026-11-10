@@ -97,6 +97,10 @@ The header holds the connection status, Chat, sign-in, and Settings. Each tab ke
 
 ![Findings tab showing next steps for each audience, the environment profile, and key evidence](docs/screenshots/workspace-findings-current.png)
 
+### Discovery tab
+
+![Discovery tab showing the run status, a formatted Insights brief with its SPL, and the report library](docs/screenshots/workspace-discovery-current.png)
+
 ## 📸 SPL Library Workflow
 
 The SPL Library keeps reusable SPL in the managed context workspace so operators can save good queries from chat, inspect stored context, and reuse saved SPL without leaving the tool.

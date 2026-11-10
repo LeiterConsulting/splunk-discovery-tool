@@ -455,7 +455,7 @@ class DiscoveryV2Pipeline:
                 "severity": str(rec.get("priority", "medium")).lower(),
                 "domain": rec.get("category", "general"),
                 "impact": rec.get("description", ""),
-                "mitigation": rec.get("suggested_actions", rec.get("next_steps", "Investigate and remediate through targeted Splunk validation."))
+                "mitigation": rec.get("suggested_actions", rec.get("next_steps", ""))
             })
 
         def _count_category(predicate) -> int:

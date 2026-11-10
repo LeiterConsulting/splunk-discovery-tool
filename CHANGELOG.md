@@ -154,6 +154,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Discovery steps tile in the environment profile, which showed the estimate made before the run
 - Cards that repeated the same next steps: Mission's Admin tasks, Investigations, and Executive summary cards, and Intelligence's Top priorities, Coverage gaps, and Suggested investigations cards. Findings now lists each step once
 
+### 📄 Discovery, Capabilities & Knowledge Base Pages
+
+#### Added
+- Remove for optional capabilities: `POST /api/capabilities/{name}/uninstall` turns a capability off and marks it not installed. Its packages, settings, and Knowledge Base data are kept, so Install brings it back as it was
+- The report viewer formats Markdown reports: headings, lists, tables, quotes, and code blocks. The page builds them as elements, never as HTML, so a report cannot add markup to the page. Export still downloads the original file
+- Browser checks: capability cards offer only the actions for their state, Run details starts folded after a finished run, report names have no underscores, Settings > Troubleshoot has no Save Settings, the welcome screen lists three steps, Set Up Connections on a fresh install opens Settings, the newest run's reports show without expanding anything, and Markdown reports show headings and code blocks instead of raw markers. The contrast check also covers a formatted Markdown report
+
+#### Changed
+- The Discovery tab has one status card with the run state, key facts, Stop or Run Discovery, and View Summary (Summarize when no summary is saved). The report library comes first; on phones the viewer appears after you pick a report. Stages and the activity log sit under Run details, which opens while discovery runs and after a failed or stopped run
+- Reports show plain names such as Insights brief and Operator runbook, with the file name underneath. Other reports get a readable name that keeps acronyms, such as SPL library report. The empty report viewer is one line
+- The report library opens on the newest run, so its reports show without expanding the year, day, and run. Each run has a smaller View Summary or Summarize button in the neutral style, says "1 report" instead of "1 reports", and no longer shows an unlabeled clock time
+- The SPL buttons (Open in Splunk, Save to Library, Use in Chat, Copy) share one neutral style instead of four colors. Generate Runbook on Overview uses the neutral style, so Download Runbook is the one main action
+- Capability cards show only the actions that fit their state: Install when not installed, Turn On and Remove when off, Test and Turn Off when on. Settings sit under Advanced settings, with Save Settings only for installed capabilities. Splunk Search Links shows its link builder only when it is on and ready
+- The Capabilities tab shows one line of counts instead of five tiles, and the Knowledge Base card links to its tab only when it is installed
+- The Knowledge Base tab has one Status card with the capability actions and Reindex; index counts appear once it is installed. Preview Chat Context says what it needs before it works, Clear Preview appears only after a preview, and the extra Refresh List button is gone (Refresh at the top reloads the library)
+- Capability messages say "turn on" instead of "enable" and name the capability instead of its internal ID
+- The welcome screen lists three numbered steps (Connect, Run discovery, Review and act) instead of four overlapping panels, offers Set Up Connections until the app is connected, and fits on a phone screen
+- Runbooks, persona playbooks, and Findings cards leave out a line when discovery recorded nothing for it, instead of repeating generic text such as "Create implementation task for: ..." or "Schedule this as a recurring task." Executive themes come from the suggested use cases and the 90-day focus from the top recommendations, instead of fixed text
+- Compare runs on Overview and the M-26-14 tab appears only after two or more discovery runs
+
+#### Fixed
+- The Discovery tab offered Summarize for runs that already had a saved summary
+- Disabled buttons in Dark matched the card behind them, and Download Runbook, Build Report Package, and Download package kept their light disabled colors
+- Settings > Troubleshoot showed Save Settings, which saved the hidden connection form
+- Nine elements used `shrink-0`, which Tailwind 2 does not generate; they now use `flex-shrink-0`
+- Advanced settings in Dark sat on a near-black bar that stood out from its card
+
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added

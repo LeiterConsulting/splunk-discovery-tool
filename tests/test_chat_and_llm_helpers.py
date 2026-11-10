@@ -1303,6 +1303,39 @@ class ChatHelperTests(unittest.TestCase):
         self.assertEqual(playbooks["admin"]["actions"][0]["title"], "Tune ingestion")
         self.assertEqual(playbooks["analyst"]["hypotheses"][0]["title"], "Monitor latency")
 
+    def test_persona_playbooks_leave_missing_fields_empty(self):
+        overview = type(
+            "OverviewStub",
+            (),
+            {"total_indexes": 3, "total_sourcetypes": 4, "total_hosts": 2},
+        )()
+
+        playbooks = web_app.build_persona_playbooks(
+            overview,
+            [
+                {"title": "Tune ingestion", "priority": "high"},
+                {
+                    "title": "Alert on admin logins",
+                    "priority": "high",
+                    "description": "Admin logins are not alerted.",
+                    "suggested_actions": ["Create a login alert"],
+                },
+            ],
+            [{"title": "Monitor latency"}, {"title": "Track lockouts", "business_value": "Fewer locked-out users."}],
+            {"tool_count": 2},
+        )
+
+        bare, detailed = playbooks["admin"]["actions"]
+        self.assertEqual((bare["why"], bare["effort"], bare["next_step"]), ("", "", ""))
+        self.assertEqual(detailed["next_step"], "Create a login alert")
+        self.assertEqual(playbooks["analyst"]["hypotheses"][0]["success_metric"], "")
+        self.assertEqual(playbooks["executive"]["business_value_themes"], ["Fewer locked-out users."])
+        self.assertEqual(playbooks["executive"]["next_90_day_focus"], ["Tune ingestion", "Alert on admin logins"])
+
+        bare_card = web_app._build_operator_voice_admin_item(bare, "direct")
+        self.assertEqual((bare_card["summary"], bare_card["meta"], bare_card["badge"]), ("", "", ""))
+        self.assertEqual(web_app._build_operator_voice_admin_item(detailed, "executive")["meta"], "Decision needed: Create a login alert")
+        self.assertEqual(web_app._build_operator_voice_analyst_item({"title": "Monitor latency"}, "direct")["meta"], "")
     def test_chat_stream_drains_terminal_update_when_task_finishes_at_timeout(self):
         original_process_chat = web_app.process_chat_with_streaming
         original_wait_for = web_app.asyncio.wait_for

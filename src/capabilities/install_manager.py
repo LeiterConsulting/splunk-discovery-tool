@@ -221,6 +221,31 @@ class CapabilityManager:
         self.config_manager.save_capability(config)
         return self._result(definition.name, "disable", True, "Capability disabled.")
 
+    def uninstall_capability(self, name: str) -> CapabilityActionResult:
+        """Turn a capability off and mark it not installed.
+
+        Python packages stay in the environment, and user settings and indexed
+        knowledge stay on disk so a later install picks up where it left off.
+        """
+        definition = self.registry.get_definition(name)
+        if definition is None:
+            return CapabilityActionResult(False, name, "uninstall", "Unknown capability.")
+        config = self._get_or_create_config(definition)
+
+        if not config.installed and not config.enabled:
+            return self._result(definition.name, "uninstall", True, "Capability is not installed.")
+
+        config.enabled = False
+        config.installed = False
+        config.version = None
+        config.installed_at = None
+        config.restart_required = False
+        config.last_error = None
+        config.health_status = "not_installed"
+        config.health_message = "Capability is not installed."
+        self.config_manager.save_capability(config)
+        return self._result(definition.name, "uninstall", True, "Capability removed.")
+
     def test_capability(self, name: str, action: str = "test") -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:

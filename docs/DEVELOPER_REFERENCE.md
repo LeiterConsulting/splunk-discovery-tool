@@ -140,6 +140,7 @@ Every button should communicate purpose:
 - `POST /api/capabilities/{name}/install` → Install or prepare a capability
 - `POST /api/capabilities/{name}/enable` → Enable an installed capability
 - `POST /api/capabilities/{name}/disable` → Disable a capability
+- `POST /api/capabilities/{name}/uninstall` → Turn a capability off and mark it not installed (Python packages, settings, and indexed knowledge stay)
 - `POST /api/capabilities/{name}/test` → Run a capability health check
 - `POST /api/capabilities/{name}/reindex` → Rebuild indexed retrieval content for capabilities that support it
 - `POST /api/capabilities/{name}/config` → Persist capability-specific config
