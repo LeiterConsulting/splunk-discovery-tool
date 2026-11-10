@@ -8,12 +8,14 @@
     "test:auth-browser": "node tools/test_auth_browser.mjs",
     "test:settings-profiles-browser": "node tools/test_settings_profiles_browser.mjs",
     "test:settings-troubleshoot-browser": "node tools/test_settings_troubleshoot_browser.mjs",
+    "test:ui-contrast-browser": "node tools/test_ui_contrast_browser.mjs",
     "test:account-functions": "node tools/run_account_function_tests.mjs"
   },
   "devDependencies": {
     "@fortawesome/fontawesome-free": "6.0.0",
     "esbuild": "0.25.4",
     "playwright": "^1.59.1",
+    "postcss": "8.5.28",
     "react": "18.2.0",
     "react-dom": "18.2.0",
     "tailwindcss": "2.2.19"

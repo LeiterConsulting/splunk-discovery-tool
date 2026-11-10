@@ -1,16 +1,22 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, copyFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { transform } from 'esbuild';
+
+const require = createRequire(import.meta.url);
+const postcss = require('postcss');
+const tailwindcss = require('tailwindcss');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const repoRoot = resolve(__dirname, '..');
 const staticRoot = join(repoRoot, 'src', 'static');
 const vendorRoot = join(staticRoot, 'vendor');
+const tailwindConfigPath = join(repoRoot, 'tailwind.config.cjs');
 const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
 const runtimeScriptRefs = [
   '/static/vendor/react/react.production.min.js',
@@ -18,7 +24,7 @@ const runtimeScriptRefs = [
   '/static/app.js',
 ];
 const runtimeStyleRefs = [
-  '/static/vendor/tailwind/tailwind.min.css',
+  '/static/app.css',
   '/static/vendor/fontawesome/css/all.min.css',
 ];
 
@@ -106,7 +112,7 @@ function renderStaticIndex(html) {
     .replace(/\s*<script src="https:\/\/unpkg.com\/@babel\/standalone\/babel\.min\.js"><\/script>\s*/i, '\n')
     .replace(
       '<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">',
-      '<link href="/static/vendor/tailwind/tailwind.min.css" rel="stylesheet">',
+      '<link href="/static/app.css" rel="stylesheet">',
     )
     .replace(
       '<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">',
@@ -131,20 +137,33 @@ async function buildAppScript(appSource) {
   return transformed.code;
 }
 
+async function buildStylesheet() {
+  const config = require(tailwindConfigPath);
+  const result = await postcss([tailwindcss(config)]).process(
+    '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n',
+    { from: undefined },
+  );
+  const minified = await transform(result.css, { loader: 'css', minify: true, charset: 'utf8' });
+  return minified.code;
+}
+
 async function main() {
   const html = renderLegacyHtml();
   const appSource = extractInlineScript(html);
   const appCode = await buildAppScript(appSource);
+  const appCss = await buildStylesheet();
   const staticIndex = renderStaticIndex(html);
   const buildManifest = {
     built_at_utc: new Date().toISOString(),
     source: {
       legacy_html_sha256: sha256Text(html),
       app_source_sha256: sha256Text(appSource),
+      tailwind_config_sha256: sha256Text(readFileSync(tailwindConfigPath, 'utf8')),
     },
     artifacts: {
       index_html_sha256: sha256Text(staticIndex),
       app_js_sha256: sha256Text(appCode),
+      app_css_sha256: sha256Text(appCss),
     },
     runtime: {
       script_refs: runtimeScriptRefs,
@@ -154,6 +173,7 @@ async function main() {
       react: packageJson.devDependencies.react,
       react_dom: packageJson.devDependencies['react-dom'],
       tailwindcss: packageJson.devDependencies.tailwindcss,
+      postcss: packageJson.devDependencies.postcss,
       fontawesome: packageJson.devDependencies['@fortawesome/fontawesome-free'],
       esbuild: packageJson.devDependencies.esbuild,
     },
@@ -163,7 +183,6 @@ async function main() {
   ensureDir(staticRoot);
   ensureDir(vendorRoot);
   ensureDir(join(vendorRoot, 'react'));
-  ensureDir(join(vendorRoot, 'tailwind'));
   ensureDir(join(vendorRoot, 'fontawesome', 'css'));
 
   copyFileSync(
@@ -175,10 +194,6 @@ async function main() {
     join(vendorRoot, 'react', 'react-dom.production.min.js'),
   );
   copyFileSync(
-    resolvePackageAsset('tailwindcss/dist/tailwind.min.css'),
-    join(vendorRoot, 'tailwind', 'tailwind.min.css'),
-  );
-  copyFileSync(
     resolvePackageAsset('@fortawesome/fontawesome-free/css/all.min.css'),
     join(vendorRoot, 'fontawesome', 'css', 'all.min.css'),
   );
@@ -188,6 +203,7 @@ async function main() {
   );
 
   writeFileSync(join(staticRoot, 'app.js'), appCode, 'utf8');
+  writeFileSync(join(staticRoot, 'app.css'), appCss, 'utf8');
   writeFileSync(join(staticRoot, 'index.html'), staticIndex, 'utf8');
   writeFileSync(join(staticRoot, 'build-manifest.json'), `${JSON.stringify(buildManifest, null, 2)}\n`, 'utf8');
 

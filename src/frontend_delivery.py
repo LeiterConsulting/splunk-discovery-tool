@@ -12,7 +12,9 @@ from frontend_legacy import get_frontend_html
 STATIC_DIR = Path(__file__).with_name("static")
 STATIC_INDEX_PATH = STATIC_DIR / "index.html"
 STATIC_APP_PATH = STATIC_DIR / "app.js"
+STATIC_APP_CSS_PATH = STATIC_DIR / "app.css"
 STATIC_BUILD_MANIFEST_PATH = STATIC_DIR / "build-manifest.json"
+TAILWIND_CONFIG_PATH = Path(__file__).resolve().parent.parent / "tailwind.config.cjs"
 
 REQUIRED_LOCAL_SCRIPT_REFS = [
     "/static/vendor/react/react.production.min.js",
@@ -21,7 +23,7 @@ REQUIRED_LOCAL_SCRIPT_REFS = [
 ]
 
 REQUIRED_LOCAL_STYLE_REFS = [
-    "/static/vendor/tailwind/tailwind.min.css",
+    "/static/app.css",
     "/static/vendor/fontawesome/css/all.min.css",
 ]
 
@@ -58,6 +60,7 @@ def compute_source_fingerprint() -> Dict[str, str]:
     return {
         "legacy_html_sha256": compute_text_sha256(legacy_html),
         "app_source_sha256": compute_text_sha256(app_source),
+        "tailwind_config_sha256": compute_text_sha256(_read_text(TAILWIND_CONFIG_PATH)),
     }
 
 
@@ -70,9 +73,11 @@ def _read_text(path: Path) -> str:
 def compute_artifact_fingerprint(static_dir: Path = STATIC_DIR) -> Dict[str, str]:
     index_text = _read_text(static_dir / "index.html")
     app_text = _read_text(static_dir / "app.js")
+    css_text = _read_text(static_dir / "app.css")
     return {
         "index_html_sha256": compute_text_sha256(index_text) if index_text else "",
         "app_js_sha256": compute_text_sha256(app_text) if app_text else "",
+        "app_css_sha256": compute_text_sha256(css_text) if css_text else "",
     }
 
 
@@ -96,7 +101,12 @@ def get_frontend_sync_status(static_dir: Path = STATIC_DIR) -> Dict[str, Any]:
 
     missing_files = [
         str(path.relative_to(static_dir.parent))
-        for path in (static_dir / "index.html", static_dir / "app.js", static_dir / "build-manifest.json")
+        for path in (
+            static_dir / "index.html",
+            static_dir / "app.js",
+            static_dir / "app.css",
+            static_dir / "build-manifest.json",
+        )
         if not path.exists() or not path.is_file()
     ]
     missing_script_refs = [ref for ref in REQUIRED_LOCAL_SCRIPT_REFS if ref not in static_index_text]

@@ -1,12 +1,14 @@
 {
-  "built_at_utc": "2026-11-09T21:46:52.233Z",
+  "built_at_utc": "2026-11-10T14:19:14.260Z",
   "source": {
-    "legacy_html_sha256": "18399e373d39b1d3821f578a7297c5a4bb347c5175c8783322ec93ca39e0d573",
-    "app_source_sha256": "3353457c95a2c59475517bd2687eebca6f61cfc4a756e6e9cfc52214d48f09f0"
+    "legacy_html_sha256": "1743bfd6fa83d79fdfc3b4796226dddf3f033fd04df6f9850f3be7f40b25d657",
+    "app_source_sha256": "21c3828a96da4c604d85412b159ab139c77a9579861f55af7da22cac4844d04c",
+    "tailwind_config_sha256": "2e0a2f943e914cff4e33e5da53b32c49dc451ea2653f94172808994f3b1d2809"
   },
   "artifacts": {
-    "index_html_sha256": "f29306d8a25dbacb11bd73e1a2577caebbaeb2f21e710bd8ba3552b2b1651d89",
-    "app_js_sha256": "6a32e44310bd058855f185103d340c203eea0733db3239de42416965032a2ac2"
+    "index_html_sha256": "103f3f231c5e5e81d64f5f362d1d9c8b66965a46f3b494318796b2bfa0542c04",
+    "app_js_sha256": "ff91ae9a479506f9df1e0d092d2871883c32d87dc433604a45563c7bec8fc562",
+    "app_css_sha256": "7ac2434b69f2fe154eb054072761f61428dc854947738a2988cd14e83525374b"
   },
   "runtime": {
     "script_refs": [
@@ -15,7 +17,7 @@
       "/static/app.js"
     ],
     "style_refs": [
-      "/static/vendor/tailwind/tailwind.min.css",
+      "/static/app.css",
       "/static/vendor/fontawesome/css/all.min.css"
     ]
   },
@@ -23,6 +25,7 @@
     "react": "18.2.0",
     "react_dom": "18.2.0",
     "tailwindcss": "2.2.19",
+    "postcss": "8.5.28",
     "fontawesome": "6.0.0",
     "esbuild": "0.25.4"
   }

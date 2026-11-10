@@ -171,13 +171,15 @@ Every button should communicate purpose:
    - `npm run test:browser`
    - `npm run test:settings-profiles-browser`
    - `npm run test:settings-troubleshoot-browser`
+   - `npm run test:ui-contrast-browser`
    - `npm run test:auth-browser`
    - `npm run test:account-functions`
    - `python -m ruff check src tests`
    - `python -W error::SyntaxWarning -m compileall -q src tests`
    - `python -m unittest discover -v`
 - because the frontend source is maintained in `src/frontend_legacy_template.html` and then transpiled into shipped static assets, CSS selectors and JavaScript regex literals must keep build-safe escaping or strict compile validation will fail
-- `tools/render_frontend_template.py` renders the legacy inline template, and `tools/build_frontend.mjs` transpiles its JSX plus vendors pinned local assets so runtime delivery no longer depends on CDN-hosted React, Tailwind, Font Awesome, or in-browser Babel
+- `tools/render_frontend_template.py` renders the legacy inline template, and `tools/build_frontend.mjs` transpiles its JSX, builds `src/static/app.css` with Tailwind's JIT engine from `tailwind.config.cjs`, and vendors pinned local assets so runtime delivery no longer depends on CDN-hosted React, Tailwind, Font Awesome, or in-browser Babel
+- every Tailwind color reads its RGB channels from a CSS variable (`--c-<color>-<shade>`) defined per theme (`:root` for Light, `[data-theme='dark']`, `[data-theme='neo']`) at the top of the template's `<style>` block; change colors there rather than adding hex values in markup, then run `npm run test:ui-contrast-browser` to confirm every theme still meets WCAG AA contrast
 - `tools/check_frontend_sync.py` and `tests/test_frontend_delivery.py` now enforce that the shipped static bundle still matches the legacy inline frontend source before release
 
 ## 10) Build-Your-Own Checklist
