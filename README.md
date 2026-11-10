@@ -9,7 +9,7 @@
 ## ✨ What’s Included
 
 - Discovery pipeline with intelligence artifacts and stable compatibility filenames (`v2_intelligence_blueprint_*`, `v2_insights_brief_*`, `v2_operator_runbook_*`, `v2_developer_handoff_*`)
-- Unified web workspace with Mission, Intelligence, Discovery, Context, Capabilities, and focused Chat/Summary surfaces
+- Unified web workspace with Overview, Findings, Discovery, Knowledge Base, and Capabilities tabs, tabs added by enabled capabilities (such as M-26-14), and focused Chat and Summary views
 - Durable worker-backed runtime state for discovery and summarization, including persisted progress and restart-safe recovery
 - AI summarization endpoint (`/summarize-session`) generating contextual SPL queries, investigation tracks, and admin tasks
 - Managed SPL Library and local RAG context workspace for reusable queries and operator-facing knowledge assets
@@ -73,12 +73,15 @@ After startup, open the URL printed in the console (typically **http://localhost
 
 ## 🧠 Workspace Overview
 
-- **Mission**: Current discovery handoff, snapshot deltas, admin next actions, analyst tracks, and executive framing
-- **Intelligence**: Blueprint briefings, priority board, coverage gaps, and role-adapted operator readouts
-- **Discovery**: Live runtime monitor, stage ledger, durable session outputs, and summary launch/resume controls
-- **Context**: Managed knowledge assets, SPL Library, reusable query evidence, and operator-facing context previews
-- **Capabilities**: Optional packs for RAG, exports, visualization, and Splunk deeplink workflows
-- **Chat and Summary**: Full-screen investigation chat plus generated runbook/summary surfaces when operators need to go deep
+The header holds the connection status, Chat, sign-in, and Settings. Each tab keeps its own actions, and the theme choice lives in Settings > Appearance.
+
+- **Overview**: Discovery status, key numbers, the top three next steps, run comparison, the runbook, and report packages
+- **Findings**: The full next-step lists for admins, analysts, and executives, the environment profile, key evidence, and patterns
+- **Discovery**: Run discovery, follow each stage, and open saved reports and summaries
+- **Knowledge Base**: Managed knowledge assets, the SPL Library, reusable query evidence, and context previews
+- **Capabilities**: Optional add-ons for the knowledge base, exports, charts, and Splunk search links
+- **Capability tabs**: An enabled capability can add its own tab after the core tabs. The M-26-14 Readiness Advisor adds an M-26-14 tab
+- **Chat and Summary**: Full-screen investigation chat plus the runbook and summary views when you need more detail
 
 ## 📸 Current Workspace Snapshots
 
@@ -86,13 +89,13 @@ After startup, open the URL printed in the console (typically **http://localhost
 
 ![Current Splunk Discovery Tool welcome screen and workspace](docs/screenshots/welcome-splash-current.png)
 
-### Mission workspace
+### Overview tab
 
-![Current Mission workspace showing handoff, deltas, and operator action layers](docs/screenshots/workspace-mission-current.png)
+![Overview tab showing discovery status, key numbers, and the top next steps](docs/screenshots/workspace-overview-current.png)
 
-### Intelligence workspace
+### Findings tab
 
-![Current Intelligence workspace showing blueprint briefing and priority board](docs/screenshots/workspace-intelligence-current.png)
+![Findings tab showing next steps for each audience, the environment profile, and key evidence](docs/screenshots/workspace-findings-current.png)
 
 ## 📸 SPL Library Workflow
 
@@ -104,7 +107,7 @@ The SPL Library keeps reusable SPL in the managed context workspace so operators
 
 ### Browse the SPL Library
 
-![SPL Library listing in the Context workspace](docs/screenshots/spl-library-listing.png)
+![SPL Library listing in the Knowledge Base tab](docs/screenshots/spl-library-listing.png)
 
 ### Inspect Stored Asset Detail
 

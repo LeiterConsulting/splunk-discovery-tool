@@ -345,6 +345,25 @@ class CapabilityFrameworkTests(unittest.TestCase):
             finally:
                 os.chdir(original_cwd)
 
+    def test_capability_state_describes_the_workspace_tab_it_adds(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(temp_path / "config.encrypted")), registry=CapabilityRegistry())
+                states = manager.list_capabilities(refresh_health=False)
+
+                advisor_workspace = states["m26_14_advisor"]["workspace"]
+                self.assertEqual(advisor_workspace["id"], "m26-14")
+                self.assertEqual(advisor_workspace["label"], "M-26-14")
+                self.assertTrue(advisor_workspace["description"])
+                self.assertIsNone(states["rag_local"]["workspace"])
+                json.dumps(states)
+            finally:
+                os.chdir(original_cwd)
+
     def test_rag_local_install_enable_and_query_flow(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             temp_path = Path(temp_dir)

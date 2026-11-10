@@ -124,7 +124,7 @@ Every button should communicate purpose:
 
 ## 8) Workspace Endpoint Map (Current)
 
-- `GET /api/discovery/dashboard` → Mission intelligence cards
+- `GET /api/discovery/dashboard` → Overview and Findings data
 - `GET /api/discovery/compare` → Session delta metrics
 - `GET /api/discovery/runbook` → Persona runbook payload
 - `GET /api/v2/intelligence` → Latest blueprint payload
@@ -195,3 +195,5 @@ Every button should communicate purpose:
 For the proposed optional RAG and installable enhancement-pack model, see:
 
 - `docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md`
+
+A capability can add its own workspace tab by setting `workspace` on its `CapabilityDefinition` to a `CapabilityWorkspace(id, label, description)`. `GET /api/capabilities` returns it as `workspace` (or `null`) on each capability, and the UI shows the tab after the core tabs while the capability is installed and enabled. The tab label comes from `label`; the frontend maps `id` to the view it opens in `MODULE_WORKSPACE_OPENERS`.

@@ -43,15 +43,18 @@ const themeNames = (process.env.UI_CONTRAST_THEMES || Object.keys(THEMES).join('
 // A navigation change that silently skips a surface would otherwise let the gate pass.
 const REQUIRED_SURFACES = [
     'welcome',
-    'tab-mission',
-    'tab-intelligence',
+    'tab-overview',
+    'tab-findings',
+    'tab-m26-14',
     'tab-discovery',
-    'tab-context',
+    'tab-knowledge-base',
     'tab-capabilities',
     'discovery-report-open',
     'chat',
     'chat-settings',
+    'connection-details',
     'settings-connections',
+    'settings-appearance',
 ];
 // Visible text must not show raw identifiers, broken plurals, or retired names and jargon.
 const LANGUAGE_RULES = [
@@ -381,7 +384,7 @@ async function auditTheme(browser, baseUrl, themeName) {
             await splash.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => {});
         }
 
-        for (const tab of ['mission', 'intelligence', 'm26-14', 'discovery', 'context', 'capabilities']) {
+        for (const tab of ['overview', 'findings', 'm26-14', 'discovery', 'knowledge-base', 'capabilities']) {
             if (await clickIfPresent(page.locator(`#workspace-tab-${tab}`))) {
                 await settle(page, 1200);
                 await capture(`tab-${tab}`, null, true);
@@ -413,9 +416,9 @@ async function auditTheme(browser, baseUrl, themeName) {
             await closeDialogs(page);
         }
 
-        await clickIfPresent(page.locator('#workspace-tab-mission'));
+        await clickIfPresent(page.locator('#workspace-tab-overview'));
         await settle(page);
-        if (await clickIfPresent(page.locator('button', { hasText: 'Open Chat' }))) {
+        if (await clickIfPresent(page.getByRole('button', { name: 'Open chat', exact: true }))) {
             await settle(page, 1000);
             await capture('chat', '[role="dialog"]');
             if (await clickIfPresent(page.getByRole('button', { name: 'Open chat settings' }))) {
@@ -425,7 +428,7 @@ async function auditTheme(browser, baseUrl, themeName) {
             await closeDialogs(page);
         }
 
-        if (await clickIfPresent(page.getByRole('button', { name: /View MCP connection details/ }))) {
+        if (await clickIfPresent(page.getByTestId('header-connection-status'))) {
             await settle(page, 600);
             await capture('connection-details', '.connection-popover');
             await closeDialogs(page);
@@ -434,7 +437,7 @@ async function auditTheme(browser, baseUrl, themeName) {
 
         if (await clickIfPresent(page.getByRole('button', { name: 'Open settings' }))) {
             await settle(page, 800);
-            for (const tab of ['connections', 'users', 'access', 'troubleshoot']) {
+            for (const tab of ['connections', 'users', 'access', 'appearance', 'troubleshoot']) {
                 if (await clickIfPresent(page.getByTestId(`settings-tab-${tab}`))) {
                     await settle(page, 800);
                     await capture(`settings-${tab}`, '.settings-modal-shell');
@@ -487,12 +490,14 @@ async function checkThemeSwitching(browser, baseUrl) {
         await dismissSplash();
         await expectState('loading with Light saved', { theme: 'light', scheme: 'light', saved: 'light' });
         await page.getByRole('button', { name: 'Open settings' }).click();
+        await page.getByTestId('settings-tab-appearance').click();
         await page.getByTestId('settings-theme-option-neo').click();
         await expectState('choosing Neo', { theme: 'neo', scheme: 'dark', saved: 'neo' });
         await page.reload({ waitUntil: 'domcontentloaded' });
         await dismissSplash();
         await expectState('reloading with Neo saved', { theme: 'neo', scheme: 'dark', saved: 'neo' });
         await page.getByRole('button', { name: 'Open settings' }).click();
+        await page.getByTestId('settings-tab-appearance').click();
         await page.getByTestId('settings-theme-option-system').click();
         await expectState('choosing System on a dark computer', { theme: 'dark', scheme: 'dark', saved: 'system' });
         const resolved = (await page.getByTestId('settings-theme-resolved').innerText().catch(() => '')).trim();
@@ -528,6 +533,11 @@ async function main() {
     let browser = null;
     try {
         await waitForServer(`${baseUrl}/`, logs, server);
+        // Turning on the M-26-14 module adds its tab, so the module tab and its page are audited too.
+        for (const action of ['install', 'enable']) {
+            const response = await fetch(`${baseUrl}/api/capabilities/m26_14_advisor/${action}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+            if (!response.ok) throw new Error(`Could not ${action} the M-26-14 module: HTTP ${response.status}`);
+        }
         browser = await chromium.launch({ headless: true });
         problems.push(...await checkThemeSwitching(browser, baseUrl));
         for (const themeName of themeNames) {

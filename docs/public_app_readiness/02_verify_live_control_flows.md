@@ -16,8 +16,8 @@ Controls that appear valid but fail silently create more damage than controls th
 
 1. App shell and top navigation
 2. Settings and connection details
-3. Mission workspace actions
-4. Intelligence workspace actions
+3. Overview tab actions
+4. Findings tab actions
 5. Artifacts browsing and report selection
 6. Capabilities workspace controls
 7. Chat open, close, clear, settings, suggested queries, and follow-on actions
