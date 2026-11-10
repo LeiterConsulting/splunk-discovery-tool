@@ -67,7 +67,7 @@ Validated evidence:
 
 ### PAR-F009: Frontend delivery hardening is now complete
 
-The UI now serves checked-in local static assets by default instead of relying on CDN-delivered React, Tailwind `2.2.19`, Font Awesome, and in-browser Babel. A build-time pipeline renders the legacy inline template, transpiles the JSX into `src/static/app.js`, and vendors pinned local runtime assets under `src/static/vendor/`, while the FastAPI app serves `src/static/index.html` at runtime.
+The UI now serves checked-in local static assets by default instead of relying on CDN-delivered React, Tailwind `2.2.19`, Font Awesome, and in-browser Babel. A build-time pipeline renders the legacy inline template, transpiles the JSX into `src/static/app.js`, builds `src/static/app.css` with Tailwind's JIT engine, and vendors pinned local runtime assets under `src/static/vendor/`, while the FastAPI app serves `src/static/index.html` at runtime.
 
 ## Cross-Cutting Patterns
 

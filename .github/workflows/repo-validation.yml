@@ -91,6 +91,9 @@ jobs:
       - name: Run settings troubleshooting browser regression
         run: npm run test:settings-troubleshoot-browser
 
+      - name: Run UI contrast browser check
+        run: npm run test:ui-contrast-browser
+
       - name: Run Ruff
         run: python -m ruff check src tests
 

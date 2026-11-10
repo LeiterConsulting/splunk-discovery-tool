@@ -87,6 +87,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - After installing again in a new folder, the out-of-date banner kept appearing on the old copy's port and told users to restart, which only restarted the new copy on a fallback port
 - Saving an MCP configuration from the form dropped its CA bundle path, and Test Connection ignored the CA bundle and sent a request without the JSON-RPC `jsonrpc`/`id` fields that strict MCP servers require
 
+### 🎨 Themes, Contrast & Stylesheet
+
+#### Added
+- **Neo theme** in Settings > Appearance, next to Light, Dark, and System, and saved like the others. It replaces the hidden Construct theme, which only lasted for one browser tab
+- `tools/test_ui_contrast_browser.mjs` (`npm run test:ui-contrast-browser`, also run in CI): opens each workspace tab, the report viewer, the summary tabs, chat, chat settings, connection details, and each Settings tab in Light, Dark, Neo, and System (light and dark) against seeded discovery output. It fails when text or a placeholder falls below WCAG AA contrast, when text is smaller than 12px, or when a view can't be reached
+
+#### Changed
+- The stylesheet is built at `npm run build:frontend` time with Tailwind's JIT engine (`tailwind.config.cjs`) into `src/static/app.css`, which holds only the classes the app uses (75 KB instead of the 2.9 MB full Tailwind file)
+- Colors come from per-theme CSS variables in the template, so each theme recolors every utility class. Light darkens gray helper text; Dark keeps the standard grays; Neo maps the palette to greens
+- Layouts written with Tailwind arbitrary values (two-column grids, size limits, dialog stacking) now take effect; the full Tailwind file never included them
+- Text that was 10-11px is now 12px, and uppercase labels use less letter-spacing
+- Google Fonts are no longer loaded; Neo uses the system monospace font
+- `build-manifest.json` records the Tailwind config and `app.css` hashes, so `tools/check_frontend_sync.py` reports a stale stylesheet
+
+#### Fixed
+- Text below 4.5:1 contrast: gray helper text and placeholders, the dark-theme Export link, translucent header buttons, the discovery log banner, and chat settings hints. A full pass found 36 failures in Light, 14 in Dark, and about 50 in Construct; every theme now has none
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added
