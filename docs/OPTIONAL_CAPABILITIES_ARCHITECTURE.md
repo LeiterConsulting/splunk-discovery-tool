@@ -399,7 +399,7 @@ Each card should show:
 
 ### Dedicated workspace tab
 
-Add a new workspace tab next to Mission, Intelligence, and Artifacts:
+Add a new workspace tab next to the core workspace tabs:
 
 - `Capabilities`
 

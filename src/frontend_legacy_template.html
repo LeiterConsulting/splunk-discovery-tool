@@ -169,12 +169,46 @@
         .ui-link { color: rgb(var(--ui-link)); }
         .ui-link:hover { color: rgb(var(--ui-link-hover)); }
 
+        /* Fades the right edge so a tab row that overflows on narrow screens reads as scrollable. */
+        .dt4sms-shell-tablist {
+            scrollbar-width: none;
+            -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+            mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+            padding-right: 1.5rem;
+        }
+
+        .dt4sms-shell-tablist::-webkit-scrollbar {
+            display: none;
+        }
+
+        .dt4sms-shell-tablist [role='tab']:focus-visible {
+            outline-offset: -2px;
+        }
+
+        .dt4sms-shell-module-start {
+            position: relative;
+            margin-left: 0.75rem;
+        }
+
+        .dt4sms-shell-module-start::before {
+            content: '';
+            position: absolute;
+            left: -0.5rem;
+            top: 0.75rem;
+            bottom: 0.75rem;
+            width: 1px;
+            background: rgb(var(--c-gray-300));
+        }
+
+        [data-color-scheme='dark'] .dt4sms-shell-module-start::before {
+            background: rgb(var(--c-gray-600));
+        }
+
         @media (prefers-reduced-motion: reduce) {
             .animated-gradient,
             .pulse-ring,
             .fade-in,
-            .slide-in,
-            .dt4sms-shell-status-chip {
+            .slide-in {
                 animation: none !important;
             }
         }
@@ -407,15 +441,6 @@
             color: rgb(var(--c-slate-200));
         }
 
-        @keyframes neoGlowPulse {
-            0%, 100% {
-                box-shadow: 0 0 0 rgba(var(--c-green-400), 0), 0 0 28px rgba(var(--c-green-400), 0.1);
-            }
-            50% {
-                box-shadow: 0 0 18px rgba(var(--c-green-400), 0.18), 0 0 42px rgba(var(--c-green-400), 0.14);
-            }
-        }
-
         [data-theme='neo'] body {
             background:
                 radial-gradient(circle at top, rgba(var(--c-green-400), 0.12), transparent 34%),
@@ -472,48 +497,49 @@
             text-transform: uppercase;
         }
 
-        [data-theme='neo'] .dt4sms-shell-tabbar,
-        [data-theme='neo'] .dt4sms-shell-tablist {
-            background: rgb(var(--c-gray-900)) !important;
-            border-color: rgba(var(--c-green-300), 0.22) !important;
+        @media (max-width: 479px) {
+            [data-theme='neo'] .dt4sms-shell-title {
+                font-size: 0.875rem;
+                letter-spacing: 0.02em;
+            }
         }
 
         [data-theme='neo'] .dt4sms-shell-tablist [role='tab'] {
             color: rgb(var(--c-green-200)) !important;
-            border-color: rgba(var(--c-green-300), 0.18) !important;
             letter-spacing: 0.06em;
             text-transform: uppercase;
-            transition: background-color 180ms ease, color 180ms ease;
+            font-size: 0.8125rem;
+            transition: color 180ms ease, border-color 180ms ease;
         }
 
         [data-theme='neo'] .dt4sms-shell-tablist [role='tab'][aria-selected='true'] {
-            background: rgb(var(--c-green-700)) !important;
             color: rgb(var(--c-white)) !important;
-            box-shadow: inset 0 0 0 1px rgba(var(--c-green-200), 0.2), 0 0 16px rgba(var(--c-green-400), 0.12);
+            border-bottom-color: rgb(var(--c-green-400)) !important;
+            text-shadow: 0 0 12px rgba(var(--c-green-400), 0.45);
         }
 
         [data-theme='neo'] .dt4sms-shell-tablist [role='tab'][aria-selected='false']:hover {
-            background: rgb(var(--c-gray-800)) !important;
             color: rgb(var(--c-gray-50)) !important;
+            border-bottom-color: rgba(var(--c-green-300), 0.45) !important;
         }
 
-        [data-theme='neo'] .dt4sms-shell-quick-actions > button,
-        [data-theme='neo'] .dt4sms-shell-quick-actions > label,
-        [data-theme='neo'] .dt4sms-shell-status-actions > button,
-        [data-theme='neo'] .dt4sms-shell-status-card {
+        [data-theme='neo'] .dt4sms-shell-module-start::before {
+            background: rgba(var(--c-green-300), 0.35);
+        }
+
+        [data-theme='neo'] .dt4sms-shell-action,
+        [data-theme='neo'] .dt4sms-voice-control {
             background: rgb(var(--c-gray-800)) !important;
             border-color: rgba(var(--c-green-300), 0.22) !important;
             color: rgb(var(--c-gray-100)) !important;
         }
 
-        [data-theme='neo'] .dt4sms-shell-quick-actions > button:hover,
-        [data-theme='neo'] .dt4sms-shell-quick-actions > label:hover,
-        [data-theme='neo'] .dt4sms-shell-status-actions > button:hover {
+        [data-theme='neo'] .dt4sms-shell-action:hover {
             background: rgb(var(--c-gray-700)) !important;
             color: rgb(var(--c-gray-50)) !important;
         }
 
-        [data-theme='neo'] .dt4sms-shell-voice-control select {
+        [data-theme='neo'] .dt4sms-voice-control select {
             background: rgb(var(--c-gray-950)) !important;
             color: rgb(var(--c-gray-50)) !important;
             border-color: rgba(var(--c-green-300), 0.22) !important;
@@ -528,10 +554,6 @@
 
         [data-theme='neo'] .dt4sms-shell-primary-action:hover {
             background: rgb(var(--c-green-700)) !important;
-        }
-
-        [data-theme='neo'] .dt4sms-shell-status-chip {
-            animation: neoGlowPulse 4.4s ease-in-out infinite;
         }
 
         [data-theme='neo'] .settings-modal-shell {
@@ -1953,6 +1975,26 @@
             const rawValue = String(value || '').trim();
             return PROVIDER_NAMES[rawValue.toLowerCase()] || rawValue || 'Not configured';
         };
+        const TABLIST_NAVIGATION_KEYS = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+        const handleTablistKeyDown = (event) => {
+            if (!TABLIST_NAVIGATION_KEYS.includes(event.key)) {
+                return;
+            }
+            const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]')).filter((tab) => !tab.disabled);
+            const currentIndex = tabs.indexOf(document.activeElement);
+            if (currentIndex === -1) {
+                return;
+            }
+            event.preventDefault();
+            let nextIndex = currentIndex;
+            if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length;
+            if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+            if (event.key === 'Home') nextIndex = 0;
+            if (event.key === 'End') nextIndex = tabs.length - 1;
+            tabs[nextIndex].focus();
+            tabs[nextIndex].click();
+        };
+
 
         function App() {
             const THEME_PREFERENCE_KEY = 'dt4sms_theme_preference';
@@ -2717,15 +2759,12 @@
                         return {
                             label: 'Starting discovery',
                             shortValue: 'Starting',
-                            summary: 'You can switch tabs while it runs. The Discovery button in the header shows progress.',
+                            summary: 'You can switch tabs while it runs. The Discovery tab shows progress.',
                             monitorLabel: 'Live',
                             bannerTitle: 'Discovery is starting',
                             statusBadgeClass: isDarkTheme
                                 ? 'bg-amber-950 text-amber-100 border border-amber-700'
                                 : 'bg-amber-50 text-amber-800 border border-amber-200',
-                            headerChipClass: isDarkTheme
-                                ? 'bg-amber-950/60 border-amber-700 text-amber-100'
-                                : 'bg-amber-50 border-amber-200 text-amber-900',
                             tonePanelClass: isDarkTheme
                                 ? 'bg-amber-950/40 border-amber-700'
                                 : 'bg-amber-50 border-amber-200',
@@ -2738,15 +2777,12 @@
                         return {
                             label: 'Discovery running',
                             shortValue: 'Running',
-                            summary: 'You can switch tabs while it runs. The Discovery button in the header shows progress.',
+                            summary: 'You can switch tabs while it runs. The Discovery tab shows progress.',
                             monitorLabel: 'Live',
                             bannerTitle: 'Discovery is running',
                             statusBadgeClass: isDarkTheme
                                 ? 'bg-indigo-950 text-indigo-100 border border-indigo-700'
                                 : 'bg-indigo-50 text-indigo-800 border border-indigo-200',
-                            headerChipClass: isDarkTheme
-                                ? 'bg-indigo-950/60 border-indigo-700 text-indigo-100'
-                                : 'bg-indigo-50 border-indigo-200 text-indigo-900',
                             tonePanelClass: isDarkTheme
                                 ? 'bg-indigo-950/50 border-indigo-700'
                                 : 'bg-indigo-50 border-indigo-200',
@@ -2765,9 +2801,6 @@
                             statusBadgeClass: isDarkTheme
                                 ? 'bg-emerald-950 text-emerald-100 border border-emerald-700'
                                 : 'bg-emerald-50 text-emerald-800 border border-emerald-200',
-                            headerChipClass: isDarkTheme
-                                ? 'bg-emerald-950/60 border-emerald-700 text-emerald-100'
-                                : 'bg-emerald-50 border-emerald-200 text-emerald-900',
                             tonePanelClass: isDarkTheme
                                 ? 'bg-emerald-950/45 border-emerald-700'
                                 : 'bg-emerald-50 border-emerald-200',
@@ -2786,9 +2819,6 @@
                             statusBadgeClass: isDarkTheme
                                 ? 'bg-rose-950 text-rose-100 border border-rose-700'
                                 : 'bg-rose-50 text-rose-800 border border-rose-200',
-                            headerChipClass: isDarkTheme
-                                ? 'bg-rose-950/60 border-rose-700 text-rose-100'
-                                : 'bg-rose-50 border-rose-200 text-rose-900',
                             tonePanelClass: isDarkTheme
                                 ? 'bg-rose-950/45 border-rose-700'
                                 : 'bg-rose-50 border-rose-200',
@@ -2807,9 +2837,6 @@
                             statusBadgeClass: isDarkTheme
                                 ? 'bg-orange-950 text-orange-100 border border-orange-700'
                                 : 'bg-orange-50 text-orange-800 border border-orange-200',
-                            headerChipClass: isDarkTheme
-                                ? 'bg-orange-950/60 border-orange-700 text-orange-100'
-                                : 'bg-orange-50 border-orange-200 text-orange-900',
                             tonePanelClass: isDarkTheme
                                 ? 'bg-orange-950/45 border-orange-700'
                                 : 'bg-orange-50 border-orange-200',
@@ -2829,9 +2856,6 @@
                             statusBadgeClass: isDarkTheme
                                 ? 'bg-gray-900 text-gray-100 border border-gray-700'
                                 : 'bg-gray-50 text-gray-800 border border-gray-200',
-                            headerChipClass: isDarkTheme
-                                ? 'bg-gray-800 border-gray-600 text-gray-100'
-                                : 'bg-white border-gray-300 text-gray-900',
                             tonePanelClass: isDarkTheme
                                 ? 'bg-gray-900 border-gray-700'
                                 : 'bg-gray-50 border-gray-200',
@@ -2842,9 +2866,6 @@
                         };
                 }
             })();
-            const discoveryHeaderChipLabel = isMissionDiscoveryActive
-                ? `Discovery ${Math.max(discoveryProgressPercent, 1)}%`
-                : `Discovery ${discoveryStatusMeta.shortValue}`;
             const discoveryNarrative = (() => {
                 if (isMissionDiscoveryActive) {
                     return discoveryActivePhase
@@ -3092,31 +3113,6 @@
                         };
                 }
             };
-            const buildOperatorVoiceExecutiveItem = (item, voice, idx, type = 'theme') => {
-                const summary = getNormalizedLine(item, 'No executive summary was recorded.');
-
-                if (voice === 'evidence') {
-                    return {
-                        title: type === 'theme' ? `Evidence theme ${idx + 1}` : `90-day check ${idx + 1}`,
-                        summary,
-                        meta: type === 'theme' ? 'Use this to justify spending on data and monitoring.' : 'Use this to set measurable checkpoints for leadership.',
-                    };
-                }
-
-                if (voice === 'executive') {
-                    return {
-                        title: type === 'theme' ? `Board theme ${idx + 1}` : `Quarter priority ${idx + 1}`,
-                        summary,
-                        meta: type === 'theme' ? 'Present this as business risk and the benefit of fixing it.' : 'Assign an owner and carry this into the next planning cycle.',
-                    };
-                }
-
-                return {
-                    title: type === 'theme' ? `Theme ${idx + 1}` : `90-day action ${idx + 1}`,
-                    summary,
-                    meta: type === 'theme' ? 'Use this to decide what to hand off next.' : 'Schedule this as a recurring task.',
-                };
-            };
             const summarizeFindingEntry = (entry) => {
                 const findings = Array.isArray(entry?.findings) ? entry.findings.filter(Boolean) : [];
                 return getNormalizedLine(findings[0], 'See the evidence entry for details.');
@@ -3126,98 +3122,56 @@
             const missionStats = latestMissionSession?.stats || {};
             const missionFreshness = getMissionFreshnessMeta(latestMissionSession?.created_at || latestMissionSession?.timestamp);
             const missionHasPreviousSession = !!discoveryDashboard?.previous;
-            const missionReportCount = Array.isArray(latestMissionSession?.report_paths) ? latestMissionSession.report_paths.length : 0;
-            const missionAdminActions = Array.isArray(latestMissionSession?.personas?.admin?.actions)
-                ? latestMissionSession.personas.admin.actions
-                : [];
-            const missionAnalystTracks = Array.isArray(latestMissionSession?.personas?.analyst?.hypotheses)
-                ? latestMissionSession.personas.analyst.hypotheses
-                : [];
-            const missionExecutiveThemes = Array.isArray(latestMissionSession?.personas?.executive?.business_value_themes)
-                ? latestMissionSession.personas.executive.business_value_themes
-                : [];
-            const missionExecutiveFocus = Array.isArray(latestMissionSession?.personas?.executive?.next_90_day_focus)
-                ? latestMissionSession.personas.executive.next_90_day_focus
-                : [];
             const missionExecutiveHeadline = latestMissionSession?.personas?.executive?.headline
                 || `Readiness score is ${formatMissionMetricValue(discoveryDashboard?.kpis?.readiness_score)} out of 100, with ${countLabel(discoveryDashboard?.kpis?.recommendation_count, 'recommendation')} to follow up.`;
-            const missionSummaryCards = [
+            const workspaceMetricTone = {
+                shellClass: isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200',
+                labelClass: mutedTextClass,
+                valueClass: headingClass,
+            };
+            const describeMissionChange = (delta) => (missionHasPreviousSession
+                ? `${formatMissionTrendValue(delta)} since the previous run.`
+                : '');
+            const missionStatCards = [
+                {
+                    label: 'Readiness',
+                    value: `${formatMissionMetricValue(discoveryDashboard?.kpis?.readiness_score)}/100`,
+                    detail: describeMissionChange(discoveryDashboard?.trends?.readiness_delta),
+                    ...workspaceMetricTone,
+                },
                 {
                     label: 'Hosts',
                     value: formatMissionMetricValue(missionOverview.total_hosts),
-                    detail: `${countLabel(missionOverview.total_sources, 'source')} found.`,
-                    shellClass: isDarkTheme ? 'bg-blue-950 border-blue-800' : 'bg-blue-50 border-blue-200',
-                    labelClass: isDarkTheme ? 'text-blue-200' : 'text-blue-800',
-                    valueClass: isDarkTheme ? 'text-blue-50' : 'text-blue-950',
+                    detail: `${countLabel(missionOverview.total_sources, 'source')}.`,
+                    ...workspaceMetricTone,
+                },
+                {
+                    label: 'Indexes',
+                    value: formatMissionMetricValue(discoveryDashboard?.kpis?.total_indexes),
+                    detail: describeMissionChange(discoveryDashboard?.trends?.indexes_delta),
+                    ...workspaceMetricTone,
+                },
+                {
+                    label: 'Sourcetypes',
+                    value: formatMissionMetricValue(discoveryDashboard?.kpis?.total_sourcetypes),
+                    detail: describeMissionChange(discoveryDashboard?.trends?.sourcetypes_delta),
+                    ...workspaceMetricTone,
                 },
                 {
                     label: 'Data in last 24 hours',
                     value: missionOverview.data_volume_24h || 'Unknown',
                     detail: missionOverview.splunk_version
-                        ? `Splunk ${missionOverview.splunk_version}${missionOverview.license_state ? ` • License ${missionOverview.license_state}` : ''}`
-                        : 'Splunk version and license were not recorded.',
-                    shellClass: isDarkTheme ? 'bg-emerald-950 border-emerald-800' : 'bg-emerald-50 border-emerald-200',
-                    labelClass: isDarkTheme ? 'text-emerald-200' : 'text-emerald-800',
-                    valueClass: isDarkTheme ? 'text-emerald-50' : 'text-emerald-950',
+                        ? `Splunk ${missionOverview.splunk_version}${missionOverview.license_state ? `, license ${missionOverview.license_state}` : ''}.`
+                        : 'Splunk version was not recorded.',
+                    ...workspaceMetricTone,
                 },
                 {
                     label: 'Recommendations',
                     value: formatMissionMetricValue(missionStats.recommendation_count || discoveryDashboard?.kpis?.recommendation_count),
-                    detail: `${countLabel(missionStats.suggested_use_case_count, 'suggested use case')} and ${countLabel(missionAdminActions.length, 'admin task')}.`,
-                    shellClass: isDarkTheme ? 'bg-amber-950 border-amber-800' : 'bg-amber-50 border-amber-200',
-                    labelClass: isDarkTheme ? 'text-amber-200' : 'text-amber-900',
-                    valueClass: isDarkTheme ? 'text-amber-50' : 'text-amber-950',
-                },
-                {
-                    label: 'Discovery steps',
-                    value: formatMissionMetricValue(missionStats.discovery_steps),
-                    detail: `${countLabel(missionReportCount, 'report')} and ${countLabel(discoveryDashboard?.kpis?.tool_count, 'MCP tool')} available.`,
-                    shellClass: isDarkTheme ? 'bg-purple-950 border-purple-800' : 'bg-purple-50 border-purple-200',
-                    labelClass: isDarkTheme ? 'text-purple-200' : 'text-purple-800',
-                    valueClass: isDarkTheme ? 'text-purple-50' : 'text-purple-950',
+                    detail: describeMissionChange(discoveryDashboard?.trends?.recommendations_delta),
+                    ...workspaceMetricTone,
                 },
             ];
-            const missionChangeCards = [
-                {
-                    label: 'Readiness score',
-                    value: formatMissionTrendValue(discoveryDashboard?.trends?.readiness_delta),
-                    detail: 'Change since the previous run.',
-                    shellClass: isDarkTheme ? 'bg-indigo-950 border-indigo-800' : 'bg-indigo-50 border-indigo-200',
-                    labelClass: isDarkTheme ? 'text-indigo-200' : 'text-indigo-800',
-                    valueClass: isDarkTheme ? 'text-indigo-50' : 'text-indigo-950',
-                },
-                {
-                    label: 'Indexes',
-                    value: formatMissionTrendValue(discoveryDashboard?.trends?.indexes_delta),
-                    detail: 'Indexes added or removed.',
-                    shellClass: isDarkTheme ? 'bg-blue-950 border-blue-800' : 'bg-blue-50 border-blue-200',
-                    labelClass: isDarkTheme ? 'text-blue-200' : 'text-blue-800',
-                    valueClass: isDarkTheme ? 'text-blue-50' : 'text-blue-950',
-                },
-                {
-                    label: 'Sourcetypes',
-                    value: formatMissionTrendValue(discoveryDashboard?.trends?.sourcetypes_delta),
-                    detail: 'Sourcetypes added or removed.',
-                    shellClass: isDarkTheme ? 'bg-emerald-950 border-emerald-800' : 'bg-emerald-50 border-emerald-200',
-                    labelClass: isDarkTheme ? 'text-emerald-200' : 'text-emerald-800',
-                    valueClass: isDarkTheme ? 'text-emerald-50' : 'text-emerald-950',
-                },
-                {
-                    label: 'Recommendations',
-                    value: formatMissionTrendValue(discoveryDashboard?.trends?.recommendations_delta),
-                    detail: 'Change in the number of recommendations.',
-                    shellClass: isDarkTheme ? 'bg-amber-950 border-amber-800' : 'bg-amber-50 border-amber-200',
-                    labelClass: isDarkTheme ? 'text-amber-200' : 'text-amber-900',
-                    valueClass: isDarkTheme ? 'text-amber-50' : 'text-amber-950',
-                },
-            ];
-            const missionAdminVoiceCards = missionAdminActions.slice(0, 3).map((action) => buildOperatorVoiceAdminCard(action, operatorVoice));
-            const missionAnalystVoiceCards = missionAnalystTracks.slice(0, 3).map((track) => buildOperatorVoiceAnalystCard(track, operatorVoice));
-            const missionExecutiveSourceItems = missionExecutiveThemes.length > 0 ? missionExecutiveThemes : missionExecutiveFocus;
-            const missionExecutiveVoiceCards = missionExecutiveSourceItems.slice(0, 3).map((item, idx) => buildOperatorVoiceExecutiveItem(item, operatorVoice, idx, missionExecutiveThemes.length > 0 ? 'theme' : 'focus'));
-            const missionRunbookAdminCards = missionAdminActions.slice(0, 6).map((action) => buildOperatorVoiceAdminCard(action, operatorVoice));
-            const missionRunbookAnalystCards = missionAnalystTracks.slice(0, 6).map((track) => buildOperatorVoiceAnalystCard(track, operatorVoice));
-            const missionRunbookExecutiveCards = missionExecutiveSourceItems.slice(0, 6).map((item, idx) => buildOperatorVoiceExecutiveItem(item, operatorVoice, idx, missionExecutiveThemes.length > 0 ? 'theme' : 'focus'));
             const intelligenceGapCount = v2CoverageGaps.length;
             const intelligenceFindingCount = v2FindingLedger.length;
             const intelligenceUseCaseCount = v2UseCases.length;
@@ -3232,12 +3186,6 @@
             const visibleIntelligenceNotablePatterns = showAllIntelligencePatterns
                 ? intelligenceNotablePatterns
                 : intelligenceNotablePatterns.slice(0, intelligencePatternDisplayLimit);
-            const intelligenceExecutiveSourceItems = v2UseCases
-                .map((item) => getNormalizedLine(item?.business_value))
-                .filter(Boolean);
-            const intelligenceExecutivePatternItems = intelligenceNotablePatterns
-                .map((pattern) => getNormalizedLine(pattern?.description || pattern?.signal || pattern?.title))
-                .filter(Boolean);
             const intelligenceHeadline = (() => {
                 if (operatorVoice === 'evidence') {
                     return `${countLabel(intelligenceGapCount, 'coverage gap')}, ${countLabel(intelligenceUseCaseCount, 'investigation')}, and ${countLabel(intelligenceFindingCount, 'evidence entry', 'evidence entries')} to verify.`;
@@ -3258,14 +3206,12 @@
             })();
             const intelligenceSummaryCards = [
                 {
-                    label: 'Coverage Gaps',
+                    label: 'Coverage gaps',
                     value: formatMissionMetricValue(intelligenceGapCount),
                     detail: intelligenceTopGap?.gap
                         ? `Top gap: ${intelligenceTopGap.gap}`
                         : 'No high-priority gaps found.',
-                    shellClass: isDarkTheme ? 'bg-rose-950 border-rose-800' : 'bg-rose-50 border-rose-200',
-                    labelClass: isDarkTheme ? 'text-rose-200' : 'text-rose-800',
-                    valueClass: isDarkTheme ? 'text-rose-50' : 'text-rose-950',
+                    ...workspaceMetricTone,
                 },
                 {
                     label: 'Investigations',
@@ -3273,9 +3219,7 @@
                     detail: intelligenceTopUseCase?.title
                         ? `Top: ${intelligenceTopUseCase.title}`
                         : 'No investigations suggested.',
-                    shellClass: isDarkTheme ? 'bg-indigo-950 border-indigo-800' : 'bg-indigo-50 border-indigo-200',
-                    labelClass: isDarkTheme ? 'text-indigo-200' : 'text-indigo-800',
-                    valueClass: isDarkTheme ? 'text-indigo-50' : 'text-indigo-950',
+                    ...workspaceMetricTone,
                 },
                 {
                     label: 'Evidence entries',
@@ -3283,53 +3227,86 @@
                     detail: intelligenceTopFinding?.title
                         ? `First: ${intelligenceTopFinding.title}`
                         : 'No evidence recorded.',
-                    shellClass: isDarkTheme ? 'bg-emerald-950 border-emerald-800' : 'bg-emerald-50 border-emerald-200',
-                    labelClass: isDarkTheme ? 'text-emerald-200' : 'text-emerald-800',
-                    valueClass: isDarkTheme ? 'text-emerald-50' : 'text-emerald-950',
+                    ...workspaceMetricTone,
                 },
                 {
                     label: 'Hosts',
                     value: formatMissionMetricValue(v2Overview.total_hosts),
                     detail: `${formatMissionMetricValue(v2Overview.total_indexes)} indexes, ${formatMissionMetricValue(v2Overview.total_sourcetypes)} sourcetypes, ${formatMissionMetricValue(v2Overview.total_sources)} sources.`,
-                    shellClass: isDarkTheme ? 'bg-blue-950 border-blue-800' : 'bg-blue-50 border-blue-200',
-                    labelClass: isDarkTheme ? 'text-blue-200' : 'text-blue-800',
-                    valueClass: isDarkTheme ? 'text-blue-50' : 'text-blue-950',
+                    ...workspaceMetricTone,
                 },
             ];
-            const intelligencePriorityBoard = [
-                {
-                    label: 'Top coverage gap',
-                    detail: intelligenceTopGap?.why_it_matters || 'No major gap found.',
-                    badge: formatOperatorPriorityLabel(intelligenceTopGap?.priority),
-                    badgeClass: getOperatorPriorityClasses(intelligenceTopGap?.priority),
-                },
-                {
-                    label: 'Top investigation',
-                    detail: intelligenceTopUseCase?.description || intelligenceTopUseCase?.scenario || 'No investigation suggested.',
-                    badge: intelligenceTopUseCase?.implementation_complexity ? `Complexity: ${intelligenceTopUseCase.implementation_complexity}` : 'Complexity unknown',
-                    badgeClass: getOperatorPriorityClasses(intelligenceTopUseCase?.implementation_complexity === 'high' ? 'high' : 'medium'),
-                },
-                {
-                    label: 'Latest evidence',
-                    detail: summarizeFindingEntry(intelligenceTopFinding),
-                    badge: intelligenceTopFinding?.timestamp ? formatMissionDateTime(intelligenceTopFinding.timestamp, 'Time not recorded') : 'Time not recorded',
-                    badgeClass: isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-200' : 'bg-gray-100 border-gray-300 text-gray-700',
-                },
-            ];
-            const intelligenceAdminBriefs = v2CoverageGaps.slice(0, 3).map((gap) => buildOperatorVoiceAdminCard({
-                title: gap?.gap || 'Coverage gap',
-                why: gap?.why_it_matters || 'This monitoring gap needs a plan to close it.',
-                effort: gap?.priority || 'medium',
-                next_step: 'Close this gap, then run discovery again to confirm it is fixed.',
-            }, operatorVoice));
-            const intelligenceAnalystBriefs = v2UseCases.slice(0, 3).map((useCase) => buildOperatorVoiceAnalystCard({
-                title: useCase?.title || useCase?.name || 'Suggested investigation',
-                question: useCase?.description || useCase?.scenario || 'Decide what this investigation should prove.',
-                success_metric: (Array.isArray(useCase?.success_metrics) && useCase.success_metrics[0]) || useCase?.business_value || 'Detection or response measurably improves.',
-            }, operatorVoice));
-            const intelligenceExecutiveBriefs = (intelligenceExecutiveSourceItems.length > 0 ? intelligenceExecutiveSourceItems : intelligenceExecutivePatternItems)
-                .slice(0, 3)
-                .map((item, idx) => buildOperatorVoiceExecutiveItem(item, operatorVoice, idx, intelligenceExecutiveSourceItems.length > 0 ? 'theme' : 'focus'));
+            const getFirstNormalizedLine = (value) => {
+                const entries = Array.isArray(value) ? value : [value];
+                for (const entry of entries) {
+                    const text = entry && typeof entry === 'object'
+                        ? (entry.action || entry.step || entry.title || entry.description)
+                        : entry;
+                    const normalized = getNormalizedLine(text);
+                    if (normalized) {
+                        return normalized;
+                    }
+                }
+                return '';
+            };
+            const v2RiskRegister = Array.isArray(v2Blueprint?.risk_register) ? v2Blueprint.risk_register : [];
+            const findingsAdminItems = v2CoverageGaps.map((gap, idx) => {
+                const title = getNormalizedLine(gap?.gap, `Coverage gap ${idx + 1}`);
+                const matchingRisk = v2RiskRegister.find((entry) => getNormalizedLine(entry?.risk) === title) || null;
+                const card = buildOperatorVoiceAdminCard({
+                    title,
+                    why: gap?.why_it_matters,
+                    next_step: getFirstNormalizedLine(matchingRisk?.mitigation) || 'Close this gap, then run discovery again to confirm it is fixed.',
+                }, operatorVoice);
+                return {
+                    title: card.title,
+                    summary: card.summary,
+                    meta: card.meta,
+                    badge: `${formatOperatorPriorityLabel(gap?.priority)} priority`,
+                    badgeClass: getOperatorPriorityClasses(gap?.priority),
+                };
+            });
+            const findingsAnalystItems = v2UseCases.map((useCase, idx) => {
+                const successMetric = getFirstNormalizedLine(useCase?.success_metrics) || getNormalizedLine(useCase?.business_value);
+                const card = buildOperatorVoiceAnalystCard({
+                    title: getNormalizedLine(useCase?.title || useCase?.name, `Investigation ${idx + 1}`),
+                    question: useCase?.description || useCase?.scenario || useCase?.use_case,
+                    success_metric: successMetric,
+                }, operatorVoice);
+                const complexity = getNormalizedLine(useCase?.implementation_complexity).toLowerCase();
+                return {
+                    ...card,
+                    meta: successMetric ? card.meta : '',
+                    badge: complexity ? `${complexity.charAt(0).toUpperCase()}${complexity.slice(1)} effort` : '',
+                    badgeClass: `${panelMutedClass} ${mutedTextClass}`,
+                };
+            });
+            const findingsExecutiveItems = (() => {
+                const businessValueItems = v2UseCases
+                    .map((useCase, idx) => ({
+                        title: getNormalizedLine(useCase?.title || useCase?.name, `Investigation ${idx + 1}`),
+                        summary: getNormalizedLine(useCase?.business_value),
+                    }))
+                    .filter((item) => item.summary);
+                if (businessValueItems.length > 0) {
+                    return businessValueItems;
+                }
+                return intelligenceNotablePatterns
+                    .map((pattern, idx) => ({
+                        title: formatIntelligencePatternLabel(pattern?.title || pattern?.category, `Pattern ${idx + 1}`),
+                        summary: getNormalizedLine(pattern?.description || pattern?.signal),
+                    }))
+                    .filter((item) => item.summary);
+            })();
+            const findingsExecutiveNextStep = findingsExecutiveItems.find((item) => item.title !== findingsAnalystItems[0]?.title)
+                || findingsExecutiveItems[0]
+                || null;
+            // Overview shows the first item of each Findings list so the two pages never disagree.
+            const findingsNextSteps = [
+                findingsAdminItems[0] ? { ...findingsAdminItems[0], audience: 'Admin' } : null,
+                findingsAnalystItems[0] ? { ...findingsAnalystItems[0], audience: 'Analyst' } : null,
+                findingsExecutiveNextStep ? { ...findingsExecutiveNextStep, audience: 'Executive' } : null,
+            ].filter(Boolean);
             const summaryStageOrder = {
                 idle: 0,
                 queued: 1,
@@ -3436,6 +3413,7 @@
                 { id: 'connections', label: 'Connections', icon: 'fa-plug' },
                 { id: 'users', label: 'Users', icon: 'fa-users' },
                 { id: 'access', label: 'Security', icon: 'fa-key' },
+                { id: 'appearance', label: 'Appearance', icon: 'fa-adjust' },
                 { id: 'troubleshoot', label: 'Troubleshoot', icon: 'fa-stethoscope' },
             ];
 
@@ -4309,7 +4287,7 @@
                         summary: 'Your AI model runs locally, so discovery will be slower than with a hosted provider.',
                         details: [
                             'It can take several minutes, depending on the model and your hardware.',
-                            'You can switch tabs while it runs. The Discovery button in the header shows progress.',
+                            'You can switch tabs while it runs. The Discovery tab shows progress.',
                             'You can stop the run at any time from the Discovery tab.'
                         ],
                         confirmLabel: 'Run Discovery',
@@ -4461,6 +4439,172 @@
                 setWorkspaceTab('m26-14');
                 refreshM2614Workspace();
             };
+
+            const openFindingsWorkspace = () => {
+                setWorkspaceTab('intelligence');
+                refreshIntelligenceWorkspace();
+            };
+
+            // A capability lists its tab in its "workspace" metadata; this map says which page renders it.
+            const MODULE_WORKSPACE_OPENERS = {
+                'm26-14': openM2614Workspace,
+            };
+            const moduleWorkspaceTabs = Object.values(capabilitiesData?.capabilities || {})
+                .filter((capability) => capability?.installed && capability?.enabled && capability?.workspace?.id)
+                .map((capability) => {
+                    const workspaceId = String(capability.workspace.id);
+                    const open = MODULE_WORKSPACE_OPENERS[workspaceId];
+                    if (!open) {
+                        return null;
+                    }
+                    return {
+                        id: workspaceId,
+                        label: String(capability.workspace.label || capability.title || workspaceId),
+                        description: String(capability.workspace.description || ''),
+                        isActive: workspaceTab === workspaceId,
+                        open,
+                    };
+                })
+                .filter(Boolean);
+
+            const headerButtonClass = isDarkTheme
+                ? 'border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700'
+                : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-100';
+            const headerConnectionMeta = (() => {
+                if (connectionInfoStatus === 'connected') {
+                    return {
+                        label: 'Connected',
+                        summary: 'The Splunk MCP server and AI model are set up.',
+                        dotClass: 'bg-green-500',
+                    };
+                }
+                if (connectionInfoStatus === 'partial') {
+                    return {
+                        label: 'Setup incomplete',
+                        summary: headerMcpConnected
+                            ? 'The Splunk MCP server is set up. Add an AI model in Settings.'
+                            : 'The AI model is set up. Add a Splunk MCP server in Settings.',
+                        dotClass: 'bg-amber-500',
+                    };
+                }
+                if (connectionInfoStatus === 'error') {
+                    return {
+                        label: 'Status unavailable',
+                        summary: 'The app could not read its connection settings.',
+                        dotClass: 'bg-red-500',
+                    };
+                }
+                return {
+                    label: 'Not connected',
+                    summary: 'Add your Splunk MCP server and AI model in Settings.',
+                    dotClass: 'bg-red-500',
+                };
+            })();
+            const headerAuthSummary = headerAuthVisible
+                ? `Signed in as ${currentAuthUser.username}. ${headerAuthRoleLabel}. ${headerAuthProviderLabel}.${headerAuthAssignmentLabel ? ` ${headerAuthAssignmentLabel}.` : ''}`
+                : '';
+            const getWorkspaceTabClass = (isActive) => `dt4sms-shell-tab inline-flex flex-shrink-0 items-center gap-2 whitespace-nowrap border-b-2 px-3 py-2.5 text-sm transition-colors ${isActive
+                ? (isDarkTheme ? 'border-indigo-300 text-white font-semibold' : 'border-indigo-600 text-indigo-700 font-semibold')
+                : (isDarkTheme ? 'border-transparent text-gray-300 hover:text-white hover:border-gray-500' : 'border-transparent text-gray-600 hover:text-gray-900 hover:border-gray-300')}`;
+            const discoveryTabIndicator = (() => {
+                if (isMissionDiscoveryActive) {
+                    const percent = Math.max(discoveryProgressPercent, 1);
+                    return {
+                        text: `${percent}%`,
+                        textClass: isDarkTheme ? 'text-amber-200' : 'text-amber-800',
+                        srText: `discovery is running, ${percent}% done`,
+                    };
+                }
+                if (discoveryStatusNormalized === 'error') {
+                    return {
+                        text: 'Failed',
+                        textClass: isDarkTheme ? 'text-red-300' : 'text-red-700',
+                        srText: 'the last discovery run failed',
+                    };
+                }
+                return null;
+            })();
+
+            const renderOperatorVoiceSelect = () => (
+                <label
+                    className={`dt4sms-voice-control inline-flex items-center gap-2 rounded-lg border px-2.5 py-1 text-sm ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                    title={operatorVoiceDefinition.description}
+                >
+                    <span className={`text-xs font-semibold ${mutedTextClass}`}>Style</span>
+                    <select
+                        data-testid="workspace-operator-voice-select"
+                        value={operatorVoice}
+                        onChange={(event) => setOperatorVoice(event.target.value)}
+                        className={`rounded border px-2 py-1 text-xs ${isDarkTheme ? 'border-gray-600 bg-gray-900 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                        aria-label="Wording style"
+                    >
+                        {OPERATOR_VOICE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                    </select>
+                </label>
+            );
+
+            const renderWorkspaceRefreshButton = (onRefresh, label) => (
+                <button
+                    type="button"
+                    onClick={onRefresh}
+                    className={`dt4sms-shell-action inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${headerButtonClass}`}
+                    title={label}
+                    aria-label={label}
+                >
+                    <i className="fas fa-sync" aria-hidden="true"></i>
+                    <span>Refresh</span>
+                </button>
+            );
+
+            const renderWorkspaceMetricCard = (card) => (
+                <div key={card.label} className={`dt4sms-neo-metric rounded-xl border px-4 py-4 ${card.shellClass}`}>
+                    <div className={`text-xs uppercase tracking-wide ${card.labelClass}`}>{card.label}</div>
+                    <div className={`mt-2 text-2xl font-semibold ${card.valueClass}`}>{card.value}</div>
+                    {card.detail && <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{card.detail}</div>}
+                </div>
+            );
+
+            const renderFindingsList = ({ key, icon, iconClass, title, audience, items, emptyText }) => (
+                <section
+                    key={key}
+                    data-testid={`findings-list-${key}`}
+                    aria-labelledby={`findings-list-${key}-heading`}
+                    className={`dt4sms-neo-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}
+                >
+                    <div className="flex items-start justify-between gap-2 mb-3">
+                        <div>
+                            <div className="flex items-center gap-2">
+                                <i className={`fas ${icon} ${iconClass}`} aria-hidden="true"></i>
+                                <h3 id={`findings-list-${key}-heading`} className={`text-sm font-semibold ${headingClass}`}>{title}</h3>
+                            </div>
+                            <p className={`mt-1 text-xs ${mutedTextClass}`}>{audience}</p>
+                        </div>
+                        {items.length > 0 && (
+                            <span className={`rounded-full px-2 py-0.5 border text-xs ${panelMutedClass} ${mutedTextClass}`}>{items.length}</span>
+                        )}
+                    </div>
+                    {items.length === 0 ? (
+                        <div className={`text-xs ${mutedTextClass}`}>{emptyText}</div>
+                    ) : (
+                        <ul className="space-y-2 text-xs">
+                            {items.map((item, idx) => (
+                                <li key={`findings-${key}-${idx}`} data-testid={`findings-list-${key}-item`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                    <div className="flex flex-wrap items-start justify-between gap-2">
+                                        <div data-testid="findings-item-title" className={`font-medium ${headingClass}`}>{item.title}</div>
+                                        {item.badge && (
+                                            <span className={`rounded-full px-2 py-0.5 border text-xs ${item.badgeClass}`}>{item.badge}</span>
+                                        )}
+                                    </div>
+                                    {item.summary && <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>}
+                                    {item.meta && <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>}
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </section>
+            );
 
             const loadCapabilities = async () => {
                 try {
@@ -5258,7 +5402,7 @@
                     return null;
                 }
 
-                const fallbackSuccessMessage = String(options.successMessage || 'Knowledge asset saved to the context library.').trim();
+                const fallbackSuccessMessage = String(options.successMessage || 'Saved to the Knowledge Base.').trim();
                 const fallbackErrorMessage = String(options.errorMessage || 'Knowledge asset import failed.').trim();
                 const logLabel = String(options.logLabel || 'knowledge asset import').trim() || 'knowledge asset import';
 
@@ -5314,7 +5458,7 @@
                 }
 
                 return importKnowledgeAssetToLibrary(payload, {
-                    successMessage: 'SPL query saved to the context library.',
+                    successMessage: 'SPL query saved to the Knowledge Base.',
                     errorMessage: 'Failed to save SPL query to the library.',
                     logLabel: 'save SPL query to library',
                 });
@@ -6731,7 +6875,7 @@
                     {
                         eyebrow: 'Understand',
                         title: 'See what matters',
-                        description: 'Mission shows what to do next. Intelligence shows coverage gaps, suggested investigations, and evidence.',
+                        description: 'Overview shows what to do next. Findings lists coverage gaps, investigations, and evidence.',
                         shellClass: isDarkTheme ? 'bg-emerald-950 border-emerald-800' : 'bg-emerald-50 border-emerald-200',
                     },
                     {
@@ -6742,17 +6886,17 @@
                     },
                 ];
                 const splashWorkspaceGuide = [
-                    'Mission: a summary of the latest run and what to do next.',
-                    'Intelligence: coverage gaps, suggested investigations, and evidence.',
+                    'Overview: the latest run at a glance, with the next steps.',
+                    'Findings: coverage gaps, investigations, and evidence.',
                     'Discovery: run discovery and open its reports.',
-                    'Context: documents and saved SPL that Chat can search.',
+                    'Knowledge Base: documents and saved SPL that Chat can search.',
                     'Capabilities: optional add-ons for search, export, charts, and Splunk links.',
-                    'Settings (gear icon): Splunk and AI connections, users, and access.',
+                    'Settings (gear icon): Splunk and AI connections, users, access, and appearance.',
                 ];
                 const splashGettingStarted = [
                     'Connect your Splunk MCP server and an AI model in Settings.',
                     'Run discovery from the Discovery tab.',
-                    'Review the results on Mission and Intelligence, or ask questions in Chat.',
+                    'Review the results on Overview and Findings, or ask questions in Chat.',
                 ];
 
                 return (
@@ -12697,7 +12841,7 @@
                 }
 
                 return importKnowledgeAssetToLibrary(assetImport, {
-                    successMessage: action?.successMessage || 'Context asset saved to the context library.',
+                    successMessage: action?.successMessage || 'Saved to the Knowledge Base.',
                     errorMessage: action?.errorMessage || 'Failed to save context asset to the library.',
                     logLabel: 'save summary context asset to library',
                 });
@@ -13726,7 +13870,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                 <div className="mb-6 space-y-3" data-testid="report-viewer-spl-blocks">
                                     <div className={`rounded-lg border px-4 py-3 ${panelMutedClass}`}>
                                         <div className={`text-sm font-medium ${headingClass}`}>Detected SPL Blocks</div>
-                                        <div className={`mt-1 text-xs ${subtextClass}`}>Save report-visible SPL into the context library, open it in Splunk Web, or bring it into chat.</div>
+                                        <div className={`mt-1 text-xs ${subtextClass}`}>Save SPL from this report to the Knowledge Base, open it in Splunk Web, or bring it into Chat.</div>
                                     </div>
                                     {reportSplQueries.map((splQuery, splIndex) => (
                                         <div key={`${selectedReport || 'report'}-spl-${splIndex}`} data-testid="report-viewer-spl-card" className={`rounded-lg border px-4 py-3 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-300'}`}>
@@ -13804,7 +13948,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                             <div className={`rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
                                 <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>While It Runs</div>
                                 <div className={`mt-2 text-sm font-semibold ${headingClass}`}>Use any tab</div>
-                                <div className={`mt-1 text-xs ${subtextClass}`}>Discovery keeps running. Click the Discovery status in the header to come back.</div>
+                                <div className={`mt-1 text-xs ${subtextClass}`}>Discovery keeps running. Select the Discovery tab to come back.</div>
                             </div>
                         </div>
                     </div>
@@ -14000,302 +14144,203 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                     {/* Unified Static Top Bar */}
                     <header ref={headerRef} className={`dt4sms-top-shell ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} sticky top-0 z-50 shadow-sm border-b`}>
                         <div className={`${workspaceShellWidthClass} mx-auto px-4 sm:px-6 lg:px-8`}>
-                            <div className="flex flex-wrap lg:flex-nowrap justify-between items-center gap-3 py-2 sm:py-3">
+                            <div className="dt4sms-shell-topbar flex items-center justify-between gap-3 pt-3 pb-2">
                                 <div className="dt4sms-shell-brand flex items-center min-w-0">
-                                    <i className="dt4sms-shell-brand-icon fas fa-search text-xl sm:text-2xl text-indigo-600 mr-2 sm:mr-3"></i>
-                                    <div className="min-w-0 flex flex-col justify-center leading-tight sm:-translate-y-px">
-                                        <h1 className={`dt4sms-shell-title text-lg sm:text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Splunk Discovery Tool</h1>
-                                        {headerAuthVisible && (
-                                            <div data-testid="header-auth-indicator" className={`mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs ${mutedTextClass}`}>
-                                                <span className="inline-flex items-center gap-1.5 min-w-0">
-                                                    <i className={`fas fa-user-circle ${isDarkTheme ? 'text-emerald-300' : 'text-indigo-600'}`}></i>
-                                                    <span className={`font-medium truncate ${headingClass}`}>Signed in as {currentAuthUser.username}</span>
-                                                </span>
-                                                <span className="hidden sm:inline">&bull;</span>
-                                                <span>{headerAuthRoleLabel}</span>
-                                                {headerAuthAssignmentLabel && (
-                                                    <>
-                                                        <span className="hidden lg:inline">&bull;</span>
-                                                        <span className="hidden lg:inline">{headerAuthAssignmentLabel}</span>
-                                                    </>
-                                                )}
-                                                <span className="hidden md:inline">&bull;</span>
-                                                <span className="hidden md:inline">{headerAuthProviderLabel}</span>
-                                                <button
-                                                    type="button"
-                                                    data-testid="header-logout-button"
-                                                    onClick={handleAuthLogout}
-                                                    className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-medium transition-colors ${isDarkTheme ? 'border-gray-600 bg-gray-900 text-gray-100 hover:bg-gray-700' : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-100'}`}
-                                                >
-                                                    Sign Out
-                                                </button>
-                                            </div>
-                                        )}
-                                    </div>
+                                    <i className="dt4sms-shell-brand-icon fas fa-search text-lg sm:text-xl text-indigo-600 mr-2 sm:mr-3" aria-hidden="true"></i>
+                                    <h1 className={`dt4sms-shell-title truncate text-base sm:text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Splunk Discovery Tool</h1>
                                 </div>
 
-                                <div className="dt4sms-shell-nav flex-1 min-w-[320px] flex items-center justify-center">
-                                    <div className={`dt4sms-shell-tabbar w-full max-w-3xl rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-indigo-950/70 border border-indigo-700' : 'bg-indigo-50 border border-indigo-200'}`}>
-                                        <div className="flex flex-wrap items-center justify-center gap-2">
-                                            <div className="dt4sms-shell-tablist inline-flex rounded-lg border border-indigo-300 overflow-hidden text-xs sm:text-xs bg-indigo-900" role="tablist" aria-label="Workspace views">
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-mission"
-                                                    role="tab"
-                                                    aria-selected={isMissionTab}
-                                                    tabIndex={isMissionTab ? 0 : -1}
-                                                    onClick={() => setWorkspaceTab('mission')}
-                                                    className={`px-3 sm:px-4 py-1.5 ${isMissionTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="A summary of the latest run and what to do next"
-                                                >
-                                                    Mission
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-intelligence"
-                                                    role="tab"
-                                                    aria-selected={isIntelligenceTab}
-                                                    tabIndex={isIntelligenceTab ? 0 : -1}
-                                                    onClick={() => {
-                                                        setWorkspaceTab('intelligence');
-                                                        refreshIntelligenceWorkspace();
-                                                    }}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isIntelligenceTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Coverage gaps, suggested investigations, and evidence"
-                                                >
-                                                    Intelligence
-                                                </button>
-                                                {showM2614WorkspaceTab && (
-                                                    <button
-                                                        type="button"
-                                                        id="workspace-tab-m26-14"
-                                                        data-testid="workspace-tab-m26-14"
-                                                        role="tab"
-                                                        aria-selected={isM2614Tab}
-                                                        tabIndex={isM2614Tab ? 0 : -1}
-                                                        onClick={openM2614Workspace}
-                                                        className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isM2614Tab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                        title="M-26-14 advisor: readiness posture, compare, and curated validation"
-                                                    >
-                                                        M-26-14
-                                                    </button>
-                                                )}
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-discovery"
-                                                    data-testid="workspace-tab-discovery"
-                                                    role="tab"
-                                                    aria-selected={isArtifactsTab}
-                                                    tabIndex={isArtifactsTab ? 0 : -1}
-                                                    onClick={openDiscoveryWorkspace}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isArtifactsTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Run discovery and open its reports"
-                                                >
-                                                    Discovery
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-context"
-                                                    data-testid="workspace-tab-context"
-                                                    role="tab"
-                                                    aria-selected={isCapabilitiesRagView}
-                                                    tabIndex={isCapabilitiesRagView ? 0 : -1}
-                                                    onClick={() => openRagCapabilitiesWorkspace({ libraryFilter: 'spl_library' })}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesRagView ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Documents and saved SPL that Chat can search"
-                                                >
-                                                    Context
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    id="workspace-tab-capabilities"
-                                                    data-testid="workspace-tab-capabilities"
-                                                    role="tab"
-                                                    aria-selected={isCapabilitiesOverview}
-                                                    tabIndex={isCapabilitiesOverview ? 0 : -1}
-                                                    onClick={openCapabilitiesOverview}
-                                                    className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isCapabilitiesOverview ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                    title="Optional add-ons for search, export, charts, and Splunk links"
-                                                >
-                                                    Capabilities
-                                                </button>
-                                                {isChatFullscreen && (
-                                                    <button
-                                                        type="button"
-                                                        id="workspace-tab-chat"
-                                                        role="tab"
-                                                        aria-selected={isChatTab}
-                                                        tabIndex={isChatTab ? 0 : -1}
-                                                        onClick={() => {
-                                                            setIsChatOpen(false);
-                                                            setWorkspaceTab('chat');
-                                                        }}
-                                                        className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isChatTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                        title="Chat in full screen"
-                                                    >
-                                                        Chat
-                                                    </button>
-                                                )}
-                                                {isSummaryFullscreen && (
-                                                    <button
-                                                        type="button"
-                                                        id="workspace-tab-summary"
-                                                        role="tab"
-                                                        aria-selected={isSummaryTab}
-                                                        tabIndex={isSummaryTab ? 0 : -1}
-                                                        onClick={() => {
-                                                            setIsSummaryModalOpen(false);
-                                                            setWorkspaceTab('summary-workspace');
-                                                        }}
-                                                        className={`px-3 sm:px-4 py-1.5 border-l border-indigo-300 ${isSummaryTab ? 'bg-white text-indigo-900 font-semibold' : 'bg-transparent text-indigo-200 hover:bg-indigo-700'}`}
-                                                        title="Discovery summary in full screen"
-                                                    >
-                                                        Summary
-                                                    </button>
-                                                )}
-                                            </div>
-
-                                            <div className="dt4sms-shell-quick-actions flex flex-wrap items-center gap-1.5 sm:gap-2 text-xs sm:text-xs">
-                                                {isArtifactsTab && (
-                                                    <button
-                                                        onClick={isMissionDiscoveryActive ? abortDiscovery : startDiscovery}
-                                                        className={`px-2.5 sm:px-3 py-1.5 rounded ${isMissionDiscoveryActive ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
-                                                        title={isMissionDiscoveryActive ? 'Stop the discovery run' : 'Start a full discovery run'}
-                                                    >
-                                                        {isMissionDiscoveryActive ? (
-                                                            <><i className="fas fa-stop mr-1"></i>Abort Discovery</>
-                                                        ) : (
-                                                            <><i className="fas fa-rocket mr-1"></i>Run Discovery</>
-                                                        )}
-                                                    </button>
-                                                )}
-                                                {isIntelligenceTab && (
-                                                    <button
-                                                        onClick={refreshIntelligenceWorkspace}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white"
-                                                        title="Refresh intelligence KPIs and trends"
-                                                    >
-                                                        <i className="fas fa-brain mr-1"></i>Refresh Findings
-                                                    </button>
-                                                )}
-                                                {isM2614Tab && (
-                                                    <button
-                                                        onClick={refreshM2614Workspace}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
-                                                        title="Refresh M-26-14 posture and curated validation catalog"
-                                                    >
-                                                        <i className="fas fa-shield-halved mr-1"></i>Refresh M-26-14
-                                                    </button>
-                                                )}
-                                                {isArtifactsTab && (
-                                                    <button
-                                                        onClick={refreshArtifactsWorkspace}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
-                                                        title="Reload discovery outputs and report library"
-                                                    >
-                                                        <i className="fas fa-folder-open mr-1"></i>Refresh Discovery
-                                                    </button>
-                                                )}
-                                                {isCapabilitiesOverview && (
-                                                    <button
-                                                        onClick={refreshCapabilitiesWorkspace}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-violet-600 hover:bg-violet-700 text-white"
-                                                        title="Refresh optional capability inventory and health"
-                                                    >
-                                                        <i className="fas fa-puzzle-piece mr-1"></i>Refresh Capabilities
-                                                    </button>
-                                                )}
-                                                {isCapabilitiesRagView && (
-                                                    <button
-                                                        onClick={() => openRagCapabilitiesWorkspace({ libraryFilter: ragLibraryFilter })}
-                                                        className="px-2.5 sm:px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-700 text-white"
-                                                        title="Refresh the context workspace and managed SPL library"
-                                                    >
-                                                        <i className="fas fa-book-open mr-1"></i>Refresh Context
-                                                    </button>
-                                                )}
-                                                {(isMissionTab || isIntelligenceTab) && (
-                                                    <label
-                                                        className={`dt4sms-shell-action dt4sms-shell-voice-control inline-flex items-center gap-2 rounded border px-2.5 py-1.5 ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
-                                                        title={operatorVoiceDefinition.description}
-                                                    >
-                                                        <span className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Style</span>
-                                                        <select
-                                                            data-testid="workspace-operator-voice-select"
-                                                            value={operatorVoice}
-                                                            onChange={(event) => setOperatorVoice(event.target.value)}
-                                                            className={`rounded border px-2 py-1 text-xs ${isDarkTheme ? 'border-gray-600 bg-gray-900 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
-                                                            aria-label="Select wording style"
-                                                        >
-                                                            {OPERATOR_VOICE_OPTIONS.map((option) => (
-                                                                <option key={option.value} value={option.value}>{option.label}</option>
-                                                            ))}
-                                                        </select>
-                                                    </label>
-                                                )}
-                                                <button
-                                                    onClick={openChatSurface}
-                                                    className="dt4sms-shell-primary-action px-2.5 sm:px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white"
-                                                    title={isChatFullscreen ? 'Go to the full-screen chat' : 'Chat with your Splunk environment'}
-                                                >
-                                                    <i className="fas fa-comments mr-1"></i>Open Chat
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="dt4sms-shell-status-actions flex items-center flex-wrap justify-end gap-2 sm:gap-3">
+                                <div className="dt4sms-shell-status-actions flex flex-shrink-0 items-center justify-end gap-2">
                                     <button
                                         type="button"
-                                        data-testid="header-discovery-status-chip"
-                                        onClick={openDiscoveryWorkspace}
-                                        className={`dt4sms-shell-status-chip flex items-center gap-2 px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border transition-colors ${discoveryStatusMeta.headerChipClass}`}
-                                        title={`${discoveryHeaderChipLabel}. ${discoveryNarrative}`}
-                                        aria-label={`${discoveryHeaderChipLabel}. Open the Discovery workspace.`}
-                                    >
-                                        <span aria-hidden="true" className={`w-2.5 h-2.5 rounded-full ${discoveryStatusMeta.dotClass} ${isMissionDiscoveryActive ? 'animate-pulse' : ''}`}></span>
-                                        <span className="text-xs font-semibold uppercase tracking-wide">Discovery</span>
-                                        <span className="text-xs sm:text-sm font-medium">{isMissionDiscoveryActive ? `${Math.max(discoveryProgressPercent, 1)}%` : discoveryStatusMeta.shortValue}</span>
-                                    </button>
-                                    <button
-                                        type="button"
-                                        className={`dt4sms-shell-action flex items-center cursor-pointer px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg transition-colors ${isDarkTheme ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
+                                        data-testid="header-connection-status"
+                                        className={`dt4sms-shell-action inline-flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm transition-colors ${headerButtonClass}`}
                                         onClick={openConnectionModal}
-                                        title="View MCP connection details"
-                                        aria-label={headerMcpConnected ? 'View MCP connection details. MCP connected.' : 'View MCP connection details. MCP disconnected.'}
+                                        title={`${headerConnectionMeta.summary} AI model: ${headerLlmDisplayLabel}.`}
+                                        aria-label={`Connection details. ${headerConnectionMeta.label}. AI model: ${headerLlmDisplayLabel}.`}
                                         aria-haspopup="dialog"
                                         aria-expanded={isConnectionModalOpen}
                                         aria-controls="connection-details-popover"
                                     >
-                                        <span aria-hidden="true" className={`w-3 h-3 rounded-full mr-2 ${headerMcpConnected ? 'bg-green-500' : 'bg-red-500'}`}></span>
-                                        <span className={`text-xs sm:text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                            {headerMcpConnected ? 'MCP Connected' : 'MCP Disconnected'}
-                                        </span>
+                                        <span aria-hidden="true" className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}`}></span>
+                                        <span className="hidden sm:inline font-medium">{headerConnectionMeta.label}</span>
+                                        {connectionInfo?.llm?.configured && (
+                                            <span aria-hidden="true" className={`hidden xl:inline max-w-[16rem] truncate ${mutedTextClass}`}>{headerLlmDisplayLabel}</span>
+                                        )}
                                     </button>
-                                    <div
-                                        className={`dt4sms-shell-status-card flex items-center px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border ${isDarkTheme ? 'bg-gray-800 border-purple-500' : 'bg-white border-purple-200'}`}
-                                        title="AI model in use"
-                                    >
-                                        <i className="fas fa-brain text-purple-600 mr-2"></i>
-                                        <div className="flex flex-col">
-                                            <span className={`text-xs leading-tight ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>AI model</span>
-                                            <span className={`text-xs sm:text-sm font-medium leading-tight ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                {headerLlmDisplayLabel}
-                                            </span>
-                                        </div>
-                                    </div>
                                     <button
+                                        type="button"
+                                        onClick={openChatSurface}
+                                        className="dt4sms-shell-primary-action inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-600 hover:bg-indigo-700 text-white"
+                                        title={isChatFullscreen ? 'Go to the full-screen chat' : 'Chat with your Splunk environment'}
+                                        aria-label="Open chat"
+                                    >
+                                        <i className="fas fa-comments" aria-hidden="true"></i>
+                                        <span className="hidden sm:inline">Chat</span>
+                                    </button>
+                                    {headerAuthVisible && (
+                                        <div
+                                            data-testid="header-auth-indicator"
+                                            className={`flex items-center gap-2 text-sm ${mutedTextClass}`}
+                                            title={headerAuthSummary}
+                                        >
+                                            <i className={`fas fa-user-circle ${isDarkTheme ? 'text-emerald-300' : 'text-indigo-600'}`} aria-hidden="true"></i>
+                                            <span className="sr-only">Signed in as {currentAuthUser.username}. {headerAuthRoleLabel}. {headerAuthProviderLabel}.{headerAuthAssignmentLabel ? ` ${headerAuthAssignmentLabel}.` : ''}</span>
+                                            <span aria-hidden="true" className={`hidden md:inline max-w-[10rem] truncate font-medium ${headingClass}`}>{currentAuthUser.username}</span>
+                                            <span aria-hidden="true" className="hidden 2xl:inline text-xs">{headerAuthRoleLabel}</span>
+                                            <button
+                                                type="button"
+                                                data-testid="header-logout-button"
+                                                onClick={handleAuthLogout}
+                                                className={`dt4sms-shell-action inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm font-medium transition-colors ${headerButtonClass}`}
+                                                aria-label="Sign Out"
+                                            >
+                                                <i className="fas fa-right-from-bracket md:hidden" aria-hidden="true"></i>
+                                                <span className="hidden md:inline">Sign Out</span>
+                                            </button>
+                                        </div>
+                                    )}
+                                    <button
+                                        type="button"
                                         onClick={openSettings}
-                                        className={`dt4sms-shell-action px-2 py-1.5 sm:px-3 sm:py-2 rounded-lg border font-medium ${isDarkTheme ? 'bg-gray-700 hover:bg-gray-600 text-gray-100 border-gray-600' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'}`}
+                                        className={`dt4sms-shell-action inline-flex items-center rounded-lg border px-2.5 py-1.5 text-sm transition-colors ${headerButtonClass}`}
                                         title="Open settings"
                                         aria-label="Open settings"
                                     >
-                                        <i className="fas fa-cog"></i>
+                                        <i className="fas fa-cog" aria-hidden="true"></i>
                                     </button>
                                 </div>
                             </div>
 
+                            <nav className="dt4sms-shell-nav -mb-px" aria-label="Workspace">
+                                <div className="dt4sms-shell-tablist flex items-stretch gap-1 overflow-x-auto" role="tablist" aria-label="Workspace views" onKeyDown={handleTablistKeyDown}>
+                                    <button
+                                        type="button"
+                                        id="workspace-tab-overview"
+                                        data-testid="workspace-tab-overview"
+                                        role="tab"
+                                        aria-selected={isMissionTab}
+                                        tabIndex={isMissionTab ? 0 : -1}
+                                        onClick={() => setWorkspaceTab('mission')}
+                                        className={getWorkspaceTabClass(isMissionTab)}
+                                        title="The latest run at a glance, with the next steps"
+                                    >
+                                        Overview
+                                    </button>
+                                    <button
+                                        type="button"
+                                        id="workspace-tab-findings"
+                                        data-testid="workspace-tab-findings"
+                                        role="tab"
+                                        aria-selected={isIntelligenceTab}
+                                        tabIndex={isIntelligenceTab ? 0 : -1}
+                                        onClick={openFindingsWorkspace}
+                                        className={getWorkspaceTabClass(isIntelligenceTab)}
+                                        title="Coverage gaps, investigations, and evidence from the latest run"
+                                    >
+                                        Findings
+                                    </button>
+                                    <button
+                                        type="button"
+                                        id="workspace-tab-discovery"
+                                        data-testid="workspace-tab-discovery"
+                                        role="tab"
+                                        aria-selected={isArtifactsTab}
+                                        tabIndex={isArtifactsTab ? 0 : -1}
+                                        onClick={openDiscoveryWorkspace}
+                                        className={getWorkspaceTabClass(isArtifactsTab)}
+                                        title="Run discovery and open its reports"
+                                    >
+                                        Discovery
+                                        {discoveryTabIndicator && (
+                                            <span data-testid="header-discovery-status" className={`inline-flex items-center gap-1.5 text-xs font-semibold ${discoveryTabIndicator.textClass}`}>
+                                                <span aria-hidden="true" className={`h-2 w-2 rounded-full ${discoveryStatusMeta.dotClass} ${isMissionDiscoveryActive ? 'animate-pulse' : ''}`}></span>
+                                                {discoveryTabIndicator.text}
+                                                <span className="sr-only">({discoveryTabIndicator.srText})</span>
+                                            </span>
+                                        )}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        id="workspace-tab-knowledge-base"
+                                        data-testid="workspace-tab-knowledge-base"
+                                        role="tab"
+                                        aria-selected={isCapabilitiesRagView}
+                                        tabIndex={isCapabilitiesRagView ? 0 : -1}
+                                        onClick={() => openRagCapabilitiesWorkspace({ libraryFilter: 'spl_library' })}
+                                        className={getWorkspaceTabClass(isCapabilitiesRagView)}
+                                        title="Documents and saved SPL that Chat can search"
+                                    >
+                                        Knowledge Base
+                                    </button>
+                                    <button
+                                        type="button"
+                                        id="workspace-tab-capabilities"
+                                        data-testid="workspace-tab-capabilities"
+                                        role="tab"
+                                        aria-selected={isCapabilitiesOverview}
+                                        tabIndex={isCapabilitiesOverview ? 0 : -1}
+                                        onClick={openCapabilitiesOverview}
+                                        className={getWorkspaceTabClass(isCapabilitiesOverview)}
+                                        title="Optional add-ons for search, export, charts, and Splunk links"
+                                    >
+                                        Capabilities
+                                    </button>
+                                    {isChatFullscreen && (
+                                        <button
+                                            type="button"
+                                            id="workspace-tab-chat"
+                                            data-testid="workspace-tab-chat"
+                                            role="tab"
+                                            aria-selected={isChatTab}
+                                            tabIndex={isChatTab ? 0 : -1}
+                                            onClick={() => {
+                                                setIsChatOpen(false);
+                                                setWorkspaceTab('chat');
+                                            }}
+                                            className={getWorkspaceTabClass(isChatTab)}
+                                            title="Chat in full screen"
+                                        >
+                                            Chat
+                                        </button>
+                                    )}
+                                    {isSummaryFullscreen && (
+                                        <button
+                                            type="button"
+                                            id="workspace-tab-summary"
+                                            data-testid="workspace-tab-summary"
+                                            role="tab"
+                                            aria-selected={isSummaryTab}
+                                            tabIndex={isSummaryTab ? 0 : -1}
+                                            onClick={() => {
+                                                setIsSummaryModalOpen(false);
+                                                setWorkspaceTab('summary-workspace');
+                                            }}
+                                            className={getWorkspaceTabClass(isSummaryTab)}
+                                            title="Discovery summary in full screen"
+                                        >
+                                            Summary
+                                        </button>
+                                    )}
+                                    {moduleWorkspaceTabs.map((moduleTab, index) => (
+                                        <button
+                                            key={moduleTab.id}
+                                            type="button"
+                                            id={`workspace-tab-${moduleTab.id}`}
+                                            data-testid={`workspace-tab-${moduleTab.id}`}
+                                            role="tab"
+                                            aria-selected={moduleTab.isActive}
+                                            tabIndex={moduleTab.isActive ? 0 : -1}
+                                            onClick={moduleTab.open}
+                                            className={`${getWorkspaceTabClass(moduleTab.isActive)}${index === 0 ? ' dt4sms-shell-module-start' : ''}`}
+                                            title={moduleTab.description || moduleTab.label}
+                                        >
+                                            <i className="fas fa-puzzle-piece text-xs" aria-hidden="true"></i>
+                                            {moduleTab.label}
+                                        </button>
+                                    ))}
+                                </div>
+                            </nav>
                         </div>
                     </header>
 
@@ -14307,20 +14352,15 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                 {/* Discovery Intelligence Hub */}
                                 {isMissionTab && (
                                 <div className={`dt4sms-neo-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
-                                    <div className="flex items-center justify-between mb-4">
+                                    <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
                                         <div>
                                             <h2 className={`text-lg font-semibold ${headingClass}`}>Overview</h2>
                                             <p className={`text-sm ${subtextClass}`}>What the latest discovery run found and what to do next.</p>
                                         </div>
-                                        <button
-                                            type="button"
-                                            onClick={loadDiscoveryDashboard}
-                                            className="ui-link"
-                                            title="Refresh"
-                                            aria-label="Refresh the overview"
-                                        >
-                                            <i className="fas fa-sync"></i>
-                                        </button>
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            {renderOperatorVoiceSelect()}
+                                            {renderWorkspaceRefreshButton(refreshIntelligenceWorkspace, 'Refresh the overview')}
+                                        </div>
                                     </div>
 
                                     {!discoveryDashboard || !discoveryDashboard.has_data ? (
@@ -14329,53 +14369,23 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         </div>
                                     ) : (
                                         <>
-                                            <div className="grid grid-cols-1 xl:grid-cols-5 gap-4 mb-4">
-                                                <div className={`dt4sms-neo-hero xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
-                                                    <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                                                        <div className="max-w-3xl">
-                                                            <div className={`text-xs uppercase tracking-wider ${mutedTextClass}`}>Latest run</div>
-                                                            <div className="mt-2 flex flex-wrap items-center gap-2">
-                                                                <span className={`dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
-                                                                    {missionFreshness.label}
-                                                                </span>
-                                                                <span className={`text-xs ${mutedTextClass}`}>
-                                                                    Last run: {formatMissionDateTime(latestMissionSession?.created_at || latestMissionSession?.timestamp, latestMissionSession?.timestamp || 'Unavailable')}
-                                                                </span>
-                                                            </div>
-                                                            <h3 className={`mt-3 text-xl font-semibold ${headingClass}`}>{missionExecutiveHeadline}</h3>
-                                                            <p className={`mt-2 text-sm leading-6 ${subtextClass}`}>{missionFreshness.summary}</p>
-                                                        </div>
+                                            <div className={`dt4sms-neo-hero rounded-xl border p-5 mb-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
+                                                <div className="max-w-3xl">
+                                                    <div className={`text-xs uppercase tracking-wider ${mutedTextClass}`}>Latest run</div>
+                                                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                                                        <span className={`dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
+                                                            {missionFreshness.label}
+                                                        </span>
+                                                        <span className={`text-xs ${mutedTextClass}`}>
+                                                            Last run: {formatMissionDateTime(latestMissionSession?.created_at || latestMissionSession?.timestamp, latestMissionSession?.timestamp || 'Unavailable')}
+                                                        </span>
                                                     </div>
-
-                                                    <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
-                                                        {missionSummaryCards.map((card) => (
-                                                            <div key={card.label} className={`dt4sms-neo-metric rounded-xl border px-4 py-4 ${card.shellClass}`}>
-                                                                <div className={`text-xs uppercase tracking-wide ${card.labelClass}`}>{card.label}</div>
-                                                                <div className={`mt-2 text-2xl font-semibold ${card.valueClass}`}>{card.value}</div>
-                                                                <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{card.detail}</div>
-                                                            </div>
-                                                        ))}
-                                                    </div>
+                                                    <h3 className={`mt-3 text-xl font-semibold ${headingClass}`}>{missionExecutiveHeadline}</h3>
+                                                    <p className={`mt-2 text-sm leading-6 ${subtextClass}`}>{missionFreshness.summary}</p>
                                                 </div>
 
-                                                <div className={`dt4sms-neo-sidecard xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                    <div className="flex items-center gap-2 mb-3">
-                                                        <i className="fas fa-chart-line text-indigo-600"></i>
-                                                        <h3 className={`text-sm font-semibold ${headingClass}`}>What Changed Since Last Run</h3>
-                                                    </div>
-                                                    <div className="space-y-3">
-                                                        {missionChangeCards.map((card) => (
-                                                            <div key={card.label} className={`dt4sms-neo-item rounded-xl border px-4 py-3 ${card.shellClass}`}>
-                                                                <div className="flex items-start justify-between gap-3">
-                                                                    <div>
-                                                                        <div className={`text-xs uppercase tracking-wide ${card.labelClass}`}>{card.label}</div>
-                                                                        <div className={`mt-1 text-xs leading-5 ${subtextClass}`}>{card.detail}</div>
-                                                                    </div>
-                                                                    <div className={`text-sm font-semibold whitespace-nowrap ${card.valueClass}`}>{missionHasPreviousSession ? card.value : 'First run'}</div>
-                                                                </div>
-                                                            </div>
-                                                        ))}
-                                                    </div>
+                                                <div data-testid="overview-stats" className="mt-5 grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3">
+                                                    {missionStatCards.map(renderWorkspaceMetricCard)}
                                                 </div>
                                             </div>
 
@@ -14417,98 +14427,42 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 </div>
                                             </div>
 
-                                            <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4">
-                                                <div className={`dt4sms-neo-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                    <div className="flex items-center gap-2 mb-3">
-                                                        <i className="fas fa-clipboard-list text-emerald-600"></i>
-                                                        <h3 className={`text-sm font-semibold ${headingClass}`}>Admin tasks</h3>
+                                            <div data-testid="overview-next-steps" className={`dt4sms-neo-section rounded-xl border p-4 mb-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
+                                                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                                                    <div className="flex items-center gap-2">
+                                                        <i className="fas fa-list-check text-emerald-600" aria-hidden="true"></i>
+                                                        <h3 className={`text-sm font-semibold ${headingClass}`}>Next steps</h3>
                                                     </div>
-                                                    {missionAdminActions.length === 0 ? (
-                                                        <div className={`text-xs ${mutedTextClass}`}>The latest run found no admin tasks.</div>
-                                                    ) : (
-                                                        <ul className="space-y-2 text-xs">
-                                                            {missionAdminVoiceCards.map((action, idx) => (
-                                                                <li key={`mission-admin-${idx}`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
-                                                                    <div className="flex flex-wrap items-start justify-between gap-2">
-                                                                        <div className={`font-medium ${headingClass}`}>{action.title}</div>
-                                                                        <span className={`rounded-full px-2 py-0.5 border text-xs ${panelMutedClass} ${mutedTextClass}`}>{action.badge}</span>
-                                                                    </div>
-                                                                    <div className={`mt-1 leading-5 ${subtextClass}`}>{action.summary}</div>
-                                                                    <div className={`mt-2 ${mutedTextClass}`}>{action.meta}</div>
-                                                                </li>
-                                                            ))}
-                                                        </ul>
-                                                    )}
+                                                    <button
+                                                        type="button"
+                                                        data-testid="overview-see-all-findings"
+                                                        onClick={openFindingsWorkspace}
+                                                        className="ui-link text-xs font-medium"
+                                                    >
+                                                        See all findings
+                                                    </button>
                                                 </div>
-
-                                                <div className={`dt4sms-neo-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                    <div className="flex items-center gap-2 mb-3">
-                                                        <i className="fas fa-crosshairs text-indigo-600"></i>
-                                                        <h3 className={`text-sm font-semibold ${headingClass}`}>Investigations</h3>
+                                                {findingsNextSteps.length === 0 ? (
+                                                    <div className={`text-xs ${mutedTextClass}`}>
+                                                        {v2Intelligence?.has_data ? 'The latest run suggested no next steps.' : 'Next steps appear here after discovery finishes.'}
                                                     </div>
-                                                    {missionAnalystTracks.length === 0 ? (
-                                                        <div className={`text-xs ${mutedTextClass}`}>The latest run suggested no investigations.</div>
-                                                    ) : (
-                                                        <ul className="space-y-2 text-xs">
-                                                            {missionAnalystVoiceCards.map((track, idx) => (
-                                                                <li key={`mission-analyst-${idx}`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
-                                                                    <div className={`font-medium ${headingClass}`}>{track.title}</div>
-                                                                    <div className={`mt-1 leading-5 ${subtextClass}`}>{track.summary}</div>
-                                                                    <div className={`mt-2 ${mutedTextClass}`}>{track.meta}</div>
-                                                                </li>
-                                                            ))}
-                                                        </ul>
-                                                    )}
-                                                </div>
-
-                                                <div className={`dt4sms-neo-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                    <div className="flex items-center gap-2 mb-3">
-                                                        <i className="fas fa-briefcase text-purple-600"></i>
-                                                        <h3 className={`text-sm font-semibold ${headingClass}`}>Executive summary</h3>
-                                                    </div>
-                                                    <div className="space-y-2 text-xs">
-                                                        {missionExecutiveVoiceCards.map((item, idx) => (
-                                                            <div key={`mission-executive-${idx}`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
-                                                                <div className={`font-medium ${headingClass}`}>{item.title}</div>
+                                                ) : (
+                                                    <ol className={`grid grid-cols-1 gap-3 ${findingsNextSteps.length >= 3 ? 'lg:grid-cols-3' : (findingsNextSteps.length === 2 ? 'md:grid-cols-2' : '')}`}>
+                                                        {findingsNextSteps.map((item, idx) => (
+                                                            <li key={`next-step-${idx}`} data-testid="overview-next-step" className={`dt4sms-neo-item rounded-lg border px-3 py-3 text-xs ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'}`}>
+                                                                <div className="flex flex-wrap items-start justify-between gap-2">
+                                                                    <span className={`uppercase tracking-wide ${mutedTextClass}`}>{item.audience}</span>
+                                                                    {item.badge && (
+                                                                        <span className={`rounded-full px-2 py-0.5 border ${item.badgeClass}`}>{item.badge}</span>
+                                                                    )}
+                                                                </div>
+                                                                <div data-testid="overview-next-step-title" className={`mt-2 text-sm font-medium ${headingClass}`}>{item.title}</div>
                                                                 <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>
-                                                                <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>
-                                                            </div>
+                                                                {item.meta && <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>}
+                                                            </li>
                                                         ))}
-                                                        {missionExecutiveThemes.length === 0 && missionExecutiveFocus.length === 0 && (
-                                                            <div className={`rounded-lg border px-3 py-3 ${panelMutedClass} ${mutedTextClass}`}>
-                                                                The latest run recorded no executive themes.
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                            </div>
-
-                                            <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-indigo-900 border border-indigo-700' : 'bg-indigo-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-800'}`}>Readiness</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-indigo-50' : 'text-indigo-900'}`}>{formatMissionMetricValue(discoveryDashboard.kpis?.readiness_score)}/100</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-800'}`}>{missionHasPreviousSession ? `${formatMissionTrendValue(discoveryDashboard.trends?.readiness_delta)} vs previous run` : 'First run'}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-blue-900 border border-blue-700' : 'bg-blue-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-blue-200' : 'text-blue-800'}`}>Indexes</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-blue-50' : 'text-blue-900'}`}>{formatMissionMetricValue(discoveryDashboard.kpis?.total_indexes)}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-blue-300' : 'text-blue-800'}`}>{missionHasPreviousSession ? `${formatMissionTrendValue(discoveryDashboard.trends?.indexes_delta)} vs previous run` : 'First run'}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-green-900 border border-green-700' : 'bg-green-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-green-200' : 'text-green-800'}`}>Sourcetypes</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-green-50' : 'text-green-900'}`}>{formatMissionMetricValue(discoveryDashboard.kpis?.total_sourcetypes)}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-green-300' : 'text-green-800'}`}>{missionHasPreviousSession ? `${formatMissionTrendValue(discoveryDashboard.trends?.sourcetypes_delta)} vs previous run` : 'First run'}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-amber-900 border border-amber-700' : 'bg-amber-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-amber-200' : 'text-amber-900'}`}>Recommendations</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-amber-50' : 'text-amber-900'}`}>{formatMissionMetricValue(discoveryDashboard.kpis?.recommendation_count)}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-amber-300' : 'text-amber-900'}`}>{missionHasPreviousSession ? `${formatMissionTrendValue(discoveryDashboard.trends?.recommendations_delta)} vs previous run` : 'First run'}</div>
-                                                </div>
-                                                <div className={`rounded p-3 ${isDarkTheme ? 'bg-purple-900 border border-purple-700' : 'bg-purple-50'}`}>
-                                                    <div className={`text-xs uppercase tracking-wide ${isDarkTheme ? 'text-purple-200' : 'text-purple-800'}`}>MCP tools</div>
-                                                    <div className={`text-xl font-bold ${isDarkTheme ? 'text-purple-50' : 'text-purple-900'}`}>{formatMissionMetricValue(discoveryDashboard.kpis?.tool_count)}</div>
-                                                    <div className={`text-xs ${isDarkTheme ? 'text-purple-300' : 'text-purple-800'}`}>On the connected MCP server</div>
-                                                </div>
+                                                    </ol>
+                                                )}
                                             </div>
 
                                             <div className={`border rounded p-3 mb-4 ${isDarkTheme ? 'border-gray-600' : 'border-gray-200'}`}>
@@ -14584,7 +14538,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
 
                                             <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
                                                 <div className={`dt4sms-neo-runbook xl:col-span-3 border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800/40' : 'border-gray-200 bg-white'}`}>
-                                                    <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-3">
+                                                    <div className="flex flex-col gap-3 mb-3">
                                                         <div>
                                                             <h3 className={`text-sm font-semibold ${headingClass}`}>Runbook</h3>
                                                             <p className={`text-xs mt-1 ${mutedTextClass}`}>
@@ -14592,10 +14546,10 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             </p>
                                                         </div>
 
-                                                        <div className="flex items-center gap-2 text-xs">
+                                                        <div className="flex flex-wrap items-center gap-2 text-xs">
                                                             <button
                                                                 onClick={refreshRunbook}
-                                                                className="px-3 py-1 bg-green-700 hover:bg-green-800 text-white rounded"
+                                                                className="px-3 py-1 whitespace-nowrap bg-green-700 hover:bg-green-800 text-white rounded"
                                                             >
                                                                 Generate Runbook
                                                             </button>
@@ -14607,14 +14561,14 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                     }
                                                                 }}
                                                                 disabled={!discoveryDashboard?.has_data}
-                                                                className={`px-3 py-1 rounded ${discoveryDashboard?.has_data ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
+                                                                className={`px-3 py-1 whitespace-nowrap rounded ${discoveryDashboard?.has_data ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
                                                             >
                                                                 Download Runbook
                                                             </button>
                                                         </div>
                                                     </div>
 
-                                                    <div className="inline-flex rounded border border-gray-300 overflow-hidden text-xs mb-3" role="tablist" aria-label="Runbook audience">
+                                                    <div className={`inline-flex rounded border overflow-hidden text-xs mb-3 ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="tablist" aria-label="Runbook audience" onKeyDown={handleTablistKeyDown}>
                                                         <button
                                                             type="button"
                                                             id="workflow-tab-admin"
@@ -14623,7 +14577,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             aria-controls="workflow-panel-admin"
                                                             tabIndex={workflowTab === 'admin' ? 0 : -1}
                                                             onClick={() => setWorkflowTab('admin')}
-                                                            className={`px-3 py-1 ${workflowTab === 'admin' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
+                                                            className={`px-3 py-1 ${workflowTab === 'admin' ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'bg-gray-900 text-gray-200 hover:bg-gray-800' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
                                                         >
                                                             Admin
                                                         </button>
@@ -14635,7 +14589,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             aria-controls="workflow-panel-analyst"
                                                             tabIndex={workflowTab === 'analyst' ? 0 : -1}
                                                             onClick={() => setWorkflowTab('analyst')}
-                                                            className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'analyst' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
+                                                            className={`px-3 py-1 border-l ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'} ${workflowTab === 'analyst' ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'bg-gray-900 text-gray-200 hover:bg-gray-800' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
                                                         >
                                                             Analyst
                                                         </button>
@@ -14647,67 +14601,22 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             aria-controls="workflow-panel-executive"
                                                             tabIndex={workflowTab === 'executive' ? 0 : -1}
                                                             onClick={() => setWorkflowTab('executive')}
-                                                            className={`px-3 py-1 border-l border-gray-300 ${workflowTab === 'executive' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700'}`}
+                                                            className={`px-3 py-1 border-l ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'} ${workflowTab === 'executive' ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'bg-gray-900 text-gray-200 hover:bg-gray-800' : 'bg-white text-gray-700 hover:bg-gray-100')}`}
                                                         >
                                                             Executive
                                                         </button>
                                                     </div>
 
-                                                {workflowTab === 'admin' && (
-                                                    <ul id="workflow-panel-admin" role="tabpanel" aria-labelledby="workflow-tab-admin" className={`text-xs space-y-2 ${subtextClass}`}>
-                                                        {missionRunbookAdminCards.map((action, idx) => (
-                                                            <li key={idx} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
-                                                                <div className="flex flex-wrap items-start justify-between gap-2">
-                                                                    <div className={`font-medium ${headingClass}`}>{action.title}</div>
-                                                                    <span className={`rounded-full px-2 py-0.5 border text-xs ${panelMutedClass} ${mutedTextClass}`}>{action.badge}</span>
-                                                                </div>
-                                                                <div className={`mt-1 ${subtextClass}`}>{action.summary}</div>
-                                                                <div className={`mt-1 ${mutedTextClass}`}>{action.meta}</div>
-                                                            </li>
-                                                        ))}
-                                                    </ul>
-                                                )}
-
-                                                {workflowTab === 'analyst' && (
-                                                    <ul id="workflow-panel-analyst" role="tabpanel" aria-labelledby="workflow-tab-analyst" className={`text-xs space-y-2 ${subtextClass}`}>
-                                                        {missionRunbookAnalystCards.map((track, idx) => (
-                                                            <li key={idx} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
-                                                                <div className={`font-medium ${headingClass}`}>{track.title}</div>
-                                                                <div className={`mt-1 ${subtextClass}`}>{track.summary}</div>
-                                                                <div className={`mt-1 ${mutedTextClass}`}>{track.meta}</div>
-                                                            </li>
-                                                        ))}
-                                                    </ul>
-                                                )}
-
-                                                {workflowTab === 'executive' && (
-                                                    <div id="workflow-panel-executive" role="tabpanel" aria-labelledby="workflow-tab-executive" className={`text-xs space-y-2 ${subtextClass}`}>
-                                                        {discoveryDashboard.latest?.personas?.executive?.headline && (
-                                                            <div className={`dt4sms-neo-item ${isDarkTheme ? 'bg-indigo-950 border-indigo-800' : 'bg-indigo-50 border-indigo-200'} border rounded px-3 py-2`}>
-                                                                <div className={`font-medium ${headingClass}`}>Headline</div>
-                                                                <div className={`mt-1 ${subtextClass}`}>{discoveryDashboard.latest.personas.executive.headline}</div>
-                                                            </div>
-                                                        )}
-                                                        {missionRunbookExecutiveCards.map((item, idx) => (
-                                                            <div key={`executive-focus-${idx}`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded px-3 py-2`}>
-                                                                <div className={`font-medium ${headingClass}`}>{item.title}</div>
-                                                                <div className={`mt-1 ${subtextClass}`}>{item.summary}</div>
-                                                                <div className={`mt-1 ${mutedTextClass}`}>{item.meta}</div>
-                                                            </div>
-                                                        ))}
+                                                    <div id={`workflow-panel-${workflowTab}`} role="tabpanel" aria-labelledby={`workflow-tab-${workflowTab}`} className={`text-xs ${mutedTextClass}`}>
+                                                        {runbookPayload && runbookPayload.has_data
+                                                            ? `Ready to download: ${runbookPayload.title || 'Runbook'}.`
+                                                            : 'Select Generate Runbook to build it.'}
                                                     </div>
-                                                )}
-
-                                                    {runbookPayload && runbookPayload.has_data && (
-                                                        <div className={`mt-3 text-xs ${mutedTextClass}`}>
-                                                            Ready to download: {runbookPayload.title || 'Runbook'}
-                                                        </div>
-                                                    )}
                                                 </div>
 
                                                 <div className={`dt4sms-neo-runbook xl:col-span-2 border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800/40' : 'border-gray-200 bg-white'}`}>
                                                     <div className="flex flex-col gap-3">
-                                                        <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                                                        <div className="flex flex-col gap-3">
                                                             <div>
                                                                 <h3 className={`text-sm font-semibold ${headingClass}`}>Report Package</h3>
                                                                 <p className={`text-xs mt-1 ${mutedTextClass}`}>
@@ -14715,7 +14624,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                 </p>
                                                             </div>
 
-                                                            <div className="flex items-center gap-2 text-xs">
+                                                            <div className="flex flex-wrap items-center gap-2 text-xs">
                                                                 <button
                                                                     onClick={async () => {
                                                                         const currentRunbook = await ensureCurrentRunbookPayload();
@@ -14728,14 +14637,14 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                         });
                                                                     }}
                                                                     disabled={!canUseExportTools || exportBuildState.status === 'loading'}
-                                                                    className={`px-3 py-1 rounded ${canUseExportTools && exportBuildState.status !== 'loading' ? 'bg-cyan-700 hover:bg-cyan-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
+                                                                    className={`px-3 py-1 whitespace-nowrap rounded ${canUseExportTools && exportBuildState.status !== 'loading' ? 'bg-cyan-700 hover:bg-cyan-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
                                                                 >
                                                                     {exportBuildState.status === 'loading' ? 'Building Package...' : 'Build Report Package'}
                                                                 </button>
                                                                 <button
                                                                     onClick={() => downloadCapabilityExport(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name)}
                                                                     disabled={!(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name)}
-                                                                    className={`px-3 py-1 rounded ${(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name) ? 'bg-slate-700 hover:bg-slate-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
+                                                                    className={`px-3 py-1 whitespace-nowrap rounded ${(exportBuildState.bundle?.download_name || exportCapability?.latest_bundle?.name) ? 'bg-slate-700 hover:bg-slate-800 text-white' : 'bg-gray-200 text-gray-500 cursor-not-allowed'}`}
                                                                 >
                                                                     {downloadPackageLabel}
                                                                 </button>
@@ -14798,167 +14707,74 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
 
                                 {isIntelligenceTab && (
                                     <div className={`dt4sms-neo-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}`}>
-                                        <div className="flex items-center justify-between mb-4">
+                                        <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
                                             <div>
                                                 <h2 className={`text-lg font-semibold ${headingClass}`}>Findings</h2>
-                                                <p className={`text-sm ${subtextClass}`}>Coverage gaps, suggested investigations, and evidence from the latest discovery run.</p>
+                                                <p className={`text-sm ${subtextClass}`}>Coverage gaps, investigations, and evidence from the latest discovery run.</p>
                                             </div>
-                                            <button
-                                                type="button"
-                                                onClick={refreshIntelligenceWorkspace}
-                                                className="ui-link"
-                                                title="Refresh findings"
-                                                aria-label="Refresh findings"
-                                            >
-                                                <i className="fas fa-sync"></i>
-                                            </button>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                {renderOperatorVoiceSelect()}
+                                                {renderWorkspaceRefreshButton(refreshIntelligenceWorkspace, 'Refresh findings')}
+                                            </div>
                                         </div>
 
                                         {!v2Intelligence || !v2Intelligence.has_data ? (
                                             <div className={`text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}`}>
-                                                {v2Intelligence?.message || 'No findings yet. Run discovery from the Discovery tab to see findings here.'}
+                                                No findings yet. Run discovery from the Discovery tab to see findings here.
                                             </div>
                                         ) : (
                                             <>
-                                                <div className="grid grid-cols-1 xl:grid-cols-5 gap-4 mb-4">
-                                                    <div className={`dt4sms-neo-hero xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
-                                                        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                                                            <div className="max-w-3xl">
-                                                                <div className={`text-xs uppercase tracking-wider ${mutedTextClass}`}>Latest run</div>
-                                                                <div className="mt-2 flex flex-wrap items-center gap-2">
-                                                                    <span className={`dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
-                                                                        {missionFreshness.label}
-                                                                    </span>
-                                                                    <span className={`dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}`}>
-                                                                        Style: {operatorVoiceDefinition.label}
-                                                                    </span>
-                                                                    <span className={`text-xs ${mutedTextClass}`}>
-                                                                        Last run: {formatMissionDateTime(latestMissionSession?.created_at || latestMissionSession?.timestamp, latestMissionSession?.timestamp || 'Unavailable')}
-                                                                    </span>
-                                                                </div>
-                                                                <h3 className={`mt-3 text-xl font-semibold ${headingClass}`}>{intelligenceHeadline}</h3>
-                                                                <p className={`mt-2 text-sm leading-6 ${subtextClass}`}>{intelligenceWhyNow}</p>
-                                                            </div>
+                                                <div className={`dt4sms-neo-hero rounded-xl border p-5 mb-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-slate-50 border-slate-200'}`}>
+                                                    <div className="max-w-3xl">
+                                                        <div className={`text-xs uppercase tracking-wider ${mutedTextClass}`}>Latest run</div>
+                                                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                                                            <span className={`dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}`}>
+                                                                {missionFreshness.label}
+                                                            </span>
+                                                            <span className={`text-xs ${mutedTextClass}`}>
+                                                                Last run: {formatMissionDateTime(latestMissionSession?.created_at || latestMissionSession?.timestamp, latestMissionSession?.timestamp || 'Unavailable')}
+                                                            </span>
                                                         </div>
-
-                                                        <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
-                                                            {intelligenceSummaryCards.map((card) => (
-                                                                <div key={card.label} className={`dt4sms-neo-metric rounded-xl border px-4 py-4 ${card.shellClass}`}>
-                                                                    <div className={`text-xs uppercase tracking-wide ${card.labelClass}`}>{card.label}</div>
-                                                                    <div className={`mt-2 text-2xl font-semibold ${card.valueClass}`}>{card.value}</div>
-                                                                    <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{card.detail}</div>
-                                                                </div>
-                                                            ))}
-                                                        </div>
+                                                        <h3 className={`mt-3 text-xl font-semibold ${headingClass}`}>{intelligenceHeadline}</h3>
+                                                        <p className={`mt-2 text-sm leading-6 ${subtextClass}`}>{intelligenceWhyNow}</p>
                                                     </div>
 
-                                                    <div className={`dt4sms-neo-sidecard xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                        <div className="flex items-center gap-2 mb-3">
-                                                            <i className="fas fa-layer-group text-rose-600"></i>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Top priorities</h3>
-                                                        </div>
-                                                        <div className="space-y-3">
-                                                            {intelligencePriorityBoard.map((item) => (
-                                                                <div key={item.label} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-xl px-4 py-3`}>
-                                                                    <div className="flex items-start justify-between gap-3">
-                                                                        <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>{item.label}</div>
-                                                                        <span className={`rounded-full px-2 py-0.5 border text-xs ${item.badgeClass}`}>{item.badge}</span>
-                                                                    </div>
-                                                                    <div className={`mt-2 text-xs leading-5 ${subtextClass}`}>{item.detail}</div>
-                                                                </div>
-                                                            ))}
-                                                        </div>
+                                                    <div data-testid="findings-stats" className="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
+                                                        {intelligenceSummaryCards.map(renderWorkspaceMetricCard)}
                                                     </div>
                                                 </div>
 
                                                 <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4">
-                                                    <div className={`dt4sms-neo-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                        <div className="flex items-center gap-2 mb-3">
-                                                            <i className="fas fa-clipboard-check text-emerald-600"></i>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Admin actions</h3>
-                                                        </div>
-                                                        {intelligenceAdminBriefs.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No admin actions suggested.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {intelligenceAdminBriefs.map((item, idx) => (
-                                                                    <li key={`intelligence-admin-${idx}`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
-                                                                        <div className="flex flex-wrap items-start justify-between gap-2">
-                                                                            <div className={`font-medium ${headingClass}`}>{item.title}</div>
-                                                                            <span className={`rounded-full px-2 py-0.5 border text-xs ${panelMutedClass} ${mutedTextClass}`}>{item.badge}</span>
-                                                                        </div>
-                                                                        <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>
-                                                                        <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-
-                                                    <div className={`dt4sms-neo-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                        <div className="flex items-center gap-2 mb-3">
-                                                            <i className="fas fa-search text-indigo-600"></i>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Analyst investigations</h3>
-                                                        </div>
-                                                        {intelligenceAnalystBriefs.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No investigations suggested.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {intelligenceAnalystBriefs.map((item, idx) => (
-                                                                    <li key={`intelligence-analyst-${idx}`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
-                                                                        <div className={`font-medium ${headingClass}`}>{item.title}</div>
-                                                                        <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>
-                                                                        <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-
-                                                    <div className={`dt4sms-neo-section rounded-xl border p-4 ${isDarkTheme ? 'bg-gray-950 border-gray-800' : 'bg-white border-gray-200'}`}>
-                                                        <div className="flex items-center gap-2 mb-3">
-                                                            <i className="fas fa-briefcase text-purple-600"></i>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Executive summary</h3>
-                                                        </div>
-                                                        {intelligenceExecutiveBriefs.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No executive summary was generated.</div>
-                                                        ) : (
-                                                            <div className="space-y-2 text-xs">
-                                                                {intelligenceExecutiveBriefs.map((item, idx) => (
-                                                                    <div key={`intelligence-executive-${idx}`} className={`dt4sms-neo-item ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
-                                                                        <div className={`font-medium ${headingClass}`}>{item.title}</div>
-                                                                        <div className={`mt-1 leading-5 ${subtextClass}`}>{item.summary}</div>
-                                                                        <div className={`mt-2 ${mutedTextClass}`}>{item.meta}</div>
-                                                                    </div>
-                                                                ))}
-                                                            </div>
-                                                        )}
-                                                    </div>
+                                                    {renderFindingsList({
+                                                        key: 'admin',
+                                                        icon: 'fa-shield-alt',
+                                                        iconClass: 'text-rose-600',
+                                                        title: 'Coverage gaps',
+                                                        audience: 'For admins. Highest priority first.',
+                                                        items: findingsAdminItems,
+                                                        emptyText: 'No coverage gaps found.',
+                                                    })}
+                                                    {renderFindingsList({
+                                                        key: 'analyst',
+                                                        icon: 'fa-search',
+                                                        iconClass: 'text-indigo-600',
+                                                        title: 'Investigations',
+                                                        audience: 'For analysts.',
+                                                        items: findingsAnalystItems,
+                                                        emptyText: 'No investigations suggested.',
+                                                    })}
+                                                    {renderFindingsList({
+                                                        key: 'executive',
+                                                        icon: 'fa-briefcase',
+                                                        iconClass: 'text-purple-600',
+                                                        title: 'Executive summary',
+                                                        audience: 'For leadership.',
+                                                        items: findingsExecutiveItems,
+                                                        emptyText: 'No executive summary was generated.',
+                                                    })}
                                                 </div>
 
                                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                                                    <div className={`border rounded p-4 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                                        <div className="flex items-center gap-2 mb-3">
-                                                            <i className="fas fa-shield-alt text-rose-600"></i>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Coverage gaps</h3>
-                                                        </div>
-                                                        {v2CoverageGaps.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No high-priority gaps found.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {v2CoverageGaps.slice(0, 6).map((gap, idx) => (
-                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg p-3`}>
-                                                                        <div className="flex items-start justify-between gap-3">
-                                                                            <div className={`font-medium ${headingClass}`}>{gap.gap || 'Coverage gap'}</div>
-                                                                            <span className={`rounded-full px-2 py-0.5 border text-xs ${getOperatorPriorityClasses(gap.priority)}`}>{formatOperatorPriorityLabel(gap.priority)}</span>
-                                                                        </div>
-                                                                        <div className={`mt-1 ${subtextClass}`}>{gap.why_it_matters || 'No description provided.'}</div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-
                                                     <div className={`border rounded p-4 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
                                                         <div className="flex items-center gap-2 mb-3">
                                                             <i className="fas fa-project-diagram text-sky-600"></i>
@@ -14971,25 +14787,42 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                 <div className={`mt-1 ${subtextClass}`}>License: {v2Overview.license_state || 'Unknown'}</div>
                                                             </div>
                                                             <div className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
-                                                                <div className={mutedTextClass}>Discovery steps</div>
-                                                                <div className={`mt-1 font-medium ${headingClass}`}>{formatMissionMetricValue(v2Overview.estimated_discovery_steps)}</div>
-                                                                <div className={`mt-1 ${subtextClass}`}>{v2Overview.estimated_time || 'No time estimate'}</div>
-                                                            </div>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                 <div className={mutedTextClass}>Data</div>
                                                                 <div className={`mt-1 font-medium ${headingClass}`}>{formatMissionMetricValue(v2CapabilityGraph?.data_surface?.indexes || v2Overview.total_indexes)} indexes</div>
                                                                 <div className={`mt-1 ${subtextClass}`}>{formatMissionMetricValue(v2CapabilityGraph?.data_surface?.sourcetypes || v2Overview.total_sourcetypes)} sourcetypes • {formatMissionMetricValue(v2CapabilityGraph?.data_surface?.sources || v2Overview.total_sources)} sources</div>
                                                             </div>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
+                                                            <div className={`col-span-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg px-3 py-3`}>
                                                                 <div className={mutedTextClass}>Users and objects</div>
                                                                 <div className={`mt-1 font-medium ${headingClass}`}>{formatMissionMetricValue(v2CapabilityGraph?.operations_surface?.users || v2Overview.total_users)} users</div>
                                                                 <div className={`mt-1 ${subtextClass}`}>{formatMissionMetricValue(v2CapabilityGraph?.operations_surface?.knowledge_objects || v2Overview.total_knowledge_objects)} knowledge objects • {formatMissionMetricValue(v2CapabilityGraph?.operations_surface?.kv_collections || v2Overview.total_kv_collections)} KV collections</div>
                                                             </div>
                                                         </div>
                                                     </div>
+
+                                                    <div className={`border rounded p-4 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                                        <div className="flex items-center gap-2 mb-3">
+                                                            <i className="fas fa-stream text-emerald-600"></i>
+                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Key evidence</h3>
+                                                        </div>
+                                                        {v2FindingLedger.length === 0 ? (
+                                                            <div className={`text-xs ${mutedTextClass}`}>No evidence recorded.</div>
+                                                        ) : (
+                                                            <ul className="space-y-2 text-xs">
+                                                                {v2FindingLedger.slice(0, 6).map((entry, idx) => (
+                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg p-3`}>
+                                                                        <div className="flex items-start justify-between gap-3">
+                                                                            <div className={`font-medium ${headingClass}`}>Step {entry.step || 0}: {entry.title || 'Discovery step'}</div>
+                                                                            <span className={`text-xs ${mutedTextClass}`}>{formatMissionDateTime(entry.timestamp, 'Time not recorded')}</span>
+                                                                        </div>
+                                                                        <div className={`mt-1 ${subtextClass}`}>{summarizeFindingEntry(entry)}</div>
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        )}
+                                                    </div>
                                                 </div>
 
-                                                <div className={`border rounded p-4 mb-4 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                                <div className={`border rounded p-4 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
                                                     <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between mb-3">
                                                         <div>
                                                             <div className="flex items-center gap-2">
@@ -15072,57 +14905,6 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                         </div>
                                                     )}
                                                 </div>
-
-                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                    <div className={`border rounded p-4 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                                        <div className="flex items-center gap-2 mb-3">
-                                                            <i className="fas fa-stream text-emerald-600"></i>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Key evidence</h3>
-                                                        </div>
-                                                        {v2FindingLedger.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No evidence recorded.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {v2FindingLedger.slice(0, 6).map((entry, idx) => (
-                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg p-3`}>
-                                                                        <div className="flex items-start justify-between gap-3">
-                                                                            <div className={`font-medium ${headingClass}`}>Step {entry.step || 0}: {entry.title || 'Discovery step'}</div>
-                                                                            <span className={`text-xs ${mutedTextClass}`}>{formatMissionDateTime(entry.timestamp, 'Time not recorded')}</span>
-                                                                        </div>
-                                                                        <div className={`mt-1 ${subtextClass}`}>{summarizeFindingEntry(entry)}</div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-
-                                                    <div className={`border rounded p-4 ${isDarkTheme ? 'border-gray-600 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                                        <div className="flex items-center gap-2 mb-3">
-                                                            <i className="fas fa-lightbulb text-amber-600"></i>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Suggested investigations</h3>
-                                                        </div>
-                                                        {v2UseCases.length === 0 ? (
-                                                            <div className={`text-xs ${mutedTextClass}`}>No investigations suggested.</div>
-                                                        ) : (
-                                                            <ul className="space-y-2 text-xs">
-                                                                {v2UseCases.slice(0, 6).map((item, idx) => (
-                                                                    <li key={idx} className={`${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'} border rounded-lg p-3`}>
-                                                                        <div className="flex items-start justify-between gap-3">
-                                                                            <div className={`font-medium ${headingClass}`}>{item.title || item.name || `Investigation ${idx + 1}`}</div>
-                                                                            <span className={`rounded-full px-2 py-0.5 border text-xs ${getOperatorPriorityClasses(item.implementation_complexity === 'high' ? 'high' : 'medium')}`}>
-                                                                                {item.implementation_complexity ? `Complexity: ${item.implementation_complexity}` : 'Complexity unknown'}
-                                                                            </span>
-                                                                        </div>
-                                                                        <div className={`mt-1 ${subtextClass}`}>{item.description || item.use_case || 'No description available.'}</div>
-                                                                        <div className={`mt-2 ${mutedTextClass}`}>
-                                                                            {(Array.isArray(item.success_metrics) && item.success_metrics[0]) || item.business_value || 'No success measure recorded.'}
-                                                                        </div>
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        )}
-                                                    </div>
-                                                </div>
                                             </>
                                         )}
                                     </div>
@@ -15141,29 +14923,10 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     </p>
                                                 </div>
 
-                                                <div className="flex flex-col sm:items-end gap-3">
-                                                    <div className={`inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600 bg-gray-900' : 'border-gray-300 bg-gray-100'}`} role="tablist" aria-label="Capabilities views">
-                                                        <button
-                                                            type="button"
-                                                            role="tab"
-                                                            aria-selected={isCapabilitiesOverview}
-                                                            tabIndex={isCapabilitiesOverview ? 0 : -1}
-                                                            onClick={openCapabilitiesOverview}
-                                                            className={`px-3 py-1.5 text-xs sm:text-sm font-medium ${isCapabilitiesOverview ? 'bg-indigo-600 text-white' : (isDarkTheme ? 'text-gray-200 hover:bg-gray-800' : 'text-gray-700 hover:bg-white')}`}
-                                                        >
-                                                            Overview
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            role="tab"
-                                                            aria-selected={isCapabilitiesRagView}
-                                                            tabIndex={isCapabilitiesRagView ? 0 : -1}
-                                                            onClick={openRagCapabilitiesWorkspace}
-                                                            className={`px-3 py-1.5 text-xs sm:text-sm font-medium border-l ${isCapabilitiesRagView ? 'bg-sky-600 text-white border-sky-500' : (isDarkTheme ? 'border-gray-700 text-gray-200 hover:bg-gray-800' : 'border-gray-300 text-gray-700 hover:bg-white')}`}
-                                                        >
-                                                            Knowledge Base
-                                                        </button>
-                                                    </div>
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    {isCapabilitiesRagView
+                                                        ? renderWorkspaceRefreshButton(() => openRagCapabilitiesWorkspace({ libraryFilter: ragLibraryFilter }), 'Refresh the Knowledge Base')
+                                                        : renderWorkspaceRefreshButton(refreshCapabilitiesWorkspace, 'Refresh capabilities')}
                                                 </div>
                                             </div>
 
@@ -15491,7 +15254,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                 title={isMissionDiscoveryActive ? 'Stop the discovery run' : 'Start a full discovery run'}
                                                             >
                                                                 {isMissionDiscoveryActive ? (
-                                                                    <><i className="fas fa-stop mr-1"></i>Abort Discovery</>
+                                                                    <><i className="fas fa-stop mr-1"></i>Stop Discovery</>
                                                                 ) : (
                                                                     <><i className="fas fa-rocket mr-1"></i>Run Discovery</>
                                                                 )}
@@ -15502,7 +15265,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                 className="px-3 py-2 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
                                                                 title="Reload the report library"
                                                             >
-                                                                <i className="fas fa-folder-open mr-1"></i>Refresh Discovery
+                                                                <i className="fas fa-folder-open mr-1"></i>Refresh
                                                             </button>
                                                         </div>
                                                     </div>
@@ -16883,7 +16646,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                 {/* Tab Navigation */}
                                 {!isLoadingSummary && summaryData && (
                                     <div className={`border-b ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
-                                        <div className="flex space-x-1 px-6" role="tablist" aria-label="Summary views">
+                                        <div className="flex space-x-1 px-6" role="tablist" aria-label="Summary views" onKeyDown={handleTablistKeyDown}>
                                             <button
                                                 type="button"
                                                 id="summary-tab-summary"
@@ -18345,80 +18108,10 @@ ${query.spl}`,
                                     </button>
                                 </div>
 
-                                <div className={`px-6 py-4 border-b ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
-                                    <div className="flex items-center justify-between mb-3">
-                                        <h3 id="settings-appearance-heading" className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                            <i className={`fas fa-adjust mr-2 ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`} aria-hidden="true"></i>
-                                            Appearance
-                                        </h3>
-                                        {themePreference === 'system' && (
-                                            <span data-testid="settings-theme-resolved" className={`text-xs ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                                Showing {resolvedTheme === 'dark' ? 'Dark' : 'Light'} to match your computer
-                                            </span>
-                                        )}
-                                    </div>
-                                    <div className={`dt4sms-appearance-theme-group inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="group" aria-labelledby="settings-appearance-heading">
-                                        {THEME_PREFERENCE_OPTIONS.map((option, index) => {
-                                            const isSelected = themePreference === option.value;
-                                            return (
-                                                <button
-                                                    key={option.value}
-                                                    type="button"
-                                                    data-testid={`settings-theme-option-${option.value}`}
-                                                    onClick={() => applyThemePreference(option.value)}
-                                                    className={`px-3 py-2 text-xs font-medium ${index > 0 ? 'border-l' : ''} ${isSelected ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
-                                                    aria-pressed={isSelected}
-                                                >
-                                                    {option.label}
-                                                </button>
-                                            );
-                                        })}
-                                    </div>
-                                    <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                        System follows your computer&apos;s light or dark setting. Neo is a dark green-on-black theme.
-                                    </p>
-                                    <div className={`mt-4 pt-4 border-t ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
-                                        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                                            <div>
-                                                <h3 className={`text-sm font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
-                                                    <i className="fas fa-door-open mr-2 text-indigo-600"></i>
-                                                    Welcome Screen
-                                                </h3>
-                                                <p className={`mt-1 text-xs ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                                    The introduction shown the first time this browser opens the app.
-                                                </p>
-                                            </div>
-                                            <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium border ${hasDismissedWelcomeSplash ? (isDarkTheme ? 'bg-gray-950 border-emerald-800 text-emerald-200' : 'bg-emerald-50 border-emerald-200 text-emerald-800') : (isDarkTheme ? 'bg-gray-900 border-amber-800 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-800')}`}>
-                                                {hasDismissedWelcomeSplash ? 'Hidden in this browser' : 'Shows next time'}
-                                            </span>
-                                        </div>
-                                        <div className="mt-3 flex flex-wrap gap-2">
-                                            <button
-                                                type="button"
-                                                data-testid="settings-preview-welcome-splash"
-                                                onClick={previewWelcomeSplash}
-                                                className={`rounded-lg px-3 py-2 text-xs font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-100 border border-gray-700 hover:bg-gray-700' : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50'}`}
-                                            >
-                                                <i className="fas fa-eye mr-2"></i>
-                                                Show Welcome Screen
-                                            </button>
-                                            <button
-                                                type="button"
-                                                data-testid="settings-reset-welcome-splash"
-                                                onClick={resetWelcomeSplashPreference}
-                                                className={`rounded-lg px-3 py-2 text-xs font-medium ${isDarkTheme ? 'bg-indigo-950 text-indigo-100 border border-indigo-800 hover:bg-indigo-900' : 'bg-indigo-50 text-indigo-800 border border-indigo-200 hover:bg-indigo-100'}`}
-                                            >
-                                                <i className="fas fa-rotate-left mr-2"></i>
-                                                Show Again Next Time
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-
                                 {/* Scrollable Content */}
                                 <div className="flex-1 overflow-y-auto p-6 space-y-6">
                                     <div className={`rounded-xl border p-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                        <div className="grid gap-2 md:grid-cols-4">
+                                        <div className="grid gap-2 grid-cols-2 sm:grid-cols-3 md:grid-cols-5">
                                             {SETTINGS_MODAL_TABS.map((tab) => {
                                                 const isActive = activeSettingsTab === tab.id;
                                                 return (
@@ -18443,6 +18136,81 @@ ${query.spl}`,
                                     {renderSecurityAccessSettings()}
 
                                     {renderSettingsTroubleshooter()}
+
+                                    {activeSettingsTab === 'appearance' && (
+                                        <div data-testid="settings-appearance-panel" className="space-y-6">
+                                            <section className={`rounded-lg border p-6 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`} aria-labelledby="settings-appearance-heading">
+                                                <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                                                    <h3 id="settings-appearance-heading" className={`text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
+                                                        <i className={`fas fa-adjust mr-2 ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`} aria-hidden="true"></i>
+                                                        Theme
+                                                    </h3>
+                                                    {themePreference === 'system' && (
+                                                        <span data-testid="settings-theme-resolved" className={`text-xs ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
+                                                            Showing {resolvedTheme === 'dark' ? 'Dark' : 'Light'} to match your computer
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <p className={`text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
+                                                    Changes apply right away and are saved for this browser. System follows your computer&apos;s light or dark setting. Neo is a dark green-on-black theme.
+                                                </p>
+                                                <div className={`dt4sms-appearance-theme-group mt-4 inline-flex rounded-lg border overflow-hidden ${isDarkTheme ? 'border-gray-600' : 'border-gray-300'}`} role="group" aria-labelledby="settings-appearance-heading">
+                                                    {THEME_PREFERENCE_OPTIONS.map((option, index) => {
+                                                        const isSelected = themePreference === option.value;
+                                                        return (
+                                                            <button
+                                                                key={option.value}
+                                                                type="button"
+                                                                data-testid={`settings-theme-option-${option.value}`}
+                                                                onClick={() => applyThemePreference(option.value)}
+                                                                className={`px-4 py-2 text-sm font-medium ${index > 0 ? 'border-l' : ''} ${isSelected ? 'bg-indigo-600 text-white border-indigo-500' : (isDarkTheme ? 'bg-gray-800 text-gray-200 hover:bg-gray-700 border-gray-600' : 'bg-white text-gray-700 hover:bg-gray-100 border-gray-300')}`}
+                                                                aria-pressed={isSelected}
+                                                            >
+                                                                {option.label}
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </section>
+
+                                            <section className={`rounded-lg border p-6 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`} aria-labelledby="settings-welcome-heading">
+                                                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                                                    <div>
+                                                        <h3 id="settings-welcome-heading" className={`text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>
+                                                            <i className={`fas fa-door-open mr-2 ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`} aria-hidden="true"></i>
+                                                            Welcome Screen
+                                                        </h3>
+                                                        <p className={`mt-1 text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
+                                                            The introduction shown the first time this browser opens the app.
+                                                        </p>
+                                                    </div>
+                                                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium border ${hasDismissedWelcomeSplash ? (isDarkTheme ? 'bg-gray-950 border-emerald-800 text-emerald-200' : 'bg-emerald-50 border-emerald-200 text-emerald-800') : (isDarkTheme ? 'bg-gray-900 border-amber-800 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-800')}`}>
+                                                        {hasDismissedWelcomeSplash ? 'Hidden in this browser' : 'Shows next time'}
+                                                    </span>
+                                                </div>
+                                                <div className="mt-4 flex flex-wrap gap-2">
+                                                    <button
+                                                        type="button"
+                                                        data-testid="settings-preview-welcome-splash"
+                                                        onClick={previewWelcomeSplash}
+                                                        className={`rounded-lg px-3 py-2 text-sm font-medium ${isDarkTheme ? 'bg-gray-900 text-gray-100 border border-gray-600 hover:bg-gray-700' : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50'}`}
+                                                    >
+                                                        <i className="fas fa-eye mr-2" aria-hidden="true"></i>
+                                                        Show Welcome Screen
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        data-testid="settings-reset-welcome-splash"
+                                                        onClick={resetWelcomeSplashPreference}
+                                                        className={`rounded-lg px-3 py-2 text-sm font-medium ${isDarkTheme ? 'bg-indigo-950 text-indigo-100 border border-indigo-800 hover:bg-indigo-900' : 'bg-indigo-50 text-indigo-800 border border-indigo-200 hover:bg-indigo-100'}`}
+                                                    >
+                                                        <i className="fas fa-rotate-left mr-2" aria-hidden="true"></i>
+                                                        Show Again Next Time
+                                                    </button>
+                                                </div>
+                                            </section>
+                                        </div>
+                                    )}
 
                                     {/* Kept mounted while hidden so typed values and the saved lists survive tab switches */}
                                     <div data-testid="settings-connections-panel" className="space-y-6" hidden={activeSettingsTab !== 'connections'}>
@@ -19323,7 +19091,8 @@ ${query.spl}`,
                                             View Dependencies
                                         </button>
 
-                                        {/* Always show Save Settings button */}
+                                        {/* Appearance changes apply immediately, so a Save button there would suggest they do not. */}
+                                        {activeSettingsTab !== 'appearance' && (
                                         <button
                                             onClick={async () => {
                                                 const providerEl = document.getElementById('llm-provider');
@@ -19378,6 +19147,7 @@ ${query.spl}`,
                                             <i className="fas fa-save mr-2"></i>
                                             Save Settings
                                         </button>
+                                        )}
                                     </div>
                                 </div>
                             </div>

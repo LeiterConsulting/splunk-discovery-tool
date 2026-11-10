@@ -5,6 +5,18 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
+class CapabilityWorkspace:
+    """A workspace tab that a capability adds to the app while it is installed and enabled."""
+
+    id: str
+    label: str
+    description: str = ""
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"id": self.id, "label": self.label, "description": self.description}
+
+
+@dataclass
 class CapabilityDefinition:
     """Static definition for a known capability pack."""
 
@@ -24,6 +36,7 @@ class CapabilityDefinition:
     enabled_by_default: bool = False
     priority: int = 100
     maturity: str = "foundation"
+    workspace: Optional[CapabilityWorkspace] = None
 
 
 @dataclass

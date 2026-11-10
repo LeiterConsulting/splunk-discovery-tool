@@ -702,7 +702,15 @@ async function runWelcomeSplashRegression(baseUrl) {
         await welcomeSplash.getByRole('button', { name: 'Get Started' }).click();
         await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
         await page.getByRole('button', { name: 'Open settings' }).click();
+        await page.getByTestId('settings-tab-appearance').click();
+        await page.getByTestId('settings-appearance-panel').waitFor({ timeout: 30000 });
+        assert(
+            (await page.getByRole('button', { name: 'Save Settings' }).count()) === 0,
+            'Settings > Appearance applies changes right away, so it should not show Save Settings.',
+        );
         await page.getByTestId('settings-reset-welcome-splash').click();
+        await page.getByTestId('settings-tab-connections').click();
+        await page.getByRole('button', { name: 'Save Settings' }).waitFor({ timeout: 30000 });
         await page.getByRole('button', { name: 'Close settings' }).click();
 
         await page.reload({ waitUntil: 'networkidle' });
@@ -1031,9 +1039,9 @@ async function runWorkspaceSmoke(baseUrl) {
         await assertChatPromptContains(page, reportQuery);
         await closeChatModal(page);
 
-        await page.getByTestId('workspace-tab-context').click({ force: true });
-        const contextTabSelected = await page.getByTestId('workspace-tab-context').getAttribute('aria-selected');
-        assert(contextTabSelected === 'true', 'Context workspace tab did not become active.');
+        await page.getByTestId('workspace-tab-knowledge-base').click({ force: true });
+        const knowledgeBaseTabSelected = await page.getByTestId('workspace-tab-knowledge-base').getAttribute('aria-selected');
+        assert(knowledgeBaseTabSelected === 'true', 'Knowledge Base workspace tab did not become active.');
 
         await page.getByTestId('context-library-filter-spl_library').waitFor({ state: 'visible' });
         await page.getByTestId('context-library-filter-spl_library').click();
@@ -1109,9 +1117,34 @@ async function runOperatorWorkflowRegression(baseUrl, seededRuntimeState) {
         await page.goto(baseUrl, { waitUntil: 'networkidle' });
         await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
 
-        await page.locator('#workspace-tab-mission').click({ force: true });
+        await page.locator('#workspace-tab-overview').click({ force: true });
         await page.getByText('Discovery status', { exact: true }).first().waitFor({ state: 'visible' });
         await page.getByText('Discovery run completed').first().waitFor({ state: 'visible' });
+
+        const overviewNextStepTitles = (await page.getByTestId('overview-next-step-title').allInnerTexts()).map((title) => title.trim());
+        assert(overviewNextStepTitles.length > 0, 'Overview did not show any next steps for the seeded run.');
+
+        // Arrow keys move between workspace tabs and open them.
+        await page.locator('#workspace-tab-overview').focus();
+        await page.keyboard.press('ArrowRight');
+        await page.waitForFunction(() => document.activeElement?.id === 'workspace-tab-findings'
+            && document.activeElement?.getAttribute('aria-selected') === 'true', null, { timeout: 10000 });
+        await page.getByTestId('findings-list-admin').waitFor({ state: 'visible' });
+        const firstFindingTitles = [];
+        for (const key of ['admin', 'analyst', 'executive']) {
+            const title = page.getByTestId(`findings-list-${key}`).getByTestId('findings-item-title').first();
+            if (await title.count()) firstFindingTitles.push((await title.innerText()).trim());
+        }
+        for (const nextStepTitle of overviewNextStepTitles) {
+            assert(
+                firstFindingTitles.includes(nextStepTitle) || (await page.getByTestId('findings-item-title').filter({ hasText: nextStepTitle }).count()) > 0,
+                `Overview next step "${nextStepTitle}" does not appear on Findings.`,
+            );
+        }
+        assert(overviewNextStepTitles[0] === firstFindingTitles[0], `Overview's first next step "${overviewNextStepTitles[0]}" should be the top coverage gap on Findings ("${firstFindingTitles[0]}").`);
+        await page.keyboard.press('Home');
+        await page.waitForFunction(() => document.activeElement?.id === 'workspace-tab-overview'
+            && document.activeElement?.getAttribute('aria-selected') === 'true', null, { timeout: 10000 });
 
         const buildPackageButton = page.getByRole('button', { name: 'Build Report Package' });
         await buildPackageButton.waitFor({ state: 'visible' });
@@ -1309,7 +1342,7 @@ async function main() {
         console.log(`Visualization browser regression passed: ${visualizationResult.barHeights.length} bars, ${visualizationResult.linePoints} line points, ${visualizationResult.truncatedLabels} truncated dense labels.`);
         console.log(`Welcome splash regression passed: persisted dismissal ${welcomeSplashResult.persistedDismissal ? 'verified' : 'not verified'}.`);
         console.log(`Workspace browser smoke passed: ${workspaceResult.reportSplCardCount} report SPL card and ${workspaceResult.libraryCardCount} SPL library card verified.`);
-        console.log(`Operator workflow regression passed: Mission handoff, report package build, and cached summary verified for session ${operatorResult.sessionTimestamp}${operatorResult.bundleName ? ` using ${operatorResult.bundleName}` : ''}.`);
+        console.log(`Operator workflow regression passed: Overview handoff, report package build, and cached summary verified for session ${operatorResult.sessionTimestamp}${operatorResult.bundleName ? ` using ${operatorResult.bundleName}` : ''}.`);
         console.log(`Active summary worker regression passed: resume and abort controls validated for session ${activeSummaryWorkerResult.sessionTimestamp}.`);
     } catch (error) {
         console.error('Visualization browser regression failed.');

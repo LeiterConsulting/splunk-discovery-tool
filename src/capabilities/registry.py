@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Optional
 
-from capabilities.models import CapabilityDefinition
+from capabilities.models import CapabilityDefinition, CapabilityWorkspace
 
 
 KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
@@ -37,6 +37,11 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         enabled_by_default=False,
         priority=25,
         maturity="phase6",
+        workspace=CapabilityWorkspace(
+            id="m26-14",
+            label="M-26-14",
+            description="M-26-14 readiness estimate, run comparison, and live checks",
+        ),
     ),
     "rag_local": CapabilityDefinition(
         name="rag_local",

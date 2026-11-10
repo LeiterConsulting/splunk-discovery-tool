@@ -42,11 +42,13 @@ The web app consumes current discovery data through dedicated endpoints:
 - `GET /api/discovery/compare` (session comparison)
 - `GET /api/discovery/runbook` (persona runbook payload)
 
-The UI is organized into three tabs:
+The UI is organized into five core tabs, followed by any tabs that enabled capabilities add:
 
-1. **Mission** — discovery execution, live log, and generated session views
-2. **Intelligence** — blueprint KPIs, coverage gaps, capability graph, and finding ledger
-3. **Artifacts** — artifact browsing and export or access workflows
+1. **Overview**: discovery status, key numbers, top next steps, run comparison, runbook, and report packages
+2. **Findings**: next steps for each audience, the environment profile, key evidence, and patterns
+3. **Discovery**: discovery runs, stage progress, saved reports, and summaries
+4. **Knowledge Base**: managed knowledge assets and the SPL Library
+5. **Capabilities**: install, enable, test, and configure optional capabilities
 
 ## Chat with Splunk (Developer Notes)
 

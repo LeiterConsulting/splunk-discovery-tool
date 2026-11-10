@@ -140,6 +140,7 @@ class CapabilityManager:
                 "runtime_available": definition.runtime_available,
                 "requires_restart_on_install": definition.requires_restart_on_install,
                 "maturity": definition.maturity,
+                "workspace": definition.workspace.to_dict() if definition.workspace else None,
             }
         )
         payload.update(self._extra_capability_state(definition, config))

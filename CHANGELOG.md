@@ -127,6 +127,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The summary dialog showed the raw session ID as its subtitle, and category names such as "data quality" were lowercase
 - Settings tab icons were read aloud as part of the tab names
 
+### 🧭 Navigation & Page Layout
+
+#### Added
+- Capabilities can add their own workspace tab: `CapabilityWorkspace(id, label, description)` on a `CapabilityDefinition`, returned as `workspace` by `GET /api/capabilities`. The tab appears after the core tabs while the capability is installed and enabled, and its label comes from this metadata. The M-26-14 Readiness Advisor adds the M-26-14 tab this way
+- A connection status button in the header (Connected, Setup incomplete, Status unavailable, or Not connected) that opens connection details
+- The Discovery tab shows the progress of a running discovery, or Failed after a failed run
+- Arrow keys, Home, and End move between tabs in the workspace tab bar, the runbook audience tabs, and the summary view tabs
+- Settings > Appearance holds the theme choice and the welcome screen options. Changes there apply right away, so it has no Save Settings button
+
+#### Changed
+- The workspace tabs are Overview, Findings, Discovery, Knowledge Base, and Capabilities, followed by capability tabs. Mission is now Overview, Intelligence is now Findings, and Context is now Knowledge Base
+- The header has two rows: the app name, connection status, Chat, sign-in, and Settings on top, then the tabs. Actions such as Refresh and the wording style sit on the page they affect
+- Overview shows the discovery status, one row of six key numbers, the top three next steps, run comparison, the runbook, and report packages
+- Findings shows the full next-step lists: coverage gaps for admins (with the matching risk mitigation as the next step), investigations for analysts, and business value for executives. The environment profile and key evidence follow, then patterns
+- Overview and Findings read their next steps from the same lists, so the top three on Overview always match the start of the lists on Findings
+- The runbook card on Overview shows a short description instead of repeating the next-step lists
+- The Capabilities tab has a Refresh button instead of a second row of tabs
+- The Runbook and Report Package cards put their buttons under the description, and the buttons wrap on narrow screens
+- Abort Discovery is now Stop Discovery
+- The README screenshots show the Overview and Findings tabs
+
+#### Removed
+- The Chat tab; Chat opens from the header
+- The theme picker at the top of the workspace (now in Settings > Appearance)
+- The Discovery steps tile in the environment profile, which showed the estimate made before the run
+- Cards that repeated the same next steps: Mission's Admin tasks, Investigations, and Executive summary cards, and Intelligence's Top priorities, Coverage gaps, and Suggested investigations cards. Findings now lists each step once
+
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added
