@@ -1,6 +1,6 @@
 # Configuration Variables & Tolerances
 
-Comprehensive enumeration of all configurable parameters, thresholds, and constants in the Discovery Tool for Splunk MCP Server.
+Comprehensive enumeration of all configurable parameters, thresholds, and constants in Splunk Discovery Tool.
 
 ---
 

@@ -129,7 +129,7 @@ export function buildOperatorFixtureSummary(timestamp = OPERATOR_FIXTURE_TIMESTA
         timestamp,
         ai_summary: [
             '## Executive Summary',
-            `Session ${timestamp} confirms a reusable authentication-monitoring workflow for the current environment.`,
+            'This run confirms a reusable authentication-monitoring workflow for the current environment.',
             'Operators already have enough evidence to validate alert coverage without waiting for a new discovery run.',
             '',
             '## Priority Actions',
@@ -146,7 +146,7 @@ export function buildOperatorFixtureSummary(timestamp = OPERATOR_FIXTURE_TIMESTA
             '## Trend Story',
             '- Failed logins are low volume but persistent enough to justify a focused review loop.',
             '',
-            '## Recursive Next Loop',
+            '## Next Check',
             '- Re-run the auth-failure validation query after alert tuning and compare the next session against this cached baseline.',
         ].join('\n'),
         readiness_score: 78,
@@ -314,14 +314,14 @@ export function buildOperatorFixtureSummary(timestamp = OPERATOR_FIXTURE_TIMESTA
 
 export function buildCompletedDiscoveryPhasePlan(completedAt) {
     const phases = [
-        { key: 'pipeline_boot', label: 'Bootstrap', detail: 'Runtime validation complete.' },
-        { key: 'signal_capture', label: 'Signal Capture', detail: 'Environment signal capture complete.' },
-        { key: 'evidence_collection', label: 'Evidence Collection', detail: 'Evidence collection complete.' },
-        { key: 'classification_map', label: 'Classification Map', detail: 'Classification map generated.' },
-        { key: 'recommendation_queue', label: 'Recommendation Queue', detail: 'Recommendations generated.' },
-        { key: 'use_case_generation', label: 'Use Case Generation', detail: 'Use cases generated.' },
-        { key: 'blueprint_assembly', label: 'Blueprint Assembly', detail: 'Blueprint assembled.' },
-        { key: 'artifact_packaging', label: 'Artifact Packaging', detail: 'Artifacts packaged to output.' },
+        { key: 'pipeline_boot', label: 'Prepare', detail: 'Settings checked.' },
+        { key: 'signal_capture', label: 'Survey the environment', detail: 'Survey complete.' },
+        { key: 'evidence_collection', label: 'Collect details', detail: 'Details collected.' },
+        { key: 'classification_map', label: 'Classify data', detail: 'Data classified.' },
+        { key: 'recommendation_queue', label: 'Recommend actions', detail: 'Recommendations written.' },
+        { key: 'use_case_generation', label: 'Suggest use cases', detail: 'Use cases suggested.' },
+        { key: 'blueprint_assembly', label: 'Assemble results', detail: 'Results assembled.' },
+        { key: 'artifact_packaging', label: 'Save reports', detail: 'Reports saved.' },
     ];
 
     return phases.map((phase, index) => ({

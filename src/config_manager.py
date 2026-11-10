@@ -110,7 +110,7 @@ class ServerConfig:
 
 @dataclass
 class OIDCConfig:
-    """OIDC provider settings for DT4SMS external authentication."""
+    """OIDC provider settings for Splunk Discovery Tool external authentication."""
     issuer_url: str = ""
     client_id: str = ""
     client_secret: str = ""

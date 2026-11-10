@@ -245,11 +245,11 @@ async function dismissWelcomeSplashIfPresent(page, options = {}) {
         return false;
     }
 
-    await page.getByRole('heading', { name: 'Welcome to DT4SMS' }).waitFor({ timeout: 30000 });
+    await page.getByRole('heading', { name: 'Welcome to Splunk Discovery Tool' }).waitFor({ timeout: 30000 });
     if (options.dontShowAgain) {
         await welcomeSplash.locator('[data-testid="welcome-splash-dismiss-checkbox"]').check();
     }
-    await welcomeSplash.getByRole('button', { name: 'Enter Workspace' }).click();
+    await welcomeSplash.getByRole('button', { name: 'Get Started' }).click();
     await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
     return true;
 }
@@ -507,7 +507,7 @@ async function seedOperatorRuntimeState() {
             report_count: reportCount,
             error: null,
             current_phase_key: 'artifact_packaging',
-            current_phase_title: 'Artifact Packaging',
+            current_phase_title: 'Save reports',
             phase_plan: phasePlan,
             last_run_outcome: {
                 status: 'completed',
@@ -516,7 +516,7 @@ async function seedOperatorRuntimeState() {
                 completed_at: completedAt,
                 result_timestamp: latestSession.timestamp,
                 report_count: reportCount,
-                phase_title: 'Artifact Packaging',
+                phase_title: 'Save reports',
                 error: null,
             },
             progress: {
@@ -693,13 +693,13 @@ async function runWelcomeSplashRegression(baseUrl) {
         await page.goto(baseUrl, { waitUntil: 'networkidle' });
         const welcomeSplash = page.locator('[data-testid="welcome-splash-modal"]');
         await welcomeSplash.waitFor({ state: 'visible', timeout: 30000 });
-        await page.getByRole('heading', { name: 'Welcome to DT4SMS' }).waitFor({ timeout: 30000 });
-        await page.getByText('DT4SMS turns Splunk discovery, investigation, reporting, and operator handoff into one guided workspace.').waitFor({ timeout: 30000 });
+        await page.getByRole('heading', { name: 'Welcome to Splunk Discovery Tool' }).waitFor({ timeout: 30000 });
+        await page.getByText('This tool surveys your Splunk environment, explains what it found, and suggests what to do next.').waitFor({ timeout: 30000 });
 
         const splashCheckbox = welcomeSplash.locator('[data-testid="welcome-splash-dismiss-checkbox"]');
         assert(!(await splashCheckbox.isChecked()), 'Welcome splash do-not-show checkbox should be off by default.');
 
-        await welcomeSplash.getByRole('button', { name: 'Enter Workspace' }).click();
+        await welcomeSplash.getByRole('button', { name: 'Get Started' }).click();
         await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
         await page.getByRole('button', { name: 'Open settings' }).click();
         await page.getByTestId('settings-reset-welcome-splash').click();
@@ -708,7 +708,7 @@ async function runWelcomeSplashRegression(baseUrl) {
         await page.reload({ waitUntil: 'networkidle' });
         await welcomeSplash.waitFor({ state: 'visible', timeout: 30000 });
         await splashCheckbox.check();
-        await welcomeSplash.getByRole('button', { name: 'Enter Workspace' }).click();
+        await welcomeSplash.getByRole('button', { name: 'Get Started' }).click();
         await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
 
         await page.reload({ waitUntil: 'networkidle' });
@@ -795,8 +795,8 @@ async function runWorkspaceSmoke(baseUrl) {
         capabilities: {
             rag_chromadb: {
                 name: 'rag_chromadb',
-                title: 'Indexed Artifact Search',
-                description: 'Indexed artifact search plus managed knowledge assets for context-rich retrieval.',
+                title: 'Knowledge Base',
+                description: 'Indexes your reports and imported documents so the AI assistant can find relevant context.',
                 purpose: 'Surface managed context assets and saved SPL queries.',
                 intent: 'Give operators a persistent retrieval and context workspace.',
                 category: 'rag',
@@ -841,10 +841,10 @@ async function runWorkspaceSmoke(baseUrl) {
             },
             splunk_deeplink_tools: {
                 name: 'splunk_deeplink_tools',
-                title: 'Splunk Deeplink Tools',
+                title: 'Splunk Search Links',
                 description: 'Build Splunk Web deep links for saved queries.',
                 purpose: 'Open saved searches directly in Splunk Web.',
-                intent: 'Preserve operator flow between DT4SMS and Splunk.',
+                intent: 'Open a finding in Splunk with one click.',
                 category: 'tool_pack',
                 install_method: 'internal',
                 maturity: 'foundation',
@@ -934,7 +934,7 @@ async function runWorkspaceSmoke(baseUrl) {
                 capability_usage: [
                     {
                         name: 'rag_chromadb',
-                        title: 'Indexed Artifact Search',
+                        title: 'Knowledge Base',
                         category: 'rag',
                         used_in: 'llm_prompt',
                         contribution: 'Surfaced 1 reusable SPL candidate.',
@@ -1110,7 +1110,7 @@ async function runOperatorWorkflowRegression(baseUrl, seededRuntimeState) {
         await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
 
         await page.locator('#workspace-tab-mission').click({ force: true });
-        await page.getByText('Mission Handoff').waitFor({ state: 'visible' });
+        await page.getByText('Discovery status', { exact: true }).first().waitFor({ state: 'visible' });
         await page.getByText('Discovery run completed').first().waitFor({ state: 'visible' });
 
         const buildPackageButton = page.getByRole('button', { name: 'Build Report Package' });
@@ -1130,11 +1130,11 @@ async function runOperatorWorkflowRegression(baseUrl, seededRuntimeState) {
             generatedArtifacts.push(path.join(seededRuntimeState.exportDir, fileName));
         }
 
-        await page.getByText('Current Report Package').first().waitFor({ state: 'visible' });
-        await page.getByText('This package was built from the selected session and the active persona runbook.').waitFor({ state: 'visible' });
+        await page.getByText('New report package', { exact: true }).waitFor({ state: 'visible' });
+        await page.getByText(/^Contents: .+ reports, .+ runbook, .+ style$/).waitFor({ state: 'visible' });
 
         await page.getByTestId('workspace-tab-discovery').click({ force: true });
-        await page.getByText('Discovery Stage Ledger').waitFor({ state: 'visible' });
+        await page.getByText('Discovery stages', { exact: true }).waitFor({ state: 'visible' });
 
         const summaryAction = page.getByTestId('discovery-ledger-summary-action');
         await summaryAction.waitFor({ state: 'visible' });
@@ -1156,10 +1156,14 @@ async function runOperatorWorkflowRegression(baseUrl, seededRuntimeState) {
         await summaryTitle.waitFor({ state: 'visible' });
         await page.getByText('Priority Actions').first().waitFor({ state: 'visible' });
         await page.getByText('Quick Wins').first().waitFor({ state: 'visible' });
-        const reviewLoopCount = await page.getByText(/Next Review Loop|Recursive Next Loop/i).count();
+        const reviewLoopCount = await page.getByText('Next Check', { exact: true }).count();
         assert(reviewLoopCount > 0, 'Summary dialog did not render a next-review section.');
         const summarySurfaceText = (await page.locator('body').textContent()) || '';
-        assert(summarySurfaceText.includes(seededRuntimeState.latestSession.timestamp), 'Summary surface did not identify the seeded session.');
+        const [, sessionYear, sessionMonth, sessionDay] = seededRuntimeState.latestSession.timestamp.match(/^(\d{4})(\d{2})(\d{2})_/) || [];
+        const sessionMonthName = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][Number(sessionMonth) - 1];
+        const expectedRunLabel = `Run of ${sessionMonthName} ${Number(sessionDay)}, ${sessionYear}`;
+        assert(summarySurfaceText.includes(expectedRunLabel), `Summary surface did not show "${expectedRunLabel}" for the seeded session.`);
+        assert(!(await summaryTitle.locator('xpath=..').textContent() || '').includes(seededRuntimeState.latestSession.timestamp), 'Summary header showed the raw session timestamp.');
 
         await page.locator('#summary-tab-context').click();
         await page.locator('#summary-tabpanel-context').waitFor({ state: 'visible' });
@@ -1235,7 +1239,7 @@ async function runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState) {
         await page.goto(baseUrl, { waitUntil: 'networkidle' });
         await dismissWelcomeSplashIfPresent(page, { dontShowAgain: true });
         await page.getByTestId('workspace-tab-discovery').click({ force: true });
-        await page.getByText('Discovery Stage Ledger').waitFor({ state: 'visible' });
+        await page.getByText('Discovery stages', { exact: true }).waitFor({ state: 'visible' });
 
         await expandDiscoveryReportHierarchy(page, 'active summary worker session');
         const cachedSummaryButtons = page.getByTestId('discovery-report-session-toggle').locator('button').filter({ hasText: 'View Summary' });
@@ -1244,21 +1248,21 @@ async function runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState) {
         await cachedSummaryButtons.first().click({ force: true });
 
         await page.getByRole('dialog').waitFor({ state: 'visible' });
-        await page.getByText('Reconnect to the running summary worker?').waitFor({ state: 'visible' });
-        await page.getByText('Use the loading workspace Abort Summary control if you need to stop the worker after reconnecting.').waitFor({ state: 'visible' });
+        await page.getByText('Reconnect to the summary in progress?').waitFor({ state: 'visible' });
+        await page.getByText('To stop it, reconnect and select Stop Summary.').waitFor({ state: 'visible' });
 
-        const resumeSummaryButton = page.getByRole('button', { name: 'Resume Summary' });
+        const resumeSummaryButton = page.getByRole('button', { name: 'Reconnect', exact: true });
         await resumeSummaryButton.click();
 
         await page.getByText('Analyzing Your Splunk Environment').waitFor({ state: 'visible' });
-        await page.getByText('Connected to worker PID 424242. You can close the workspace and resume this summary later, or stop it now.').waitFor({ state: 'visible' });
+        await page.getByText('This summary keeps running if you close this window (process 424242). Come back later to see it, or stop it now.').waitFor({ state: 'visible' });
 
-        const abortSummaryButton = page.getByRole('button', { name: 'Abort Summary' });
+        const abortSummaryButton = page.getByRole('button', { name: 'Stop Summary' });
         await abortSummaryButton.waitFor({ state: 'visible' });
         await abortSummaryButton.click();
 
-        await page.getByText('Discovery Stage Ledger').waitFor({ state: 'visible' });
-        await page.getByText('Reconnect to the running summary worker?').waitFor({ state: 'hidden' });
+        await page.getByText('Discovery stages', { exact: true }).waitFor({ state: 'visible' });
+        await page.getByText('Reconnect to the summary in progress?').waitFor({ state: 'hidden' });
         assert(summarizeSessionRequestCount === 1, `Expected exactly one summarize-session request, received ${summarizeSessionRequestCount}.`);
         assert(abortSummaryRequestCount === 1, `Expected exactly one abort-summary request, received ${abortSummaryRequestCount}.`);
         assert(dialogMessages.length === 0, `Expected first-party summary worker flow without native dialogs, but received: ${dialogMessages.join(' | ')}`);

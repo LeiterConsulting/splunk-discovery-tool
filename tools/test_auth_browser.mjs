@@ -425,11 +425,11 @@ async function dismissWelcomeSplashIfPresent(page, options = {}) {
         return false;
     }
 
-    await page.getByRole('heading', { name: 'Welcome to DT4SMS' }).waitFor({ timeout: 30000 });
+    await page.getByRole('heading', { name: 'Welcome to Splunk Discovery Tool' }).waitFor({ timeout: 30000 });
     if (options.dontShowAgain) {
         await welcomeSplash.locator('[data-testid="welcome-splash-dismiss-checkbox"]').check();
     }
-    await welcomeSplash.getByRole('button', { name: 'Enter Workspace' }).click();
+    await welcomeSplash.getByRole('button', { name: 'Get Started' }).click();
     await welcomeSplash.waitFor({ state: 'hidden', timeout: 30000 });
     return true;
 }
@@ -439,8 +439,8 @@ async function openSecurityAccessTab(page) {
     await page.getByRole('heading', { name: 'Settings' }).waitFor({ timeout: 30000 });
     await page.getByRole('button', { name: 'Users' }).click();
     await page.getByRole('heading', { name: 'Local Users' }).waitFor({ timeout: 30000 });
-    await page.getByRole('button', { name: 'MCP/API & Tokens' }).click();
-    await page.getByText('Install-wide Security Controls').waitFor({ timeout: 30000 });
+    await page.getByTestId('settings-tab-access').click();
+    await page.getByText('Sign-in and API Settings').waitFor({ timeout: 30000 });
     await page.getByRole('heading', { name: 'Access Tokens' }).waitFor({ timeout: 30000 });
 }
 
@@ -475,7 +475,7 @@ async function verifyAuthEnableGuideFlow(page) {
 
     await authToggle.click();
     await authGuideModal.waitFor({ state: 'visible', timeout: 30000 });
-    await page.getByRole('heading', { name: 'Review authentication methods before enabling access control' }).waitFor({ timeout: 30000 });
+    await page.getByRole('heading', { name: 'Before you turn on sign-in' }).waitFor({ timeout: 30000 });
     await authGuideModal.getByRole('button', { name: 'Exit' }).first().click();
     await authGuideModal.waitFor({ state: 'hidden', timeout: 30000 });
     assert((await authToggle.getAttribute('aria-pressed')) === 'false', 'Auth toggle should remain off after exiting the guide.');
@@ -564,7 +564,7 @@ async function runLocalPasswordScenario() {
         await withBrowser(async (context) => {
             const page = await context.newPage();
             await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
-            await page.getByRole('heading', { name: 'DT4SMS Sign In' }).waitFor({ timeout: 30000 });
+            await page.getByRole('heading', { name: 'Sign in to Splunk Discovery Tool' }).waitFor({ timeout: 30000 });
             await page.locator('#username').fill(LOCAL_ADMIN_USERNAME);
             await page.locator('#password').fill(LOCAL_ADMIN_INITIAL_PASSWORD);
             await page.getByRole('button', { name: 'Sign In' }).click();
@@ -590,7 +590,7 @@ async function runLocalPasswordScenario() {
             assert(authStatus.password_reset_required === false, 'Password reset should be cleared after updating the bootstrap password.');
 
             await page.getByTestId('header-logout-button').click();
-            await page.getByRole('heading', { name: 'DT4SMS Sign In' }).waitFor({ timeout: 30000 });
+            await page.getByRole('heading', { name: 'Sign in to Splunk Discovery Tool' }).waitFor({ timeout: 30000 });
             const postLogoutStatus = await getAuthStatus(page);
             assert(!postLogoutStatus.authenticated, 'Local logout should clear the session cookie.');
         });
@@ -640,7 +640,7 @@ async function runOidcScenario() {
         await withBrowser(async (context) => {
             const page = await context.newPage();
             await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
-            await page.getByRole('heading', { name: 'DT4SMS Sign In' }).waitFor({ timeout: 30000 });
+            await page.getByRole('heading', { name: 'Sign in to Splunk Discovery Tool' }).waitFor({ timeout: 30000 });
             await page.locator('a.button').click();
 
             await page.getByRole('button', { name: 'Open settings' }).waitFor({ timeout: 30000 });
@@ -658,7 +658,7 @@ async function runOidcScenario() {
             assert(authStatus.user?.role === 'admin', 'OIDC flow did not apply the admin role claim.');
 
             await page.getByTestId('header-logout-button').click();
-            await page.getByRole('heading', { name: 'DT4SMS Sign In' }).waitFor({ timeout: 30000 });
+            await page.getByRole('heading', { name: 'Sign in to Splunk Discovery Tool' }).waitFor({ timeout: 30000 });
             const postLogoutStatus = await getAuthStatus(page);
             assert(!postLogoutStatus.authenticated, 'OIDC logout should clear the DT4SMS session cookie.');
         });

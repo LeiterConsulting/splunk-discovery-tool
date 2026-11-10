@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small CLI for DT4SMS external RAG API bootstrapping and usage."""
+"""Small CLI for Splunk Discovery Tool external RAG API setup and usage."""
 
 from __future__ import annotations
 
@@ -139,8 +139,8 @@ def _write_token_file(path: Optional[str], token: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DT4SMS external RAG API helper")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="DT4SMS base URL")
+    parser = argparse.ArgumentParser(description="Splunk Discovery Tool external RAG API helper")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Splunk Discovery Tool base URL")
     parser.add_argument("--admin-user", default=None, help="Admin username for auth-enabled installs")
     parser.add_argument("--admin-password", default=None, help="Admin password for auth-enabled installs")
 

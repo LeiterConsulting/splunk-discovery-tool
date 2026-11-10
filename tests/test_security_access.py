@@ -1046,7 +1046,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
             self.assertEqual(discovery["status"], "starting")
             self.assertEqual(discovery["worker_pid"], fake_worker_pid)
             self.assertEqual(discovery["current_phase_key"], "pipeline_boot")
-            self.assertEqual(discovery["current_phase_title"], "Bootstrap")
+            self.assertEqual(discovery["current_phase_title"], "Prepare")
             self.assertGreater(len(discovery["phase_plan"]), 0)
             self.assertEqual(discovery["phase_plan"][0]["key"], "pipeline_boot")
             self.assertEqual(discovery["phase_plan"][0]["status"], "active")
@@ -3496,7 +3496,7 @@ Environment summary.
 
         landing = self.client.get("/")
         self.assertEqual(landing.status_code, 200)
-        self.assertIn("DT4SMS Sign In", landing.text)
+        self.assertIn("Sign in to Splunk Discovery Tool", landing.text)
 
         status = self.client.get("/api/auth/status")
         self.assertEqual(status.status_code, 200)
@@ -4949,7 +4949,7 @@ Environment summary.
         output_dir = self.temp_path / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "notes.txt").write_text(
-            "This file exists under output but is not part of the published DT4SMS artifact catalog.",
+            "This file exists under output but is not part of the published Splunk Discovery Tool artifact catalog.",
             encoding="utf-8",
         )
 
@@ -5060,7 +5060,7 @@ Environment summary.
             "session": dict(latest_session),
             "persona": str(persona or "admin"),
             "voice": str(voice or "direct"),
-            "voice_label": "Executive Brief" if str(voice or "direct") == "executive" else "Direct Ops",
+            "voice_label": "Executive" if str(voice or "direct") == "executive" else "Direct",
             "title": "Admin Operational Runbook",
             "filename": f"runbook_admin_{str(voice or 'direct')}_20260517_101010.md",
             "markdown": "# Discovery Operational Runbook\n\nLeadership ask: Investigate queue pressure first.",
@@ -5174,7 +5174,7 @@ Environment summary.
             self.assertEqual(runbook_result["session"]["timestamp"], "20260517_101010")
             self.assertEqual(runbook_result["persona"], "admin")
             self.assertEqual(runbook_result["voice"], "executive")
-            self.assertEqual(runbook_result["voice_label"], "Executive Brief")
+            self.assertEqual(runbook_result["voice_label"], "Executive")
             self.assertIn("Leadership ask:", runbook_result["markdown"])
             self.assertNotIn("sensitive_local_path", json.dumps(runbook_result))
 
@@ -5235,12 +5235,12 @@ Environment summary.
 
             self.assertTrue(result["has_data"])
             self.assertEqual(result["voice"], "executive")
-            self.assertEqual(result["voice_label"], "Executive Brief")
+            self.assertEqual(result["voice_label"], "Executive")
             self.assertEqual(result["filename"], "runbook_executive_executive_20260517_101010.md")
-            self.assertEqual(result["title"], "Executive Brief Executive Operational Runbook")
-            self.assertIn("**Voice:** Executive Brief", result["markdown"])
-            self.assertIn("Quarter Priority 1", result["markdown"])
-            self.assertIn("Carry this into the next planning cycle with an accountable owner.", result["markdown"])
+            self.assertEqual(result["title"], "Executive runbook (Executive style)")
+            self.assertIn("**Style:** Executive", result["markdown"])
+            self.assertIn("Quarter priority 1", result["markdown"])
+            self.assertIn("Assign an owner and carry this into the next planning cycle.", result["markdown"])
         finally:
             web_app.load_discovery_sessions = original_load_discovery_sessions
             web_app.hydrate_discovery_session = original_hydrate_discovery_session

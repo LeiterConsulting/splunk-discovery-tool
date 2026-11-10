@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Universal Installer for Discovery Tool for Splunk MCP Server (DT4SMS)
+# Universal Installer for Splunk Discovery Tool
 # Supports Windows (Git Bash/WSL), macOS, and Linux
 # Version: 1.0.0
 
@@ -14,8 +14,8 @@ NC='\033[0m' # No Color
 
 # Version and metadata
 VERSION="1.0.0"
-APP_NAME="Discovery Tool for Splunk MCP Server"
-APP_SHORT="DT4SMS"
+APP_NAME="Splunk Discovery Tool"
+APP_SHORT="Splunk Discovery Tool"
 LAUNCH_DIR="$(pwd)"
 INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_FILE="$INSTALL_DIR/.install_manifest.json"
@@ -103,7 +103,7 @@ print_msg() {
 # Show help
 show_help() {
     cat << EOF
-${GREEN}${APP_NAME} (${APP_SHORT}) v${VERSION}${NC}
+${GREEN}${APP_NAME} v${VERSION}${NC}
 
 ${BLUE}USAGE:${NC}
     ./install.sh [OPTIONS]

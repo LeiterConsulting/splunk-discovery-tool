@@ -1,4 +1,4 @@
-"""Chroma-backed RAG provider for indexed DT4SMS artifacts."""
+"""Chroma-backed RAG provider for indexed Splunk Discovery Tool artifacts."""
 
 from typing import Any, Dict, Optional
 
@@ -8,7 +8,7 @@ from capabilities.rag.indexer import ArtifactSourceIndexer
 
 
 class ChromaRAGProvider(BaseRAGProvider):
-    """Retrieve context from a persistent Chroma collection built from DT4SMS artifacts."""
+    """Retrieve context from a persistent Chroma collection built from Splunk Discovery Tool artifacts."""
 
     def __init__(self, config: CapabilityConfig, definition: CapabilityDefinition):
         self.config = config

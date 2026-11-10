@@ -1,10 +1,10 @@
 # Security, Access, and External API Roadmap
 
-> Historical note: this document started as the implementation roadmap for DT4SMS security and external access. Local auth, OIDC, per-user MCP assignment, token issuance, the read-only external RAG API, the inbound MCP surface, and browser account-function coverage now ship in the current repo. The phase sections below remain useful as implementation history and extension notes.
+> Historical note: this document started as the implementation roadmap for Splunk Discovery Tool security and external access. Local auth, OIDC, per-user MCP assignment, token issuance, the read-only external RAG API, the inbound MCP surface, and browser account-function coverage now ship in the current repo. The phase sections below remain useful as implementation history and extension notes.
 
 ## Goal
 
-Document the optional security and access model in DT4SMS without making the base install or demo workflow more complex. The app should continue to install and run exactly as it does today when security features are not enabled.
+Document the optional security and access model in Splunk Discovery Tool without making the base install or demo workflow more complex. The app should continue to install and run exactly as it does today when security features are not enabled.
 
 This roadmap covers:
 
@@ -99,7 +99,7 @@ Add two separate inbound surfaces:
 - read-only REST API for RAG and discovery metadata
 - read-only inbound MCP server for agent clients
 
-These must use inbound DT4SMS-issued tokens. They are not the same as outbound MCP credentials used to connect to Splunk-side services.
+These must use inbound tokens issued by Splunk Discovery Tool. They are not the same as outbound MCP credentials used to connect to Splunk-side services.
 
 ## Settings Information Architecture
 

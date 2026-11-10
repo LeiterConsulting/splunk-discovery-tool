@@ -1,5 +1,5 @@
 """
-Discovery pipeline for DT4SMS.
+Discovery pipeline for Splunk Discovery Tool.
 
 This module defines a modern, developer-friendly discovery execution path that:
 - runs purposeful phases with explicit intent,
@@ -135,42 +135,42 @@ class DiscoveryV2Pipeline:
     async def _run(self, display: Any, progress: Any) -> Dict[str, Any]:
         engine = self.discovery_engine
         if hasattr(progress, "update_progress"):
-            await progress.update_progress(2, "Initializing discovery pipeline...")
-        display.phase("🧠 Discovery: Environment Signal Capture")
-        display.info("Collecting high-level environment topology and platform signals...")
+            await progress.update_progress(2, "Starting discovery...")
+        display.phase("🧠 Surveying the environment")
+        display.info("Looking at the overall environment and platform...")
         # A failure here means the index inventory itself is unreachable, which is fatal by design.
         overview = await engine.get_quick_overview()
         estimated_steps = max(1, int(getattr(overview, "estimated_discovery_steps", 10) or 10))
         progress.set_total_steps(100)
-        await progress.update_progress(10, "Signal capture complete. Beginning evidence collection...")
+        await progress.update_progress(10, "Survey complete. Collecting details...")
         display.show_overview_summary(overview)
 
-        display.phase("🧭 Discovery: Evidence Collection")
-        display.info("Running iterative discovery tasks across indexes, sourcetypes, hosts, and platform controls...")
+        display.phase("🧭 Collecting details")
+        display.info("Checking indexes, sourcetypes, hosts, and platform settings...")
         step_count = 0
         try:
             async for result in engine.discover_environment():
                 step_count += 1
                 max_steps = max(estimated_steps, step_count)
                 collection_progress = min(76, 10 + int((step_count / max_steps) * 66))
-                await progress.update_progress(collection_progress, f"Evidence {step_count}/{max_steps}: {result.description}")
+                await progress.update_progress(collection_progress, f"Step {step_count}/{max_steps}: {result.description}")
         except Exception as exc:
             self._record_pipeline_error(display, "Evidence collection", exc)
 
-        await progress.update_progress(78, f"Evidence collection complete with {step_count} discovery steps.")
+        await progress.update_progress(78, f"Collected details in {step_count} discovery steps.")
 
-        display.phase("🔬 Discovery: Classification Map")
-        display.info("Synthesizing classifications from discovered telemetry...")
-        await progress.update_progress(82, "Synthesizing classification map...")
+        display.phase("🔬 Classifying data")
+        display.info("Grouping the collected data by what it is used for...")
+        await progress.update_progress(82, "Classifying data...")
         try:
             classifications = await engine.classify_data()
         except Exception as exc:
             self._record_pipeline_error(display, "Classification", exc)
             classifications = {}
 
-        display.phase("📋 Discovery: Recommendation Queue")
-        display.info("Generating prioritized recommendations based on detected patterns...")
-        await progress.update_progress(88, "Building recommendation queue...")
+        display.phase("📋 Recommending actions")
+        display.info("Writing prioritized recommendations from the findings...")
+        await progress.update_progress(88, "Writing recommendations...")
         try:
             recommendations = await engine.generate_recommendations()
         except Exception as exc:
@@ -179,9 +179,9 @@ class DiscoveryV2Pipeline:
             recommendations = fallback() if callable(fallback) else []
         recommendations = [item for item in (recommendations or []) if isinstance(item, dict)]
 
-        display.phase("🧪 Discovery: Use Case Generation")
-        display.info("Generating cross-functional use cases for admin, analyst, and executive personas...")
-        await progress.update_progress(92, "Generating suggested use cases...")
+        display.phase("🧪 Suggesting use cases")
+        display.info("Suggesting use cases for admins, analysts, and executives...")
+        await progress.update_progress(92, "Suggesting use cases...")
         try:
             suggested_use_cases = await engine.generate_suggested_use_cases()
         except Exception as exc:
@@ -196,12 +196,12 @@ class DiscoveryV2Pipeline:
             self._display(
                 display,
                 "warning",
-                "⚠️ AI enrichment incomplete for: " + ", ".join(degraded) + ". Deterministic results from discovered data were used.",
+                "⚠️ The AI step did not finish for: " + ", ".join(degraded) + ". These results come from the discovered data only.",
             )
 
         discovery_results = engine.get_all_results()
-        display.phase("🧱 Discovery: Blueprint Assembly")
-        await progress.update_progress(95, "Assembling intelligence blueprint payload...")
+        display.phase("🧱 Assembling results")
+        await progress.update_progress(95, "Assembling results...")
         artifact_payload = self._build_v2_payload(
             overview=overview,
             discovery_results=discovery_results,
@@ -210,9 +210,9 @@ class DiscoveryV2Pipeline:
             suggested_use_cases=suggested_use_cases,
         )
 
-        display.phase("📦 Discovery: Artifact Packaging")
-        display.info("Writing blueprint, runbook, insights, and handoff artifacts to output/ ...")
-        await progress.update_progress(98, "Packaging artifacts to output directory...")
+        display.phase("📦 Saving reports")
+        display.info("Writing the results file, runbooks, and reports to the output folder...")
+        await progress.update_progress(98, "Saving reports...")
         export_result = self._export_v2_bundle(artifact_payload)
 
         return {
@@ -365,7 +365,7 @@ class DiscoveryV2Pipeline:
             f"Surface coverage {coverage_points}/{max_coverage} ({len(surfaces_ok)} of {len(SURFACE_WEIGHTS)} core surfaces collected); "
             f"data freshness {freshness_points:.1f}/{FRESHNESS_WEIGHT} ({freshness_basis}); "
             f"collection reliability {reliability_points}/{RELIABILITY_WEIGHT} "
-            f"({len(failed_groups)} step group(s) failed or skipped)."
+            f"({len(failed_groups)} step {'group' if len(failed_groups) == 1 else 'groups'} failed or skipped)."
         )
         return {
             "score": score,

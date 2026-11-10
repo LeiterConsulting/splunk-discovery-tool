@@ -243,14 +243,14 @@ async function main() {
         const splash = page.locator('[data-testid="welcome-splash-modal"]');
         await splash.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
         if (await splash.isVisible().catch(() => false)) {
-            await splash.getByRole('button', { name: 'Enter Workspace' }).click();
+            await splash.getByRole('button', { name: 'Get Started' }).click();
             await splash.waitFor({ state: 'hidden', timeout: 15000 });
         }
         await page.getByRole('button', { name: 'Open settings' }).click();
         await page.getByRole('heading', { name: 'Settings' }).waitFor({ timeout: 30000 });
 
         // First profile on a fresh install: the dialog previews the typed values and the profile becomes active.
-        await page.getByRole('button', { name: 'Create New Configuration' }).click();
+        await page.getByRole('button', { name: 'Add MCP Server' }).click();
         await page.locator('#mcp-url').fill(mcpUrl);
         await page.locator('#mcp-token').fill(PROFILE_TOKEN);
         await page.getByRole('button', { name: 'Save as New Configuration' }).click();
@@ -280,7 +280,7 @@ async function main() {
         // Names with quotes, slashes, and hashes must work for every action.
         for (const name of ["Chris's Lab", 'Lab/Dev #1']) {
             await buttonWithText(page, 'Cancel').click({ timeout: 2000 }).catch(() => {});
-            await page.getByRole('button', { name: 'Create New Configuration' }).click();
+            await page.getByRole('button', { name: 'Add MCP Server' }).click();
             await page.locator('#mcp-url').fill(mcpUrl);
             await page.locator('#mcp-token').fill(SECOND_TOKEN);
             await page.getByRole('button', { name: 'Save as New Configuration' }).click();

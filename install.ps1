@@ -1,4 +1,4 @@
-# Universal Installer for Discovery Tool for Splunk MCP Server (DT4SMS)
+# Universal Installer for Splunk Discovery Tool
 # PowerShell version for Windows
 # Version: 1.0.0
 
@@ -69,8 +69,8 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 
 # Version and metadata
 $VERSION = "1.0.0"
-$APP_NAME = "Discovery Tool for Splunk MCP Server"
-$APP_SHORT = "DT4SMS"
+$APP_NAME = "Splunk Discovery Tool"
+$APP_SHORT = "Splunk Discovery Tool"
 $INSTALL_DIR = $PSScriptRoot
 $MANIFEST_FILE = Join-Path $INSTALL_DIR ".install_manifest.json"
 $PID_FILE = Join-Path $INSTALL_DIR ".dt4sms.pid"
@@ -132,7 +132,7 @@ function Invoke-PipInstallWithFallback {
 
 # Show help
 function Show-Help {
-    Write-ColorMsg $ColorGreen "$APP_NAME ($APP_SHORT) v$VERSION"
+    Write-ColorMsg $ColorGreen "$APP_NAME v$VERSION"
     Write-Host ""
     Write-ColorMsg $ColorBlue "USAGE:"
     Write-Host "    .\install.ps1 [OPTIONS]"

@@ -209,7 +209,7 @@ async function openSettings(page) {
     const splash = page.locator('[data-testid="welcome-splash-modal"]');
     await splash.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
     if (await splash.isVisible().catch(() => false)) {
-        await splash.getByRole('button', { name: 'Enter Workspace' }).click();
+        await splash.getByRole('button', { name: 'Get Started' }).click();
         await splash.waitFor({ state: 'hidden', timeout: 15000 });
     }
     const statusResponse = page.waitForResponse((response) => response.url().endsWith('/api/troubleshoot/server-status'), { timeout: 30000 });
@@ -262,7 +262,7 @@ async function main() {
         assert(!(await page.getByTestId('settings-server-stale-banner').isVisible()), 'A freshly started server must not be reported as stale.');
 
         // A rejected token: the MCP form's Troubleshoot button carries the typed values over and explains the 401.
-        await page.getByRole('button', { name: 'Create New Configuration' }).click();
+        await page.getByRole('button', { name: 'Add MCP Server' }).click();
         await page.locator('#mcp-url').fill(mcpUrl);
         await page.locator('#mcp-token').fill(WRONG_TOKEN);
         await page.getByTestId('mcp-troubleshoot').click();
@@ -274,7 +274,7 @@ async function main() {
         assert(await stageStatus(page, 'network') === 'pass', 'The network stage should pass when the server answers.');
         assert(await stageStatus(page, 'response') === 'fail', 'The response stage should fail on HTTP 401.');
         const reportText = await page.getByTestId('troubleshoot-report-text').textContent();
-        assert(reportText.includes('DT4SMS troubleshooting report: MCP server'), 'The report text should be shown.');
+        assert(reportText.includes('Splunk Discovery Tool troubleshooting report: MCP server'), 'The report text should be shown.');
         assert(!reportText.includes(WRONG_TOKEN), 'The report must not contain the token.');
         await page.getByTestId('troubleshoot-copy-report').click();
         await page.getByTestId('troubleshoot-copy-status').waitFor({ timeout: 5000 });
@@ -374,7 +374,7 @@ async function main() {
 
         // AI provider: a local Ollama endpoint that isn't listening fails at the network stage.
         await page.getByTestId('settings-tab-connections').click();
-        await page.getByRole('button', { name: 'Create New Connection' }).click();
+        await page.getByRole('button', { name: 'Add AI Model' }).click();
         await page.locator('#llm-provider').selectOption('ollama');
         await page.locator('#llm-endpoint-url').fill(`http://127.0.0.1:${closedPort}`);
         await page.getByTestId('llm-troubleshoot').click();

@@ -980,21 +980,21 @@ class CapabilityManager:
         )
         guidance = {
             "summary": (
-                "Indexed Artifact Search installs ChromaDB into the active DT4SMS Python environment. "
+                "The Knowledge Base installs ChromaDB into the Python environment that runs Splunk Discovery Tool. "
                 "First-time installs can take a few minutes while pip resolves transitive packages and unpacks wheels."
             ),
             "dependency_packages": list(definition.dependency_packages),
             "expected_duration_label": "This first-time install can take a few minutes on Windows while pip resolves and unpacks ChromaDB dependencies.",
             "operator_notes": [
-                "DT4SMS runs this install with the same Python interpreter that is currently hosting the app.",
-                "If the install succeeds, restart the app, then enable Indexed Artifact Search and run a reindex before using it in chat.",
-                "If the install keeps failing, run the commands below in the active DT4SMS environment so pip output stays visible.",
+                "Splunk Discovery Tool runs this install with the same Python interpreter that runs the app.",
+                "If the install succeeds, restart the app, then enable the Knowledge Base and run Reindex before using it in chat.",
+                "If the install keeps failing, run the commands below in the same Python environment so you can see the pip output.",
             ],
             "next_steps": [
-                "Confirm DT4SMS is using the intended virtual environment or Python installation before retrying.",
+                "Confirm Splunk Discovery Tool is using the intended virtual environment or Python installation before retrying.",
                 "Verify the host can reach the configured Python package index and that SSL or proxy policy is not blocking pip.",
                 "Upgrade pip, setuptools, and wheel in the active environment, then retry the ChromaDB install command directly.",
-                "After a successful install, restart DT4SMS, enable Indexed Artifact Search, and run Reindex to build the retrieval store.",
+                "After a successful install, restart Splunk Discovery Tool, enable the Knowledge Base, and run Reindex to build the index.",
             ],
             "install_commands": [
                 f'"{sys.executable}" -m pip install --upgrade pip setuptools wheel',
@@ -1026,7 +1026,7 @@ class CapabilityManager:
         if no_matching_distribution and package_indexes:
             primary_index = package_indexes[0]
             guidance["next_steps"] = [
-                f"Review the active pip index configuration ({primary_index}) and confirm it is the intended package source for DT4SMS.",
+                f"Review the active pip index configuration ({primary_index}) and confirm it is the intended package source for Splunk Discovery Tool.",
                 "If this host uses a private mirror or offline repository, verify that chromadb and its transitive dependencies are published there.",
                 *guidance["next_steps"],
             ]
@@ -1059,7 +1059,7 @@ class CapabilityManager:
                     visible_indexes = f"{visible_indexes}, +{len(package_indexes) - 2} more"
                 return (
                     f"pip did not find any chromadb distributions on the active package index ({visible_indexes}). "
-                    "If DT4SMS is using a private mirror or filtered repository, verify that chromadb and its dependencies are published there before retrying."
+                    "If Splunk Discovery Tool is using a private mirror or filtered repository, verify that chromadb and its dependencies are published there before retrying."
                 )
             return (
                 "The active Python environment could not resolve a compatible chromadb package from the current package index. "
@@ -1116,7 +1116,7 @@ class CapabilityManager:
                 "package_indexes": package_indexes,
                 "preflight_warning": "This install is likely to fail because pip is currently configured with no package index.",
                 "preflight_reason": (
-                    "Optional capability installs inherit the host Python environment, and PIP_NO_INDEX is active for this DT4SMS process. "
+                    "Optional capability installs inherit the host Python environment, and PIP_NO_INDEX is active for this Splunk Discovery Tool process. "
                     "Clear that override or use a direct public-PyPI install path before retrying in the UI."
                 ),
                 "alternative_methods": self._build_pip_alternative_methods(install_target, requires_clearing_no_index=True),
@@ -1131,7 +1131,7 @@ class CapabilityManager:
                 "preflight_warning": f"This install is likely to fail because the active pip index ({primary_index}) is not public PyPI.",
                 "preflight_reason": (
                     "Optional capability installs inherit the current Python environment. "
-                    "If this dev-space mirror or filtered repository does not publish chromadb and its dependencies, the runtime install will fail before DT4SMS can recover."
+                    "If this dev-space mirror or filtered repository does not publish chromadb and its dependencies, the install will fail before Splunk Discovery Tool can recover."
                 ),
                 "alternative_methods": self._build_pip_alternative_methods(install_target),
             }

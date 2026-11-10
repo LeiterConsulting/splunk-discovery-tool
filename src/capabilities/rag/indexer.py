@@ -368,7 +368,7 @@ class HashEmbeddingFunction:
 
 
 class ArtifactSourceIndexer:
-    """Collect and index DT4SMS artifacts into a Chroma collection."""
+    """Collect and index Splunk Discovery Tool artifacts into a Chroma collection."""
 
     SUMMARY_FILENAME = "index_summary.json"
     ASSET_MANIFEST_FILENAME = "knowledge_assets_manifest.json"
@@ -1425,7 +1425,7 @@ class ArtifactSourceIndexer:
             "Operator context brief",
             "",
             f"Question: {query}",
-            f"Coverage: {len(matched_assets)} asset(s) across {asset_type_label}.",
+            f"Coverage: {len(matched_assets)} {'asset' if len(matched_assets) == 1 else 'assets'} across {asset_type_label}.",
         ]
         if source_labels:
             lines.append(f"Sources: {', '.join(source_labels)}.")

@@ -4,7 +4,7 @@
 
 The public-readiness blockers and medium-severity UX issues found in this initiative are now closed in the audited surfaces.
 
-The remediation slice corrected the shared styling mismatch that produced invisible actions, converted major non-semantic controls into proper buttons, tabs, and dialogs, closed the missing chat-control labels found during the earlier audit, cleared the KPI/helper-text contrast regression in both themes, and translated the capability/export copy into operator-facing language. DT4SMS is now ready for controlled preview and public-facing use with one documented architectural follow-up around frontend delivery hardening.
+The remediation slice corrected the shared styling mismatch that produced invisible actions, converted major non-semantic controls into proper buttons, tabs, and dialogs, closed the missing chat-control labels found during the earlier audit, cleared the KPI/helper-text contrast regression in both themes, and translated the capability/export copy into operator-facing language. Splunk Discovery Tool is now ready for controlled preview and public-facing use with one documented architectural follow-up around frontend delivery hardening.
 
 ## Current Release Gate Recommendation
 

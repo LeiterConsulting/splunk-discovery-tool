@@ -103,6 +103,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 - Text below 4.5:1 contrast: gray helper text and placeholders, the dark-theme Export link, translucent header buttons, the discovery log banner, and chat settings hints. A full pass found 36 failures in Light, 14 in Dark, and about 50 in Construct; every theme now has none
+
+### ✍️ Plain Language & Text Fixes
+
+#### Added
+- `tests/test_ui_copy.py`: fails when the template contains the old product name, the Construct theme name, "(s)" plurals, doubled words, listed jargon, or dates formatted without `formatMissionDateTime()`
+- The contrast browser check also reads the text of each view and fails on the old product name, raw session or ISO timestamps, "(s)" plurals, doubled words, `undefined` or `NaN`, and listed jargon. Report bodies and code blocks are skipped because they show saved data as written
+
+#### Changed
+- The app is called Splunk Discovery Tool everywhere: page title, header, welcome screen, sign-in page, troubleshooting report, docs, and installers
+- Plain wording across Mission, Intelligence, Discovery, the Knowledge Base, Capabilities, the discovery summary, chat, and Settings. For example: discovery stages are Prepare, Survey the environment, Collect details, and so on; report styles are Direct, Evidence-led, and Executive; the welcome button is Get Started; Settings tabs are Connections, Users, Security, and Troubleshoot; the connection buttons are Add MCP Server and Add AI Model; Abort Summary is Stop Summary
+- Capability names: M-26-14 Readiness Advisor, Quick Report Search, Knowledge Base, Splunk Search Links, Charts, and Report Packages, each with a one-line description of what it does
+- Dates show as "May 22, 2026, 1:02 AM" instead of raw session IDs or ISO strings, and counts use the right singular or plural
+- The AI summary prompt asks for a "Next Check" section instead of "Recursive Next Loop"; summaries saved with the old heading still show it
+- With sign-in off, Settings says anyone can use the app instead of calling it demo mode
+- Removed filler: the welcome screen's repeated "Welcome" label, a "Fun Facts" line, the capability "Stage" field, the "Available now" badge on every capability card, and unused summary and capability card code
+
+#### Fixed
+- The executive summary repeated its first paragraph
+- The chat connection popover named a provider when no AI model was configured
+- The empty MCP list told users to click "Save Current Config", a button that does not exist
+- The Users and Security tabs in Settings both used the heading "Security & Access"
+- The summary dialog showed the raw session ID as its subtitle, and category names such as "data quality" were lowercase
+- Settings tab icons were read aloud as part of the tab names
+
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added

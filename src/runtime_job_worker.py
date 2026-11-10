@@ -146,7 +146,7 @@ def _record_worker_failure(job_type: str, payload: Dict[str, Any], exc: Exceptio
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="DT4SMS durable runtime job worker")
+    parser = argparse.ArgumentParser(description="Splunk Discovery Tool background job worker")
     parser.add_argument("job_type", choices=["discovery", "summary"])
     parser.add_argument("request_path")
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-"""Capability framework for optional DT4SMS features."""
+"""Capability framework for optional Splunk Discovery Tool features."""
 
 from capabilities.health import CapabilityHealthService
 from capabilities.install_manager import CapabilityManager

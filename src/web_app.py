@@ -1,5 +1,5 @@
 """
-FastAPI Web Application for Splunk MCP Use Case Discovery Tool
+FastAPI Web Application for Splunk Discovery Tool
 
 A modern web-based interface providing real-time progress tracking,
 animated progress indicators, and comprehensive report management.
@@ -474,7 +474,7 @@ def _decode_oidc_id_token(id_token: Any) -> Dict[str, Any]:
     token_value = str(id_token or "").strip()
     token_segments = token_value.split(".")
     if len(token_segments) == 5:
-        raise ValueError("OIDC token exchange returned an encrypted id_token, which DT4SMS does not support")
+        raise ValueError("OIDC token exchange returned an encrypted id_token, which Splunk Discovery Tool does not support")
     if len(token_segments) != 3:
         raise ValueError("OIDC token exchange returned a malformed id_token")
 
@@ -1509,7 +1509,7 @@ EXTERNAL_MCP_SERVER_NAME = "dt4sms-external-mcp"
 EXTERNAL_MCP_TOOL_DEFINITIONS = [
     {
         "name": "rag_search",
-        "description": "Search the managed DT4SMS RAG asset plane and return sanitized read-only results.",
+        "description": "Search the Splunk Discovery Tool RAG knowledge assets and return sanitized read-only results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1568,7 +1568,7 @@ EXTERNAL_MCP_TOOL_DEFINITIONS = [
     },
     {
         "name": "system_get_runtime_summary",
-        "description": "Return a sanitized read-only DT4SMS runtime summary, including auth posture, configured integrations, discovery coverage, and artifact availability.",
+        "description": "Return a sanitized read-only Splunk Discovery Tool runtime summary, including auth posture, configured integrations, discovery coverage, and artifact availability.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -1577,7 +1577,7 @@ EXTERNAL_MCP_TOOL_DEFINITIONS = [
     },
     {
         "name": "capabilities_list",
-        "description": "List sanitized capability state and health summaries for the DT4SMS capability plane.",
+        "description": "List sanitized capability state and health summaries for the Splunk Discovery Tool optional capabilities.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1592,11 +1592,11 @@ EXTERNAL_MCP_TOOL_DEFINITIONS = [
     },
     {
         "name": "capabilities_get_detail",
-        "description": "Load sanitized detail for one DT4SMS capability, including capability-specific readiness summaries when available.",
+        "description": "Load sanitized detail for one Splunk Discovery Tool capability, including capability-specific readiness summaries when available.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "capability_name": {"type": "string", "description": "Registered DT4SMS capability name."},
+                "capability_name": {"type": "string", "description": "Registered Splunk Discovery Tool capability name."},
                 "refresh_health": {
                     "type": "boolean",
                     "description": "When true, refresh capability health before returning the detail.",
@@ -1609,7 +1609,7 @@ EXTERNAL_MCP_TOOL_DEFINITIONS = [
     },
     {
         "name": "artifacts_list",
-        "description": "List sanitized generated DT4SMS artifacts from the local output catalog.",
+        "description": "List sanitized generated Splunk Discovery Tool artifacts from the local output catalog.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1635,11 +1635,11 @@ EXTERNAL_MCP_TOOL_DEFINITIONS = [
     },
     {
         "name": "artifacts_get_detail",
-        "description": "Load sanitized metadata and a bounded preview for one generated DT4SMS artifact.",
+        "description": "Load sanitized metadata and a bounded preview for one generated Splunk Discovery Tool artifact.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "artifact_name": {"type": "string", "description": "Artifact filename from the DT4SMS output catalog."},
+                "artifact_name": {"type": "string", "description": "Artifact filename from the Splunk Discovery Tool output catalog."},
                 "max_chars": {
                     "type": "integer",
                     "description": "Maximum preview characters to inline for textual artifacts.",
@@ -1805,48 +1805,48 @@ def _operator_voice_label(value: Any) -> str:
     if voice == "evidence":
         return "Evidence-led"
     if voice == "executive":
-        return "Executive Brief"
-    return "Direct Ops"
+        return "Executive"
+    return "Direct"
 
 
 def _build_operator_voice_admin_item(action: Dict[str, Any], voice: str) -> Dict[str, str]:
-    title = str(action.get("title") or "Admin control follow-up").strip() or "Admin control follow-up"
-    why = str(action.get("why") or "This control path needs a concrete owner and implementation sequence.").strip()
-    next_step = str(action.get("next_step") or "Review the full runbook for sequencing.").strip()
+    title = str(action.get("title") or "Admin follow-up").strip() or "Admin follow-up"
+    why = str(action.get("why") or "This needs an owner and a plan.").strip()
+    next_step = str(action.get("next_step") or "See the runbook for the order of steps.").strip()
     effort = str(action.get("effort") or "unknown").strip() or "unknown"
 
     if voice == "evidence":
         return {
             "title": title,
             "summary": why,
-            "meta": f"Evidence path: {next_step}",
-            "badge": f"Validation effort: {effort}",
+            "meta": f"How to verify: {next_step}",
+            "badge": f"Effort: {effort}",
         }
     if voice == "executive":
         return {
             "title": title,
             "summary": f"Risk if ignored: {why}",
-            "meta": f"Leadership ask: {next_step}",
-            "badge": f"Investment shape: {effort}",
+            "meta": f"Decision needed: {next_step}",
+            "badge": f"Effort: {effort}",
         }
     return {
         "title": title,
         "summary": why,
-        "meta": f"Next move: {next_step}",
-        "badge": f"Effort lane: {effort}",
+        "meta": f"Next step: {next_step}",
+        "badge": f"Effort: {effort}",
     }
 
 
 def _build_operator_voice_analyst_item(track: Dict[str, Any], voice: str) -> Dict[str, str]:
     title = str(track.get("title") or "Investigation track").strip() or "Investigation track"
-    question = str(track.get("question") or "Define the detection hypothesis and validate it against current telemetry.").strip()
-    success_metric = str(track.get("success_metric") or "Define a measurable validation path in the runbook.").strip()
+    question = str(track.get("question") or "Decide what to look for, then check it against current data.").strip()
+    success_metric = str(track.get("success_metric") or "Decide how you will measure success.").strip()
 
     if voice == "evidence":
         return {
             "title": title,
             "summary": question,
-            "meta": f"Validation signal: {success_metric}",
+            "meta": f"Proof: {success_metric}",
         }
     if voice == "executive":
         return {
@@ -1856,30 +1856,30 @@ def _build_operator_voice_analyst_item(track: Dict[str, Any], voice: str) -> Dic
         }
     return {
         "title": title,
-        "summary": f"Test now: {question}",
-        "meta": f"Success signal: {success_metric}",
+        "summary": f"Check: {question}",
+        "meta": f"Done when: {success_metric}",
     }
 
 
 def _build_operator_voice_executive_item(item: Any, voice: str, index: int, item_type: str = "theme") -> Dict[str, str]:
-    summary = str(item or "No executive framing was captured.").strip() or "No executive framing was captured."
+    summary = str(item or "No executive summary was recorded.").strip() or "No executive summary was recorded."
 
     if voice == "evidence":
         return {
-            "title": f"{'Evidence Theme' if item_type == 'theme' else '90-Day Validation'} {index}",
+            "title": f"{'Evidence theme' if item_type == 'theme' else '90-day check'} {index}",
             "summary": summary,
-            "meta": "Use this to justify telemetry and control investment." if item_type == "theme" else "Use this to set measurable leadership checkpoints.",
+            "meta": "Use this to justify spending on data and monitoring." if item_type == "theme" else "Use this to set measurable checkpoints for leadership.",
         }
     if voice == "executive":
         return {
-            "title": f"{'Board Theme' if item_type == 'theme' else 'Quarter Priority'} {index}",
+            "title": f"{'Board theme' if item_type == 'theme' else 'Quarter priority'} {index}",
             "summary": summary,
-            "meta": "Frame this as business exposure and resilience upside." if item_type == "theme" else "Carry this into the next planning cycle with an accountable owner.",
+            "meta": "Present this as business risk and the benefit of fixing it." if item_type == "theme" else "Assign an owner and carry this into the next planning cycle.",
         }
     return {
-        "title": f"{'Value Lever' if item_type == 'theme' else '90-Day Move'} {index}",
+        "title": f"{'Theme' if item_type == 'theme' else '90-day action'} {index}",
         "summary": summary,
-        "meta": "Use this to align the next operator handoff." if item_type == "theme" else "Turn this into a scheduled operating move.",
+        "meta": "Use this to decide what to hand off next." if item_type == "theme" else "Schedule this as a recurring task.",
     }
 
 
@@ -2066,7 +2066,7 @@ def _build_external_discovery_dashboard_payload() -> Dict[str, Any]:
     if not payload.get("has_data"):
         return {
             "has_data": False,
-            "message": str(payload.get("message") or "No discovery sessions available yet."),
+            "message": str(payload.get("message") or "No discovery runs yet."),
             "sessions": sessions,
         }
     return {
@@ -2117,7 +2117,7 @@ def _build_external_discovery_runbook_payload(
     if not payload.get("has_data"):
         return {
             "has_data": False,
-            "message": str(payload.get("message") or "No discovery sessions available."),
+            "message": str(payload.get("message") or "No discovery runs yet."),
             "sessions": sessions,
         }
     return {
@@ -2147,7 +2147,7 @@ def _build_external_discovery_compare_payload(
     if not payload.get("has_data"):
         return {
             "has_data": False,
-            "message": str(payload.get("message") or "Unable to compare discovery sessions."),
+            "message": str(payload.get("message") or "Could not compare discovery runs."),
             "sessions": sessions,
             "current_session": _sanitize_external_discovery_session_summary(payload.get("current") or {}),
             "baseline_session": _sanitize_external_discovery_session_summary(payload.get("baseline") or {}),
@@ -2203,7 +2203,7 @@ def _build_external_mcp_initialize_result() -> Dict[str, Any]:
                 "listChanged": False,
             }
         },
-        "instructions": "Use bearer auth with an inbound_mcp token scoped for mcp:tools:read. All tools are read-only wrappers over DT4SMS RAG, artifact, capability, and runtime summary surfaces.",
+        "instructions": "Use bearer auth with an inbound_mcp token scoped for mcp:tools:read. All tools are read-only wrappers over Splunk Discovery Tool RAG, artifact, capability, and runtime summary surfaces.",
     }
 
 
@@ -2275,7 +2275,7 @@ def _handle_external_mcp_tool_call(request_id: Any, params: Any) -> JSONResponse
             message = f"Retrieved managed RAG asset detail for '{asset_id}'."
         elif tool_name == "system_get_runtime_summary":
             payload = _build_external_runtime_summary_payload()
-            message = "Retrieved a sanitized DT4SMS runtime summary."
+            message = "Retrieved a sanitized Splunk Discovery Tool runtime summary."
         elif tool_name == "capabilities_list":
             payload = _build_external_capabilities_list_payload(
                 refresh_health=_normalize_external_boolean(arguments.get("refresh_health"), "refresh_health", False)
@@ -2355,7 +2355,7 @@ def build_login_page() -> str:
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DT4SMS Sign In</title>
+    <title>Sign in to Splunk Discovery Tool</title>
     <style>
         body { margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f172a, #1e293b 55%, #334155); color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
         .panel { width: min(420px, calc(100vw - 32px)); background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 18px; box-shadow: 0 24px 80px rgba(15, 23, 42, 0.45); padding: 32px; }
@@ -2373,7 +2373,7 @@ def build_login_page() -> str:
 <body>
     <div class="panel">
         <div class="eyebrow">Security Enabled</div>
-        <h1>DT4SMS Sign In</h1>
+        <h1>Sign in to Splunk Discovery Tool</h1>
         <p>Authentication is enabled for this installation. Sign in to continue.</p>
         <form id="login-form">
             <label for="username">Username</label>
@@ -2418,7 +2418,7 @@ def build_oidc_login_page(provider_status: Dict[str, Any]) -> str:
     button_disabled = "disabled" if not provider_status.get("ready") else ""
     button_label = "Sign In With OpenID Connect" if provider_status.get("ready") else "OIDC Provider Not Ready"
     helper_text = (
-        "Use the configured identity provider to sign in to DT4SMS."
+        "Sign in with your organization's identity provider."
         if provider_status.get("ready")
         else "OIDC authentication is enabled, but issuer URL, client ID, or client secret is still incomplete."
     )
@@ -2429,7 +2429,7 @@ def build_oidc_login_page(provider_status: Dict[str, Any]) -> str:
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DT4SMS Sign In</title>
+    <title>Sign in to Splunk Discovery Tool</title>
     <style>
         body {{ margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f172a, #1e293b 55%, #1d4ed8); color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
         .panel {{ width: min(460px, calc(100vw - 32px)); background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 18px; box-shadow: 0 24px 80px rgba(15, 23, 42, 0.45); padding: 32px; }}
@@ -2445,14 +2445,14 @@ def build_oidc_login_page(provider_status: Dict[str, Any]) -> str:
 <body>
     <div class="panel">
         <div class="eyebrow">Security Enabled</div>
-        <h1>DT4SMS Sign In</h1>
+        <h1>Sign in to Splunk Discovery Tool</h1>
         <p>{html.escape(helper_text)}</p>
         <div class="issuer"><strong>Issuer:</strong> {issuer_url}</div>
         <a class="button" href="/api/auth/oidc/start" {button_disabled}>
             <span>OpenID Connect</span>
             <span>{html.escape(button_label)}</span>
         </a>
-        <div class="hint">DT4SMS will establish the same app session model after OIDC authentication completes.</div>
+        <div class="hint">After the identity provider confirms who you are, you return to Splunk Discovery Tool.</div>
     </div>
 </body>
 </html>
@@ -2494,7 +2494,7 @@ def build_password_reset_page(username: str) -> str:
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DT4SMS Password Reset</title>
+    <title>Reset password for Splunk Discovery Tool</title>
     <style>
         body {{ margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #111827, #1f2937 55%, #374151); color: #e5e7eb; min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
         .panel {{ width: min(460px, calc(100vw - 32px)); background: rgba(17, 24, 39, 0.95); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 18px; box-shadow: 0 24px 80px rgba(15, 23, 42, 0.45); padding: 32px; }}
@@ -2753,8 +2753,8 @@ def get_or_create_llm_client(config):
 
 
 app = FastAPI(
-    title="Discovery Tool for Splunk MCP Server (DT4SMS)",
-    description="Intelligent environment analysis with encrypted config, AI-powered summarization, and advanced SPL generation",
+    title="Splunk Discovery Tool",
+    description="Finds what a Splunk environment contains and suggests next steps. Includes encrypted settings, AI summaries, and SPL generation.",
     version="1.0.0"
 )
 
@@ -3344,81 +3344,81 @@ DISCOVERY_PHASE_MODELS = {
     "v2": [
         {
             "key": "pipeline_boot",
-            "label": "Bootstrap",
-            "description": "Validate runtime settings and initialize the discovery pipeline.",
+            "label": "Prepare",
+            "description": "Check the settings and start discovery.",
             "progress_start": 0.0,
             "progress_end": 8.0,
             "baseline_seconds": 45.0,
-            "match_tokens": ["v2 discovery pipeline"],
+            "match_tokens": ["preparing discovery", "v2 discovery pipeline"],
         },
         {
             "key": "signal_capture",
-            "label": "Signal Capture",
-            "description": "Capture environment topology and establish the discovery scope.",
+            "label": "Survey the environment",
+            "description": "Find what the environment contains and set the scope.",
             "progress_start": 2.0,
             "progress_end": 12.0,
             "baseline_seconds": 75.0,
-            "match_tokens": ["environment signal capture"],
+            "match_tokens": ["surveying the environment", "environment signal capture"],
         },
         {
             "key": "evidence_collection",
-            "label": "Evidence Collection",
-            "description": "Enumerate environment evidence and collect detailed telemetry for analysis.",
+            "label": "Collect details",
+            "description": "Gather details about indexes, sourcetypes, hosts, and settings.",
             "progress_start": 10.0,
             "progress_end": 78.0,
             "baseline_seconds": 300.0,
-            "match_tokens": ["evidence collection"],
+            "match_tokens": ["collecting details", "evidence collection"],
         },
         {
             "key": "classification_map",
-            "label": "Classification Map",
-            "description": "Classify the captured telemetry and normalize findings into an analyst-ready map.",
+            "label": "Classify data",
+            "description": "Group the collected data by what it is used for.",
             "progress_start": 78.0,
             "progress_end": 84.0,
             "baseline_seconds": 70.0,
-            "match_tokens": ["classification map"],
+            "match_tokens": ["classifying data", "classification map"],
         },
         {
             "key": "recommendation_queue",
-            "label": "Recommendation Queue",
-            "description": "Generate prioritized follow-on actions from the classified evidence.",
+            "label": "Recommend actions",
+            "description": "Turn the findings into prioritized recommendations.",
             "progress_start": 84.0,
             "progress_end": 90.0,
             "baseline_seconds": 70.0,
-            "match_tokens": ["recommendation queue"],
+            "match_tokens": ["recommending actions", "recommendation queue"],
         },
         {
             "key": "use_case_generation",
-            "label": "Use Case Generation",
-            "description": "Assemble suggested detection and response use cases from the discovery findings.",
+            "label": "Suggest use cases",
+            "description": "Suggest detection and monitoring use cases.",
             "progress_start": 90.0,
             "progress_end": 94.0,
             "baseline_seconds": 80.0,
-            "match_tokens": ["use case generation"],
+            "match_tokens": ["suggesting use cases", "use case generation"],
         },
         {
             "key": "blueprint_assembly",
-            "label": "Blueprint Assembly",
-            "description": "Build the intelligence blueprint and operator handoff package.",
+            "label": "Assemble results",
+            "description": "Combine the findings into the results file and runbooks.",
             "progress_start": 94.0,
             "progress_end": 97.0,
             "baseline_seconds": 45.0,
-            "match_tokens": ["blueprint assembly"],
+            "match_tokens": ["assembling results", "blueprint assembly"],
         },
         {
             "key": "artifact_packaging",
-            "label": "Artifact Packaging",
-            "description": "Write reports, package artifacts, and register the discovery output.",
+            "label": "Save reports",
+            "description": "Write the reports and add this run to the report library.",
             "progress_start": 97.0,
             "progress_end": 100.0,
             "baseline_seconds": 50.0,
-            "match_tokens": ["artifact packaging"],
+            "match_tokens": ["saving reports", "artifact packaging"],
         },
     ],
     "legacy": [
         {
             "key": "quick_overview",
-            "label": "Quick Overview",
+            "label": "Quick overview",
             "description": "Collect a baseline overview and size the environment.",
             "progress_start": 0.0,
             "progress_end": 12.0,
@@ -3427,8 +3427,8 @@ DISCOVERY_PHASE_MODELS = {
         },
         {
             "key": "environment_discovery",
-            "label": "Environment Discovery",
-            "description": "Walk the environment and collect detailed discovery evidence.",
+            "label": "Explore the environment",
+            "description": "Walk the environment and collect details.",
             "progress_start": 12.0,
             "progress_end": 58.0,
             "baseline_seconds": 300.0,
@@ -3436,7 +3436,7 @@ DISCOVERY_PHASE_MODELS = {
         },
         {
             "key": "classification_analysis",
-            "label": "Classification Analysis",
+            "label": "Classify data",
             "description": "Classify and score the collected findings.",
             "progress_start": 58.0,
             "progress_end": 72.0,
@@ -3445,7 +3445,7 @@ DISCOVERY_PHASE_MODELS = {
         },
         {
             "key": "recommendation_generation",
-            "label": "Recommendation Generation",
+            "label": "Recommend actions",
             "description": "Generate prioritized recommendations from the discovery output.",
             "progress_start": 72.0,
             "progress_end": 82.0,
@@ -3454,7 +3454,7 @@ DISCOVERY_PHASE_MODELS = {
         },
         {
             "key": "legacy_use_case_generation",
-            "label": "Use Case Generation",
+            "label": "Suggest use cases",
             "description": "Draft suggested use cases from the environment findings.",
             "progress_start": 82.0,
             "progress_end": 90.0,
@@ -3463,8 +3463,8 @@ DISCOVERY_PHASE_MODELS = {
         },
         {
             "key": "report_export",
-            "label": "Report Export",
-            "description": "Export final reports and persist the discovery results.",
+            "label": "Save reports",
+            "description": "Write the final reports and save the discovery results.",
             "progress_start": 90.0,
             "progress_end": 100.0,
             "baseline_seconds": 75.0,
@@ -3614,16 +3614,16 @@ def _build_discovery_last_run_outcome(snapshot: Dict[str, Any]) -> Dict[str, Any
 
     if status == "completed":
         title = "Discovery run completed"
-        summary = f"Finished at {completed_at or 'the latest checkpoint'} and produced {report_count} report artifact{'s' if report_count != 1 else ''}."
+        summary = f"Finished at {completed_at or 'the latest checkpoint'} and produced {report_count} report{'s' if report_count != 1 else ''}."
     elif status == "interrupted":
         title = "Discovery run interrupted"
         summary = f"The app restarted during {phase_title.lower()}. Review the latest checkpoint and rerun when ready."
     elif status == "aborted":
         title = "Discovery run stopped"
-        summary = f"Stopped during {phase_title.lower()}. Review the ledger before starting a new run."
+        summary = f"Stopped during {phase_title.lower()}. Review the activity log before starting a new run."
     elif status == "error":
         title = "Discovery run failed"
-        summary = error_message or f"Failed during {phase_title.lower()}. Review the latest log output for the blocking error."
+        summary = error_message or f"Failed during {phase_title.lower()}. Check the latest log output to see what stopped it."
     else:
         title = "Discovery monitor"
         summary = "No completed discovery outcome is available yet."
@@ -5367,7 +5367,7 @@ def build_llm_continuity_context(
         "SESSION CONTINUITY GATE:",
         "- Treat the current user message as a continuation of the active investigation unless the user clearly changes topic.",
         "- Resolve pronouns, shorthand, omitted nouns, and aliases using the active focus, remembered entities, last result, and recent turns before answering.",
-        "- Prefer the current Splunk/DT4SMS session context over generic interpretations when the request is ambiguous.",
+        "- Prefer the current Splunk and Splunk Discovery Tool session context over generic interpretations when the request is ambiguous.",
     ]
 
     if state_lines:
@@ -5726,7 +5726,7 @@ def build_visualization_capability_usage(visualization_spec: Optional[Dict[str, 
     return [
         {
             "name": "visualization_tools",
-            "title": definition.title if definition else "Visualization Tools",
+            "title": definition.title if definition else "Charts",
             "category": definition.category if definition else "tool_pack",
             "used_in": "chat_preview",
             "contribution": summary_text,
@@ -7177,7 +7177,7 @@ Available tools:
 {available_tools_text}
 
 Rules:
-1) Your primary expertise is DT4SMS, Splunk, discovery outputs, optional capabilities, and RAG context.
+1) Your primary expertise is Splunk Discovery Tool, Splunk, discovery outputs, optional capabilities, and RAG context.
 2) You may answer broader questions directly, but do not claim tool-backed or environment-specific evidence unless it comes from the provided context or executed tools.
 3) When a session continuity gate is present, treat the current request as a follow-up unless the user clearly changes topic.
 4) For live data requests, make a tool call instead of guessing. Use one tool call per reply and wait for the result.
@@ -7439,7 +7439,7 @@ def is_scope_relevant_chat_request(
     memory: Optional[Dict[str, Any]] = None,
     report_intent: Optional[str] = None,
 ) -> bool:
-    """Return True when a chat request is within DT4SMS/Splunk scope."""
+    """Return True when a chat request is within Splunk Discovery Tool or Splunk scope."""
     if not isinstance(user_message, str):
         return False
 
@@ -7468,9 +7468,9 @@ def is_scope_relevant_chat_request(
 
 
 def build_scope_redirect_response() -> str:
-    """Return a concise reminder that chat is scoped to DT4SMS and Splunk work."""
+    """Return a concise reminder that chat is scoped to Splunk Discovery Tool and Splunk work."""
     return (
-        "I'm here to help with DT4SMS, Splunk investigations, discovery findings, optional capabilities, RAG context, and related operational questions. "
+        "I'm here to help with Splunk Discovery Tool, Splunk investigations, discovery findings, optional capabilities, RAG context, and related operational questions. "
         "Small utility asks like basic math or unit conversions are fine, but this chat is not meant to be a general-purpose AI resource. "
         "Ask me about searches, indexes, sourcetypes, platform health, discovery recommendations, RAG assets, or capability configuration."
     )
@@ -7480,7 +7480,7 @@ def build_scope_redirect_follow_on_actions() -> List[Dict[str, str]]:
     """Provide a few in-scope prompts when chat redirects an unrelated request."""
     return [
         _make_follow_on_action(
-            "Explain DT4SMS scope",
+            "Explain what this tool covers",
             "What can this tool help me do across Splunk, discovery outputs, capabilities, and the RAG workspace?",
             "scope_redirect",
         ),
@@ -9140,7 +9140,7 @@ def build_discovery_compare_payload(
     if len(sessions) < 2:
         return {
             "has_data": False,
-            "message": "At least two discovery sessions are required for compare.",
+            "message": "Run discovery at least twice to compare runs.",
             "sessions": sessions[:20]
         }
 
@@ -9619,7 +9619,7 @@ async def _build_m26_14_llm_analysis_payload(
         {
             "role": "system",
             "content": (
-                "You are producing grounded M-26-14 advisor guidance for a Splunk discovery tool. "
+                "You are producing grounded M-26-14 advisor guidance for Splunk Discovery Tool. "
                 "Use only the provided evidence. Do not claim formal compliance. Do not invent SPL, logs, hosts, sourcetypes, or policies. "
                 "Return strict JSON with keys: summary, environment_relevance, recommended_adjustments, suggested_follow_ups, evidence_gaps, confidence_notes. "
                 "Each list should contain short strings."
@@ -9712,7 +9712,7 @@ def build_m26_14_profile_payload(
     if not sessions:
         return {
             "has_data": False,
-            "message": "No discovery sessions are available yet.",
+            "message": "No discovery runs yet.",
             "validation_packs": list_m26_14_validation_packs(),
             "sessions": [],
         }
@@ -9744,7 +9744,7 @@ def build_m26_14_compare_payload(
     if len(sessions) < 2:
         return {
             "has_data": False,
-            "message": "At least two discovery sessions are required for M-26-14 compare.",
+            "message": "Run discovery at least twice to compare M-26-14 readiness.",
             "sessions": sessions[:20],
         }
 
@@ -9792,7 +9792,7 @@ def build_session_runbook_payload(
     if not sessions:
         return {
             "has_data": False,
-            "message": "No discovery sessions available.",
+            "message": "No discovery runs yet.",
             "sessions": []
         }
 
@@ -9814,11 +9814,11 @@ def build_session_runbook_payload(
     personas = selected.get("personas", {}) if isinstance(selected.get("personas", {}), dict) else {}
     steps: List[Dict[str, Any]] = []
     markdown_lines = [
-        "# Discovery Operational Runbook",
+        "# Discovery Runbook",
         "",
         f"**Session:** {ts}",
-        f"**Persona:** {persona_key.title()}",
-        f"**Voice:** {voice_label}",
+        f"**Audience:** {persona_key.title()}",
+        f"**Style:** {voice_label}",
         f"**Readiness Score:** {_safe_int(selected.get('readiness_score', 0))}/100",
         ""
     ]
@@ -9919,7 +9919,7 @@ def build_session_runbook_payload(
         "persona": persona_key,
         "voice": voice_key,
         "voice_label": voice_label,
-        "title": f"{voice_label} {persona_key.title()} Operational Runbook",
+        "title": f"{persona_key.title()} runbook ({voice_label} style)",
         "filename": filename,
         "markdown": "\n".join(markdown_lines),
         "steps": steps,
@@ -9939,7 +9939,7 @@ def build_discovery_dashboard_payload(scope_key: Optional[str] = None) -> Dict[s
     if not latest:
         return {
             "has_data": False,
-            "message": "No discovery sessions available yet.",
+            "message": "No discovery runs yet.",
             "sessions": []
         }
 
@@ -10358,9 +10358,10 @@ class WebSocketDisplayManager:
     
     async def show_banner(self):
         banner_payload = {
-            "title": "Splunk MCP Use Case Discovery Tool",
-            "subtitle": "Intelligent Environment Analysis & Recommendation Engine",
-            "start_time": self.start_time.strftime('%Y-%m-%d %H:%M:%S')
+            "title": "Splunk Discovery Tool",
+            "subtitle": "Discovery run",
+            "start_time": self.start_time.strftime('%Y-%m-%d %H:%M:%S'),
+            "start_time_iso": self.start_time.isoformat(),
         }
         _append_discovery_runtime_activity("banner", banner_payload, scope_key=self.scope_key)
         await self.send_to_clients("banner", banner_payload)
@@ -10423,7 +10424,9 @@ class WebSocketDisplayManager:
         elapsed = datetime.now() - self.start_time
         completion_payload = {
             "duration": str(elapsed),
-            "report_paths": report_paths
+            "duration_seconds": round(elapsed.total_seconds()),
+            "report_paths": report_paths,
+            "report_count": len(report_paths),
         }
         _append_discovery_runtime_activity("completion", completion_payload, scope_key=self.scope_key)
         asyncio.create_task(self.send_to_clients("completion", completion_payload))
@@ -10614,7 +10617,7 @@ async def start_discovery(request: Request, background_tasks: BackgroundTasks):
             "percentage": 0,
             "current_step": 0,
             "total_steps": 0,
-            "description": "Preparing discovery pipeline...",
+            "description": "Preparing discovery...",
             "eta_seconds": None,
             "eta_method": "stage_calibrated",
         },
@@ -10622,7 +10625,7 @@ async def start_discovery(request: Request, background_tasks: BackgroundTasks):
     discovery_snapshot = _append_discovery_runtime_activity(
         "info",
         {
-            "message": "Discovery worker launched. Progress is now backed by durable runtime state.",
+            "message": "Discovery started in a background process. Progress is saved as it runs.",
             "worker_pid": worker_process.pid,
         },
         scope_key=scope_key,
@@ -10762,7 +10765,7 @@ async def run_discovery(
         progress = ProgressTracker(normalized_scope_key)
 
         if DISCOVERY_PIPELINE_VERSION == "v2":
-            display.phase("🚀 Discovery Pipeline")
+            display.phase("🚀 Preparing discovery")
             v2_pipeline = DiscoveryV2Pipeline(
                 discovery_engine,
                 output_root=_discovery_scope_output_dir(normalized_scope_key),
@@ -10828,7 +10831,7 @@ async def run_discovery(
                     + ", ".join((discovery_quality["failed_steps"] + [str(item.get("stage", item)) if isinstance(item, dict) else str(item) for item in discovery_quality["pipeline_errors"]])[:8])
                     + ". The readiness score reflects the missing evidence."
                 )
-            display.success("✅ Discovery artifact bundle generated")
+            display.success("✅ Discovery reports saved")
             display.show_final_summary(report_paths)
 
             _update_discovery_runtime_state(
@@ -11959,7 +11962,7 @@ def build_summary_infographic_brief(timestamp: str, summary_data: Optional[Dict[
 
     return {
         "session_id": timestamp,
-        "report_title": "DT4SMS Executive Summary",
+        "report_title": "Splunk Discovery Tool Executive Summary",
         "readiness_score": payload.get("readiness_score", v2_context.get("readiness_score")),
         "executive_summary": str(payload.get("ai_summary") or "").strip(),
         "stats": payload.get("stats") if isinstance(payload.get("stats"), dict) else {},
@@ -11997,7 +12000,7 @@ def build_summary_infographic_prompt(timestamp: str, summary_data: Optional[Dict
     prompt_prefix = f"""Create a polished single-page infographic poster for a Splunk discovery executive report.
 
 Goal:
-- Turn the supplied DT4SMS summary into an executive-ready infographic.
+- Turn the supplied Splunk Discovery Tool summary into an executive-ready infographic.
 - Keep every fact anchored to the provided summary.
 - Prefer clear sectioning, concise labels, and high information density.
 - Do not invent vendors, data sources, metrics, logos, incident claims, or counts that are not in the source material.
@@ -12290,7 +12293,7 @@ async def start_oidc_login(request: Request):
 
 @app.get("/api/auth/oidc/callback")
 async def complete_oidc_login(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
-    """Complete the OIDC authorization-code flow and issue a normal DT4SMS session."""
+    """Complete the OIDC authorization-code flow and issue a normal app session."""
     if not is_auth_enabled() or get_auth_provider() != "oidc":
         raise HTTPException(status_code=404, detail="OIDC authentication is not enabled")
 
@@ -12350,7 +12353,7 @@ async def complete_oidc_login(request: Request, code: Optional[str] = None, stat
             details={"reason": "user_disabled_or_missing"},
         )
         return HTMLResponse(
-            content=build_auth_error_page("OIDC sign-in denied", "The linked DT4SMS user is disabled or unavailable."),
+            content=build_auth_error_page("OIDC sign-in denied", "The linked Splunk Discovery Tool user is disabled or no longer exists."),
             status_code=403,
         )
 
@@ -15330,7 +15333,7 @@ Extract specific findings in these categories:
 4. **Optimization Opportunities** (retention policies, acceleration, index consolidation)
 5. **Compliance Gaps** (missing audit logs, retention violations, access control issues)
 6. **Trend Signals** (behavior shifts over time windows, emerging hot spots)
-7. **Risk & Vulnerability Hypotheses** (areas needing recursive validation)
+7. **Risk & Vulnerability Hypotheses** (areas that need follow-up checks)
 
 For each finding, provide:
 - **Type**: Specific issue type
@@ -15580,7 +15583,7 @@ Please provide:
 3. **Quick Wins** (2-3 easy implementations with high impact)
 4. **Risk Areas** (Any security or compliance gaps identified)
 5. **Trend Story** (what appears to be changing, increasing, or degrading)
-6. **Recursive Next Loop** (what should be re-checked in the next discovery cycle)
+6. **Next Check** (what to check again in the next discovery run)
 
 Keep it concise and actionable. Focus on business value, risk reduction, and measurable outcomes. Base all statements on actual data from the reports above."""
     
@@ -19065,7 +19068,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         if chat_runtime_profile["short_circuit_greetings"] and small_talk and not has_session_context:
             # Small local models answer greetings faster and better without the full tool prompt.
             greeting_prompt = (
-                "You are the DT4SMS Splunk assistant. Reply warmly in one or two sentences and offer to help "
+                "You are the Splunk Discovery Tool assistant. Reply warmly in one or two sentences and offer to help "
                 "the user explore or troubleshoot their Splunk data."
             )
             mission_block = format_mission_context(mission)
@@ -19899,7 +19902,7 @@ if __name__ == "__main__":
     if startup_port != 8003:
         print(f"Preferred port 8003 unavailable; using fallback port {startup_port}.")
     
-    print("Starting Splunk MCP Discovery Tool Web Interface")
+    print("Starting the Splunk Discovery Tool web interface")
     print(f"Access the interface at: http://localhost:{startup_port}")
     print(f"WebSocket endpoint: ws://localhost:{startup_port}/ws")
     

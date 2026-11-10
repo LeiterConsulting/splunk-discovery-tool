@@ -2,7 +2,7 @@
 
 ## Status
 
-This document records the current implementation direction for the DT4SMS M-26-14 advisor workspace.
+This document records the current implementation direction for the Splunk Discovery Tool M-26-14 advisor workspace.
 
 - Model: internal optional capability pack, enabled from Settings and surfaced through the capability framework
 - Surface: hidden-until-enabled workspace tab
