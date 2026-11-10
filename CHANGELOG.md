@@ -181,6 +181,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Nine elements used `shrink-0`, which Tailwind 2 does not generate; they now use `flex-shrink-0`
 - Advanced settings in Dark sat on a near-black bar that stood out from its card
 
+### 🪟 Summary, Chat, Connection Details & M-26-14
+
+#### Added
+- The contrast check opens the MCP server and AI model forms in Settings > Connections and both save dialogs, so it now covers 120 surfaces across five themes instead of 105
+
+#### Changed
+- **Summary dialog**: the header shows Discovery Summary, a Saved badge, and the run date, without a gradient. Tabs share one underline style and show their counts in plain text; the green New badge is gone
+  - Executive Summary opens with "What this run found" and four tiles (Readiness, Open risks, Coverage gaps, Admin tasks), followed by Details, By the Numbers, Priority Actions, and Quick Wins
+  - SPL Queries show "High priority" or "Medium priority" and where the search came from (AI-generated, Environment-based, Template-based), with filter buttons that show counts. "From discovery" and "Why it matters" replace "📋 Discovery Finding" and "Business Value", and Show SPL replaces View SPL Code
+  - Admin Tasks use plain labels: Checklist, Expected result, Suggest a Fix (was Get Remediation Help), Run Again (was Re-verify), Likely Cause, Chance of success, How to Prevent It, and How to Undo (was Rollback Instructions). Verification history reads "Attempt 2: Passed" instead of "Attempt #2 - SUCCESS"
+  - While a summary builds, the dialog says Building Your Summary with a solid progress bar, and Stop Summary is a standard red button
+- **Chat**: searches are labeled "Search that ran" or "Suggested search (not run)", the step list reads "Steps taken (3 rounds, 12s)" instead of "Investigation Timeline (3 iterations, 12s)", and View Raw Data is now Show raw data. The typing dots move only when the system allows motion, and screen readers hear "The assistant is working."
+- **Chat Settings**: groups settings into Answer Limits, AI Model, Retries and Sampling, Answer Quality, and Extras. Max response length is a number field that explains when the AI connection allows fewer tokens (for example "allows up to 8,192 tokens, so answers stop at 8,192"), and the footer says changes apply right away and reset when the server restarts
+- **Connection Details**: the header shows the overall status. The Splunk MCP server and AI model sections are each marked Set up or Not set up and list the address, saved name, provider, model, and endpoint, with a hint when something is missing. A load error shows a plain message with Try Again, and Open Settings sits at the bottom (the main action while the app is not connected)
+- **M-26-14 tab**: renamed M-26-14 Readiness Advisor to M-26-14 Readiness and rewrote its text in plain language
+  - Priority objectives spell out Continuous Event Monitoring (CEM) and Threat Hunting, Investigation, Response, and Forensics (THIRF)
+  - Compare Runs has labeled run pickers and shows Readiness change and Maturity floor change instead of "Δ"
+  - Maturity elements list Found, Missing, Not yet known, and Next step
+  - Live Checks (was Curated Live Validation) has Check, Suggested checks, and From/To fields with a Splunk time hint, shows the "Search that will run", and starts with Run Check
+  - Check results show What Discovery Found, Related Context, Searches you can reuse, and AI Review (was Grounded Advisory)
+- M-26-14 server messages use plain language: why AI review is unavailable or turned off, unknown checks, a missing MCP server, failed checks, and the check descriptions, evidence, gaps, and next steps. Two checks are renamed: Alert and Detection Coverage (was Alert and Detection Posture) and Timestamp and Data Freshness (was Timestamp and Freshness Sanity)
+- **Save dialogs** for MCP configurations and AI model connections are labeled dialogs that close with Escape, with a neutral header, an amber note when saving replaces a saved item, labeled fields, a list of the settings to save, plain confirmation text, and green success messages that screen readers announce. Titles read Save (or Update) MCP Configuration and Save (or Update) AI Model Connection
+- Settings panels (MCP server, AI model, troubleshooter, security) use neutral cards, and their buttons use the shared primary and secondary styles. Fetch Models and Auto-Assess use the neutral small button style instead of purple and indigo
+- The warning toast is solid amber, toasts no longer bounce, the discovery banner is solid indigo, and saved-list buttons no longer grow on hover
+
+#### Removed
+- The last gradient backgrounds, including the `.animated-gradient` style, and the dark-theme overrides that only existed to restyle them
+
+#### Fixed
+- Admin Tasks showed "Generating Tasks..." with no end when a summary had no tasks; it now says the run has no admin tasks and suggests asking in Chat
+- In Dark, Neo, and system dark, the AI model form's auto-tune box and the Fetch Models and Auto-Assess buttons kept light backgrounds under lightened text (1.3:1 to 1.8:1 contrast), and the recommended-model note used dark green text on its dark background
+- Fetch Models and Auto-Assess sat inside the Model and Max Tokens labels, so screen readers announced them as "Model" and "Max Tokens" buttons and clicking either label ran the action. The labels now name their fields
+- The required-field asterisk in the save dialogs was dark red on a dark background in dark themes
+- Icons in the Settings connection forms were part of the button names that screen readers and browser tests see; they are now hidden from assistive technology
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added

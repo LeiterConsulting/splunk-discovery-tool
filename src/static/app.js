@@ -1065,7 +1065,7 @@
     tabs[nextIndex].click();
   };
   function App() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa, _ya, _za, _Aa, _Ba, _Ca, _Da, _Ea, _Fa, _Ga, _Ha, _Ia, _Ja, _Ka, _La, _Ma, _Na, _Oa, _Pa, _Qa;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa, _ya, _za, _Aa, _Ba, _Ca, _Da, _Ea, _Fa, _Ga, _Ha, _Ia, _Ja;
     const THEME_PREFERENCE_KEY = "dt4sms_theme_preference";
     const OPERATOR_VOICE_PREFERENCE_KEY = "dt4sms_operator_voice";
     const OPERATOR_VOICE_OPTIONS = [
@@ -1101,8 +1101,8 @@
     const [workflowTab, setWorkflowTab] = useState("admin");
     const [compareSelection, setCompareSelection] = useState({ current: "latest", baseline: "previous" });
     const [discoveryCompare, setDiscoveryCompare] = useState(null);
-    const [m2614Profile, setM2614Profile] = useState({ has_data: false, message: "M-26-14 advisor has not been loaded yet." });
-    const [m2614Compare, setM2614Compare] = useState({ has_data: false, message: "M-26-14 compare has not been loaded yet." });
+    const [m2614Profile, setM2614Profile] = useState({ has_data: false, message: "Loading M-26-14 readiness..." });
+    const [m2614Compare, setM2614Compare] = useState({ has_data: false, message: "Choose two runs, then select Compare." });
     const [m2614ValidationCatalog, setM2614ValidationCatalog] = useState({
       status: "idle",
       capability: null,
@@ -1491,22 +1491,6 @@
     const headerMcpConnected = !!((_y = connectionInfo == null ? void 0 : connectionInfo.mcp) == null ? void 0 : _y.configured);
     const headerLlmDisplayLabel = String(((_z = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _z.display_label) || "").trim() || "Not configured";
     const connectionInfoStatus = String((connectionInfo == null ? void 0 : connectionInfo.status) || "disconnected").toLowerCase();
-    const connectionStatusMeta = connectionInfoStatus === "connected" ? {
-      icon: "fa-check-circle",
-      panelClass: "bg-green-50 border-green-200",
-      textClass: "text-green-800",
-      message: "Connection settings are configured for both MCP and LLM."
-    } : connectionInfoStatus === "partial" ? {
-      icon: "fa-exclamation-triangle",
-      panelClass: "bg-amber-50 border-amber-200",
-      textClass: "text-amber-800",
-      message: "Some connection settings are still missing."
-    } : {
-      icon: "fa-circle-xmark",
-      panelClass: "bg-gray-100 border-gray-200",
-      textClass: "text-gray-700",
-      message: "No connection settings are configured yet."
-    };
     const canUseSplunkDeeplinks = !!(deeplinkCapability == null ? void 0 : deeplinkCapability.installed) && !!(deeplinkCapability == null ? void 0 : deeplinkCapability.enabled) && !(deeplinkCapability == null ? void 0 : deeplinkCapability.restart_required) && String((deeplinkCapability == null ? void 0 : deeplinkCapability.health_status) || "").toLowerCase() === "ready";
     const canUseExportTools = !!(exportCapability == null ? void 0 : exportCapability.installed) && !!(exportCapability == null ? void 0 : exportCapability.enabled) && !(exportCapability == null ? void 0 : exportCapability.restart_required) && String((exportCapability == null ? void 0 : exportCapability.health_status) || "").toLowerCase() === "ready";
     useEffect(() => {
@@ -2240,7 +2224,7 @@
       const toneClasses = {
         success: "bg-green-600 text-white",
         error: "bg-red-600 text-white",
-        warning: "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600",
+        warning: "bg-amber-500 text-gray-900",
         info: "bg-blue-600 text-white"
       };
       const toneIcons = {
@@ -4215,7 +4199,7 @@
     };
     const runM2614Validation = async () => {
       if (!(selectedM2614ValidationPack == null ? void 0 : selectedM2614ValidationPack.id)) {
-        setM2614ValidationState({ status: "error", error: "Select a curated validation pack before running live validation." });
+        setM2614ValidationState({ status: "error", error: "Choose a check before you run it." });
         return;
       }
       setM2614ValidationState({ status: "loading", error: "" });
@@ -4238,7 +4222,7 @@
         setM2614ValidationState({ status: "success", error: "" });
       } catch (error) {
         console.error("Failed to run M-26-14 validation:", error);
-        setM2614ValidationState({ status: "error", error: error.message || "Failed to run M-26-14 validation." });
+        setM2614ValidationState({ status: "error", error: error.message || "The check could not run." });
       }
     };
     const loadRunbookPayload = async (timestamp = "latest", persona = workflowTab, voice = operatorVoice) => {
@@ -5098,58 +5082,82 @@
         ragActionInProgress === "reindex" ? "Reindexing..." : "Reindex"
       ) : null))), ragIsInstalled && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 xl:grid-cols-4 gap-3 mt-5" }, /* @__PURE__ */ React.createElement("div", { className: ragTileClass }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Indexed Documents"), /* @__PURE__ */ React.createElement("div", { className: `text-2xl font-semibold mt-1 ${headingClass}` }, ragIndexedDocumentCount)), /* @__PURE__ */ React.createElement("div", { className: ragTileClass }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Source Files"), /* @__PURE__ */ React.createElement("div", { className: `text-2xl font-semibold mt-1 ${headingClass}` }, (ragIndexSummary == null ? void 0 : ragIndexSummary.source_file_count) || 0)), /* @__PURE__ */ React.createElement("div", { className: ragTileClass }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Imported Items"), /* @__PURE__ */ React.createElement("div", { className: `text-2xl font-semibold mt-1 ${headingClass}` }, ragDisplayedAssetCount)), /* @__PURE__ */ React.createElement("div", { className: ragTileClass }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Ready for Chat"), /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold mt-2 ${headingClass}` }, canUseRagContextPreview ? "Yes" : "Not yet"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, "Last indexed: ", lastIndexedLabel))), ragIsInstalled && (ragIndexSourceTypes.length > 0 || ragKnowledgeAssetTypeCounts.length > 0) && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-2 ${headingClass}` }, "Indexed by Source"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragIndexSourceTypes.length > 0 ? ragIndexSourceTypes.map(([sourceType, count]) => /* @__PURE__ */ React.createElement("span", { key: sourceType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-white text-gray-700 border-gray-300"}` }, formatCapabilitySourceTypeLabel(sourceType), ": ", count)) : /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, "Nothing indexed yet."))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-2 ${headingClass}` }, "Imported by Type"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragKnowledgeAssetTypeCounts.length > 0 ? ragKnowledgeAssetTypeCounts.map(([assetType, count]) => /* @__PURE__ */ React.createElement("span", { key: assetType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-white text-gray-700 border-gray-300"}` }, formatKnowledgeAssetTypeLabel(assetType), ": ", count)) : /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, "Nothing imported yet.")))));
     };
+    const M2614_OBJECTIVE_NAMES = {
+      CEM: "Continuous Event Monitoring (CEM)",
+      THIRF: "Threat Hunting, Investigation, Response, and Forensics (THIRF)"
+    };
+    const formatM2614ObjectiveName = (value) => {
+      const raw = String(value || "").trim();
+      return M2614_OBJECTIVE_NAMES[raw.toUpperCase()] || raw || "Objective";
+    };
+    const formatM2614Delta = (value) => {
+      if (value == null || value === "") return "Unknown";
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return String(value);
+      return numeric > 0 ? `+${numeric}` : String(numeric);
+    };
+    const formatM2614Level = (value) => value == null ? "Unknown" : `Level ${value}`;
     const renderM2614WorkspaceView = () => {
-      var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2, _i2, _j2, _k2, _l2, _m2, _n2;
-      return /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 mb-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${isDarkTheme ? "bg-rose-950 text-rose-100 border border-rose-800" : "bg-rose-50 text-rose-900 border border-rose-200"}` }, "Advisory only"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${getCapabilityStatusClasses((m2614AdvisorCapability == null ? void 0 : m2614AdvisorCapability.health_status) || "unknown")}` }, formatCapabilityStatusLabel((m2614AdvisorCapability == null ? void 0 : m2614AdvisorCapability.health_status) || "unknown")), headerAuthVisible && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}` }, headerAuthRoleLabel)), /* @__PURE__ */ React.createElement("h2", { className: `mt-4 text-xl font-semibold ${headingClass}` }, "M-26-14 Readiness Advisor"), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, "Estimates M-26-14 readiness from your discovery results, shows where the evidence is thin, and runs targeted live checks for CEM, THIRF, retention, and log management."), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-xs ${mutedTextClass}` }, canRunM2614Validation ? "Analysts and admins can run live checks here while the MCP connection is healthy." : "You can review results. Only analysts and admins can run live checks.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 text-xs" }, /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => refreshM2614Workspace(),
-          className: "inline-flex items-center rounded-lg bg-indigo-600 px-3 py-2 font-medium text-white transition-colors hover:bg-indigo-700"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync mr-2" }),
-        "Refresh Advisor"
-      ), /* @__PURE__ */ React.createElement(
+      var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2, _i2, _j2;
+      const m2614IconClass = isDarkTheme ? "text-indigo-300" : "text-indigo-600";
+      const m2614SectionClass = `rounded-lg shadow-sm p-6 border ${panelClass}`;
+      const m2614CardClass = `rounded-lg border p-4 ${panelMutedClass}`;
+      const m2614PillClass = `inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-white text-gray-700 border-gray-300"}`;
+      const m2614InputClass = `w-full rounded-md border px-3 py-2 text-sm ${isDarkTheme ? "border-gray-600 bg-gray-900 text-gray-100" : "border-gray-300 bg-white text-gray-900"}`;
+      const m2614LabelClass = `block text-sm font-medium mb-1 ${headingClass}`;
+      const m2614CodeClass = `overflow-x-auto rounded-md border p-3 text-xs font-mono whitespace-pre-wrap ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-gray-50 border-gray-200 text-gray-900"}`;
+      const m2614BulletClass = `mt-1.5 h-1.5 w-1.5 flex-shrink-0 rounded-full ${isDarkTheme ? "bg-gray-400" : "bg-gray-500"}`;
+      const m2614NoticeClass = `rounded-md border px-3 py-2 text-sm ${isDarkTheme ? "border-red-800 bg-red-950 text-red-100" : "border-red-200 bg-red-50 text-red-800"}`;
+      const canStartM2614Validation = !!selectedM2614ValidationPack && canRunM2614Validation && m2614ValidationState.status !== "loading";
+      const renderSectionHeader = (icon, title, description, id) => /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { id, className: `flex items-center gap-2 text-base font-semibold ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${icon} text-sm ${m2614IconClass}`, "aria-hidden": "true" }), title), description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${subtextClass}` }, description));
+      const renderLabeledLine = (label, value, toneClass = subtextClass) => value ? /* @__PURE__ */ React.createElement("div", { className: `text-sm ${toneClass}` }, /* @__PURE__ */ React.createElement("dt", { className: "inline font-semibold" }, label), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, value)) : null;
+      const renderBulletList = (items, keyPrefix) => /* @__PURE__ */ React.createElement("ul", { className: `space-y-1.5 text-sm ${subtextClass}` }, items.map((item, itemIdx) => /* @__PURE__ */ React.createElement("li", { key: `${keyPrefix}-${itemIdx}`, className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: m2614BulletClass }), /* @__PURE__ */ React.createElement("span", null, item))));
+      const firstItem = (value) => Array.isArray(value) && value.length > 0 ? value[0] : "";
+      const sourceSummary = (m2614Profile == null ? void 0 : m2614Profile.source_summary) || {};
+      return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "m2614-page-title", className: m2614SectionClass }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("h2", { id: "m2614-page-title", className: `text-lg font-semibold ${headingClass}` }, "M-26-14 Readiness"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${getCapabilityStatusClasses((m2614AdvisorCapability == null ? void 0 : m2614AdvisorCapability.health_status) || "unknown")}` }, formatCapabilityStatusLabel((m2614AdvisorCapability == null ? void 0 : m2614AdvisorCapability.health_status) || "unknown")), headerAuthVisible && /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, headerAuthRoleLabel)), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, "Estimates how ready this Splunk environment is for the logging requirements in OMB memo M-26-14. It uses your discovery results, shows where the evidence is thin, and runs read-only searches to check monitoring, investigation, retention, and log management."), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Advisory only."), " These are estimates to guide your review, not a compliance decision.", " ", canRunM2614Validation ? "You can run live checks while the Splunk MCP server is connected." : "You can review results. Only analysts and admins can run live checks.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, renderWorkspaceRefreshButton(() => refreshM2614Workspace(), "Refresh M-26-14 readiness"), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: openCapabilitiesOverview,
-          className: `inline-flex items-center rounded-lg border px-3 py-2 font-medium ${isDarkTheme ? "border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700" : "border-gray-300 bg-white text-gray-700 hover:bg-gray-50"}`
+          className: `inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${secondaryButtonClass}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-sliders-h mr-2" }),
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-sliders-h", "aria-hidden": "true" }),
         "Capability Settings"
-      ))), !m2614Profile || !m2614Profile.has_data ? /* @__PURE__ */ React.createElement("div", { className: `mt-6 rounded-xl border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}` }, (m2614Profile == null ? void 0 : m2614Profile.message) || "No M-26-14 advisory profile is available yet. Run Discovery to generate a current blueprint.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-4 ${isDarkTheme ? "bg-indigo-950 border-indigo-800" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-indigo-200" : "text-indigo-900"}` }, "Readiness Estimate"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-2xl font-semibold ${isDarkTheme ? "text-indigo-50" : "text-indigo-950"}` }, formatMissionMetricValue(m2614Profile == null ? void 0 : m2614Profile.readiness_estimate), "/100"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${isDarkTheme ? "text-indigo-200" : "text-indigo-900"}` }, "Session ", formatMissionSessionSelectionLabel((m2614Profile == null ? void 0 : m2614Profile.timestamp) || compareSelection.current))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Evidence Confidence"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-2xl font-semibold ${headingClass}` }, formatM2614StatusLabel(m2614Profile == null ? void 0 : m2614Profile.confidence)), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, "Confidence stays intentionally conservative until curated validation replaces discovery-only heuristics.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Maturity Floor"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-2xl font-semibold ${headingClass}` }, ((_a2 = m2614Profile == null ? void 0 : m2614Profile.maturity_floor) == null ? void 0 : _a2.level) == null ? "Unknown" : `Level ${m2614Profile.maturity_floor.level}`), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, ((_b2 = m2614Profile == null ? void 0 : m2614Profile.maturity_floor) == null ? void 0 : _b2.explanation) || "No defensible floor is available yet.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Observed Footprint"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-sm font-semibold ${headingClass}` }, formatMissionMetricValue((_c2 = m2614Profile == null ? void 0 : m2614Profile.source_summary) == null ? void 0 : _c2.total_indexes), " indexes • ", formatMissionMetricValue((_d2 = m2614Profile == null ? void 0 : m2614Profile.source_summary) == null ? void 0 : _d2.total_hosts), " hosts"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, "Security sources ", formatMissionMetricValue((_e2 = m2614Profile == null ? void 0 : m2614Profile.source_summary) == null ? void 0 : _e2.security_source_count), " • Compliance sources ", formatMissionMetricValue((_f2 = m2614Profile == null ? void 0 : m2614Profile.source_summary) == null ? void 0 : _f2.compliance_source_count)))), /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-1 gap-4 xl:grid-cols-5" }, /* @__PURE__ */ React.createElement("div", { className: `xl:col-span-3 rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye text-indigo-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Priority Objectives")), /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-3 ${subtextClass}` }, "CEM and THIRF status is derived from the blueprint first, then strengthened with curated validation evidence."), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 md:grid-cols-2" }, m2614PriorityObjectives.length > 0 ? m2614PriorityObjectives.map((objective) => /* @__PURE__ */ React.createElement("div", { key: objective.objective || objective.status, className: `rounded-xl border px-4 py-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, objective.objective || "Objective"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${getM2614StatusClasses(objective.status)}` }, formatM2614StatusLabel(objective.status))), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, Array.isArray(objective.notes) && objective.notes.length > 0 ? objective.notes[0] : "No notes recorded for this objective yet."), Array.isArray(objective.evidence) && objective.evidence.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-xs ${mutedTextClass}` }, "Evidence: ", objective.evidence[0]))) : /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}` }, "Priority-objective posture is not available for the selected session."))), sessionCatalog.length >= 2 && /* @__PURE__ */ React.createElement("div", { className: `xl:col-span-2 rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code-compare text-emerald-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Compare runs")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 text-xs mb-3" }, /* @__PURE__ */ React.createElement(
+      ))), !m2614Profile || !m2614Profile.has_data ? /* @__PURE__ */ React.createElement("div", { className: `mt-6 rounded-lg border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}` }, (m2614Profile == null ? void 0 : m2614Profile.message) || "No readiness estimate yet. Run discovery to create one.") : /* @__PURE__ */ React.createElement("dl", { className: "mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4" }, /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Readiness estimate"), /* @__PURE__ */ React.createElement("dd", { className: `mt-2 text-2xl font-semibold ${headingClass}` }, formatMissionMetricValue(m2614Profile == null ? void 0 : m2614Profile.readiness_estimate), "/100"), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 text-sm ${subtextClass}` }, "From the run on ", formatMissionSessionSelectionLabel((m2614Profile == null ? void 0 : m2614Profile.timestamp) || compareSelection.current))), /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Confidence"), /* @__PURE__ */ React.createElement("dd", { className: `mt-2 text-2xl font-semibold ${headingClass}` }, formatM2614StatusLabel(m2614Profile == null ? void 0 : m2614Profile.confidence)), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 text-sm ${subtextClass}` }, "How strongly the evidence supports this estimate. Live checks can raise it.")), /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Maturity floor"), /* @__PURE__ */ React.createElement("dd", { className: `mt-2 text-2xl font-semibold ${headingClass}` }, formatM2614Level((_a2 = m2614Profile == null ? void 0 : m2614Profile.maturity_floor) == null ? void 0 : _a2.level)), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 text-sm ${subtextClass}` }, ((_b2 = m2614Profile == null ? void 0 : m2614Profile.maturity_floor) == null ? void 0 : _b2.explanation) || "The lowest maturity level the evidence supports. Not enough evidence yet.")), /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "What discovery saw"), /* @__PURE__ */ React.createElement("dd", { className: `mt-2 text-lg font-semibold ${headingClass}` }, countLabel(Number(sourceSummary.total_indexes) || 0, "index", "indexes"), ", ", countLabel(Number(sourceSummary.total_hosts) || 0, "host")), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 text-sm ${subtextClass}` }, countLabel(Number(sourceSummary.security_source_count) || 0, "security source"), ", ", countLabel(Number(sourceSummary.compliance_source_count) || 0, "compliance source"))))), (m2614Profile == null ? void 0 : m2614Profile.has_data) && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "m2614-objectives-title", className: m2614SectionClass }, renderSectionHeader("fa-bullseye", "Priority Objectives", "M-26-14 organizes logging around two objectives. Each status starts from discovery results and gets stronger as live checks confirm it.", "m2614-objectives-title"), m2614PriorityObjectives.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 md:grid-cols-2" }, m2614PriorityObjectives.map((objective) => /* @__PURE__ */ React.createElement("div", { key: objective.objective || objective.status, className: m2614CardClass }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold ${headingClass}` }, formatM2614ObjectiveName(objective.objective)), /* @__PURE__ */ React.createElement("span", { className: `inline-flex flex-shrink-0 items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${getM2614StatusClasses(objective.status)}` }, formatM2614StatusLabel(objective.status))), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${subtextClass}` }, firstItem(objective.notes) || "No notes for this objective yet."), firstItem(objective.evidence) && /* @__PURE__ */ React.createElement("dl", { className: "mt-2" }, renderLabeledLine("Evidence:", firstItem(objective.evidence), mutedTextClass))))) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}` }, "No objective status is available for this run.")), sessionCatalog.length >= 2 && /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "m2614-compare-title", className: m2614SectionClass }, renderSectionHeader("fa-code-compare", "Compare Runs", "See how readiness changed between two discovery runs.", "m2614-compare-title"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-end gap-3 mb-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "m2614-compare-current", className: m2614LabelClass }, "Run"), /* @__PURE__ */ React.createElement(
         "select",
         {
+          id: "m2614-compare-current",
           value: compareSelection.current,
           onChange: (e) => setCompareSelection((prev) => ({ ...prev, current: e.target.value })),
           "data-testid": "m2614-compare-current-select",
-          className: `border rounded px-2 py-1 ${isDarkTheme ? "border-gray-600 bg-gray-700 text-gray-100" : "border-gray-300 bg-white text-gray-900"}`
+          className: m2614InputClass
         },
         /* @__PURE__ */ React.createElement("option", { value: "latest" }, "Latest run"),
         sessionCatalog.map((session) => /* @__PURE__ */ React.createElement("option", { key: `m2614-current-${session.timestamp}`, value: session.timestamp }, formatMissionSessionSelectionLabel(session.timestamp)))
-      ), /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, "vs"), /* @__PURE__ */ React.createElement(
+      )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "m2614-compare-baseline", className: m2614LabelClass }, "Compared with"), /* @__PURE__ */ React.createElement(
         "select",
         {
+          id: "m2614-compare-baseline",
           value: compareSelection.baseline,
           onChange: (e) => setCompareSelection((prev) => ({ ...prev, baseline: e.target.value })),
           "data-testid": "m2614-compare-baseline-select",
-          className: `border rounded px-2 py-1 ${isDarkTheme ? "border-gray-600 bg-gray-700 text-gray-100" : "border-gray-300 bg-white text-gray-900"}`
+          className: m2614InputClass
         },
         /* @__PURE__ */ React.createElement("option", { value: "previous" }, "Previous run"),
         sessionCatalog.map((session) => /* @__PURE__ */ React.createElement("option", { key: `m2614-baseline-${session.timestamp}`, value: session.timestamp }, formatMissionSessionSelectionLabel(session.timestamp)))
-      ), /* @__PURE__ */ React.createElement(
+      )), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: refreshM2614CompareSelection,
           "data-testid": "m2614-compare-submit",
-          className: "px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
+          className: `inline-flex items-center rounded-md border px-3 py-2 text-sm font-medium transition-colors ${secondaryButtonClass}`
         },
         "Compare"
-      )), !m2614Compare || !m2614Compare.has_data ? /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}` }, (m2614Compare == null ? void 0 : m2614Compare.message) || "Run discovery at least twice to compare runs.") : /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 sm:grid-cols-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Readiness Δ"), /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-compare-readiness-delta", className: `mt-1 text-sm font-semibold ${headingClass}` }, (_h2 = (_g2 = m2614Compare == null ? void 0 : m2614Compare.comparison) == null ? void 0 : _g2.readiness_delta) != null ? _h2 : 0)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Floor Δ"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, ((_i2 = m2614Compare == null ? void 0 : m2614Compare.comparison) == null ? void 0 : _i2.maturity_floor_delta) == null ? "Unknown" : m2614Compare.comparison.maturity_floor_delta)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Recommended Packs"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, Array.isArray((_j2 = m2614Compare == null ? void 0 : m2614Compare.comparison) == null ? void 0 : _j2.recommended_pack_ids) ? m2614Compare.comparison.recommended_pack_ids.length : 0))))), /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(0,1.12fr),minmax(380px,0.88fr)]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-layer-group text-rose-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Maturity Elements")), /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-3 ${subtextClass}` }, "Each element records discovery evidence, explicit gaps, and the next validation or remediation step."), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 xl:grid-cols-2" }, m2614MaturityElements.map((element) => /* @__PURE__ */ React.createElement("div", { key: element.id || element.label, className: `rounded-xl border px-4 py-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, element.label || element.id || "Element"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${getM2614StatusClasses(element.status)}` }, formatM2614StatusLabel(element.status))), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-2 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}` }, "Confidence: ", formatM2614StatusLabel(element.confidence)), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}` }, "Floor: ", element.estimated_level_floor == null ? "Unknown" : `Level ${element.estimated_level_floor}`)), Array.isArray(element.evidence) && element.evidence.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-xs ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Evidence:"), " ", element.evidence[0]), Array.isArray(element.gaps) && element.gaps.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Gap:"), " ", element.gaps[0]), Array.isArray(element.unknowns) && element.unknowns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Unknown:"), " ", element.unknowns[0]), Array.isArray(element.remediation) && element.remediation.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Next step:"), " ", element.remediation[0]))))), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-vial text-emerald-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Curated Live Validation")), /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-3 ${subtextClass}` }, "The advisor prefers pre-authored SPL and shows the exact query before execution."), m2614ValidationCatalog.status === "error" && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs mb-3 ${isDarkTheme ? "border-rose-800 bg-rose-950 text-rose-100" : "border-rose-200 bg-rose-50 text-rose-700"}` }, m2614ValidationCatalog.error), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: `block text-xs font-semibold uppercase tracking-wide mb-1 ${mutedTextClass}` }, "Validation Pack"), /* @__PURE__ */ React.createElement(
+      )), !m2614Compare || !m2614Compare.has_data ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-4 py-4 text-sm ${panelMutedClass} ${mutedTextClass}` }, (m2614Compare == null ? void 0 : m2614Compare.message) || "Run discovery at least twice to compare runs.") : /* @__PURE__ */ React.createElement("dl", { className: "grid grid-cols-1 gap-3 sm:grid-cols-3" }, /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Readiness change"), /* @__PURE__ */ React.createElement("dd", { "data-testid": "m2614-compare-readiness-delta", className: `mt-1 text-lg font-semibold ${headingClass}` }, formatM2614Delta((_d2 = (_c2 = m2614Compare == null ? void 0 : m2614Compare.comparison) == null ? void 0 : _c2.readiness_delta) != null ? _d2 : 0))), /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Maturity floor change"), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 text-lg font-semibold ${headingClass}` }, formatM2614Delta((_e2 = m2614Compare == null ? void 0 : m2614Compare.comparison) == null ? void 0 : _e2.maturity_floor_delta))), /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Suggested checks"), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 text-lg font-semibold ${headingClass}` }, Array.isArray((_f2 = m2614Compare == null ? void 0 : m2614Compare.comparison) == null ? void 0 : _f2.recommended_pack_ids) ? m2614Compare.comparison.recommended_pack_ids.length : 0)))), /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "m2614-elements-title", className: m2614SectionClass }, renderSectionHeader("fa-layer-group", "Maturity Elements", "Each area shows what discovery found, what is missing, and what to do next.", "m2614-elements-title"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 xl:grid-cols-2" }, m2614MaturityElements.map((element) => /* @__PURE__ */ React.createElement("div", { key: element.id || element.label, className: m2614CardClass }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold ${headingClass}` }, element.label || element.id || "Element"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex flex-shrink-0 items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${getM2614StatusClasses(element.status)}` }, formatM2614StatusLabel(element.status))), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, "Confidence: ", formatM2614StatusLabel(element.confidence)), /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, "Maturity floor: ", formatM2614Level(element.estimated_level_floor))), /* @__PURE__ */ React.createElement("dl", { className: "mt-3 space-y-1.5" }, renderLabeledLine("Found:", firstItem(element.evidence)), renderLabeledLine("Missing:", firstItem(element.gaps)), renderLabeledLine("Not yet known:", firstItem(element.unknowns), mutedTextClass), renderLabeledLine("Next step:", firstItem(element.remediation), mutedTextClass)))))), /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "m2614-checks-title", className: m2614SectionClass }, renderSectionHeader("fa-vial", "Live Checks", "Run a prepared, read-only Splunk search. You can review the exact search before it runs.", "m2614-checks-title"), m2614ValidationCatalog.status === "error" && /* @__PURE__ */ React.createElement("div", { role: "alert", className: `mb-4 ${m2614NoticeClass}` }, m2614ValidationCatalog.error), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-6 lg:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "m2614-validation-pack", className: m2614LabelClass }, "Check"), /* @__PURE__ */ React.createElement(
         "select",
         {
+          id: "m2614-validation-pack",
           value: m2614ValidationSelection.packId || (selectedM2614ValidationPack == null ? void 0 : selectedM2614ValidationPack.id) || "",
           onChange: (e) => {
             const nextPackId = e.target.value;
@@ -5158,60 +5166,68 @@
             setM2614ValidationState({ status: "idle", error: "" });
           },
           "data-testid": "m2614-validation-pack-select",
-          className: `w-full border rounded px-3 py-2 text-sm ${isDarkTheme ? "border-gray-600 bg-gray-800 text-gray-100" : "border-gray-300 bg-white text-gray-900"}`
+          className: m2614InputClass
         },
         m2614ValidationPacks.map((pack) => /* @__PURE__ */ React.createElement("option", { key: pack.id, value: pack.id }, pack.title))
-      )), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 sm:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: `block text-xs font-semibold uppercase tracking-wide mb-1 ${mutedTextClass}` }, "Earliest"), /* @__PURE__ */ React.createElement(
+      )), m2614RecommendedPacks.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { id: "m2614-suggested-checks-label", className: `text-sm font-medium mb-2 ${headingClass}` }, "Suggested checks"), /* @__PURE__ */ React.createElement("div", { role: "group", "aria-labelledby": "m2614-suggested-checks-label", className: "flex flex-wrap gap-2" }, m2614RecommendedPacks.map((pack) => {
+        const isSelected = (selectedM2614ValidationPack == null ? void 0 : selectedM2614ValidationPack.id) === pack.id;
+        return /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            key: `m2614-recommended-${pack.id}`,
+            type: "button",
+            "aria-pressed": isSelected,
+            onClick: () => setM2614ValidationSelection((prev) => ({ ...prev, packId: pack.id })),
+            className: `rounded-full border px-3 py-1 text-xs font-medium transition-colors ${isSelected ? "bg-indigo-600 text-white border-indigo-600" : secondaryButtonClass}`
+          },
+          pack.title
+        );
+      }))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 sm:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "m2614-validation-earliest", className: m2614LabelClass }, "From"), /* @__PURE__ */ React.createElement(
         "input",
         {
+          id: "m2614-validation-earliest",
           type: "text",
+          "aria-describedby": "m2614-validation-time-hint",
           value: m2614ValidationSelection.earliest,
           onChange: (e) => setM2614ValidationSelection((prev) => ({ ...prev, earliest: e.target.value })),
-          className: `w-full border rounded px-3 py-2 text-sm ${isDarkTheme ? "border-gray-600 bg-gray-800 text-gray-100" : "border-gray-300 bg-white text-gray-900"}`
+          className: m2614InputClass
         }
-      )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: `block text-xs font-semibold uppercase tracking-wide mb-1 ${mutedTextClass}` }, "Latest"), /* @__PURE__ */ React.createElement(
+      )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "m2614-validation-latest", className: m2614LabelClass }, "To"), /* @__PURE__ */ React.createElement(
         "input",
         {
+          id: "m2614-validation-latest",
           type: "text",
+          "aria-describedby": "m2614-validation-time-hint",
           value: m2614ValidationSelection.latest,
           onChange: (e) => setM2614ValidationSelection((prev) => ({ ...prev, latest: e.target.value })),
-          className: `w-full border rounded px-3 py-2 text-sm ${isDarkTheme ? "border-gray-600 bg-gray-800 text-gray-100" : "border-gray-300 bg-white text-gray-900"}`
+          className: m2614InputClass
         }
-      )))), selectedM2614ValidationPack && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}` }, formatTokenLabel(selectedM2614ValidationPack.control_area)), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}` }, String(selectedM2614ValidationPack.priority_objective || "").toUpperCase() || "Objective"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}` }, formatTokenLabel(selectedM2614ValidationPack.required_role))), /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, selectedM2614ValidationPack.title), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs leading-5 ${subtextClass}` }, selectedM2614ValidationPack.description), /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-semibold ${headingClass}` }, "Curated SPL"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 overflow-x-auto rounded-lg p-3 text-xs ${isDarkTheme ? "bg-gray-900 text-emerald-200" : "bg-gray-950 text-emerald-100"}` }, selectedM2614ValidationPack.query))), m2614RecommendedPacks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide mb-2 ${mutedTextClass}` }, "Recommended Next"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, m2614RecommendedPacks.map((pack) => /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          key: `m2614-recommended-${pack.id}`,
-          type: "button",
-          onClick: () => setM2614ValidationSelection((prev) => ({ ...prev, packId: pack.id })),
-          className: `rounded-full border px-2.5 py-1 text-xs font-medium ${(selectedM2614ValidationPack == null ? void 0 : selectedM2614ValidationPack.id) === pack.id ? "bg-indigo-600 text-white border-indigo-600" : isDarkTheme ? "bg-gray-900 text-gray-200 border-gray-700 hover:bg-gray-800" : "bg-white text-gray-700 border-gray-300 hover:bg-gray-50"}`
-        },
-        pack.title
-      )))), !canRunM2614Validation && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "border-amber-700 bg-amber-950 text-amber-100" : "border-amber-200 bg-amber-50 text-amber-700"}` }, "Live validation is role-gated. Use an analyst or admin account to run curated SPL from this workspace."), /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement(
+      ))), /* @__PURE__ */ React.createElement("p", { id: "m2614-validation-time-hint", className: `text-xs ${mutedTextClass}` }, "Use Splunk time values, such as -30d for 30 days ago or now."), !canRunM2614Validation && /* @__PURE__ */ React.createElement("div", { className: `rounded-md border px-3 py-2 text-sm ${isDarkTheme ? "border-amber-700 bg-amber-950 text-amber-100" : "border-amber-200 bg-amber-50 text-amber-900"}` }, "Only analysts and admins can run live checks. Sign in with one of those roles to run this search."), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: runM2614Validation,
-          disabled: !selectedM2614ValidationPack || !canRunM2614Validation || m2614ValidationState.status === "loading",
+          disabled: !canStartM2614Validation,
           "data-testid": "m2614-run-validation-button",
-          className: `inline-flex items-center rounded-lg px-3 py-2 text-sm font-medium ${selectedM2614ValidationPack && canRunM2614Validation && m2614ValidationState.status !== "loading" ? "bg-emerald-600 hover:bg-emerald-700 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
+          className: `inline-flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors ${canStartM2614Validation ? "bg-indigo-600 hover:bg-indigo-700 text-white" : isDarkTheme ? "bg-gray-700 text-gray-300 cursor-not-allowed" : "bg-gray-200 text-gray-600 cursor-not-allowed"}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-play mr-2" }),
-        m2614ValidationState.status === "loading" ? "Running Validation..." : "Run Curated Validation"
-      ), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Time range ", m2614ValidationSelection.earliest, " to ", m2614ValidationSelection.latest))), (m2614ValidationState.status === "error" || m2614ValidationResult) && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-result", className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-clipboard-check text-indigo-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Validation Result")), m2614ValidationState.status === "error" ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "border-rose-800 bg-rose-950 text-rose-100" : "border-rose-200 bg-rose-50 text-rose-700"}` }, m2614ValidationState.error) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${getM2614StatusClasses((m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.status) || "unknown")}` }, formatM2614StatusLabel((m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.status) || "unknown")), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${panelMutedClass} ${mutedTextClass}` }, countLabel((m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.row_count) || m2614ValidationRows.length, "row"))), /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-summary-headline", className: `text-sm font-semibold ${headingClass}` }, (m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.headline) || "Validation completed."), Array.isArray(m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.findings) && m2614ValidationSummary.findings.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: `mt-3 space-y-2 text-xs ${subtextClass}` }, m2614ValidationSummary.findings.map((finding, findingIdx) => /* @__PURE__ */ React.createElement("li", { key: `m2614-finding-${findingIdx}`, className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? "bg-emerald-300" : "bg-emerald-600"}` }), /* @__PURE__ */ React.createElement("span", null, finding)))), Array.isArray(m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.sample_rows) && m2614ValidationSummary.sample_rows.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-semibold ${headingClass}` }, "Sample Rows"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 overflow-x-auto rounded-lg p-3 text-xs ${isDarkTheme ? "bg-gray-900 text-gray-200" : "bg-gray-50 text-gray-800"}` }, JSON.stringify(m2614ValidationSummary.sample_rows, null, 2))), m2614ValidationProfileSnapshot && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-grounding-panel", className: `mt-4 rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-map-signs text-sky-600" }), /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, "Discovery Grounding")), m2614ValidationProfileSnapshot.has_data ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}` }, "Readiness ", formatMissionMetricValue(m2614ValidationProfileSnapshot.readiness_estimate), "/100"), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}` }, "Confidence ", formatM2614StatusLabel(m2614ValidationProfileSnapshot.confidence || "unknown")), /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${panelMutedClass} ${mutedTextClass}` }, "Session ", formatMissionSessionSelectionLabel(m2614ValidationProfileSnapshot.timestamp || compareSelection.current))), ((_k2 = m2614ValidationProfileSnapshot.priority_objective) == null ? void 0 : _k2.objective) && /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Priority objective:"), " ", m2614ValidationProfileSnapshot.priority_objective.objective), Array.isArray((_l2 = m2614ValidationProfileSnapshot.priority_objective) == null ? void 0 : _l2.notes) && m2614ValidationProfileSnapshot.priority_objective.notes.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Current posture:"), " ", m2614ValidationProfileSnapshot.priority_objective.notes[0]), Array.isArray((_m2 = m2614ValidationProfileSnapshot.maturity_element) == null ? void 0 : _m2.gaps) && m2614ValidationProfileSnapshot.maturity_element.gaps.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Gap to keep in view:"), " ", m2614ValidationProfileSnapshot.maturity_element.gaps[0]), Array.isArray((_n2 = m2614ValidationProfileSnapshot.maturity_element) == null ? void 0 : _n2.remediation) && m2614ValidationProfileSnapshot.maturity_element.remediation.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Suggested next step:"), " ", m2614ValidationProfileSnapshot.maturity_element.remediation[0])) : /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, m2614ValidationProfileSnapshot.message || "No discovery-grounded profile is available for this validation yet.")), m2614ValidationRagContext && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-rag-panel", className: `mt-4 rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-compass text-emerald-600" }), /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, "Environment Context")), m2614ValidationRagContext.operator_brief && /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, m2614ValidationRagContext.operator_brief), Array.isArray(m2614ValidationRagContext.recommended_uses) && m2614ValidationRagContext.recommended_uses.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: `mt-3 space-y-2 text-xs ${subtextClass}` }, m2614ValidationRagContext.recommended_uses.slice(0, 3).map((item, itemIdx) => /* @__PURE__ */ React.createElement("li", { key: `m2614-rag-use-${itemIdx}`, className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? "bg-sky-300" : "bg-sky-600"}` }), /* @__PURE__ */ React.createElement("span", null, item)))), Array.isArray(m2614ValidationRagContext.coverage_gaps) && m2614ValidationRagContext.coverage_gaps.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Context gaps:"), " ", m2614ValidationRagContext.coverage_gaps[0]), m2614ValidationReusableQueries.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4 space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${mutedTextClass}` }, "Reusable SPL Candidates"), m2614ValidationReusableQueries.map((candidate, candidateIdx) => {
+        /* @__PURE__ */ React.createElement("i", { className: `fas ${m2614ValidationState.status === "loading" ? "fa-spinner fa-spin" : "fa-play"}`, "aria-hidden": "true" }),
+        m2614ValidationState.status === "loading" ? "Running Check..." : "Run Check"
+      )), selectedM2614ValidationPack && /* @__PURE__ */ React.createElement("div", { className: m2614CardClass }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, selectedM2614ValidationPack.control_area && /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, formatTokenLabel(selectedM2614ValidationPack.control_area)), selectedM2614ValidationPack.priority_objective && /* @__PURE__ */ React.createElement("span", { className: m2614PillClass, title: formatM2614ObjectiveName(selectedM2614ValidationPack.priority_objective) }, String(selectedM2614ValidationPack.priority_objective).toUpperCase()), selectedM2614ValidationPack.required_role && /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, formatTokenLabel(selectedM2614ValidationPack.required_role), " role")), /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold ${headingClass}` }, selectedM2614ValidationPack.title), selectedM2614ValidationPack.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm leading-6 ${subtextClass}` }, selectedM2614ValidationPack.description), /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium ${headingClass}` }, "Search that will run"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 ${m2614CodeClass}` }, selectedM2614ValidationPack.query))))), (m2614ValidationState.status === "error" || m2614ValidationResult) && /* @__PURE__ */ React.createElement("section", { "data-testid": "m2614-validation-result", "aria-labelledby": "m2614-result-title", className: m2614SectionClass }, renderSectionHeader("fa-clipboard-check", "Check Result", "", "m2614-result-title"), m2614ValidationState.status === "error" ? /* @__PURE__ */ React.createElement("div", { role: "alert", className: m2614NoticeClass }, m2614ValidationState.error) : /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${getM2614StatusClasses((m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.status) || "unknown")}` }, formatM2614StatusLabel((m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.status) || "unknown")), /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, countLabel((m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.row_count) || m2614ValidationRows.length, "row"))), /* @__PURE__ */ React.createElement("p", { "data-testid": "m2614-validation-summary-headline", className: `text-sm font-semibold ${headingClass}` }, (m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.headline) || "The check finished."), Array.isArray(m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.findings) && m2614ValidationSummary.findings.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, renderBulletList(m2614ValidationSummary.findings, "m2614-finding")), Array.isArray(m2614ValidationSummary == null ? void 0 : m2614ValidationSummary.sample_rows) && m2614ValidationSummary.sample_rows.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium ${headingClass}` }, "Show sample rows"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 ${m2614CodeClass}` }, JSON.stringify(m2614ValidationSummary.sample_rows, null, 2)))), m2614ValidationProfileSnapshot && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-grounding-panel", className: m2614CardClass }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold mb-2 ${headingClass}` }, "What Discovery Found"), m2614ValidationProfileSnapshot.has_data ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, "Readiness ", formatMissionMetricValue(m2614ValidationProfileSnapshot.readiness_estimate), "/100"), /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, "Confidence: ", formatM2614StatusLabel(m2614ValidationProfileSnapshot.confidence || "unknown")), /* @__PURE__ */ React.createElement("span", { className: m2614PillClass }, "Run: ", formatMissionSessionSelectionLabel(m2614ValidationProfileSnapshot.timestamp || compareSelection.current))), /* @__PURE__ */ React.createElement("dl", { className: "space-y-1.5" }, renderLabeledLine("Objective:", ((_g2 = m2614ValidationProfileSnapshot.priority_objective) == null ? void 0 : _g2.objective) ? formatM2614ObjectiveName(m2614ValidationProfileSnapshot.priority_objective.objective) : ""), renderLabeledLine("Current state:", firstItem((_h2 = m2614ValidationProfileSnapshot.priority_objective) == null ? void 0 : _h2.notes)), renderLabeledLine("Gap to watch:", firstItem((_i2 = m2614ValidationProfileSnapshot.maturity_element) == null ? void 0 : _i2.gaps)), renderLabeledLine("Suggested next step:", firstItem((_j2 = m2614ValidationProfileSnapshot.maturity_element) == null ? void 0 : _j2.remediation), mutedTextClass))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, m2614ValidationProfileSnapshot.message || "No discovery results are available for this check yet.")), m2614ValidationRagContext && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-rag-panel", className: m2614CardClass }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold mb-2 ${headingClass}` }, "Related Context"), m2614ValidationRagContext.operator_brief && /* @__PURE__ */ React.createElement("p", { className: `text-sm ${subtextClass}` }, m2614ValidationRagContext.operator_brief), Array.isArray(m2614ValidationRagContext.recommended_uses) && m2614ValidationRagContext.recommended_uses.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, renderBulletList(m2614ValidationRagContext.recommended_uses.slice(0, 3), "m2614-rag-use")), firstItem(m2614ValidationRagContext.coverage_gaps) && /* @__PURE__ */ React.createElement("dl", { className: "mt-3" }, renderLabeledLine("Missing context:", firstItem(m2614ValidationRagContext.coverage_gaps), mutedTextClass)), m2614ValidationReusableQueries.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4 space-y-3" }, /* @__PURE__ */ React.createElement("h5", { className: `text-xs font-semibold uppercase tracking-wider ${mutedTextClass}` }, "Searches you can reuse"), m2614ValidationReusableQueries.map((candidate, candidateIdx) => {
         const query = String(candidate.query || "").trim();
         const reuseTier = String(candidate.reuse_tier || "").trim().toLowerCase();
         const fitStatus = String(candidate.environment_fit_status || "").trim().toLowerCase();
         const validationStatus = String(candidate.validation_status || "").trim().toLowerCase();
         const knownGood = Boolean(candidate.known_good) || validationStatus === "known_good";
-        return /* @__PURE__ */ React.createElement("div", { key: `m2614-validation-reuse-${candidateIdx}`, "data-testid": "m2614-validation-reusable-query-card", className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, candidate.title || "Reusable SPL candidate"), candidate.why_reuse && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, candidate.why_reuse)), renderSplQueryActionButtons2(query, {
+        return /* @__PURE__ */ React.createElement("div", { key: `m2614-validation-reuse-${candidateIdx}`, "data-testid": "m2614-validation-reusable-query-card", className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, candidate.title || "Reusable search"), candidate.why_reuse && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm ${subtextClass}` }, candidate.why_reuse)), renderSplQueryActionButtons2(query, {
           allowSave: false,
           originKind: "m2614_validation_reuse",
           originLabel: candidate.title || (selectedM2614ValidationPack == null ? void 0 : selectedM2614ValidationPack.title) || "M-26-14 reusable SPL candidate",
           sourceLabel: "M-26-14 Advisory",
           contextExcerpt: candidate.why_reuse || m2614ValidationRagContext.operator_brief || "",
           className: "sm:justify-end"
-        })), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2 text-xs" }, (reuseTier || knownGood) && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}` }, "Reuse: ", knownGood ? "Known Good" : formatSplIntelligenceLabel(reuseTier, "Candidate")), fitStatus && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}` }, "Environment Fit: ", formatSplIntelligenceLabel(fitStatus, "Unknown")), validationStatus && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}` }, "Validation: ", formatSplIntelligenceLabel(validationStatus, "Unknown"))), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 max-h-32 overflow-auto rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-gray-50 border-gray-200 text-gray-900"}` }, query));
-      }))), m2614ValidationLlmAnalysis && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-advisory-panel", className: `mt-4 rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain text-violet-600" }), /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, "Grounded Advisory")), m2614ValidationLlmAnalysis.message && m2614ValidationLlmAnalysis.status !== "ready" && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs mb-3 ${isDarkTheme ? "border-gray-700 bg-gray-900 text-gray-200" : "border-gray-200 bg-gray-50 text-gray-700"}` }, m2614ValidationLlmAnalysis.message), m2614ValidationLlmAnalysis.summary && /* @__PURE__ */ React.createElement("div", { className: `text-xs leading-6 ${subtextClass}` }, m2614ValidationLlmAnalysis.summary), m2614ValidationLlmAnalysis.environment_relevance && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Why this matters here:"), " ", m2614ValidationLlmAnalysis.environment_relevance), Array.isArray(m2614ValidationLlmAnalysis.recommended_adjustments) && m2614ValidationLlmAnalysis.recommended_adjustments.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${mutedTextClass}` }, "Recommended Adjustments"), /* @__PURE__ */ React.createElement("ul", { className: `mt-2 space-y-2 text-xs ${subtextClass}` }, m2614ValidationLlmAnalysis.recommended_adjustments.slice(0, 4).map((item, itemIdx) => /* @__PURE__ */ React.createElement("li", { key: `m2614-adjustment-${itemIdx}`, className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? "bg-violet-300" : "bg-violet-600"}` }), /* @__PURE__ */ React.createElement("span", null, item))))), Array.isArray(m2614ValidationLlmAnalysis.suggested_follow_ups) && m2614ValidationLlmAnalysis.suggested_follow_ups.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-xs ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Follow-up:"), " ", m2614ValidationLlmAnalysis.suggested_follow_ups[0]), Array.isArray(m2614ValidationLlmAnalysis.evidence_gaps) && m2614ValidationLlmAnalysis.evidence_gaps.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Evidence gap:"), " ", m2614ValidationLlmAnalysis.evidence_gaps[0]), Array.isArray(m2614ValidationLlmAnalysis.confidence_notes) && m2614ValidationLlmAnalysis.confidence_notes.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Confidence note:"), " ", m2614ValidationLlmAnalysis.confidence_notes[0]))))))));
+        })), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2 text-xs" }, (reuseTier || knownGood) && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}` }, "Reuse: ", knownGood ? "Known Good" : formatSplIntelligenceLabel(reuseTier, "Candidate")), fitStatus && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}` }, "Environment Fit: ", formatSplIntelligenceLabel(fitStatus, "Unknown")), validationStatus && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}` }, "Validation: ", formatSplIntelligenceLabel(validationStatus, "Unknown"))), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 max-h-32 overflow-auto ${m2614CodeClass}` }, query));
+      }))), m2614ValidationLlmAnalysis && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-advisory-panel", className: m2614CardClass }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold mb-2 ${headingClass}` }, "AI Review"), m2614ValidationLlmAnalysis.message && m2614ValidationLlmAnalysis.status !== "ready" && /* @__PURE__ */ React.createElement("p", { className: `mb-2 text-sm ${mutedTextClass}` }, m2614ValidationLlmAnalysis.message), m2614ValidationLlmAnalysis.summary && /* @__PURE__ */ React.createElement("p", { className: `text-sm leading-6 ${subtextClass}` }, m2614ValidationLlmAnalysis.summary), /* @__PURE__ */ React.createElement("dl", { className: "mt-2 space-y-1.5" }, renderLabeledLine("Why this matters here:", m2614ValidationLlmAnalysis.environment_relevance)), Array.isArray(m2614ValidationLlmAnalysis.recommended_adjustments) && m2614ValidationLlmAnalysis.recommended_adjustments.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, /* @__PURE__ */ React.createElement("h5", { className: `mb-2 text-xs font-semibold uppercase tracking-wider ${mutedTextClass}` }, "Suggested changes"), renderBulletList(m2614ValidationLlmAnalysis.recommended_adjustments.slice(0, 4), "m2614-adjustment")), /* @__PURE__ */ React.createElement("dl", { className: "mt-3 space-y-1.5" }, renderLabeledLine("Follow-up:", firstItem(m2614ValidationLlmAnalysis.suggested_follow_ups)), renderLabeledLine("Missing evidence:", firstItem(m2614ValidationLlmAnalysis.evidence_gaps), mutedTextClass), renderLabeledLine("Confidence note:", firstItem(m2614ValidationLlmAnalysis.confidence_notes), mutedTextClass)))))));
     };
     const renderRagWorkspaceView = () => {
       var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2;
@@ -5900,14 +5916,14 @@ This deletes the token. Anything using it loses access.`);
                                     <div class="flex flex-col gap-2 flex-shrink-0">
                                         <button
                                             data-credential-name="${escapeSettingsHtml(cred.name)}" onclick="loadCredentialIntoSettings(this.dataset.credentialName)"
-                                            class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                            class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold transition-colors"
                                             title="Load this credential into the settings form above"
                                         >
                                             <i class="fas fa-download mr-2"></i>Load
                                         </button>
                                         <button
                                             data-credential-name="${escapeSettingsHtml(cred.name)}" onclick="deleteCredential(this.dataset.credentialName)"
-                                            class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                            class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold transition-colors"
                                             title="Permanently delete this saved credential"
                                         >
                                             <i class="fas fa-trash-alt mr-2"></i>Delete
@@ -6129,21 +6145,21 @@ This action cannot be undone.`);
                                 <div class="flex flex-col gap-2 flex-shrink-0">
                                     <button
                                         data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="testMCPConfig(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold transition-colors"
                                         title="Test connection to this MCP server"
                                     >
                                         <i class="fas fa-network-wired mr-2"></i>Test
                                     </button>
                                     <button
                                         data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="loadMCPConfigIntoSettings(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold transition-colors"
                                         title="Load this configuration into active settings"
                                     >
                                         <i class="fas fa-download mr-2"></i>Load
                                     </button>
                                     <button
                                         data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="deleteMCPConfig(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold shadow-md hover:shadow-lg transition-all transform hover:scale-105"
+                                        class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold transition-colors"
                                         title="Permanently delete this saved configuration"
                                     >
                                         <i class="fas fa-trash-alt mr-2"></i>Delete
@@ -6197,7 +6213,7 @@ This action cannot be undone.`);
           await loadConfig();
           await loadMCPConfigs();
           const successDiv = document.createElement("div");
-          successDiv.className = "fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce";
+          successDiv.className = "fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50";
           successDiv.innerHTML = `
                             <div class="flex items-center gap-3">
                                 <i class="fas fa-check-circle text-2xl"></i>
@@ -6662,7 +6678,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
         /* @__PURE__ */ React.createElement("i", { className: `fas ${icon} mr-2` }),
         label
       );
-      return /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-troubleshooter" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border-2 ${isDarkTheme ? "bg-gray-800 border-amber-700" : "bg-gradient-to-r from-amber-50 to-orange-50 border-amber-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2 text-amber-600" }), "Troubleshoot a Connection"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Enter the settings that won't connect or won't save. The checks look at the app itself, the values you entered, saving, the network, and the server's reply, and explain what to fix. Nothing is saved.")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mb-4" }, kindButton("mcp", "MCP Server", "fa-server"), kindButton("llm", "AI Provider", "fa-brain")), /* @__PURE__ */ React.createElement("div", { className: panelClass2 }, /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-name" }, kind === "mcp" ? "Configuration name" : "Credential name", /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(optional; a blank ", secretLabel, " uses the one saved under this name)")), /* @__PURE__ */ React.createElement(
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-troubleshooter" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2 text-indigo-600", "aria-hidden": "true" }), "Troubleshoot a Connection"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Enter the settings that won't connect or won't save. The checks look at the app itself, the values you entered, saving, the network, and the server's reply, and explain what to fix. Nothing is saved.")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mb-4" }, kindButton("mcp", "MCP Server", "fa-server"), kindButton("llm", "AI Provider", "fa-brain")), /* @__PURE__ */ React.createElement("div", { className: panelClass2 }, /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: labelClass, htmlFor: "troubleshoot-name" }, kind === "mcp" ? "Configuration name" : "Credential name", /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(optional; a blank ", secretLabel, " uses the one saved under this name)")), /* @__PURE__ */ React.createElement(
         "input",
         {
           id: "troubleshoot-name",
@@ -6868,7 +6884,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
         }));
         handleSettingsChange();
       };
-      return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border-2 ${isDarkTheme ? "bg-gray-800 border-indigo-700" : "bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between mb-5" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-user-shield mr-2 text-indigo-600" }), activeSettingsTab === "users" ? "Users and Roles" : "Security"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, activeSettingsTab === "users" ? "Create local users, set their roles, and choose their default MCP connection." : "Turn on sign-in and manage tokens for the external REST API and inbound MCP endpoint.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-4 py-3 text-xs ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold text-gray-900" }, "Current state"), /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, "Sign-in: ", securityConfig2.auth_enabled ? "required" : "off (anyone can use the app)"), /* @__PURE__ */ React.createElement("div", null, "External API: ", securityConfig2.external_api_enabled ? "on" : "off"), /* @__PURE__ */ React.createElement("div", null, "Inbound MCP: ", securityConfig2.external_mcp_enabled ? "on" : "off"))), activeSettingsTab === "access" && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4 mb-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Mode"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, securityConfig2.auth_enabled ? "Secured" : "Open"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, securityConfig2.auth_enabled ? "Sign-in required" : "No sign-in required")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Current Session"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, (authStatus == null ? void 0 : authStatus.authenticated) ? (currentUser == null ? void 0 : currentUser.username) || "Signed in" : "Not signed in"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, (authStatus == null ? void 0 : authStatus.authenticated) ? `${(currentUser == null ? void 0 : currentUser.role) || "unknown"} access` : "No one is signed in")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Users"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, securityUsers.length), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, "Local accounts")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Tokens"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, securityTokens.length), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, "For external API and MCP clients"))), activeSettingsTab === "access" && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 md:flex-row md:items-start md:justify-between mb-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h4", { className: "text-base font-semibold text-gray-900" }, "Sign-in and API Settings"), /* @__PURE__ */ React.createElement("p", { className: "text-xs text-gray-500 mt-1" }, "Click Save Settings at the bottom to apply changes.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg px-3 py-2 text-xs ${isDarkTheme ? "bg-gray-950 border border-gray-700 text-gray-300" : "bg-gray-50 border border-gray-200 text-gray-600"}` }, "Session timeout: ", securityConfig2.session_timeout_minutes || 480, " min")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-4 xl:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: `flex items-start justify-between gap-4 rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-gray-950 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold text-gray-900" }, "Enable Authentication"), /* @__PURE__ */ React.createElement(
+      return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between mb-5" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-user-shield mr-2 text-indigo-600" }), activeSettingsTab === "users" ? "Users and Roles" : "Security"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, activeSettingsTab === "users" ? "Create local users, set their roles, and choose their default MCP connection." : "Turn on sign-in and manage tokens for the external REST API and inbound MCP endpoint.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-4 py-3 text-xs ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold text-gray-900" }, "Current state"), /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, "Sign-in: ", securityConfig2.auth_enabled ? "required" : "off (anyone can use the app)"), /* @__PURE__ */ React.createElement("div", null, "External API: ", securityConfig2.external_api_enabled ? "on" : "off"), /* @__PURE__ */ React.createElement("div", null, "Inbound MCP: ", securityConfig2.external_mcp_enabled ? "on" : "off"))), activeSettingsTab === "access" && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4 mb-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Mode"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, securityConfig2.auth_enabled ? "Secured" : "Open"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, securityConfig2.auth_enabled ? "Sign-in required" : "No sign-in required")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Current Session"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, (authStatus == null ? void 0 : authStatus.authenticated) ? (currentUser == null ? void 0 : currentUser.username) || "Signed in" : "Not signed in"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, (authStatus == null ? void 0 : authStatus.authenticated) ? `${(currentUser == null ? void 0 : currentUser.role) || "unknown"} access` : "No one is signed in")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Users"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, securityUsers.length), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, "Local accounts")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-xs uppercase tracking-wider text-gray-500" }, "Tokens"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xl font-bold text-gray-900" }, securityTokens.length), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-xs text-gray-500" }, "For external API and MCP clients"))), activeSettingsTab === "access" && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 md:flex-row md:items-start md:justify-between mb-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h4", { className: "text-base font-semibold text-gray-900" }, "Sign-in and API Settings"), /* @__PURE__ */ React.createElement("p", { className: "text-xs text-gray-500 mt-1" }, "Click Save Settings at the bottom to apply changes.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg px-3 py-2 text-xs ${isDarkTheme ? "bg-gray-950 border border-gray-700 text-gray-300" : "bg-gray-50 border border-gray-200 text-gray-600"}` }, "Session timeout: ", securityConfig2.session_timeout_minutes || 480, " min")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-4 xl:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: `flex items-start justify-between gap-4 rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-gray-950 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold text-gray-900" }, "Enable Authentication"), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
@@ -8312,6 +8328,24 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       if (source === "template") return "Template-based";
       return "Query";
     };
+    const getQueryPriorityMeta = (priority) => {
+      const level = String(priority || "").replace(/[^A-Za-z\s]/g, " ").trim().split(/\s+/)[0].toLowerCase();
+      if (!level) return null;
+      const label = `${level.charAt(0).toUpperCase()}${level.slice(1)} priority`;
+      if (level === "critical" || level === "high") {
+        return { label, className: isDarkTheme ? "bg-red-950 text-red-200 border-red-800" : "bg-red-50 text-red-800 border-red-200" };
+      }
+      if (level === "medium") {
+        return { label, className: isDarkTheme ? "bg-amber-950 text-amber-200 border-amber-800" : "bg-amber-50 text-amber-800 border-amber-200" };
+      }
+      return { label, className: isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gray-100 text-gray-700 border-gray-200" };
+    };
+    const getVerificationStatusLabel = (status) => {
+      if (status === "success") return "Passed";
+      if (status === "partial") return "Partly passed";
+      if (status === "failed") return "Failed";
+      return "Could not run";
+    };
     const getRiskTaskFilterKey = (risk) => {
       const riskText = [risk == null ? void 0 : risk.domain, risk == null ? void 0 : risk.risk, risk == null ? void 0 : risk.impact, risk == null ? void 0 : risk.mitigation].filter(Boolean).join(" ").toLowerCase();
       if (riskText.includes("security") || riskText.includes("authentication") || riskText.includes("privilege")) {
@@ -8688,7 +8722,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
         categories: Array.isArray(queryFocus2.categories) ? queryFocus2.categories : [],
         findingReference: queryFocus2.findingReference || "",
         environmentEvidence: Array.isArray(queryFocus2.environmentEvidence) ? queryFocus2.environmentEvidence : [],
-        sourceLabel: queryFocus2.sourceLabel || "Focused From Context Explorer",
+        sourceLabel: queryFocus2.sourceLabel || "From Context Explorer",
         description: queryFocus2.description || "",
         generatedQueries: Array.isArray(queryFocus2.generatedQueries) ? queryFocus2.generatedQueries : []
       });
@@ -8854,7 +8888,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
     const nextLoopSection = getSummarySection(summarySections, "Next Check") || getSummarySection(summarySections, "Recursive Next Loop");
     const readinessScore = typeof ((_O = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _O : (_N = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _N.readiness_score) === "number" ? (_Q = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _Q : (_P = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _P.readiness_score : null;
     const coverageGapItems = Array.isArray(summaryData == null ? void 0 : summaryData.coverage_gaps) ? summaryData.coverage_gaps.filter((gap) => gap && typeof gap === "object" && gap.gap).slice(0, 3) : [];
-    const trendDomainEntries = ((_R = summaryData == null ? void 0 : summaryData.trend_signals) == null ? void 0 : _R.recommendation_by_domain) ? Object.entries(summaryData.trend_signals.recommendation_by_domain) : [];
+    const trendDomainEntries = ((_R = summaryData == null ? void 0 : summaryData.trend_signals) == null ? void 0 : _R.recommendation_by_domain) ? Object.entries(summaryData.trend_signals.recommendation_by_domain).filter(([, count]) => Number(count) > 0) : [];
     const contextExplorer = (summaryData == null ? void 0 : summaryData.context_explorer) && typeof summaryData.context_explorer === "object" ? summaryData.context_explorer : {};
     const contextOverview = (contextExplorer == null ? void 0 : contextExplorer.overview) && typeof contextExplorer.overview === "object" ? contextExplorer.overview : {};
     const contextAnchors = (contextExplorer == null ? void 0 : contextExplorer.anchors) && typeof contextExplorer.anchors === "object" ? contextExplorer.anchors : {};
@@ -8912,9 +8946,9 @@ Open Troubleshoot to find out why it can't be saved?`)) {
     };
     const queryFilterOptions = [
       { key: "all", label: "All", count: focusScopedSummaryQueries.length, activeClass: "bg-indigo-600 text-white" },
-      { key: "ai_finding", label: "AI-generated", count: querySourceCounts.ai_finding, activeClass: "bg-purple-600 text-white" },
-      { key: "context_engine", label: "Environment-based", count: querySourceCounts.context_engine, activeClass: "bg-emerald-600 text-white" },
-      { key: "template", label: "Template-based", count: querySourceCounts.template, activeClass: "bg-blue-600 text-white" }
+      { key: "ai_finding", label: "AI-generated", count: querySourceCounts.ai_finding, activeClass: "bg-indigo-600 text-white" },
+      { key: "context_engine", label: "Environment-based", count: querySourceCounts.context_engine, activeClass: "bg-indigo-600 text-white" },
+      { key: "template", label: "Template-based", count: querySourceCounts.template, activeClass: "bg-indigo-600 text-white" }
     ].filter((option) => option.key === "all" || option.count > 0);
     const activeQueryFilterKey = queryFilterOptions.some((option) => option.key === queryFilter) ? queryFilter : "all";
     const filteredSummaryQueries = focusScopedSummaryQueries.filter((query) => activeQueryFilterKey === "all" || (query == null ? void 0 : query.query_source) === activeQueryFilterKey);
@@ -8956,14 +8990,14 @@ Open Troubleshoot to find out why it can't be saved?`)) {
     }, {});
     const taskFilterOptions = [
       { key: "all", label: "All", count: sortedTaskProgressSnapshots.length, activeClass: "bg-indigo-600 text-white" },
-      { key: "open", label: "Open", count: openTaskCount, activeClass: "bg-slate-700 text-white" },
-      { key: "in-progress", label: "In Progress", count: inProgressTaskCount, activeClass: "bg-blue-600 text-white" },
-      { key: "completed", label: "Completed", count: completedTaskCount, activeClass: "bg-green-600 text-white" },
+      { key: "open", label: "Open", count: openTaskCount, activeClass: "bg-indigo-600 text-white" },
+      { key: "in-progress", label: "In Progress", count: inProgressTaskCount, activeClass: "bg-indigo-600 text-white" },
+      { key: "completed", label: "Completed", count: completedTaskCount, activeClass: "bg-indigo-600 text-white" },
       ...Object.entries(taskCategoryCounts).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0])).map(([category, count]) => ({
         key: `category:${category}`,
         label: category,
         count,
-        activeClass: "bg-purple-600 text-white"
+        activeClass: "bg-indigo-600 text-white"
       }))
     ].filter((option) => option.key === "all" || option.count > 0);
     const activeTaskFilterKey = taskFilterOptions.some((option) => option.key === taskFilter) ? taskFilter : "all";
@@ -9069,7 +9103,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       const { type, data } = message;
       switch (type) {
         case "banner":
-          return /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-r from-purple-700 to-blue-700 text-white p-6 rounded-lg fade-in" }, /* @__PURE__ */ React.createElement("h1", { className: "text-2xl font-bold" }, data.title), /* @__PURE__ */ React.createElement("p", { className: "text-purple-50" }, data.subtitle), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-blue-50 mt-2" }, "Started ", formatMissionDateTime(data.start_time_iso || data.start_time, data.start_time || "at an unknown time")));
+          return /* @__PURE__ */ React.createElement("div", { className: "bg-indigo-700 text-white p-6 rounded-lg fade-in" }, /* @__PURE__ */ React.createElement("h1", { className: "text-2xl font-bold" }, data.title), /* @__PURE__ */ React.createElement("p", { className: "text-indigo-50" }, data.subtitle), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-indigo-100 mt-2" }, "Started ", formatMissionDateTime(data.start_time_iso || data.start_time, data.start_time || "at an unknown time")));
         case "phase":
           return /* @__PURE__ */ React.createElement("div", { className: `border-l-4 p-4 slide-in ${isDarkTheme ? "bg-indigo-950 border-indigo-500" : "bg-indigo-50 border-indigo-500"}` }, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-semibold ${isDarkTheme ? "text-indigo-200" : "text-indigo-900"}` }, data.title));
         case "success":
@@ -9103,55 +9137,71 @@ Open Troubleshoot to find out why it can't be saved?`)) {
           return /* @__PURE__ */ React.createElement("div", { className: `fade-in ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("pre", { className: `text-xs p-2 rounded ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-gray-50 border border-gray-200"}` }, JSON.stringify(data, null, 2)));
       }
     };
+    const summaryCardClass = isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200";
+    const summaryInsetClass = isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-gray-50 border-gray-200";
+    const summaryLabelClass = isDarkTheme ? "text-gray-400" : "text-gray-600";
+    const summaryCodeClass = isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-gray-50 border-gray-200 text-gray-900";
+    const summaryPillClass = `inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gray-100 text-gray-700 border-gray-200"}`;
+    const summaryButtonClass = `inline-flex items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition-colors ${secondaryButtonClass}`;
+    const formatSummaryLevel = (value, fallback = "") => {
+      const text = String(value || fallback || "").trim();
+      return text ? `${text.charAt(0).toUpperCase()}${text.slice(1).toLowerCase()}` : "";
+    };
     const renderExecutiveControlSummary = () => {
-      var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2, _i2, _j2, _k2, _l2, _m2, _n2, _o2, _p2, _q2, _r2, _s2, _t2, _u2, _v2, _w2, _x2, _y2, _z2, _A2, _B2;
+      var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2, _i2, _j2, _k2, _l2, _m2, _n2, _o2, _p2, _q2, _r2, _s2, _t2, _u2, _v2, _w2;
       const narrativeParagraphs = ((_a2 = executiveNarrativeSection == null ? void 0 : executiveNarrativeSection.paragraphs) == null ? void 0 : _a2.length) ? executiveNarrativeSection.paragraphs.slice(1, 4) : summaryData.ai_summary ? [summaryData.ai_summary] : [];
       const hasTrendStory = !!trendStorySection && (trendStorySection.paragraphs.length > 0 || trendStorySection.items.length > 0);
-      return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `border rounded-2xl overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700 bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900" : "border-gray-200 bg-gradient-to-r from-slate-50 via-indigo-50 to-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, "Executive Summary"), /* @__PURE__ */ React.createElement("h3", { className: `mt-2 text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "What this run found"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, ((_b2 = executiveNarrativeSection == null ? void 0 : executiveNarrativeSection.paragraphs) == null ? void 0 : _b2[0]) || "No executive summary was recorded for this run.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-indigo-800" : "bg-white border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, readinessScore != null ? readinessScore : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, getReadinessLabel(readinessScore))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-red-800" : "bg-white border-red-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, "Open Risks"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_f2 = (_e2 = (_c2 = summaryData.risk_register) == null ? void 0 : _c2.length) != null ? _e2 : (_d2 = summaryData.v2_context) == null ? void 0 : _d2.risk_register) != null ? _f2 : 0), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Risks to address")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-amber-800" : "bg-white border-amber-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-amber-300" : "text-amber-700"}` }, "Coverage Gaps"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_j2 = (_i2 = (_g2 = summaryData.coverage_gaps) == null ? void 0 : _g2.length) != null ? _i2 : (_h2 = summaryData.v2_context) == null ? void 0 : _h2.coverage_gaps) != null ? _j2 : 0), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Missing or incomplete coverage")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-emerald-800" : "bg-white border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-emerald-300" : "text-emerald-700"}` }, "Admin Tasks"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, ((_k2 = summaryData.admin_tasks) == null ? void 0 : _k2.length) || 0), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Ready to start")))), /* @__PURE__ */ React.createElement("div", { className: "mt-6 grid gap-3 md:grid-cols-4" }, [
-        { step: "1", title: "Review evidence", detail: `${countLabel((_m2 = (_l2 = summaryData.trend_signals) == null ? void 0 : _l2.evidence_steps) != null ? _m2 : 0, "evidence step")} recorded.` },
-        { step: "2", title: "Set priorities", detail: `${countLabel(((_n2 = priorityActionsSection == null ? void 0 : priorityActionsSection.items) == null ? void 0 : _n2.length) || 0, "priority action")} ready.` },
-        { step: "3", title: "Classify data", detail: `${countLabel(((_o2 = summaryData.stats) == null ? void 0 : _o2.unknown_items) || 0, "data source")} to classify.` },
-        { step: "4", title: "Check again", detail: `${countLabel(((_p2 = summaryData.recursive_investigations) == null ? void 0 : _p2.length) || 0, "follow-up check")} planned.` }
-      ].map((stage) => /* @__PURE__ */ React.createElement("div", { key: stage.step, className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex h-8 w-8 items-center justify-center rounded-full text-sm font-bold ${isDarkTheme ? "bg-indigo-900 text-indigo-100" : "bg-indigo-100 text-indigo-700"}` }, stage.step), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, stage.title), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, stage.detail))))))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 p-6 xl:grid-cols-[minmax(0,1.55fr),minmax(320px,0.95fr)]" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-6" }, (narrativeParagraphs.length > 0 || hasTrendStory) && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain text-indigo-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Details")), narrativeParagraphs.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, narrativeParagraphs.map((paragraph, idx) => /* @__PURE__ */ React.createElement("p", { key: idx, className: `text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, paragraph))), hasTrendStory && /* @__PURE__ */ React.createElement("div", { className: `${narrativeParagraphs.length > 0 ? "mt-4 " : ""}rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-blue-300" : "text-blue-700"}` }, "Trend"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, (trendStorySection.paragraphs.length > 0 ? trendStorySection.paragraphs : trendStorySection.items).slice(0, 2).map((paragraph, idx) => /* @__PURE__ */ React.createElement("p", { key: idx, className: `text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, paragraph))))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-4 lg:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye text-red-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Priority Actions")), /* @__PURE__ */ React.createElement("ol", { className: "space-y-3" }, (((_q2 = priorityActionsSection == null ? void 0 : priorityActionsSection.items) == null ? void 0 : _q2.length) ? priorityActionsSection.items : ["This summary lists no priority actions."]).slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `flex items-start gap-3 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-red-900 text-red-100" : "bg-red-100 text-red-700"}` }, idx + 1), /* @__PURE__ */ React.createElement("span", { className: "leading-6" }, item))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bolt text-amber-500" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Quick Wins")), /* @__PURE__ */ React.createElement("ul", { className: "space-y-3" }, (((_r2 = quickWinsSection == null ? void 0 : quickWinsSection.items) == null ? void 0 : _r2.length) ? quickWinsSection.items : ["This summary lists no quick wins."]).slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `flex items-start gap-3 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle mt-1 text-emerald-500" }), /* @__PURE__ */ React.createElement("span", { className: "leading-6" }, item))))))), /* @__PURE__ */ React.createElement("div", { className: "space-y-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-satellite-dish text-blue-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "By the Numbers")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-blue-300" : "text-blue-700"}` }, "Evidence Steps"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_t2 = (_s2 = summaryData.trend_signals) == null ? void 0 : _s2.evidence_steps) != null ? _t2 : 0)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-emerald-300" : "text-emerald-700"}` }, "High-Priority Recommendations"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_v2 = (_u2 = summaryData.trend_signals) == null ? void 0 : _u2.high_priority_recommendations) != null ? _v2 : 0)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-amber-300" : "text-amber-700"}` }, "Use Case Categories"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, ((_x2 = (_w2 = summaryData.stats) == null ? void 0 : _w2.categories) == null ? void 0 : _x2.length) || 0)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-orange-300" : "text-orange-700"}` }, "Unclassified Data"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, ((_y2 = summaryData.stats) == null ? void 0 : _y2.unknown_items) || 0))), trendDomainEntries.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, trendDomainEntries.map(([domain, count]) => /* @__PURE__ */ React.createElement("span", { key: domain, className: `inline-flex items-center rounded-full border px-2.5 py-1 text-xs ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold mr-2 capitalize" }, domain.replace(/_/g, " ")), /* @__PURE__ */ React.createElement("span", null, count)))), (((_z2 = riskAreasSection == null ? void 0 : riskAreasSection.items) == null ? void 0 : _z2.length) > 0 || coverageGapItems.length > 0) && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, "Main Risks"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-2" }, (((_A2 = riskAreasSection == null ? void 0 : riskAreasSection.items) == null ? void 0 : _A2.length) ? riskAreasSection.items : coverageGapItems.map((gap) => gap.gap)).slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, item))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync-alt text-purple-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Next Check")), /* @__PURE__ */ React.createElement("ul", { className: "space-y-3" }, (((_B2 = nextLoopSection == null ? void 0 : nextLoopSection.items) == null ? void 0 : _B2.length) ? nextLoopSection.items : ["This summary does not say when to check again."]).slice(0, 5).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `flex items-start gap-3 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-rotate-right mt-1 text-purple-500" }), /* @__PURE__ */ React.createElement("span", { className: "leading-6" }, item)))), summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4 space-y-2" }, summaryData.recursive_investigations.slice(0, 2).map((loop, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `rounded-lg border px-3 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, loop.loop || `Check ${idx + 1}`), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("strong", null, "Trigger:"), " ", loop.next_iteration_trigger || "N/A")))))))), summaryData.risk_register && summaryData.risk_register.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-red-950 border-red-700" : "bg-red-50 border-red-200"} border rounded-xl p-5` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 mb-4 sm:flex-row sm:items-end sm:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold mt-1 flex items-center ${isDarkTheme ? "text-red-200" : "text-red-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-shield-alt text-red-600 mr-2" }), "Top Risks (", Math.min(summaryData.risk_register.length, 6), ")")), /* @__PURE__ */ React.createElement("p", { className: `text-sm ${isDarkTheme ? "text-red-300" : "text-red-800"}` }, "The gaps most likely to cause outages, blind spots, or lost confidence.")), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, summaryData.risk_register.slice(0, 6).map((risk, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `${isDarkTheme ? "bg-gray-900 border-red-700" : "bg-white border-red-200"} border rounded-xl p-4` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-1 flex-wrap" }, /* @__PURE__ */ React.createElement("span", { className: `px-2 py-0.5 text-xs font-semibold rounded-full ${String(risk.severity || "").toLowerCase() === "high" ? "bg-red-600 text-white" : String(risk.severity || "").toLowerCase() === "critical" ? "bg-red-700 text-white" : String(risk.severity || "").toLowerCase() === "medium" ? "bg-orange-700 text-white" : "bg-gray-500 text-white"}` }, (risk.severity || "medium").toString().toUpperCase()), /* @__PURE__ */ React.createElement("span", { className: `text-xs capitalize ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, String(risk.domain || "general").replace(/_/g, " "))), /* @__PURE__ */ React.createElement("p", { className: `font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, risk.risk || "Operational risk"), risk.impact && /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-1 leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, risk.impact)), /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:items-end" }, /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => focusRiskControlPath(risk),
-          className: "px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs rounded"
-        },
-        "Show Related Tasks"
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => focusQueriesForRisk(risk),
-          className: "px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded"
-        },
-        "Show Related Searches"
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => launchChatInvestigation(
-            buildRiskInvestigationPrompt(risk),
-            { freshContext: true }
-          ),
-          className: `px-3 py-1.5 text-xs font-medium rounded border transition-colors ${isDarkTheme ? "border-red-700 bg-red-950 text-red-100 hover:bg-red-900" : "border-red-700 bg-red-700 text-white hover:bg-red-800"}`
-        },
-        "Investigate in Chat"
-      ))))))), unknownDataItems.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-orange-700" : "bg-orange-50 border-orange-200"} border rounded-xl p-5` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-4 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-orange-300" : "text-orange-700"}` }, "Control Validation Queue"), /* @__PURE__ */ React.createElement("h3", { className: `text-xl font-semibold mt-1 flex items-center ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-layer-group text-orange-500 mr-2" }), "Classify Unclear Data Sources (", unknownDataItems.length, ")"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-2 leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "The summary artifact already knows these entities are weakly understood. Use this queue to decide ownership, business value, and whether they deserve monitoring or control coverage.")), unknownDataItems.length > 4 && /* @__PURE__ */ React.createElement(
+      const summaryIconClass = isDarkTheme ? "text-indigo-300" : "text-indigo-600";
+      return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `border rounded-xl overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, "Executive Summary"), /* @__PURE__ */ React.createElement("h3", { className: `mt-2 text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "What this run found"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, ((_b2 = executiveNarrativeSection == null ? void 0 : executiveNarrativeSection.paragraphs) == null ? void 0 : _b2[0]) || "No executive summary was recorded for this run.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, readinessScore != null ? readinessScore : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, getReadinessLabel(readinessScore))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Open Risks"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_f2 = (_e2 = (_c2 = summaryData.risk_register) == null ? void 0 : _c2.length) != null ? _e2 : (_d2 = summaryData.v2_context) == null ? void 0 : _d2.risk_register) != null ? _f2 : 0), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Risks to address")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Coverage Gaps"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_j2 = (_i2 = (_g2 = summaryData.coverage_gaps) == null ? void 0 : _g2.length) != null ? _i2 : (_h2 = summaryData.v2_context) == null ? void 0 : _h2.coverage_gaps) != null ? _j2 : 0), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Missing or incomplete coverage")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Admin Tasks"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, ((_k2 = summaryData.admin_tasks) == null ? void 0 : _k2.length) || 0), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Ready to start"))))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 p-6 xl:grid-cols-[minmax(0,1.55fr),minmax(320px,0.95fr)]" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-6" }, (narrativeParagraphs.length > 0 || hasTrendStory) && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain ${summaryIconClass}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Details")), narrativeParagraphs.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, narrativeParagraphs.map((paragraph, idx) => /* @__PURE__ */ React.createElement("p", { key: idx, className: `text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, paragraph))), hasTrendStory && /* @__PURE__ */ React.createElement("div", { className: `${narrativeParagraphs.length > 0 ? "mt-4 " : ""}rounded-lg border px-4 py-3 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "Trend"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, (trendStorySection.paragraphs.length > 0 ? trendStorySection.paragraphs : trendStorySection.items).slice(0, 2).map((paragraph, idx) => /* @__PURE__ */ React.createElement("p", { key: idx, className: `text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, paragraph))))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-4 lg:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-bullseye ${summaryIconClass}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Priority Actions")), /* @__PURE__ */ React.createElement("ol", { className: "space-y-3" }, (((_l2 = priorityActionsSection == null ? void 0 : priorityActionsSection.items) == null ? void 0 : _l2.length) ? priorityActionsSection.items : ["This summary lists no priority actions."]).slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `flex items-start gap-3 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-indigo-950 text-indigo-200" : "bg-indigo-50 text-indigo-700"}` }, idx + 1), /* @__PURE__ */ React.createElement("span", { className: "leading-6" }, item))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-bolt ${summaryIconClass}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Quick Wins")), /* @__PURE__ */ React.createElement("ul", { className: "space-y-3" }, (((_m2 = quickWinsSection == null ? void 0 : quickWinsSection.items) == null ? void 0 : _m2.length) ? quickWinsSection.items : ["This summary lists no quick wins."]).slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `flex items-start gap-3 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-check-circle mt-1 ${isDarkTheme ? "text-green-300" : "text-green-700"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", { className: "leading-6" }, item))))))), /* @__PURE__ */ React.createElement("div", { className: "space-y-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-chart-bar ${summaryIconClass}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "By the Numbers")), /* @__PURE__ */ React.createElement("dl", { className: `divide-y text-sm ${isDarkTheme ? "divide-gray-800" : "divide-gray-200"}` }, [
+        ["Evidence steps", (_o2 = (_n2 = summaryData.trend_signals) == null ? void 0 : _n2.evidence_steps) != null ? _o2 : 0],
+        ["High-priority recommendations", (_q2 = (_p2 = summaryData.trend_signals) == null ? void 0 : _p2.high_priority_recommendations) != null ? _q2 : 0],
+        ["Use case categories", ((_s2 = (_r2 = summaryData.stats) == null ? void 0 : _r2.categories) == null ? void 0 : _s2.length) || 0],
+        ["Data sources to classify", ((_t2 = summaryData.stats) == null ? void 0 : _t2.unknown_items) || 0]
+      ].map(([label, value]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex items-center justify-between gap-3 py-2" }, /* @__PURE__ */ React.createElement("dt", { className: summaryLabelClass }, label), /* @__PURE__ */ React.createElement("dd", { className: `font-semibold tabular-nums ${headingClass}` }, value)))), trendDomainEntries.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "Recommendations by Area"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2" }, trendDomainEntries.map(([domain, count]) => /* @__PURE__ */ React.createElement("span", { key: domain, className: `inline-flex items-center rounded-full border px-2.5 py-1 text-xs ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold mr-2 capitalize" }, domain.replace(/_/g, " ")), /* @__PURE__ */ React.createElement("span", null, count))))), (((_u2 = riskAreasSection == null ? void 0 : riskAreasSection.items) == null ? void 0 : _u2.length) > 0 || coverageGapItems.length > 0) && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-4 py-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "Main Risks"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-2" }, (((_v2 = riskAreasSection == null ? void 0 : riskAreasSection.items) == null ? void 0 : _v2.length) ? riskAreasSection.items : coverageGapItems.map((gap) => gap.gap)).slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, item))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-sync-alt ${summaryIconClass}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Next Check")), /* @__PURE__ */ React.createElement("ul", { className: "space-y-3" }, (((_w2 = nextLoopSection == null ? void 0 : nextLoopSection.items) == null ? void 0 : _w2.length) ? nextLoopSection.items : ["This summary does not say when to check again."]).slice(0, 5).map((item, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `flex items-start gap-3 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-arrow-rotate-right mt-1 ${summaryLabelClass}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", { className: "leading-6" }, item)))), summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4 space-y-2" }, summaryData.recursive_investigations.slice(0, 2).map((loop, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `rounded-lg border px-3 py-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, loop.loop || `Check ${idx + 1}`), loop.next_iteration_trigger && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${summaryLabelClass}` }, /* @__PURE__ */ React.createElement("strong", null, "Trigger:"), " ", loop.next_iteration_trigger)))))))), summaryData.risk_register && summaryData.risk_register.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `${summaryCardClass} border rounded-lg p-5` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-shield-alt mr-2 ${isDarkTheme ? "text-red-300" : "text-red-600"}`, "aria-hidden": "true" }), "Top Risks", /* @__PURE__ */ React.createElement("span", { className: `ml-2 text-sm font-normal ${summaryLabelClass}` }, "(", Math.min(summaryData.risk_register.length, 6), ")")), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${mutedTextClass}` }, "The gaps most likely to cause outages, blind spots, or lost confidence.")), /* @__PURE__ */ React.createElement("ul", { className: "space-y-3" }, summaryData.risk_register.slice(0, 6).map((risk, idx) => {
+        const severityMeta = getQueryPriorityMeta(risk.severity || "medium");
+        const riskDomain = String(risk.domain || "").replace(/_/g, " ").trim();
+        return /* @__PURE__ */ React.createElement("li", { key: idx, className: `${summaryInsetClass} border rounded-lg p-4` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-1 flex-wrap" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${severityMeta.className}` }, formatSummaryLevel(risk.severity, "medium"), " risk"), riskDomain && /* @__PURE__ */ React.createElement("span", { className: `text-xs capitalize ${summaryLabelClass}` }, riskDomain)), /* @__PURE__ */ React.createElement("p", { className: `font-semibold ${headingClass}` }, risk.risk || "Unnamed risk"), risk.impact && /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-1 leading-6 ${mutedTextClass}` }, risk.impact), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => focusRiskControlPath(risk),
+            className: summaryButtonClass
+          },
+          "Show Related Tasks"
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => focusQueriesForRisk(risk),
+            className: summaryButtonClass
+          },
+          "Show Related Searches"
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => launchChatInvestigation(
+              buildRiskInvestigationPrompt(risk),
+              { freshContext: true }
+            ),
+            className: summaryButtonClass
+          },
+          "Investigate in Chat"
+        )));
+      }))), unknownDataItems.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `${summaryCardClass} border rounded-lg p-5` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-4 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-layer-group mr-2 ${summaryIconClass}`, "aria-hidden": "true" }), "Classify Unclear Data Sources", /* @__PURE__ */ React.createElement("span", { className: `ml-2 text-sm font-normal ${summaryLabelClass}` }, "(", unknownDataItems.length, ")")), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-1 leading-6 ${mutedTextClass}` }, "Discovery could not tell what these data sources are for. Decide who owns each one, whether it matters, and whether it needs monitoring.")), unknownDataItems.length > 4 && /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: () => setShowAllUnknownData((current) => !current),
-          className: `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${isDarkTheme ? "bg-orange-900 text-orange-100 hover:bg-orange-800" : "bg-white text-orange-800 hover:bg-orange-100 border border-orange-200"}`
+          className: `${summaryButtonClass} flex-shrink-0`
         },
         showAllUnknownData ? "Show Fewer" : `Show All ${unknownDataItems.length}`
       )), /* @__PURE__ */ React.createElement("div", { className: "mt-5 grid gap-4 lg:grid-cols-2" }, visibleUnknownData.map((item, idx) => {
         var _a3, _b3;
-        return /* @__PURE__ */ React.createElement("div", { key: `${item.name || "unknown"}-${idx}`, className: `${isDarkTheme ? "border-orange-700 bg-gray-950" : "border-orange-200 bg-white"} border rounded-xl p-4` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${isDarkTheme ? "bg-orange-900 text-orange-100" : "bg-orange-100 text-orange-800"}` }, item.type === "index" ? "Index" : "Sourcetype"), ((_a3 = item.context) == null ? void 0 : _a3.volume_category) && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs border ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, formatVolumeCategory(item.context.volume_category), " signal"), ((_b3 = item.context) == null ? void 0 : _b3.has_significant_data) && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 text-xs border ${isDarkTheme ? "bg-emerald-950 border-emerald-800 text-emerald-200" : "bg-emerald-50 border-emerald-200 text-emerald-700"}` }, "Significant telemetry")), /* @__PURE__ */ React.createElement("h4", { className: `text-base font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("code", { className: `px-2 py-1 rounded text-sm ${isDarkTheme ? "bg-gray-900 text-orange-200" : "bg-orange-50 text-gray-900"}` }, item.name || "unknown")))), /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, item.question || `Classify and validate ${item.name || "this entity"} before it becomes an unmanaged blind spot.`), Array.isArray(item.suggestions) && item.suggestions.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Likely Classifications"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 grid gap-2 sm:grid-cols-2" }, item.suggestions.slice(0, 2).map((suggestion, suggestionIdx) => /* @__PURE__ */ React.createElement("div", { key: `${suggestion.value || suggestion.label || "suggestion"}-${suggestionIdx}`, className: `${isDarkTheme ? "bg-gray-900 border-gray-800" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-2` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, suggestion.label), suggestion.description && /* @__PURE__ */ React.createElement("div", { className: `text-xs mt-1 leading-5 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, suggestion.description))))), /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
+        return /* @__PURE__ */ React.createElement("div", { key: `${item.name || "unknown"}-${idx}`, className: `${summaryInsetClass} border rounded-lg p-4` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: summaryPillClass }, item.type === "index" ? "Index" : "Sourcetype"), ((_a3 = item.context) == null ? void 0 : _a3.volume_category) && /* @__PURE__ */ React.createElement("span", { className: summaryPillClass }, formatVolumeCategory(item.context.volume_category), " volume"), ((_b3 = item.context) == null ? void 0 : _b3.has_significant_data) && /* @__PURE__ */ React.createElement("span", { className: summaryPillClass }, "Has significant data")), /* @__PURE__ */ React.createElement("h4", { className: `text-base font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("code", { className: `px-2 py-0.5 rounded border text-sm ${summaryCodeClass}` }, item.name || "unknown")))), /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${mutedTextClass}` }, item.question || `Find out what ${item.name || "this data source"} is used for and who owns it.`), Array.isArray(item.suggestions) && item.suggestions.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Likely Types"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 grid gap-2 sm:grid-cols-2" }, item.suggestions.slice(0, 2).map((suggestion, suggestionIdx) => /* @__PURE__ */ React.createElement("div", { key: `${suggestion.value || suggestion.label || "suggestion"}-${suggestionIdx}`, className: `${summaryCardClass} border rounded-lg px-3 py-2` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, suggestion.label), suggestion.description && /* @__PURE__ */ React.createElement("div", { className: `text-xs mt-1 leading-5 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, suggestion.description))))), /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
           "button",
           {
+            type: "button",
             onClick: () => {
               var _a4, _b4;
               return launchChatInvestigation(
@@ -9164,12 +9214,13 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
                 { freshContext: true }
               );
             },
-            className: "px-3 py-1.5 bg-orange-700 hover:bg-orange-800 text-white text-xs font-medium rounded transition-colors"
+            className: summaryButtonClass
           },
           "Investigate in Chat"
         ), /* @__PURE__ */ React.createElement(
           "button",
           {
+            type: "button",
             onClick: () => launchChatInvestigation(
               buildUnknownEntityValidationChatPrompt(item),
               {
@@ -9177,7 +9228,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
                 investigationMode: "unknown_entity_context_builder"
               }
             ),
-            className: "px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded"
+            className: summaryButtonClass
           },
           "Build Validation Query"
         )));
@@ -10172,84 +10223,138 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           summaryActionDialog.confirmLabel || "Continue"
         ))
       )
-    ), renderCapabilityDetailModal(), isConnectionModalOpen && /* @__PURE__ */ React.createElement(
-      "div",
-      {
-        className: "fixed inset-0 z-50",
-        onClick: () => setIsConnectionModalOpen(false)
-      },
-      /* @__PURE__ */ React.createElement(
+    ), renderCapabilityDetailModal(), isConnectionModalOpen && (() => {
+      var _a2, _b2, _c2, _d2, _e2, _f2, _g2;
+      const info = connectionInfo;
+      const hasError = !!info && (!!info.error || connectionInfoStatus === "error");
+      const mcpConfigured = !!((_a2 = info == null ? void 0 : info.mcp) == null ? void 0 : _a2.configured);
+      const llmConfigured = !!((_b2 = info == null ? void 0 : info.llm) == null ? void 0 : _b2.configured);
+      const mcpEndpoint = String(((_c2 = info == null ? void 0 : info.mcp) == null ? void 0 : _c2.endpoint) || "").trim();
+      const llmModel = String(((_d2 = info == null ? void 0 : info.llm) == null ? void 0 : _d2.model) || "").trim();
+      const llmSavedAs = String(((_e2 = info == null ? void 0 : info.llm) == null ? void 0 : _e2.display_label) || "").trim();
+      const llmEndpoint = String(((_f2 = info == null ? void 0 : info.llm) == null ? void 0 : _f2.endpoint) || "").trim();
+      const headingClass2 = isDarkTheme ? "text-gray-100" : "text-gray-900";
+      const labelClass = isDarkTheme ? "text-gray-400" : "text-gray-600";
+      const valueClass = isDarkTheme ? "text-gray-100" : "text-gray-900";
+      const dividerClass = isDarkTheme ? "border-gray-700" : "border-gray-200";
+      const iconClass = isDarkTheme ? "text-indigo-300" : "text-indigo-600";
+      const openSettingsFromPopover = () => {
+        setIsConnectionModalOpen(false);
+        openSettings();
+      };
+      const renderSetupPill = (configured) => /* @__PURE__ */ React.createElement("span", { className: `inline-flex flex-shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-medium ${configured ? isDarkTheme ? "border-green-800 bg-green-950 text-green-200" : "border-green-200 bg-green-50 text-green-800" : isDarkTheme ? "border-gray-700 bg-gray-800 text-gray-300" : "border-gray-200 bg-gray-100 text-gray-700"}` }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `h-1.5 w-1.5 rounded-full ${configured ? "bg-green-500" : "bg-gray-400"}` }), configured ? "Set up" : "Not set up");
+      const renderDetailRow = (label, value, { mono = false } = {}) => /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-[5.5rem,1fr] gap-2" }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs ${labelClass}` }, label), /* @__PURE__ */ React.createElement("dd", { className: `min-w-0 break-all text-xs ${valueClass} ${mono ? "font-mono" : "font-medium"}` }, value));
+      const renderSection = (title, icon, configured, details, missingHint) => /* @__PURE__ */ React.createElement("section", { className: `py-3 first:pt-0 last:pb-0 border-b last:border-b-0 ${dividerClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("h3", { className: `flex items-center gap-2 text-sm font-semibold ${headingClass2}` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${icon} text-xs ${iconClass}`, "aria-hidden": "true" }), title), renderSetupPill(configured)), configured ? /* @__PURE__ */ React.createElement("dl", { className: "mt-2 space-y-1.5" }, details) : /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${labelClass}` }, missingHint));
+      return /* @__PURE__ */ React.createElement(
         "div",
         {
-          id: "connection-details-popover",
-          role: "dialog",
-          "aria-modal": "false",
-          "aria-labelledby": "connection-details-title",
-          className: `connection-popover absolute rounded-xl shadow-2xl w-80 ${isDarkTheme ? "bg-gray-800 border border-gray-600" : "bg-white border border-gray-200"}`,
-          onClick: (e) => e.stopPropagation(),
-          onKeyDown: (event) => handleDialogKeyDown(event, () => setIsConnectionModalOpen(false)),
-          tabIndex: -1,
-          style: {
-            top: `${connectionModalPosition.top}px`,
-            left: `${connectionModalPosition.left}px`,
-            boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)"
-          }
+          className: "fixed inset-0 z-50",
+          onClick: () => setIsConnectionModalOpen(false)
         },
         /* @__PURE__ */ React.createElement(
           "div",
           {
-            className: `absolute -top-2 w-4 h-4 rotate-45 border-l border-t ${isDarkTheme ? "bg-gray-800 border-gray-600" : "bg-white border-gray-200"}`,
-            style: { left: `${connectionModalPosition.pointerLeft}px` }
-          }
-        ),
-        /* @__PURE__ */ React.createElement("div", { className: `p-4 border-b flex justify-between items-center relative z-10 rounded-t-xl ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-plug text-lg text-indigo-600 mr-2" }), /* @__PURE__ */ React.createElement("h2", { id: "connection-details-title", className: `text-base font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Connection Details")), /* @__PURE__ */ React.createElement(
-          "button",
-          {
-            type: "button",
-            onClick: () => setIsConnectionModalOpen(false),
-            className: `${isDarkTheme ? "text-gray-400 hover:text-gray-200" : "text-gray-400 hover:text-gray-600"} transition-colors`,
-            "aria-label": "Close connection details"
+            id: "connection-details-popover",
+            role: "dialog",
+            "aria-modal": "false",
+            "aria-labelledby": "connection-details-title",
+            className: `connection-popover absolute rounded-xl shadow-2xl w-80 ${isDarkTheme ? "bg-gray-800 border border-gray-600" : "bg-white border border-gray-200"}`,
+            onClick: (e) => e.stopPropagation(),
+            onKeyDown: (event) => handleDialogKeyDown(event, () => setIsConnectionModalOpen(false)),
+            tabIndex: -1,
+            style: {
+              top: `${connectionModalPosition.top}px`,
+              left: `${connectionModalPosition.left}px`,
+              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)"
+            }
           },
-          /* @__PURE__ */ React.createElement("i", { className: "fas fa-times" })
-        )),
-        /* @__PURE__ */ React.createElement("div", { className: "p-4 space-y-3" }, connectionInfo ? connectionInfo.error ? /* @__PURE__ */ React.createElement("div", { className: "text-sm text-red-600" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-2" }), connectionInfo.error) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-br from-purple-50 to-indigo-50 rounded-lg p-3 border border-indigo-100" }, /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold text-gray-900 mb-2 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain text-purple-600 mr-2 text-xs" }), "AI Model"), /* @__PURE__ */ React.createElement("div", { className: "space-y-1.5" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-500 w-16" }, "Provider:"), /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-900 font-semibold" }, ((_Aa = connectionInfo.llm) == null ? void 0 : _Aa.configured) === false ? "Not configured" : formatProviderName((_Ba = connectionInfo.llm) == null ? void 0 : _Ba.provider))), /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-500 w-16" }, "Model:"), /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-900 font-mono bg-white px-1.5 py-0.5 rounded border border-indigo-200" }, ((_Ca = connectionInfo.llm) == null ? void 0 : _Ca.display_label) || ((_Da = connectionInfo.llm) == null ? void 0 : _Da.model) || "Not configured")), /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-500 w-16" }, "Endpoint:"), /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-700 break-all flex-1" }, ((_Ea = connectionInfo.llm) == null ? void 0 : _Ea.endpoint) || "Not configured")))), /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-br from-green-50 to-emerald-50 rounded-lg p-3 border border-green-100" }, /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold text-gray-900 mb-2 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server text-green-600 mr-2 text-xs" }), "MCP Server"), /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-500 w-16" }, "Endpoint:"), /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-700 font-mono bg-white px-1.5 py-0.5 rounded border border-green-200 break-all flex-1" }, ((_Fa = connectionInfo.mcp) == null ? void 0 : _Fa.endpoint) || "Not configured"))), /* @__PURE__ */ React.createElement("div", { className: `flex items-center justify-center p-2.5 rounded-lg border ${connectionStatusMeta.panelClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${connectionStatusMeta.icon} mr-2 ${connectionStatusMeta.textClass}` }), /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${connectionStatusMeta.textClass}` }, connectionStatusMeta.message))) : /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-center p-6" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin text-lg text-gray-400 mr-2" }), /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-500" }, "Loading...")))
-      )
-    ), (isChatOpen || isChatTab) && /* @__PURE__ */ React.createElement(
+          /* @__PURE__ */ React.createElement(
+            "div",
+            {
+              "aria-hidden": "true",
+              className: `absolute -top-2 w-4 h-4 rotate-45 border-l border-t ${isDarkTheme ? "bg-gray-800 border-gray-600" : "bg-white border-gray-200"}`,
+              style: { left: `${connectionModalPosition.pointerLeft}px` }
+            }
+          ),
+          /* @__PURE__ */ React.createElement("div", { className: `relative z-10 flex items-start justify-between gap-3 rounded-t-xl border-b px-4 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "connection-details-title", className: `text-base font-semibold ${headingClass2}` }, "Connection Details"), info && /* @__PURE__ */ React.createElement("p", { className: `mt-0.5 flex items-center gap-1.5 text-xs ${labelClass}` }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `h-2 w-2 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}` }), headerConnectionMeta.label)), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              autoFocus: true,
+              onClick: () => setIsConnectionModalOpen(false),
+              className: `-mr-1 rounded-md p-1.5 transition-colors ${isDarkTheme ? "text-gray-400 hover:bg-gray-700 hover:text-gray-100" : "text-gray-500 hover:bg-gray-100 hover:text-gray-900"}`,
+              "aria-label": "Close connection details"
+            },
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-times", "aria-hidden": "true" })
+          )),
+          /* @__PURE__ */ React.createElement("div", { className: "px-4 py-3" }, !info ? /* @__PURE__ */ React.createElement("div", { role: "status", className: `flex items-center justify-center gap-2 py-6 text-xs ${labelClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin", "aria-hidden": "true" }), "Loading connection details...") : hasError ? /* @__PURE__ */ React.createElement("div", { role: "alert", className: `text-sm ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, "The app could not read its connection settings. Check the server logs, then try again.") : /* @__PURE__ */ React.createElement(React.Fragment, null, renderSection(
+            "Splunk MCP server",
+            "fa-server",
+            mcpConfigured,
+            mcpEndpoint ? renderDetailRow("Address", mcpEndpoint, { mono: true }) : null,
+            "Add the server address and token in Settings."
+          ), renderSection(
+            "AI model",
+            "fa-brain",
+            llmConfigured,
+            /* @__PURE__ */ React.createElement(React.Fragment, null, llmSavedAs && llmSavedAs !== llmModel && renderDetailRow("Saved as", llmSavedAs), renderDetailRow("Provider", formatProviderName((_g2 = info == null ? void 0 : info.llm) == null ? void 0 : _g2.provider)), llmModel && renderDetailRow("Model", llmModel, { mono: true }), llmEndpoint && renderDetailRow("Endpoint", llmEndpoint)),
+            "Choose a provider and model in Settings."
+          ))),
+          /* @__PURE__ */ React.createElement("div", { className: `flex justify-end gap-2 rounded-b-xl border-t px-4 py-3 ${dividerClass}` }, hasError && /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: loadConnectionInfo,
+              className: `inline-flex items-center justify-center rounded-md border px-3 py-1.5 text-sm font-medium transition-colors ${secondaryButtonClass}`
+            },
+            "Try Again"
+          ), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: openSettingsFromPopover,
+              className: connectionInfoStatus === "connected" ? `inline-flex items-center justify-center rounded-md border px-3 py-1.5 text-sm font-medium transition-colors ${secondaryButtonClass}` : "inline-flex items-center justify-center rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-indigo-700"
+            },
+            "Open Settings"
+          ))
+        )
+      );
+    })(), (isChatOpen || isChatTab) && /* @__PURE__ */ React.createElement(
       "div",
       {
         className: isChatTab ? "fixed inset-x-0 bottom-0 z-40" : "fixed inset-0 bg-black bg-opacity-50 z-50 overflow-y-auto p-3 sm:p-6",
         style: isChatTab ? { top: `${headerHeight}px` } : void 0
       },
-      /* @__PURE__ */ React.createElement("div", { className: isChatTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-6` : "min-h-full w-full flex items-center justify-center" }, /* @__PURE__ */ React.createElement("div", { className: `${isChatTab ? `h-full min-h-0 rounded-2xl shadow-2xl flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white border border-gray-200"}` : `rounded-xl shadow-2xl w-full max-w-4xl min-h-0 flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`}`, style: isChatTab ? void 0 : windowedChatDialogStyle, role: "dialog", "aria-modal": isChatTab ? "false" : "true", "aria-labelledby": "chat-modal-title", onKeyDown: (event) => handleDialogKeyDown(event, closeChatSurface) }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b flex justify-between items-center ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-comments text-2xl text-green-600 mr-3" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { id: "chat-modal-title", className: `text-xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Chat"))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center space-x-2" }, /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { className: isChatTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-6` : "min-h-full w-full flex items-center justify-center" }, /* @__PURE__ */ React.createElement("div", { className: `${isChatTab ? `h-full min-h-0 rounded-2xl shadow-2xl flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white border border-gray-200"}` : `rounded-xl shadow-2xl w-full max-w-4xl min-h-0 flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`}`, style: isChatTab ? void 0 : windowedChatDialogStyle, role: "dialog", "aria-modal": isChatTab ? "false" : "true", "aria-labelledby": "chat-modal-title", onKeyDown: (event) => handleDialogKeyDown(event, closeChatSurface) }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-comments text-xl text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { id: "chat-modal-title", className: `text-xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Chat"))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: () => setIsChatSettingsOpen(true),
-          className: `px-3 py-1 text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}`,
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
           title: "Chat settings",
           "aria-label": "Open chat settings"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog", "aria-hidden": "true" })
       ), isChatTab ? /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: () => exitChatFullscreen({ reopenModal: true }),
-          className: `px-3 py-1 text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}`,
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
           title: "Show chat in a window",
           "aria-label": "Show chat in a window"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-compress-arrows-alt" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-compress-arrows-alt", "aria-hidden": "true" })
       ) : /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: enterChatFullscreen,
-          className: `px-3 py-1 text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}`,
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
           title: "Open chat full screen",
           "aria-label": "Open chat full screen"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-expand-arrows-alt" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-expand-arrows-alt", "aria-hidden": "true" })
       ), /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -10262,20 +10367,20 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
             setServerConversationHistory(null);
             setChatSessionId(generateChatSessionId());
           },
-          className: `px-3 py-1 text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}`,
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
           title: "Clear chat",
           "aria-label": "Clear chat history"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash", "aria-hidden": "true" })
       ), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: closeChatSurface,
-          className: `${isDarkTheme ? "text-gray-400 hover:text-gray-100" : "text-gray-500 hover:text-gray-700"}`,
-          "aria-label": isChatTab ? "Close chat" : "Close chat"
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
+          "aria-label": "Close chat"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
       ))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-3 border-b flex items-center gap-3 ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-mission-input", className: `text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement(
         "input",
         {
@@ -10298,13 +10403,13 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           title: "Clear goal"
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-times" })
-      )), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4", style: fullscreenChatConversationStyle }, chatMessages.length === 0 && /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-4xl mb-4" }), /* @__PURE__ */ React.createElement("p", { className: "text-lg" }, "Ask about your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "For example: which indexes have the most data, what a search does, or how to write an SPL query.")), chatMessages.map((msg) => /* @__PURE__ */ React.createElement("div", { key: msg.id, className: `flex min-w-0 ${msg.type === "user" ? "justify-end" : "justify-start"}` }, /* @__PURE__ */ React.createElement("div", { className: `max-w-3xl min-w-0 p-4 rounded-lg ${msg.type === "user" ? "bg-indigo-600 text-white" : msg.type === "error" ? isDarkTheme ? "bg-red-900 text-red-100 border border-red-700" : "bg-red-50 text-red-800 border border-red-200" : msg.type === "warning" ? isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-900 border border-amber-200" : isDarkTheme ? "bg-gray-700 text-gray-100 border border-gray-600" : "bg-gray-100 text-gray-800"}`, style: getChatBubbleStyle(msg.type) }, msg.type === "user" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("i", { className: "fas fa-user ml-3 mt-1" })), msg.type === "assistant" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot mr-3 mt-1 text-green-600" }), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), msg.spl_query && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }), "SPL Query Executed"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 p-4 bg-gray-900 text-green-300 rounded-lg font-mono text-sm" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-300 uppercase tracking-wide" }, "Splunk Query"), renderSplQueryActionButtons2(msg.spl_query, {
+      )), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4", style: fullscreenChatConversationStyle }, chatMessages.length === 0 && /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-3xl mb-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, "Ask about your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "For example: which indexes have the most data, what a search does, or how to write an SPL query.")), chatMessages.map((msg) => /* @__PURE__ */ React.createElement("div", { key: msg.id, className: `flex min-w-0 ${msg.type === "user" ? "justify-end" : "justify-start"}` }, /* @__PURE__ */ React.createElement("div", { className: `max-w-3xl min-w-0 p-4 rounded-lg ${msg.type === "user" ? "bg-indigo-600 text-white" : msg.type === "error" ? isDarkTheme ? "bg-red-900 text-red-100 border border-red-700" : "bg-red-50 text-red-800 border border-red-200" : msg.type === "warning" ? isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-900 border border-amber-200" : isDarkTheme ? "bg-gray-700 text-gray-100 border border-gray-600" : "bg-gray-100 text-gray-800"}`, style: getChatBubbleStyle(msg.type) }, msg.type === "user" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("i", { className: "fas fa-user ml-3 mt-1", "aria-hidden": "true" })), msg.type === "assistant" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot mr-3 mt-1 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), msg.spl_query && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Search that ran"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_query, {
         originKind: "chat_assistant",
         originLabel: "Chat assistant response",
         sourceLabel: "Chat assistant response",
         contextExcerpt: msg.content,
         className: "sm:justify-end"
-      })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }), "SPL Query (Not Executed)"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 p-4 bg-gray-900 text-amber-300 rounded-lg font-mono text-sm" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs text-gray-300 uppercase tracking-wide" }, "Suggested Query"), renderSplQueryActionButtons2(msg.spl_in_text, {
+      })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Suggested search (not run)"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_in_text, {
         originKind: "chat_assistant_suggestion",
         originLabel: "Chat assistant suggestion",
         sourceLabel: "Chat assistant suggestion",
@@ -10320,15 +10425,16 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: "mt-3",
           "data-testid": "chat-capability-evidence"
         },
-        /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-emerald-300 hover:text-emerald-100" : "text-emerald-700 hover:text-emerald-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-2" }), "Capability Evidence (", msg.capability_usage.length, ")"),
-        /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-emerald-50 border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-emerald-900 text-emerald-100 border border-emerald-700" : "bg-emerald-100 text-emerald-800 border border-emerald-300"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), renderCapabilityReusableQueryCards(usage), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-emerald-100 text-emerald-800 border border-emerald-300"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "score ", chunk.score)), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))
-      ), msg.status_timeline && msg.status_timeline.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium text-blue-600 hover:text-blue-800 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2" }), "Investigation Timeline (", msg.iterations, " iterations, ", msg.execution_time, ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between px-3 py-2 rounded border-l-4 border-blue-400 ${isDarkTheme ? "bg-gray-800" : "bg-gradient-to-r from-blue-50 to-purple-50"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, status.time.toFixed(1), "s"))))), msg.mcp_data && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-database mr-1" }), "View Raw Data"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), msg.has_follow_on && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border rounded ${isDarkTheme ? "bg-indigo-900 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1" }), /* @__PURE__ */ React.createElement("span", null, "Suggested next actions")), Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, msg.follow_on_actions.map((action, idx) => {
+        /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-2", "aria-hidden": "true" }), "Capability Evidence (", msg.capability_usage.length, ")"),
+        /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-gray-100 text-gray-700 border border-gray-200"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), renderCapabilityReusableQueryCards(usage), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-200"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Match score ", chunk.score)), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))
+      ), msg.status_timeline && msg.status_timeline.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2", "aria-hidden": "true" }), "Steps taken (", [msg.iterations ? countLabel(msg.iterations, "round") : "", msg.execution_time].filter(Boolean).join(", "), ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between gap-3 px-3 py-2 rounded border-l-4 ${isDarkTheme ? "bg-gray-800 border-indigo-400" : "bg-white border-indigo-500"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs tabular-nums ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, Number(status.time || 0).toFixed(1), "s"))))), msg.mcp_data && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-database mr-1", "aria-hidden": "true" }), "Show raw data"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), msg.has_follow_on && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border rounded ${isDarkTheme ? "bg-indigo-900 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1" }), /* @__PURE__ */ React.createElement("span", null, "Suggested next actions")), Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, msg.follow_on_actions.map((action, idx) => {
         const actionLabel = typeof action === "string" ? action : action.label || action.prompt || "Follow-up action";
         const actionPrompt = typeof action === "string" ? action : action.prompt || action.label || "";
         return /* @__PURE__ */ React.createElement(
           "button",
           {
             key: idx,
+            type: "button",
             onClick: () => actionPrompt && sendSuggestedQuery(actionPrompt),
             className: `w-full text-left rounded border px-3 py-2 transition-colors ${isDarkTheme ? "bg-indigo-950 border-indigo-700 hover:bg-indigo-800 text-indigo-100" : "bg-white border-indigo-200 hover:bg-indigo-100 text-indigo-900"}`,
             title: "Run this follow-up in chat"
@@ -10336,7 +10442,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, actionLabel),
           typeof action !== "string" && action.prompt && action.prompt !== actionLabel && /* @__PURE__ */ React.createElement("div", { className: `text-xs mt-1 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, action.prompt)
         );
-      })) : /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-indigo-200" : "text-indigo-800"}` }, "Follow-up action available.")))), msg.type === "error" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-3 mt-1 text-red-600" }), /* @__PURE__ */ React.createElement("p", { className: "flex-1 whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), msg.type === "warning" && /* @__PURE__ */ React.createElement("div", { className: `flex items-start min-w-0 border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? "bg-amber-900" : "bg-amber-50"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-circle mr-3 mt-1 text-amber-600" }), /* @__PURE__ */ React.createElement("p", { className: `flex-1 whitespace-pre-wrap break-words ${isDarkTheme ? "text-amber-100" : "text-amber-800"}`, style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("div", { className: "text-xs opacity-70 mt-2" }, new Date(msg.timestamp).toLocaleTimeString(void 0, { timeStyle: "short" }))))), isTyping && /* @__PURE__ */ React.createElement("div", { className: "flex justify-start" }, /* @__PURE__ */ React.createElement("div", { className: `p-4 rounded-lg shadow-sm border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gradient-to-r from-blue-50 to-green-50 text-gray-800 border-blue-100"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center space-x-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-green-600" }), /* @__PURE__ */ React.createElement("div", { className: "flex space-x-1" }, /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-green-500 rounded-full animate-bounce" }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-blue-500 rounded-full animate-bounce", style: { animationDelay: "0.1s" } }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-purple-500 rounded-full animate-bounce", style: { animationDelay: "0.2s" } })), chatStatus && /* @__PURE__ */ React.createElement("span", { className: `text-sm ml-2 animate-pulse ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, chatStatus)))), /* @__PURE__ */ React.createElement("div", { ref: chatEndRef }))), /* @__PURE__ */ React.createElement("div", { className: `p-6 border-t ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Suggested Questions"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement(
+      })) : /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-indigo-200" : "text-indigo-800"}` }, "Follow-up action available.")))), msg.type === "error" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-3 mt-1 text-red-600" }), /* @__PURE__ */ React.createElement("p", { className: "flex-1 whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), msg.type === "warning" && /* @__PURE__ */ React.createElement("div", { className: `flex items-start min-w-0 border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? "bg-amber-900" : "bg-amber-50"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-circle mr-3 mt-1 text-amber-600" }), /* @__PURE__ */ React.createElement("p", { className: `flex-1 whitespace-pre-wrap break-words ${isDarkTheme ? "text-amber-100" : "text-amber-800"}`, style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("div", { className: "text-xs opacity-70 mt-2" }, new Date(msg.timestamp).toLocaleTimeString(void 0, { timeStyle: "short" }))))), isTyping && /* @__PURE__ */ React.createElement("div", { className: "flex justify-start" }, /* @__PURE__ */ React.createElement("div", { className: `p-4 rounded-lg border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gray-100 text-gray-800 border-gray-200"}`, role: "status", "aria-live": "polite" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center space-x-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex space-x-1", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.1s" } }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.2s" } })), /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, "The assistant is working."), chatStatus && /* @__PURE__ */ React.createElement("span", { className: `text-sm ml-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, chatStatus)))), /* @__PURE__ */ React.createElement("div", { ref: chatEndRef }))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-t ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Suggested Questions"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
@@ -10347,7 +10453,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-expanded": showSuggestedQueries,
           "aria-controls": "suggested-queries-panel"
         },
-        /* @__PURE__ */ React.createElement("i", { className: `fas ${showSuggestedQueries ? "fa-chevron-up" : "fa-chevron-down"}` })
+        /* @__PURE__ */ React.createElement("i", { className: `fas ${showSuggestedQueries ? "fa-chevron-up" : "fa-chevron-down"}`, "aria-hidden": "true" })
       ))), showSuggestedQueries && /* @__PURE__ */ React.createElement("div", { id: "suggested-queries-panel", className: "grid grid-cols-1 md:grid-cols-2 gap-2" }, suggestedChatQueries.map((query, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center border rounded-lg px-2 py-1.5 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -10364,10 +10470,11 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           onClick: () => sendSuggestedQuery(query),
           disabled: isTyping,
           className: `ml-2 px-2 py-1 text-xs rounded ${isTyping ? isDarkTheme ? "bg-gray-700 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-indigo-600 hover:bg-indigo-700 text-white"}`,
-          title: "Run this query now"
+          title: "Ask this now",
+          "aria-label": `Ask now: ${query}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-play" })
-      ))))), /* @__PURE__ */ React.createElement("div", { className: "flex space-x-4" }, /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" })
+      ))))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
         "textarea",
         {
           ref: chatInputRef,
@@ -10393,168 +10500,105 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           disabled: !chatInput.trim() || isTyping,
           "aria-label": isTyping ? "Sending chat message" : "Send chat message",
           title: isTyping ? "Sending chat message" : "Send chat message",
-          className: `px-6 py-3 rounded-lg font-medium ${chatInput.trim() && !isTyping ? "bg-indigo-600 hover:bg-indigo-700 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-300 text-gray-500 cursor-not-allowed"}`
+          className: `px-5 py-3 rounded-lg font-medium ${chatInput.trim() && !isTyping ? "bg-indigo-600 hover:bg-indigo-700 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-300 text-gray-500 cursor-not-allowed"}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-paper-plane" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-paper-plane", "aria-hidden": "true" })
       )), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-2 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Press Enter to send and Shift+Enter for a new line. The conversation is kept until you clear it."))))
-    ), isChatSettingsOpen && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" }, /* @__PURE__ */ React.createElement("div", { className: `chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`, role: "dialog", "aria-modal": "true", "aria-labelledby": "chat-settings-title", onKeyDown: (event) => handleDialogKeyDown(event, () => setIsChatSettingsOpen(false)) }, /* @__PURE__ */ React.createElement("div", { className: "p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-purple-700 to-indigo-700 text-white rounded-t-xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog text-2xl mr-3" }), /* @__PURE__ */ React.createElement("h2", { id: "chat-settings-title", className: "text-2xl font-bold" }, "Chat Settings")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center space-x-3" }, /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        type: "button",
-        onClick: resetChatSettings,
-        className: "px-4 py-2 bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg text-sm font-medium transition-all",
-        title: "Reset to defaults"
-      },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-undo mr-2" }),
-      "Reset"
-    ), /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        type: "button",
-        onClick: () => setIsChatSettingsOpen(false),
-        className: "text-white hover:text-gray-200",
-        "aria-label": "Close chat settings"
-      },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-2xl" })
-    ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 overflow-y-auto p-6 space-y-6" }, chatSettings && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg p-5 border-2 border-green-200" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-4 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-search text-green-600 mr-2" }), "Answer Limits"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Time limit per answer: ", chatSettings.max_execution_time, "s"), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "30",
-        max: "300",
-        value: chatSettings.max_execution_time,
-        onChange: (e) => updateSetting("max_execution_time", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "30s"), /* @__PURE__ */ React.createElement("span", null, "300s"))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Max search rounds per answer: ", chatSettings.max_iterations), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "1",
-        max: "10",
-        value: chatSettings.max_iterations,
-        onChange: (e) => updateSetting("max_iterations", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "1"), /* @__PURE__ */ React.createElement("span", null, "10"))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Use discovery results up to ", countLabel(chatSettings.discovery_freshness_days, "day"), " old"), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "1",
-        max: "30",
-        value: chatSettings.discovery_freshness_days,
-        onChange: (e) => updateSetting("discovery_freshness_days", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "1 day"), /* @__PURE__ */ React.createElement("span", null, "30 days"))))), /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-r from-purple-50 to-indigo-50 rounded-lg p-5 border-2 border-purple-200" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-4 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain text-purple-600 mr-2" }), "AI Model"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Max response length: ", chatSettings.max_tokens, " tokens", (activeLlmTuning == null ? void 0 : activeLlmTuning.max_tokens) && /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-purple-600" }, "(the model allows ", activeLlmTuning.max_tokens, "; the lower value applies)")), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "number",
-        min: "1000",
-        max: "128000",
-        value: chatSettings.max_tokens,
-        onChange: (e) => updateSetting("max_tokens", parseInt(e.target.value)),
-        className: "w-full px-3 py-2 border border-gray-300 rounded-md"
-      }
-    )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Temperature: ", chatSettings.temperature.toFixed(1), activeLlmTuning && activeLlmTuning.temperature !== null && activeLlmTuning.temperature !== void 0 && /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-purple-600" }, "(connection default is ", activeLlmTuning.temperature, "; moving the slider overrides it until restart)")), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "0",
-        max: "2",
-        step: "0.1",
-        value: chatSettings.temperature,
-        onChange: (e) => updateSetting("temperature", parseFloat(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "0.0 (Focused)"), /* @__PURE__ */ React.createElement("span", null, "2.0 (Creative)"))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Messages remembered: ", chatSettings.context_history), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "0",
-        max: "20",
-        value: chatSettings.context_history,
-        onChange: (e) => updateSetting("context_history", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "0"), /* @__PURE__ */ React.createElement("span", null, "20"))))), /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-r from-amber-50 to-yellow-50 rounded-lg p-5 border-2 border-amber-200" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-4 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tachometer-alt text-amber-600 mr-2" }), "Retries and Sampling"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Max retry delay: ", chatSettings.max_retry_delay, "s"), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "10",
-        max: "600",
-        value: chatSettings.max_retry_delay,
-        onChange: (e) => updateSetting("max_retry_delay", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "10s"), /* @__PURE__ */ React.createElement("span", null, "600s"))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Max retries: ", chatSettings.max_retries), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "1",
-        max: "10",
-        value: chatSettings.max_retries,
-        onChange: (e) => updateSetting("max_retries", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "1"), /* @__PURE__ */ React.createElement("span", null, "10"))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Sample rows per search: ", chatSettings.query_sample_size), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "1",
-        max: "10",
-        value: chatSettings.query_sample_size,
-        onChange: (e) => updateSetting("query_sample_size", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "1"), /* @__PURE__ */ React.createElement("span", null, "10"))))), /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-r from-blue-50 to-cyan-50 rounded-lg p-5 border-2 border-blue-200" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-4 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-blue-600 mr-2" }), "Answer Quality"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Minimum quality score: ", chatSettings.quality_threshold), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "0",
-        max: "100",
-        value: chatSettings.quality_threshold,
-        onChange: (e) => updateSetting("quality_threshold", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "0 (Permissive)"), /* @__PURE__ */ React.createElement("span", null, "100 (Strict)"))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Stop after ", chatSettings.convergence_detection, " rounds without progress"), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "3",
-        max: "10",
-        value: chatSettings.convergence_detection,
-        onChange: (e) => updateSetting("convergence_detection", parseInt(e.target.value)),
-        className: "w-full"
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "3"), /* @__PURE__ */ React.createElement("span", null, "10"))))), /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-r from-indigo-50 to-violet-50 rounded-lg p-5 border-2 border-indigo-200" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-4 flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-magic text-indigo-600 mr-2" }), "Extras"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("label", { className: "flex items-center justify-between bg-white rounded p-3 border border-indigo-100" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-gray-800" }, "Built-in Splunk Answers"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-gray-500" }, "Answer common Splunk questions with built-in routines instead of the AI model")), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "checkbox",
-        checked: !!chatSettings.enable_splunk_augmentation,
-        onChange: (e) => updateSetting("enable_splunk_augmentation", e.target.checked),
-        className: "h-4 w-4"
-      }
-    )), /* @__PURE__ */ React.createElement("label", { className: "flex items-center justify-between bg-white rounded p-3 border border-indigo-100" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-gray-800" }, "Search the Knowledge Base"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-gray-500" }, "Add matching passages from your reports and imported documents to chat answers")), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "checkbox",
-        checked: !!chatSettings.enable_rag_context,
-        onChange: (e) => updateSetting("enable_rag_context", e.target.checked),
-        className: "h-4 w-4"
-      }
-    )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-2" }, "Passages per answer: ", chatSettings.rag_max_chunks), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "range",
-        min: "1",
-        max: "6",
-        value: chatSettings.rag_max_chunks || 3,
-        onChange: (e) => updateSetting("rag_max_chunks", parseInt(e.target.value)),
-        className: "w-full",
-        disabled: !chatSettings.enable_rag_context
-      }
-    ), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-xs text-gray-500 mt-1" }, /* @__PURE__ */ React.createElement("span", null, "1"), /* @__PURE__ */ React.createElement("span", null, "6")), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-gray-500 mt-2" }, "Install the Knowledge Base on the Capabilities tab and turn it on first.")))))), /* @__PURE__ */ React.createElement("div", { className: `p-6 border-t rounded-b-xl ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600 text-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-info-circle mr-2" }), "Changes apply right away and reset when the server restarts.")))), isReportFullViewOpen && (reportContent == null ? void 0 : reportContent.type) === "image" && /* @__PURE__ */ React.createElement(
+    ), isChatSettingsOpen && (() => {
+      const closeChatSettings = () => setIsChatSettingsOpen(false);
+      const sectionClass = `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}`;
+      const sectionTitleClass = `text-base font-semibold mb-4 flex items-center ${headingClass}`;
+      const sectionIconClass = `mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`;
+      const fieldLabelClass = `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}`;
+      const fieldHintClass = `text-xs mt-2 ${summaryLabelClass}`;
+      const formatTokenCount = (value) => Number(value).toLocaleString("en-US");
+      const chatMaxTokens = Number(chatSettings == null ? void 0 : chatSettings.max_tokens) || 0;
+      const connectionMaxTokens = Number(activeLlmTuning == null ? void 0 : activeLlmTuning.max_tokens) || 0;
+      const tokenLimitHint = connectionMaxTokens > 0 ? chatMaxTokens > connectionMaxTokens ? `The current AI connection allows up to ${formatTokenCount(connectionMaxTokens)} tokens, so answers stop at ${formatTokenCount(connectionMaxTokens)}.` : `Answers stop at ${formatTokenCount(chatMaxTokens)} tokens. The current AI connection allows up to ${formatTokenCount(connectionMaxTokens)}.` : "Answers stop at this length or at the AI connection limit, whichever is lower.";
+      const hasConnectionTemperature = activeLlmTuning && activeLlmTuning.temperature !== null && activeLlmTuning.temperature !== void 0;
+      const renderRange = ({ id, label, settingKey, min, max, step = 1, minLabel, maxLabel, parse = (value) => parseInt(value, 10), fallback, disabled = false, hint = null }) => {
+        var _a2;
+        return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: id, className: fieldLabelClass }, label), /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            id,
+            type: "range",
+            min,
+            max,
+            step,
+            value: (_a2 = chatSettings[settingKey]) != null ? _a2 : fallback,
+            onChange: (e) => updateSetting(settingKey, parse(e.target.value)),
+            className: "w-full",
+            disabled
+          }
+        ), /* @__PURE__ */ React.createElement("div", { className: `flex justify-between text-xs mt-1 ${summaryLabelClass}`, "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("span", null, minLabel), /* @__PURE__ */ React.createElement("span", null, maxLabel)), hint && /* @__PURE__ */ React.createElement("p", { className: fieldHintClass }, hint));
+      };
+      const renderToggle = ({ id, label, description, settingKey }) => /* @__PURE__ */ React.createElement("label", { htmlFor: id, className: `flex items-center justify-between gap-4 rounded-md border p-3 cursor-pointer ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: `block text-sm font-medium ${headingClass}` }, label), /* @__PURE__ */ React.createElement("span", { className: `block text-xs mt-0.5 ${summaryLabelClass}` }, description)), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id,
+          type: "checkbox",
+          checked: !!chatSettings[settingKey],
+          onChange: (e) => updateSetting(settingKey, e.target.checked),
+          className: "h-4 w-4 flex-shrink-0"
+        }
+      ));
+      return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4", onClick: closeChatSettings }, /* @__PURE__ */ React.createElement("div", { className: `chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`, role: "dialog", "aria-modal": "true", "aria-labelledby": "chat-settings-title", onClick: (event) => event.stopPropagation(), onKeyDown: (event) => handleDialogKeyDown(event, closeChatSettings) }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog text-xl text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "chat-settings-title", className: `text-xl font-semibold ${headingClass}` }, "Chat Settings"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-0.5 ${mutedTextClass}` }, "How the assistant searches and answers."))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: resetChatSettings,
+          className: `inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition-colors ${secondaryButtonClass}`,
+          title: "Reset to defaults"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-undo", "aria-hidden": "true" }),
+        "Reset"
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: closeChatSettings,
+          autoFocus: true,
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
+          "aria-label": "Close chat settings"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
+      ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 overflow-y-auto p-6 space-y-5" }, chatSettings && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-limits-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-limits-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-stopwatch ${sectionIconClass}`, "aria-hidden": "true" }), "Answer Limits"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, renderRange({ id: "chat-setting-max-execution-time", label: `Time limit per answer: ${chatSettings.max_execution_time} seconds`, settingKey: "max_execution_time", min: 30, max: 300, minLabel: "30 s", maxLabel: "300 s" }), renderRange({ id: "chat-setting-max-iterations", label: `Max search rounds per answer: ${chatSettings.max_iterations}`, settingKey: "max_iterations", min: 1, max: 10, minLabel: "1", maxLabel: "10" }), renderRange({ id: "chat-setting-discovery-freshness", label: `Use discovery results up to ${countLabel(chatSettings.discovery_freshness_days, "day")} old`, settingKey: "discovery_freshness_days", min: 1, max: 30, minLabel: "1 day", maxLabel: "30 days" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-model-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-model-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain ${sectionIconClass}`, "aria-hidden": "true" }), "AI Model"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-setting-max-tokens", className: fieldLabelClass }, "Max response length (tokens)"), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "chat-setting-max-tokens",
+          type: "number",
+          min: "1000",
+          max: "128000",
+          value: chatSettings.max_tokens,
+          onChange: (e) => updateSetting("max_tokens", parseInt(e.target.value, 10)),
+          "aria-describedby": "chat-setting-max-tokens-hint",
+          className: `w-full px-3 py-2 border rounded-md ${isDarkTheme ? "bg-gray-950 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`
+        }
+      ), /* @__PURE__ */ React.createElement("p", { id: "chat-setting-max-tokens-hint", "data-testid": "chat-settings-token-hint", className: fieldHintClass }, tokenLimitHint)), renderRange({
+        id: "chat-setting-temperature",
+        label: `Temperature: ${Number(chatSettings.temperature || 0).toFixed(1)}`,
+        settingKey: "temperature",
+        min: 0,
+        max: 2,
+        step: 0.1,
+        parse: (value) => parseFloat(value),
+        minLabel: "0.0 (focused)",
+        maxLabel: "2.0 (creative)",
+        hint: hasConnectionTemperature ? `The AI connection default is ${activeLlmTuning.temperature}. Moving the slider overrides it until the server restarts.` : null
+      }), renderRange({ id: "chat-setting-context-history", label: `Messages remembered: ${chatSettings.context_history}`, settingKey: "context_history", min: 0, max: 20, minLabel: "0", maxLabel: "20" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-retries-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-retries-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-redo ${sectionIconClass}`, "aria-hidden": "true" }), "Retries and Sampling"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, renderRange({ id: "chat-setting-max-retry-delay", label: `Max retry delay: ${chatSettings.max_retry_delay} seconds`, settingKey: "max_retry_delay", min: 10, max: 600, minLabel: "10 s", maxLabel: "600 s" }), renderRange({ id: "chat-setting-max-retries", label: `Max retries: ${chatSettings.max_retries}`, settingKey: "max_retries", min: 1, max: 10, minLabel: "1", maxLabel: "10" }), renderRange({ id: "chat-setting-query-sample-size", label: `Sample rows per search: ${chatSettings.query_sample_size}`, settingKey: "query_sample_size", min: 1, max: 10, minLabel: "1", maxLabel: "10" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-quality-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-quality-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-check-circle ${sectionIconClass}`, "aria-hidden": "true" }), "Answer Quality"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, renderRange({ id: "chat-setting-quality-threshold", label: `Minimum quality score: ${chatSettings.quality_threshold}`, settingKey: "quality_threshold", min: 0, max: 100, minLabel: "0 (permissive)", maxLabel: "100 (strict)" }), renderRange({ id: "chat-setting-convergence", label: `Stop after ${chatSettings.convergence_detection} rounds without progress`, settingKey: "convergence_detection", min: 3, max: 10, minLabel: "3", maxLabel: "10" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-extras-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-extras-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-puzzle-piece ${sectionIconClass}`, "aria-hidden": "true" }), "Extras"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, renderToggle({ id: "chat-setting-splunk-augmentation", label: "Built-in Splunk Answers", description: "Answer common Splunk questions with built-in routines instead of the AI model", settingKey: "enable_splunk_augmentation" }), renderToggle({ id: "chat-setting-rag-context", label: "Search the Knowledge Base", description: "Add matching passages from your reports and imported documents to chat answers", settingKey: "enable_rag_context" }), renderRange({
+        id: "chat-setting-rag-max-chunks",
+        label: `Passages per answer: ${chatSettings.rag_max_chunks || 3}`,
+        settingKey: "rag_max_chunks",
+        min: 1,
+        max: 6,
+        fallback: 3,
+        minLabel: "1",
+        maxLabel: "6",
+        disabled: !chatSettings.enable_rag_context,
+        hint: "Install the Knowledge Base on the Capabilities tab and turn it on first."
+      }))))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-3 border-t rounded-b-xl ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("p", { className: `text-sm text-center ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-info-circle mr-2", "aria-hidden": "true" }), "Changes apply right away and reset when the server restarts."))));
+    })(), isReportFullViewOpen && (reportContent == null ? void 0 : reportContent.type) === "image" && /* @__PURE__ */ React.createElement(
       "div",
       {
         className: "fixed inset-0 flex items-center justify-center p-4",
@@ -10606,36 +10650,36 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         className: isSummaryTab ? "fixed inset-x-0 bottom-0 z-40" : "fixed inset-0 bg-black bg-opacity-50 z-50 overflow-y-auto p-4",
         style: isSummaryTab ? { top: `${headerHeight}px` } : void 0
       },
-      /* @__PURE__ */ React.createElement("div", { className: isSummaryTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-6` : "min-h-full w-full flex items-center justify-center" }, /* @__PURE__ */ React.createElement("div", { className: `${isSummaryTab ? `${isDarkTheme ? "bg-gray-900 text-gray-100 border border-gray-700" : "bg-white text-gray-900 border border-gray-200"} h-full rounded-2xl shadow-2xl flex flex-col overflow-hidden` : `${isDarkTheme ? "bg-gray-900 text-gray-100" : "bg-white text-gray-900"} rounded-xl shadow-2xl w-full max-w-7xl min-h-0 flex flex-col overflow-hidden`}`, style: isSummaryTab ? void 0 : windowedSummaryDialogStyle, role: "dialog", "aria-modal": isSummaryTab ? "false" : "true", "aria-labelledby": "summary-modal-title", onKeyDown: (event) => handleDialogKeyDown(event, closeSummaryModal) }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b border-gray-200 flex justify-between items-center bg-gradient-to-r from-indigo-700 to-purple-700 text-white ${isSummaryTab ? "rounded-t-2xl" : "rounded-t-xl"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: `fas ${(summaryData == null ? void 0 : summaryData.from_cache) ? "fa-eye" : "fa-magic"} text-2xl mr-3` }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { id: "summary-modal-title", className: "text-2xl font-bold" }, "Discovery Summary", (summaryData == null ? void 0 : summaryData.from_cache) && /* @__PURE__ */ React.createElement("span", { className: "ml-3 text-sm font-normal bg-green-700 border border-green-300 px-3 py-1 rounded-full text-white" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle mr-1" }), "Saved")), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-indigo-100 mt-1" }, `Run of ${formatMissionDateTime(currentSessionId, "an unknown date")}`))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, isSummaryTab ? /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { className: isSummaryTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-6` : "min-h-full w-full flex items-center justify-center" }, /* @__PURE__ */ React.createElement("div", { className: `${isSummaryTab ? `${isDarkTheme ? "bg-gray-900 text-gray-100 border border-gray-700" : "bg-white text-gray-900 border border-gray-200"} h-full rounded-2xl shadow-2xl flex flex-col overflow-hidden` : `${isDarkTheme ? "bg-gray-900 text-gray-100" : "bg-white text-gray-900"} rounded-xl shadow-2xl w-full max-w-7xl min-h-0 flex flex-col overflow-hidden`}`, style: isSummaryTab ? void 0 : windowedSummaryDialogStyle, role: "dialog", "aria-modal": isSummaryTab ? "false" : "true", "aria-labelledby": "summary-modal-title", onKeyDown: (event) => handleDialogKeyDown(event, closeSummaryModal) }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"} ${isSummaryTab ? "rounded-t-2xl" : "rounded-t-xl"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-file-alt text-xl text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "summary-modal-title", className: `text-xl font-semibold flex flex-wrap items-center gap-2 ${headingClass}` }, "Discovery Summary", (summaryData == null ? void 0 : summaryData.from_cache) && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-emerald-950 border-emerald-700 text-emerald-200" : "bg-emerald-50 border-emerald-200 text-emerald-800"}` }, "Saved")), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-0.5 ${mutedTextClass}` }, `Run of ${formatMissionDateTime(currentSessionId, "an unknown date")}`))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, isSummaryTab ? /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: () => exitSummaryFullscreen({ reopenModal: true }),
-          className: "text-white hover:text-gray-200",
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-800" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
           "aria-label": "Show summary in a window",
           title: "Show summary in a window"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-compress-arrows-alt text-2xl" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-compress-arrows-alt text-lg", "aria-hidden": "true" })
       ) : /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: enterSummaryFullscreen,
-          className: "text-white hover:text-gray-200",
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-800" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
           "aria-label": "Open summary full screen",
           title: "Open summary full screen"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-expand-arrows-alt text-2xl" })
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-expand-arrows-alt text-lg", "aria-hidden": "true" })
       ), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: closeSummaryModal,
-          className: "text-white hover:text-gray-200",
+          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-800" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
           "aria-label": "Close summary"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-2xl" })
-      ))), !isLoadingSummary && summaryData && /* @__PURE__ */ React.createElement("div", { className: `border-b ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex space-x-1 px-6", role: "tablist", "aria-label": "Summary views", onKeyDown: handleTablistKeyDown }, /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
+      ))), !isLoadingSummary && summaryData && /* @__PURE__ */ React.createElement("div", { className: `border-b ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 px-4 overflow-x-auto", role: "tablist", "aria-label": "Summary views", onKeyDown: handleTablistKeyDown }, /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
@@ -10645,9 +10689,9 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-controls": "summary-tabpanel-summary",
           tabIndex: activeTab === "summary" ? 0 : -1,
           onClick: () => setActiveTab("summary"),
-          className: `px-6 py-3 font-medium text-sm transition-all ${activeTab === "summary" ? isDarkTheme ? "border-b-2 border-indigo-400 text-indigo-300 bg-gray-900" : "border-b-2 border-indigo-600 text-indigo-600 bg-white" : isDarkTheme ? "text-gray-300 hover:text-white hover:bg-gray-700" : "text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
+          className: `px-4 py-3 font-medium text-sm whitespace-nowrap border-b-2 transition-colors ${activeTab === "summary" ? isDarkTheme ? "border-indigo-400 text-indigo-200 bg-gray-900" : "border-indigo-600 text-indigo-700 bg-white" : isDarkTheme ? "border-transparent text-gray-300 hover:text-white hover:bg-gray-700" : "border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain mr-2" }),
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain mr-2", "aria-hidden": "true" }),
         "Executive Summary"
       ), /* @__PURE__ */ React.createElement(
         "button",
@@ -10659,9 +10703,9 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-controls": "summary-tabpanel-context",
           tabIndex: activeTab === "context" ? 0 : -1,
           onClick: () => setActiveTab("context"),
-          className: `px-6 py-3 font-medium text-sm transition-all ${activeTab === "context" ? isDarkTheme ? "border-b-2 border-indigo-400 text-indigo-300 bg-gray-900" : "border-b-2 border-indigo-600 text-indigo-600 bg-white" : isDarkTheme ? "text-gray-300 hover:text-white hover:bg-gray-700" : "text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
+          className: `px-4 py-3 font-medium text-sm whitespace-nowrap border-b-2 transition-colors ${activeTab === "context" ? isDarkTheme ? "border-indigo-400 text-indigo-200 bg-gray-900" : "border-indigo-600 text-indigo-700 bg-white" : isDarkTheme ? "border-transparent text-gray-300 hover:text-white hover:bg-gray-700" : "border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-compass mr-2" }),
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-compass mr-2", "aria-hidden": "true" }),
         "Context Explorer"
       ), /* @__PURE__ */ React.createElement(
         "button",
@@ -10673,12 +10717,11 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-controls": "summary-tabpanel-queries",
           tabIndex: activeTab === "queries" ? 0 : -1,
           onClick: () => setActiveTab("queries"),
-          className: `px-6 py-3 font-medium text-sm transition-all ${activeTab === "queries" ? isDarkTheme ? "border-b-2 border-indigo-400 text-indigo-300 bg-gray-900" : "border-b-2 border-indigo-600 text-indigo-600 bg-white" : isDarkTheme ? "text-gray-300 hover:text-white hover:bg-gray-700" : "text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
+          className: `px-4 py-3 font-medium text-sm whitespace-nowrap border-b-2 transition-colors ${activeTab === "queries" ? isDarkTheme ? "border-indigo-400 text-indigo-200 bg-gray-900" : "border-indigo-600 text-indigo-700 bg-white" : isDarkTheme ? "border-transparent text-gray-300 hover:text-white hover:bg-gray-700" : "border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }),
-        "SPL Queries (",
-        ((_Ga = summaryData.spl_queries) == null ? void 0 : _Ga.length) || 0,
-        ")"
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }),
+        "SPL Queries ",
+        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_Aa = summaryData.spl_queries) == null ? void 0 : _Aa.length) || 0, ")")
       ), /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -10689,26 +10732,24 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-controls": "summary-tabpanel-tasks",
           tabIndex: activeTab === "tasks" ? 0 : -1,
           onClick: () => setActiveTab("tasks"),
-          className: `px-6 py-3 font-medium text-sm transition-all ${activeTab === "tasks" ? isDarkTheme ? "border-b-2 border-indigo-400 text-indigo-300 bg-gray-900" : "border-b-2 border-indigo-600 text-indigo-600 bg-white" : isDarkTheme ? "text-gray-300 hover:text-white hover:bg-gray-700" : "text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
+          className: `px-4 py-3 font-medium text-sm whitespace-nowrap border-b-2 transition-colors ${activeTab === "tasks" ? isDarkTheme ? "border-indigo-400 text-indigo-200 bg-gray-900" : "border-indigo-600 text-indigo-700 bg-white" : isDarkTheme ? "border-transparent text-gray-300 hover:text-white hover:bg-gray-700" : "border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-100"}`
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2" }),
-        "Admin Tasks (",
-        ((_Ha = summaryData.admin_tasks) == null ? void 0 : _Ha.length) || 0,
-        ")",
-        ((_Ia = summaryData.admin_tasks) == null ? void 0 : _Ia.length) > 0 && /* @__PURE__ */ React.createElement("span", { className: "ml-2 px-2 py-0.5 text-xs bg-green-600 text-white rounded-full" }, "New")
-      ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto p-6" }, isLoadingSummary ? /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-center h-full" }, /* @__PURE__ */ React.createElement("div", { className: "text-center max-w-md" }, /* @__PURE__ */ React.createElement("div", { className: "relative mb-8" }, /* @__PURE__ */ React.createElement("div", { className: `inline-block animate-spin rounded-full h-20 w-20 border-4 ${isDarkTheme ? "border-indigo-900 border-t-indigo-400" : "border-indigo-200 border-t-indigo-600"}` }), /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-3xl animate-pulse ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}` })), /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-bold mb-4 ${isDarkTheme ? "text-gray-100" : "text-gray-800"}` }, "Analyzing Your Splunk Environment"), /* @__PURE__ */ React.createElement("div", { className: `space-y-3 text-left rounded-lg shadow-sm border p-4 mb-4 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(1) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(1) ? "bg-green-600" : isSummaryStepActive(1) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(1) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(1) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(1) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-300" : "text-gray-700" }, "Loading discovery reports...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(2) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(2) ? "bg-green-600" : isSummaryStepActive(2) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(2) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(2) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(2) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Generating SPL queries...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(3) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(3) ? "bg-green-600" : isSummaryStepActive(3) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(3) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(3) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(3) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Building executive summary...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(4) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(4) ? "bg-green-600" : isSummaryStepActive(4) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(4) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(4) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(4) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Creating admin tasks..."))), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center mb-1" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, summaryProgress.message), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold text-indigo-600" }, summaryProgress.progress, "%")), /* @__PURE__ */ React.createElement("div", { className: `w-full rounded-full h-2 ${isDarkTheme ? "bg-gray-700" : "bg-gray-200"}` }, /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2", "aria-hidden": "true" }),
+        "Admin Tasks ",
+        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_Ba = summaryData.admin_tasks) == null ? void 0 : _Ba.length) || 0, ")")
+      ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto p-6" }, isLoadingSummary ? /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-center h-full" }, /* @__PURE__ */ React.createElement("div", { className: "text-center max-w-md" }, /* @__PURE__ */ React.createElement("div", { className: "relative mb-8" }, /* @__PURE__ */ React.createElement("div", { className: `inline-block animate-spin rounded-full h-20 w-20 border-4 ${isDarkTheme ? "border-indigo-900 border-t-indigo-400" : "border-indigo-200 border-t-indigo-600"}` }), /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-3xl animate-pulse ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}` })), /* @__PURE__ */ React.createElement("h3", { className: `text-xl font-semibold mb-4 ${headingClass}` }, "Building Your Summary"), /* @__PURE__ */ React.createElement("div", { className: `space-y-3 text-left rounded-lg shadow-sm border p-4 mb-4 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(1) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(1) ? "bg-green-600" : isSummaryStepActive(1) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(1) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(1) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(1) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-300" : "text-gray-700" }, "Loading discovery reports...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(2) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(2) ? "bg-green-600" : isSummaryStepActive(2) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(2) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(2) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(2) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Generating SPL queries...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(3) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(3) ? "bg-green-600" : isSummaryStepActive(3) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(3) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(3) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(3) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Building executive summary...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(4) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(4) ? "bg-green-600" : isSummaryStepActive(4) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(4) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(4) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(4) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Creating admin tasks..."))), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center mb-1" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, summaryProgress.message), /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, summaryProgress.progress, "%")), /* @__PURE__ */ React.createElement("div", { className: `w-full rounded-full h-2 ${isDarkTheme ? "bg-gray-700" : "bg-gray-200"}` }, /* @__PURE__ */ React.createElement(
         "div",
         {
-          className: "bg-gradient-to-r from-indigo-500 to-purple-600 h-2 rounded-full transition-all duration-500 ease-out",
+          className: "bg-indigo-600 h-2 rounded-full transition-all duration-500 ease-out",
           style: { width: `${summaryProgress.progress}%` }
         }
-      ))), isSummaryWorkerActive && /* @__PURE__ */ React.createElement("div", { className: `mb-4 rounded-lg border px-4 py-3 text-left ${isDarkTheme ? "border-amber-800 bg-amber-950/40" : "border-amber-200 bg-amber-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-amber-200" : "text-amber-800"}` }, "Running in the background"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm leading-6 ${isDarkTheme ? "text-amber-100" : "text-amber-900"}` }, "This summary keeps running if you close this window (process ", summaryWorkerPid, "). Come back later to see it, or stop it now.")), /* @__PURE__ */ React.createElement(
+      ))), isSummaryWorkerActive && /* @__PURE__ */ React.createElement("div", { className: `mb-4 rounded-lg border px-4 py-3 text-left ${isDarkTheme ? "border-amber-800 bg-amber-950/40" : "border-amber-200 bg-amber-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-amber-200" : "text-amber-800"}` }, "Running in the background"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm leading-6 ${isDarkTheme ? "text-amber-100" : "text-amber-900"}` }, "This summary keeps running if you close this window (process ", summaryWorkerPid, "). Come back later to see it, or stop it now.")), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: abortSummaryRun,
           disabled: isAbortingSummary,
-          className: `rounded-lg px-3 py-2 text-xs font-semibold uppercase tracking-wider ${isAbortingSummary ? "cursor-wait opacity-70" : ""} ${isDarkTheme ? "bg-rose-600 text-white hover:bg-rose-500" : "bg-rose-600 text-white hover:bg-rose-700"}`
+          className: `flex-shrink-0 rounded-md px-3 py-1.5 text-sm font-medium bg-red-600 text-white hover:bg-red-700 ${isAbortingSummary ? "cursor-wait" : ""}`
         },
         isAbortingSummary ? "Stopping..." : "Stop Summary"
       ))))) : summaryData ? /* @__PURE__ */ React.createElement("div", null, activeTab === "summary" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-summary", role: "tabpanel", "aria-labelledby": "summary-tab-summary", className: "space-y-6" }, renderExecutiveControlSummary(), summaryInfographicCapability.available && /* @__PURE__ */ React.createElement("div", { className: "flex justify-center pb-2" }, /* @__PURE__ */ React.createElement(
@@ -10721,13 +10762,13 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: `text-xs tracking-[0.35em] lowercase focus:outline-none ${isDarkTheme ? "text-gray-900" : "text-white"} ${isGeneratingSummaryInfographic ? "cursor-wait" : "cursor-pointer"}`
         },
         "magic"
-      ))), activeTab === "context" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-context", role: "tabpanel", "aria-labelledby": "summary-tab-context", className: "space-y-6" }, !hasContextExplorer ? /* @__PURE__ */ React.createElement("div", { className: `rounded-2xl border p-6 ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-700"}` }, "Context explorer data is not available for this session yet.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-2xl border overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700 bg-gradient-to-r from-slate-900 via-cyan-950 to-slate-900" : "border-gray-200 bg-gradient-to-r from-cyan-50 via-sky-50 to-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Context Explorer"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "The indexes, sourcetypes, and hosts this run found. Use them to start a chat, find related searches, or follow up on risks.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-cyan-800" : "bg-white border-cyan-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-cyan-300" : "text-cyan-700"}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_Ka = (_Ja = contextOverview.readiness_score) != null ? _Ja : readinessScore) != null ? _Ka : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Out of 100")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-blue-800" : "bg-white border-blue-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-blue-300" : "text-blue-700"}` }, "Indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_La = contextOverview.total_indexes) != null ? _La : contextIndexAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-emerald-800" : "bg-white border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-emerald-300" : "text-emerald-700"}` }, "Sourcetypes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_Ma = contextOverview.total_sourcetypes) != null ? _Ma : contextSourcetypeAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "bg-gray-950 border-amber-800" : "bg-white border-amber-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-amber-300" : "text-amber-700"}` }, "Hosts"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_Na = contextOverview.total_hosts) != null ? _Na : contextHostAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, contextOverview.data_volume_24h || "Data volume unknown"))))), /* @__PURE__ */ React.createElement("div", { className: "p-6 space-y-6" }, contextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-cyan-50 border-cyan-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-radar text-cyan-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Patterns"))), /* @__PURE__ */ React.createElement("div", { className: `inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${isDarkTheme ? "bg-cyan-950 border border-cyan-800 text-cyan-100" : "bg-white border border-cyan-200 text-cyan-800"}` }, countLabel(contextPatterns.length, "pattern"))), leadContextPattern && /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.15fr),minmax(0,0.85fr)]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-2xl border p-5 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-cyan-300" : "text-cyan-700"}` }, "Lead pattern"), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, leadContextPattern.title || "Pattern 1"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, leadContextPattern.description || "No description recorded."), leadContextPattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-cyan-950/40 border-cyan-900 text-cyan-100" : "bg-cyan-50 border-cyan-200 text-cyan-900"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-cyan-300" : "text-cyan-700"}` }, "Signal"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm leading-6 break-words" }, leadContextPattern.signal))), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, supportingContextPatterns.length > 0 ? supportingContextPatterns.map((pattern, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-pattern-${idx + 1}`, className: `rounded-xl border px-4 py-4 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-gray-950 text-cyan-200 border border-gray-700" : "bg-cyan-100 text-cyan-800 border border-cyan-200"}` }, idx + 2), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, pattern.title || `Pattern ${idx + 2}`), pattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, pattern.description), pattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs leading-5 ${isDarkTheme ? "text-cyan-200" : "text-cyan-800"}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Signal:"), " ", pattern.signal))))) : /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-4 text-sm ${isDarkTheme ? "bg-slate-900 border-slate-800 text-gray-300" : "bg-white border-slate-200 text-gray-700"}` }, "No other patterns found."))), hiddenContextPatternCount > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Showing the top ", visibleContextPatterns.length, " patterns first to keep the review focused.")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-3" }, [
+      ))), activeTab === "context" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-context", role: "tabpanel", "aria-labelledby": "summary-tab-context", className: "space-y-6" }, !hasContextExplorer ? /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-6 ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-700"}` }, "This summary has no environment details for this run.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Context Explorer"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "The indexes, sourcetypes, and hosts this run found. Use them to start a chat, find related searches, or follow up on risks.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_Da = (_Ca = contextOverview.readiness_score) != null ? _Ca : readinessScore) != null ? _Da : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Out of 100")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_Ea = contextOverview.total_indexes) != null ? _Ea : contextIndexAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Sourcetypes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_Fa = contextOverview.total_sourcetypes) != null ? _Fa : contextSourcetypeAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Hosts"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_Ga = contextOverview.total_hosts) != null ? _Ga : contextHostAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, contextOverview.data_volume_24h ? `${contextOverview.data_volume_24h} in 24 hours` : "Found by discovery"))))), /* @__PURE__ */ React.createElement("div", { className: "p-6 space-y-6" }, contextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-indigo-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Patterns"))), /* @__PURE__ */ React.createElement("div", { className: `inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${summaryInsetClass} ${headingClass}` }, countLabel(contextPatterns.length, "pattern"))), leadContextPattern && /* @__PURE__ */ React.createElement("div", { className: `mt-4 grid gap-4 ${supportingContextPatterns.length > 0 ? "xl:grid-cols-[minmax(0,1.15fr),minmax(0,0.85fr)]" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Lead pattern"), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, leadContextPattern.title || "Pattern 1"), leadContextPattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, leadContextPattern.description), leadContextPattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-4 py-3 ${summaryCardClass} ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Signal"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm leading-6 break-words" }, leadContextPattern.signal))), supportingContextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, supportingContextPatterns.map((pattern, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-pattern-${idx + 1}`, className: `rounded-lg border px-4 py-4 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-indigo-900 text-indigo-100" : "bg-indigo-100 text-indigo-700"}` }, idx + 2), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, pattern.title || `Pattern ${idx + 2}`), pattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, pattern.description), pattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs leading-5 ${summaryLabelClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Signal:"), " ", pattern.signal))))))), hiddenContextPatternCount > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Showing the top ", visibleContextPatterns.length, " of ", contextPatterns.length, " patterns.")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-3" }, [
         {
           key: "index",
           title: "Indexes",
           icon: "fa-database",
           accent: isDarkTheme ? "text-blue-300" : "text-blue-700",
-          panel: isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-blue-50 border-blue-200",
+          panel: summaryCardClass,
           items: contextIndexAnchors
         },
         {
@@ -10735,7 +10776,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           title: "Sourcetypes",
           icon: "fa-stream",
           accent: isDarkTheme ? "text-emerald-300" : "text-emerald-700",
-          panel: isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-emerald-50 border-emerald-200",
+          panel: summaryCardClass,
           items: contextSourcetypeAnchors
         },
         {
@@ -10743,70 +10784,85 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           title: "Hosts",
           icon: "fa-server",
           accent: isDarkTheme ? "text-amber-300" : "text-amber-700",
-          panel: isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-amber-50 border-amber-200",
+          panel: summaryCardClass,
           items: contextHostAnchors
         }
-      ].map((section) => /* @__PURE__ */ React.createElement("div", { key: section.key, className: `rounded-xl border p-5 ${section.panel}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: `fas ${section.icon} ${section.accent}` }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, section.title)), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, section.items.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-sm ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "None found.") : section.items.slice(0, 4).map((item, idx) => /* @__PURE__ */ React.createElement("div", { key: `${section.key}-${item.name || idx}`, className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-base font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, item.name || "Unknown"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, item.events != null ? `${Number(item.events).toLocaleString()} events` : "Event count unknown", item.size_mb != null ? ` • ${Number(item.size_mb).toFixed(1)} MB` : "")), /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${section.accent}` }, section.key)), renderSummaryContextActionButtons(item.actions))))))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-[minmax(0,1.1fr),minmax(0,0.9fr),minmax(0,0.9fr)]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece text-indigo-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Needs Classification")), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, contextUnknownEntities.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-sm ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Nothing needs classification.") : contextUnknownEntities.slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-unknown-${item.name || idx}`, className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-base font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, item.name || "Unnamed item"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, item.question || item.reason || "Needs a description and an owner.")), /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, item.type || "item")), renderSummaryContextActionButtons(item.actions))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-shield-alt text-red-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Risks and Coverage Gaps")), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, contextRiskItems.slice(0, 2).map((risk, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-risk-${idx}`, className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-red-50 border-red-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, (risk.severity || "medium").toString().toUpperCase(), " • ", risk.domain || "general"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, risk.risk || "Operational risk"), renderSummaryContextActionButtons(risk.actions))), contextCoverageGapItems.slice(0, 2).map((gap, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-gap-${idx}`, className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-amber-50 border-amber-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-amber-300" : "text-amber-700"}` }, gap.priority || "Priority not set"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, gap.gap || "Coverage gap"), gap.why_it_matters && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, gap.why_it_matters), renderSummaryContextActionButtons(gap.actions))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks text-emerald-600" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Priority Tasks")), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, contextPriorityTasks.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-sm ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "No tasks yet.") : contextPriorityTasks.slice(0, 4).map((task, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-task-${idx}`, className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-slate-900 border-slate-800" : "bg-emerald-50 border-emerald-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, task.title || `Task ${idx + 1}`), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, task.category || "General")), /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-emerald-300" : "text-emerald-700"}` }, task.priority || "MEDIUM")), renderSummaryContextActionButtons(task.actions)))))))))), activeTab === "queries" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-queries", role: "tabpanel", "aria-labelledby": "summary-tab-queries", className: isDarkTheme ? "text-gray-100" : "text-gray-900" }, queryFocus && /* @__PURE__ */ React.createElement("div", { className: `mb-4 rounded-lg p-4 border ${isDarkTheme ? "bg-indigo-950 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, queryFocus.sourceLabel || "Filtered Searches"), /* @__PURE__ */ React.createElement("h4", { className: `mt-1 text-base font-semibold ${isDarkTheme ? "text-indigo-100" : "text-indigo-900"}` }, queryFocus.title), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${isDarkTheme ? "text-indigo-200" : "text-indigo-800"}` }, queryFocus.description || `Showing searches for ${queryFocus.category}.`)), /* @__PURE__ */ React.createElement(
+      ].map((section) => /* @__PURE__ */ React.createElement("div", { key: section.key, className: `rounded-lg border p-5 ${section.panel}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: `fas ${section.icon} ${section.accent}` }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, section.title)), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, section.items.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-sm ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "None found.") : section.items.slice(0, 4).map((item, idx) => /* @__PURE__ */ React.createElement("div", { key: `${section.key}-${item.name || idx}`, className: `rounded-lg border px-4 py-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-base font-semibold break-all ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, item.name || "Unnamed"), (item.events != null || item.size_mb != null) && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${summaryLabelClass}` }, [
+        item.events != null ? `${Number(item.events).toLocaleString()} events` : "",
+        item.size_mb != null ? `${Number(item.size_mb).toFixed(1)} MB` : ""
+      ].filter(Boolean).join(" · ")))), renderSummaryContextActionButtons(item.actions))))))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-[minmax(0,1.1fr),minmax(0,0.9fr),minmax(0,0.9fr)]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece text-indigo-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Needs Classification")), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, contextUnknownEntities.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-sm ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Nothing needs classification.") : contextUnknownEntities.slice(0, 3).map((item, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-unknown-${item.name || idx}`, className: `rounded-lg border px-4 py-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-base font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, item.name || "Unnamed item"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, item.question || item.reason || "Needs a description and an owner.")), /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, item.type || "item")), renderSummaryContextActionButtons(item.actions))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-shield-alt text-red-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Risks and Coverage Gaps")), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, contextRiskItems.length === 0 && contextCoverageGapItems.length === 0 && /* @__PURE__ */ React.createElement("div", { className: `text-sm ${summaryLabelClass}` }, "No risks or coverage gaps recorded."), contextRiskItems.slice(0, 2).map((risk, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-risk-${idx}`, className: `rounded-lg border px-4 py-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, [risk.severity ? `${String(risk.severity).charAt(0).toUpperCase()}${String(risk.severity).slice(1).toLowerCase()} risk` : "Risk", risk.domain].filter(Boolean).join(" · ")), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, risk.risk || "Unnamed risk"), renderSummaryContextActionButtons(risk.actions))), contextCoverageGapItems.slice(0, 2).map((gap, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-gap-${idx}`, className: `rounded-lg border px-4 py-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-amber-300" : "text-amber-700"}` }, gap.priority ? `Coverage gap · ${gap.priority}` : "Coverage gap"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, gap.gap || "Coverage gap"), gap.why_it_matters && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, gap.why_it_matters), renderSummaryContextActionButtons(gap.actions))))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-4" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks text-indigo-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Priority Tasks")), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, contextPriorityTasks.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-sm ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "No tasks yet.") : contextPriorityTasks.slice(0, 4).map((task, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-task-${idx}`, className: `rounded-lg border px-4 py-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, task.title || `Task ${idx + 1}`), task.category && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${summaryLabelClass}` }, task.category)), task.priority && /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide whitespace-nowrap ${summaryLabelClass}` }, task.priority)), renderSummaryContextActionButtons(task.actions)))))))))), activeTab === "queries" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-queries", role: "tabpanel", "aria-labelledby": "summary-tab-queries", className: isDarkTheme ? "text-gray-100" : "text-gray-900" }, queryFocus && /* @__PURE__ */ React.createElement("div", { className: `mb-4 rounded-lg p-4 border ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, queryFocus.sourceLabel || "Filtered Searches"), /* @__PURE__ */ React.createElement("h4", { className: `mt-1 text-base font-semibold ${headingClass}` }, queryFocus.title), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${mutedTextClass}` }, queryFocus.description || `Showing searches for ${queryFocus.category}.`)), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: clearQueryFocus,
-          className: `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${isDarkTheme ? "bg-gray-900 text-gray-100 hover:bg-gray-800 border border-gray-700" : "bg-white text-gray-800 hover:bg-gray-100 border border-gray-200"}`
+          className: `${summaryButtonClass} flex-shrink-0`
         },
         "Show All Searches"
-      ))), summaryData.risk_register && summaryData.risk_register.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mb-4 rounded-lg p-4 border ${isDarkTheme ? "bg-red-950 border-red-700" : "bg-red-50 border-red-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? "text-red-200" : "text-red-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-shield-alt mr-2" }), "Searches for Top Risks"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-3 ${isDarkTheme ? "text-red-300" : "text-red-800"}` }, "Start with searches that check or reduce the most severe risks from this run."), /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, summaryData.risk_register.slice(0, 3).map((risk, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `text-xs rounded px-3 py-2 border ${isDarkTheme ? "text-red-200 bg-gray-900 border-red-800" : "text-red-900 bg-white border-red-200"}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, (risk.severity || "medium").toString().toUpperCase(), ":"), " ", risk.risk || "Operational risk")))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 mb-4 lg:flex-row lg:items-center lg:justify-between" }, /* @__PURE__ */ React.createElement("h3", { className: `text-xl font-semibold flex items-center ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code text-purple-600 mr-2" }), "SPL Queries (", filteredSummaryQueries.length, ")"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, queryFilterOptions.map((option) => /* @__PURE__ */ React.createElement(
+      ))), summaryData.risk_register && summaryData.risk_register.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mb-4 rounded-lg p-4 border ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-shield-alt mr-2 ${isDarkTheme ? "text-red-300" : "text-red-600"}`, "aria-hidden": "true" }), "Searches for Top Risks"), /* @__PURE__ */ React.createElement("p", { className: `mt-1 mb-3 text-sm ${mutedTextClass}` }, "Start with searches that check the most severe risks from this run."), /* @__PURE__ */ React.createElement("ul", { className: "space-y-2" }, summaryData.risk_register.slice(0, 3).map((risk, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `text-sm rounded-md px-3 py-2 border ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, formatSummaryLevel(risk.severity, "medium"), " risk:"), " ", risk.risk || "Unnamed risk")))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 mb-4 lg:flex-row lg:items-center lg:justify-between" }, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-code mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "SPL Queries", /* @__PURE__ */ React.createElement("span", { className: `ml-2 text-sm font-normal ${summaryLabelClass}` }, "(", filteredSummaryQueries.length, ")")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2", role: "group", "aria-label": "Filter searches by source" }, queryFilterOptions.map((option) => /* @__PURE__ */ React.createElement(
         "button",
         {
           key: option.key,
+          type: "button",
+          "aria-pressed": activeQueryFilterKey === option.key,
           onClick: () => setQueryFilter(option.key),
-          className: `px-3 py-1 text-sm font-medium rounded-lg transition-colors ${activeQueryFilterKey === option.key ? option.activeClass : isDarkTheme ? "bg-gray-700 text-gray-200 hover:bg-gray-600" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`
+          className: `px-3 py-1 text-sm font-medium rounded-md transition-colors ${activeQueryFilterKey === option.key ? option.activeClass : isDarkTheme ? "bg-gray-800 text-gray-200 hover:bg-gray-700" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`
         },
         option.label,
         " (",
         option.count,
         ")"
       )))), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, filteredSummaryQueries.length > 0 ? filteredSummaryQueries.map((query, idx) => {
-        var _a2, _b2, _c2;
-        return /* @__PURE__ */ React.createElement("div", { key: idx, className: `border rounded-xl p-5 shadow-sm hover:shadow-md transition-shadow ${((_a2 = query.priority) == null ? void 0 : _a2.startsWith("🔴")) ? isDarkTheme ? "border-red-700 bg-red-950" : "border-red-300 bg-red-50" : ((_b2 = query.priority) == null ? void 0 : _b2.startsWith("🟠")) ? isDarkTheme ? "border-orange-700 bg-orange-950" : "border-orange-300 bg-orange-50" : ((_c2 = query.priority) == null ? void 0 : _c2.startsWith("🟡")) ? isDarkTheme ? "border-yellow-700 bg-yellow-950" : "border-yellow-300 bg-yellow-50" : isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, query.priority && /* @__PURE__ */ React.createElement("div", { className: "mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `px-3 py-1 text-xs font-bold rounded-full ${query.priority.startsWith("🔴") ? "bg-red-600 text-white" : query.priority.startsWith("🟠") ? "bg-orange-700 text-white" : query.priority.startsWith("🟡") ? "bg-yellow-500 text-gray-900" : "bg-gray-600 text-white"}` }, query.priority), /* @__PURE__ */ React.createElement("span", { className: `ml-2 px-2 py-1 text-xs rounded-full ${query.query_source === "ai_finding" ? "bg-purple-600 text-white" : query.query_source === "context_engine" ? "bg-emerald-600 text-white" : query.query_source === "template" ? "bg-blue-600 text-white" : "bg-gray-600 text-white"}` }, getQuerySourceLabel(query.query_source))), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-start mb-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center flex-wrap gap-2 mb-2" }, /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, query.title), /* @__PURE__ */ React.createElement("span", { className: `px-2 py-1 text-xs rounded-full ${query.category === "Security & Compliance" ? isDarkTheme ? "bg-red-900 text-red-200" : "bg-red-100 text-red-700" : query.category === "Infrastructure & Performance" ? isDarkTheme ? "bg-blue-900 text-blue-200" : "bg-blue-100 text-blue-700" : query.category === "Capacity Planning" ? isDarkTheme ? "bg-green-900 text-green-200" : "bg-green-100 text-green-700" : isDarkTheme ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700"}` }, query.category), /* @__PURE__ */ React.createElement("span", { className: `px-2 py-1 text-xs rounded-full ${isDarkTheme ? "bg-purple-900 text-purple-200" : "bg-purple-100 text-purple-700"}` }, query.difficulty)), /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, query.description), query.finding_reference && /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-2 border-l-2 rounded-r text-xs ${isDarkTheme ? "bg-indigo-950 border-indigo-500 text-indigo-200" : "bg-indigo-50 border-indigo-600 text-indigo-900"}` }, /* @__PURE__ */ React.createElement("strong", null, "📋 Discovery Finding:"), " ", query.finding_reference), query.environment_evidence && query.environment_evidence.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2" }, query.environment_evidence.map((evidence, evidenceIdx) => /* @__PURE__ */ React.createElement("span", { key: evidenceIdx, className: `px-2 py-1 text-xs rounded-full border ${isDarkTheme ? "bg-emerald-900 text-emerald-200 border-emerald-700" : "bg-emerald-100 text-emerald-800 border-emerald-300"}` }, evidence))), /* @__PURE__ */ React.createElement("div", { className: `flex items-center space-x-4 text-xs mt-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-clock mr-1" }), query.execution_time), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line mr-1" }), query.use_case))), /* @__PURE__ */ React.createElement("div", { className: "ml-4 flex space-x-2" }, canUseSplunkDeeplinks && /* @__PURE__ */ React.createElement(
+        const priorityMeta = getQueryPriorityMeta(query.priority);
+        const querySpl = String(query.spl || "").trim();
+        const hasKnownSource = ["ai_finding", "context_engine", "template"].includes(query.query_source);
+        const queryMetaItems = [
+          query.category && { key: "category", icon: "fa-folder", label: "Category", text: query.category },
+          query.use_case && query.use_case !== query.category && { key: "use-case", icon: "fa-chart-line", label: "Use case", text: query.use_case },
+          query.difficulty && { key: "difficulty", icon: "fa-signal", label: "Difficulty", text: query.difficulty },
+          query.execution_time && { key: "run-time", icon: "fa-clock", label: "Estimated run time", text: query.execution_time }
+        ].filter(Boolean);
+        return /* @__PURE__ */ React.createElement("div", { key: idx, className: `border rounded-lg p-5 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 flex-1" }, (priorityMeta || hasKnownSource) && /* @__PURE__ */ React.createElement("div", { className: "mb-2 flex flex-wrap items-center gap-2" }, priorityMeta && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${priorityMeta.className}` }, priorityMeta.label), hasKnownSource && /* @__PURE__ */ React.createElement("span", { className: summaryPillClass }, getQuerySourceLabel(query.query_source))), /* @__PURE__ */ React.createElement("h4", { className: `text-base font-semibold ${headingClass}` }, query.title || "Untitled search"), query.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${mutedTextClass}` }, query.description), queryMetaItems.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: `mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs ${summaryLabelClass}` }, queryMetaItems.map((item) => /* @__PURE__ */ React.createElement("li", { key: item.key, title: item.label, className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: `fas ${item.icon} mr-1`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, item.label, ": "), item.text)))), querySpl && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 md:ml-4 md:flex-shrink-0" }, canUseSplunkDeeplinks && /* @__PURE__ */ React.createElement(
           "button",
           {
             type: "button",
-            onClick: () => openSplunkSearchFromChat(query.spl),
-            className: "px-3 py-1 bg-sky-600 hover:bg-sky-700 text-white text-sm rounded flex items-center space-x-1",
-            title: "Open this query in Splunk Web"
+            onClick: () => openSplunkSearchFromChat(querySpl),
+            className: summaryButtonClass,
+            title: "Open this search in Splunk Web"
           },
-          /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt" }),
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt", "aria-hidden": "true" }),
           /* @__PURE__ */ React.createElement("span", null, "Open in Splunk")
         ), /* @__PURE__ */ React.createElement(
           "button",
           {
+            type: "button",
             onClick: () => launchChatInvestigation(
               `Can you help me understand this query and run it?
 
-${query.spl}`,
+${querySpl}`,
               { freshContext: true }
             ),
-            className: "px-3 py-1 bg-green-600 hover:bg-green-700 text-white text-sm rounded flex items-center space-x-1",
-            title: "Ask about this query in Chat"
+            className: summaryButtonClass,
+            title: "Ask about this search in Chat"
           },
-          /* @__PURE__ */ React.createElement("i", { className: "fas fa-comments" }),
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-comments", "aria-hidden": "true" }),
           /* @__PURE__ */ React.createElement("span", null, "Ask in Chat")
         ), /* @__PURE__ */ React.createElement(
           "button",
           {
-            onClick: () => copyToClipboard(query.spl),
-            className: "px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded flex items-center space-x-1",
-            title: "Copy to clipboard"
+            type: "button",
+            onClick: () => copyToClipboard(querySpl),
+            className: summaryButtonClass,
+            title: "Copy the SPL to the clipboard"
           },
-          /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy" }),
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-copy", "aria-hidden": "true" }),
           /* @__PURE__ */ React.createElement("span", null, "Copy")
-        ))), /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium ${isDarkTheme ? "text-indigo-300 hover:text-indigo-200" : "text-indigo-600 hover:text-indigo-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-1" }), "View SPL Code"), /* @__PURE__ */ React.createElement("pre", { className: "mt-2 p-4 bg-gray-900 text-green-400 rounded text-sm overflow-x-auto" }, query.spl)), query.business_value && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border-l-4 rounded-r ${isDarkTheme ? "bg-yellow-950 border-yellow-600" : "bg-yellow-50 border-yellow-400"}` }, /* @__PURE__ */ React.createElement("p", { className: `text-sm ${isDarkTheme ? "text-yellow-200" : "text-yellow-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-lightbulb mr-1" }), /* @__PURE__ */ React.createElement("strong", null, "Business Value:"), " ", query.business_value)));
-      }) : /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border border-dashed p-6 text-center ${isDarkTheme ? "border-gray-700 bg-gray-900 text-gray-300" : "border-gray-300 bg-gray-50 text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "No queries match the current focus and source filter."), /* @__PURE__ */ React.createElement("p", { className: "mt-2 text-sm" }, "Clear the focus or switch the source filter to broaden the validation set.")))), activeTab === "tasks" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-tasks", role: "tabpanel", "aria-labelledby": "summary-tab-tasks", className: isDarkTheme ? "text-gray-100" : "text-gray-900" }, riskFocus && /* @__PURE__ */ React.createElement("div", { className: `mb-5 rounded-lg p-4 border ${isDarkTheme ? "bg-red-950 border-red-700" : "bg-red-50 border-red-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, "Focused From Risk Register"), /* @__PURE__ */ React.createElement("h4", { className: `mt-1 text-base font-semibold ${isDarkTheme ? "text-red-100" : "text-red-900"}` }, riskFocus.title), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${isDarkTheme ? "text-red-200" : "text-red-800"}` }, riskFocus.domain, " is now driving the execution queue. Current task lens: ", activeTaskFilterLabel, ". Use validation queries to verify the gap before or after executing the filtered tasks.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement(
+        ))), query.finding_reference && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-md border px-3 py-2 text-sm ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "From discovery:"), " ", query.finding_reference), query.environment_evidence && query.environment_evidence.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2" }, query.environment_evidence.map((evidence, evidenceIdx) => /* @__PURE__ */ React.createElement("span", { key: evidenceIdx, className: summaryPillClass }, evidence))), querySpl && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium ${isDarkTheme ? "text-indigo-300 hover:text-indigo-200" : "text-indigo-700 hover:text-indigo-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-1", "aria-hidden": "true" }), "Show SPL"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-4 rounded-md border text-sm font-mono whitespace-pre-wrap break-words overflow-x-auto ${summaryCodeClass}` }, querySpl)), query.business_value && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: `font-semibold ${headingClass}` }, "Why it matters:"), " ", query.business_value));
+      }) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border border-dashed p-6 text-center ${isDarkTheme ? "border-gray-700 bg-gray-900 text-gray-300" : "border-gray-300 bg-gray-50 text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, "No searches match this filter."), /* @__PURE__ */ React.createElement("p", { className: "mt-2 text-sm" }, queryFocus ? "Show all searches or choose another source to see more." : "Choose another source to see more searches.")))), activeTab === "tasks" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-tasks", role: "tabpanel", "aria-labelledby": "summary-tab-tasks", className: isDarkTheme ? "text-gray-100" : "text-gray-900" }, riskFocus && /* @__PURE__ */ React.createElement("div", { className: `mb-5 rounded-lg p-4 border ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "From Top Risks"), /* @__PURE__ */ React.createElement("h4", { className: `mt-1 text-base font-semibold ${headingClass}` }, riskFocus.title), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${mutedTextClass}` }, "Showing ", activeTaskFilterLabel === "All" ? "all tasks" : `${activeTaskFilterLabel} tasks`, " for ", riskFocus.domain || "this risk", ". Run the related searches to confirm the gap before and after you make changes.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: () => focusQueriesForRisk(riskFocus.riskData || { risk: riskFocus.title, domain: riskFocus.domain }),
-          className: "inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium bg-indigo-600 text-white transition-colors hover:bg-indigo-700"
+          className: "inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium bg-indigo-600 text-white transition-colors hover:bg-indigo-700"
         },
         "Show Related Searches"
       ), /* @__PURE__ */ React.createElement(
@@ -10817,7 +10873,7 @@ ${query.spl}`,
             buildRiskInvestigationPrompt(riskFocus.riskData || { risk: riskFocus.title }),
             { freshContext: true }
           ),
-          className: `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${isDarkTheme ? "bg-gray-900 text-gray-100 hover:bg-gray-800 border border-gray-700" : "bg-white text-gray-800 hover:bg-gray-100 border border-gray-200"}`
+          className: summaryButtonClass
         },
         "Investigate in Chat"
       ), /* @__PURE__ */ React.createElement(
@@ -10825,92 +10881,121 @@ ${query.spl}`,
         {
           type: "button",
           onClick: clearRiskFocus,
-          className: `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors ${isDarkTheme ? "bg-gray-900 text-gray-100 hover:bg-gray-800 border border-gray-700" : "bg-white text-gray-800 hover:bg-gray-100 border border-gray-200"}`
+          className: summaryButtonClass
         },
-        "Show All Searches"
-      )))), summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mb-5 rounded-lg p-4 border ${isDarkTheme ? "bg-purple-950 border-purple-700" : "bg-purple-50 border-purple-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold mb-2 flex items-center ${isDarkTheme ? "text-purple-200" : "text-purple-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync-alt mr-2" }), "When to Check Again"), /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, summaryData.recursive_investigations.slice(0, 2).map((loop, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `rounded p-3 text-xs border ${isDarkTheme ? "bg-gray-900 border-purple-800 text-purple-200" : "bg-white border-purple-200 text-purple-900"}` }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold" }, loop.loop || `Check ${idx + 1}`), /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, /* @__PURE__ */ React.createElement("strong", null, "Trigger:"), " ", loop.next_iteration_trigger || "N/A"))))), summaryData.admin_tasks && summaryData.admin_tasks.length > 0 ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "mb-6" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-bold mb-2 flex items-center ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks text-indigo-600 mr-3" }), "Recommended Tasks (", filteredTaskSnapshots.length, ")"), /* @__PURE__ */ React.createElement("p", { className: isDarkTheme ? "text-gray-300" : "text-gray-600" }, "Ranked for your environment. Filter by status or area.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, taskFilterOptions.map((option) => /* @__PURE__ */ React.createElement(
+        "Show All Tasks"
+      )))), summaryData.recursive_investigations && summaryData.recursive_investigations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mb-5 rounded-lg p-4 border ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold mb-3 flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-sync-alt mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "When to Check Again"), /* @__PURE__ */ React.createElement("ul", { className: "space-y-2" }, summaryData.recursive_investigations.slice(0, 2).map((loop, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `rounded-md px-3 py-2 text-sm border ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "font-semibold" }, loop.loop || `Check ${idx + 1}`), loop.next_iteration_trigger && /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${mutedTextClass}` }, "Trigger: ", loop.next_iteration_trigger))))), summaryData.admin_tasks && summaryData.admin_tasks.length > 0 ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-tasks mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "Recommended Tasks", /* @__PURE__ */ React.createElement("span", { className: `ml-2 text-sm font-normal ${summaryLabelClass}` }, "(", filteredTaskSnapshots.length, ")")), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${mutedTextClass}` }, "Ranked for your environment. Filter by status or area.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2", role: "group", "aria-label": "Filter tasks" }, taskFilterOptions.map((option) => /* @__PURE__ */ React.createElement(
         "button",
         {
           key: option.key,
+          type: "button",
+          "aria-pressed": activeTaskFilterKey === option.key,
           onClick: () => setTaskFilter(option.key),
-          className: `px-3 py-1 text-sm font-medium rounded-lg transition-colors ${activeTaskFilterKey === option.key ? option.activeClass : isDarkTheme ? "bg-gray-700 text-gray-200 hover:bg-gray-600" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`
+          className: `px-3 py-1 text-sm font-medium rounded-md transition-colors ${activeTaskFilterKey === option.key ? option.activeClass : isDarkTheme ? "bg-gray-800 text-gray-200 hover:bg-gray-700" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`
         },
         option.label,
         " (",
         option.count,
         ")"
-      ))))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-3 mb-6 sm:grid-cols-2 xl:grid-cols-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, "Total Tasks"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, taskProgressSnapshots.length)), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-gray-900 border-red-800" : "bg-white border-red-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, "High Priority"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, highPriorityTaskCount)), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-gray-900 border-indigo-800" : "bg-white border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, "In Progress"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, inProgressTaskCount)), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-3 ${isDarkTheme ? "bg-gray-900 border-green-800" : "bg-white border-green-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-green-300" : "text-green-700"}` }, "Completed"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-2xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, completedTaskCount))), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, filteredTaskSnapshots.length > 0 ? filteredTaskSnapshots.map(({ task, progress: progress2, completionPct, taskIndex }) => {
-        var _a2, _b2, _c2, _d2;
-        const taskSurfaceClass = isDarkTheme ? "rounded-xl border border-gray-700 bg-gray-950/70" : "rounded-xl border border-gray-200 bg-gray-50";
-        const taskNestedSurfaceClass = isDarkTheme ? "rounded-xl border border-gray-800 bg-gray-900" : "rounded-xl border border-gray-200 bg-white shadow-sm";
-        return /* @__PURE__ */ React.createElement("div", { key: taskIndex, className: `border rounded-xl overflow-hidden shadow-sm transition-all ${progress2.status === "completed" ? isDarkTheme ? "border-green-700 bg-gray-900" : "border-green-300 bg-white" : progress2.status === "in-progress" ? isDarkTheme ? "border-indigo-700 bg-gray-900" : "border-indigo-300 bg-white" : task.priority === "HIGH" ? isDarkTheme ? "border-red-800 bg-gray-900" : "border-red-200 bg-white" : task.priority === "MEDIUM" ? isDarkTheme ? "border-orange-800 bg-gray-900" : "border-orange-200 bg-white" : isDarkTheme ? "border-yellow-800 bg-gray-900" : "border-yellow-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-5 border-b ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between mb-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-2 flex-wrap" }, progress2.status === "completed" && /* @__PURE__ */ React.createElement("span", { className: "px-3 py-1 text-xs font-bold rounded-full bg-green-600 text-white" }, "Completed"), progress2.status === "in-progress" && /* @__PURE__ */ React.createElement("span", { className: "px-3 py-1 text-xs font-bold rounded-full bg-indigo-600 text-white animate-pulse" }, "In Progress"), /* @__PURE__ */ React.createElement("span", { className: `px-3 py-1 text-xs font-bold rounded-full ${task.priority === "HIGH" ? "bg-red-600 text-white" : task.priority === "MEDIUM" ? "bg-orange-700 text-white" : "bg-yellow-500 text-gray-900"}` }, task.priority === "HIGH" ? "High" : task.priority === "MEDIUM" ? "Medium" : "Low", " priority"), /* @__PURE__ */ React.createElement("span", { className: `px-2 py-1 text-xs font-semibold rounded-full ${task.category === "Security" ? isDarkTheme ? "bg-red-900 text-red-200" : "bg-red-100 text-red-700" : task.category === "Performance" ? isDarkTheme ? "bg-blue-900 text-blue-200" : "bg-blue-100 text-blue-700" : task.category === "Compliance" ? isDarkTheme ? "bg-purple-900 text-purple-200" : "bg-purple-100 text-purple-700" : task.category === "Data Quality" ? isDarkTheme ? "bg-green-900 text-green-200" : "bg-green-100 text-green-700" : isDarkTheme ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700"}` }, task.category), task.estimated_time && /* @__PURE__ */ React.createElement("span", { className: `px-2 py-1 text-xs rounded-full ${isDarkTheme ? "bg-indigo-900 text-indigo-200" : "bg-indigo-100 text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-clock mr-1" }), task.estimated_time)), /* @__PURE__ */ React.createElement("h4", { className: `text-xl font-bold mb-2 ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, task.title), /* @__PURE__ */ React.createElement("p", { className: `text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, task.description), /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, /* @__PURE__ */ React.createElement("div", { className: `flex items-center justify-between text-xs mb-1 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Progress: ", completionPct, "%"), /* @__PURE__ */ React.createElement("span", null, progress2.completedSteps.length, " / ", ((_a2 = task.steps) == null ? void 0 : _a2.length) || 0, " steps")), /* @__PURE__ */ React.createElement("div", { className: `w-full rounded-full h-2 overflow-hidden ${isDarkTheme ? "bg-gray-700" : "bg-gray-200"}` }, /* @__PURE__ */ React.createElement(
+      ))))), /* @__PURE__ */ React.createElement("dl", { className: "grid gap-3 mb-6 grid-cols-2 xl:grid-cols-4" }, [
+        { key: "total", label: "Total Tasks", value: taskProgressSnapshots.length },
+        { key: "high", label: "High Priority", value: highPriorityTaskCount },
+        { key: "in-progress", label: "In Progress", value: inProgressTaskCount },
+        { key: "completed", label: "Completed", value: completedTaskCount }
+      ].map((tile) => /* @__PURE__ */ React.createElement("div", { key: tile.key, className: `rounded-lg border px-4 py-3 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs font-medium uppercase tracking-wide ${summaryLabelClass}` }, tile.label), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 text-2xl font-semibold ${headingClass}` }, tile.value)))), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, filteredTaskSnapshots.length > 0 ? filteredTaskSnapshots.map(({ task, progress: progress2, completionPct, taskIndex }) => {
+        const taskSurfaceClass = `rounded-lg border p-4 ${summaryInsetClass}`;
+        const taskNestedSurfaceClass = `rounded-lg border ${summaryCardClass}`;
+        const taskStepCount = Array.isArray(task.steps) ? task.steps.length : 0;
+        const taskPriorityMeta = getQueryPriorityMeta(task.priority);
+        const hasTaskChecklist = taskStepCount > 0 || Array.isArray(task.prerequisites) && task.prerequisites.length > 0;
+        const hasTaskFollowUp = Boolean(task.verification_spl || task.rollback);
+        const taskStatusPillClass = "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold";
+        return /* @__PURE__ */ React.createElement("div", { key: taskIndex, className: `border rounded-lg overflow-hidden ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `p-5 ${hasTaskChecklist || hasTaskFollowUp ? `border-b ${isDarkTheme ? "border-gray-800" : "border-gray-200"}` : ""}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, progress2.status === "completed" && /* @__PURE__ */ React.createElement("span", { className: `${taskStatusPillClass} ${isDarkTheme ? "bg-green-950 text-green-200 border-green-800" : "bg-green-50 text-green-800 border-green-200"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check mr-1", "aria-hidden": "true" }), "Completed"), progress2.status === "in-progress" && /* @__PURE__ */ React.createElement("span", { className: `${taskStatusPillClass} ${isDarkTheme ? "bg-indigo-950 text-indigo-200 border-indigo-800" : "bg-indigo-50 text-indigo-800 border-indigo-200"}` }, "In Progress"), taskPriorityMeta && /* @__PURE__ */ React.createElement("span", { className: `${taskStatusPillClass} ${taskPriorityMeta.className}` }, taskPriorityMeta.label), task.category && /* @__PURE__ */ React.createElement("span", { className: summaryPillClass }, task.category), task.estimated_time && /* @__PURE__ */ React.createElement("span", { className: summaryPillClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-clock mr-1", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, "Estimated time: "), task.estimated_time)), /* @__PURE__ */ React.createElement("h4", { className: `text-base font-semibold ${headingClass}` }, task.title || `Task ${taskIndex + 1}`), task.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${mutedTextClass}` }, task.description), taskStepCount > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, /* @__PURE__ */ React.createElement("div", { className: `flex items-center justify-between text-xs mb-1 ${summaryLabelClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, completionPct, "% done"), /* @__PURE__ */ React.createElement("span", null, progress2.completedSteps.length, " of ", taskStepCount, " step", taskStepCount === 1 ? "" : "s")), /* @__PURE__ */ React.createElement(
           "div",
           {
-            className: `h-full rounded-full transition-all duration-500 ${completionPct === 100 ? "bg-green-500" : completionPct > 0 ? "bg-indigo-500" : "bg-gray-300"}`,
-            style: { width: `${completionPct}%` }
-          }
-        ))))), task.impact && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border-l-4 rounded-r ${isDarkTheme ? "bg-green-950 border-green-600" : "bg-green-50 border-green-500"}` }, /* @__PURE__ */ React.createElement("p", { className: `text-sm ${isDarkTheme ? "text-green-200" : "text-green-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line mr-2" }), /* @__PURE__ */ React.createElement("strong", null, "Impact:"), " ", task.impact)), /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
+            className: `w-full rounded-full h-1.5 overflow-hidden ${isDarkTheme ? "bg-gray-800" : "bg-gray-200"}`,
+            role: "progressbar",
+            "aria-label": `${task.title || `Task ${taskIndex + 1}`} progress`,
+            "aria-valuemin": 0,
+            "aria-valuemax": 100,
+            "aria-valuenow": completionPct
+          },
+          /* @__PURE__ */ React.createElement(
+            "div",
+            {
+              className: `h-full rounded-full transition-all duration-500 ${completionPct === 100 ? "bg-green-600" : "bg-indigo-600"}`,
+              style: { width: `${completionPct}%` }
+            }
+          )
+        )), task.impact && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: `font-semibold ${headingClass}` }, "Impact:"), " ", task.impact), /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
           "button",
           {
             type: "button",
             onClick: () => focusQueriesForTask(task),
-            className: "inline-flex items-center rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-700"
+            className: summaryButtonClass
           },
-          /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2" }),
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-code", "aria-hidden": "true" }),
           "Show Related Searches"
-        ))), /* @__PURE__ */ React.createElement("details", { className: "group", open: progress2.status === "in-progress" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer px-5 py-3 transition-colors list-none flex items-center justify-between ${isDarkTheme ? "bg-gradient-to-r from-indigo-950 to-purple-950 hover:from-indigo-900 hover:to-purple-900" : "bg-gradient-to-r from-indigo-50 to-purple-50 hover:from-indigo-100 hover:to-purple-100"}` }, /* @__PURE__ */ React.createElement("span", { className: `font-semibold flex items-center ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chevron-right mr-2 group-open:rotate-90 transition-transform" }), "Implementation Steps"), /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, ((_b2 = task.steps) == null ? void 0 : _b2.length) || 0, " steps")), /* @__PURE__ */ React.createElement("div", { className: `p-5 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "grid gap-5 lg:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4 min-w-0" }, task.prerequisites && task.prerequisites.length > 0 && /* @__PURE__ */ React.createElement("div", { className: taskSurfaceClass }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-3" }, /* @__PURE__ */ React.createElement("h5", { className: `font-semibold flex items-center ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-list-check mr-2 text-blue-600" }), "Prerequisites"), /* @__PURE__ */ React.createElement("span", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, task.prerequisites.length, " item", task.prerequisites.length === 1 ? "" : "s")), /* @__PURE__ */ React.createElement("ul", { className: "mt-3 space-y-2" }, task.prerequisites.map((prereq, pIdx) => /* @__PURE__ */ React.createElement("li", { key: pIdx, className: `text-sm flex items-start ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-angle-right mr-2 mt-1 text-blue-500" }), /* @__PURE__ */ React.createElement("span", null, prereq))))), /* @__PURE__ */ React.createElement("div", { className: taskSurfaceClass }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" }, /* @__PURE__ */ React.createElement("h5", { className: `font-semibold flex items-center ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-list-ol mr-2 text-indigo-600" }), "Implementation Checklist"), /* @__PURE__ */ React.createElement("span", { className: `text-xs uppercase tracking-wide ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, ((_c2 = task.steps) == null ? void 0 : _c2.length) || 0, " step", (((_d2 = task.steps) == null ? void 0 : _d2.length) || 0) === 1 ? "" : "s")), /* @__PURE__ */ React.createElement("div", { className: "mt-4 space-y-3" }, task.steps && task.steps.length > 0 && task.steps.map((step, sIdx) => {
+        ))), (hasTaskChecklist || hasTaskFollowUp) && /* @__PURE__ */ React.createElement("details", { className: "group", open: progress2.status === "in-progress" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer px-5 py-3 transition-colors list-none flex items-center justify-between ${isDarkTheme ? "bg-gray-900 hover:bg-gray-800" : "bg-gray-50 hover:bg-gray-100"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chevron-right mr-2 group-open:rotate-90 transition-transform", "aria-hidden": "true" }), taskStepCount > 0 ? "Steps and Verification" : "Task Details"), taskStepCount > 0 && /* @__PURE__ */ React.createElement("span", { className: `text-sm ${summaryLabelClass}` }, taskStepCount, " step", taskStepCount === 1 ? "" : "s")), /* @__PURE__ */ React.createElement("div", { className: "p-5" }, /* @__PURE__ */ React.createElement("div", { className: `grid gap-5 ${hasTaskChecklist && hasTaskFollowUp ? "lg:grid-cols-2" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `space-y-4 min-w-0 ${hasTaskChecklist ? "" : "hidden"}` }, task.prerequisites && task.prerequisites.length > 0 && /* @__PURE__ */ React.createElement("div", { className: taskSurfaceClass }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-3" }, /* @__PURE__ */ React.createElement("h5", { className: `text-sm font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-list-check mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "Prerequisites"), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${summaryLabelClass}` }, task.prerequisites.length, " item", task.prerequisites.length === 1 ? "" : "s")), /* @__PURE__ */ React.createElement("ul", { className: "mt-3 space-y-2" }, task.prerequisites.map((prereq, pIdx) => /* @__PURE__ */ React.createElement("li", { key: pIdx, className: `text-sm flex items-start ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-angle-right mr-2 mt-1", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", null, prereq))))), taskStepCount > 0 && /* @__PURE__ */ React.createElement("div", { className: taskSurfaceClass }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" }, /* @__PURE__ */ React.createElement("h5", { className: `text-sm font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-list-ol mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "Checklist"), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${summaryLabelClass}` }, progress2.completedSteps.length, " of ", taskStepCount, " done")), /* @__PURE__ */ React.createElement("div", { className: "mt-4 space-y-3" }, task.steps && task.steps.length > 0 && task.steps.map((step, sIdx) => {
           const isCompleted = progress2.completedSteps.includes(step.number);
-          return /* @__PURE__ */ React.createElement("div", { key: sIdx, className: `border rounded-xl p-4 transition-all ${isCompleted ? isDarkTheme ? "border-green-700 bg-green-950/40" : "border-green-300 bg-green-50" : isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3 min-w-0" }, /* @__PURE__ */ React.createElement(
+          return /* @__PURE__ */ React.createElement("div", { key: sIdx, className: `border rounded-lg p-4 transition-colors ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3 min-w-0" }, /* @__PURE__ */ React.createElement(
             "input",
             {
               type: "checkbox",
+              id: `summary-task-${taskIndex}-step-${sIdx}`,
               checked: isCompleted,
               onChange: () => toggleStepCompletion(currentSessionId, taskIndex, step.number),
-              className: "mt-1 w-5 h-5 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 cursor-pointer"
+              className: "mt-1 w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 cursor-pointer flex-shrink-0"
             }
-          ), /* @__PURE__ */ React.createElement("div", { className: "flex-shrink-0 w-8 h-8 bg-indigo-600 text-white rounded-full flex items-center justify-center font-bold text-sm" }, isCompleted ? "✓" : step.number), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: `text-sm font-medium leading-6 ${isCompleted ? "text-gray-500 line-through" : isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, step.action))), step.spl && /* @__PURE__ */ React.createElement("div", { className: "mt-3 sm:ml-16" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Step SPL"), renderSplQueryActionButtons2(step.spl, {
+          ), /* @__PURE__ */ React.createElement("label", { htmlFor: `summary-task-${taskIndex}-step-${sIdx}`, className: `flex-1 min-w-0 cursor-pointer text-sm leading-6 ${isCompleted ? `${summaryLabelClass} line-through` : headingClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Step ", step.number || sIdx + 1, "."), " ", step.action)), step.spl && /* @__PURE__ */ React.createElement("div", { className: "mt-3 sm:ml-7" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "Step SPL"), renderSplQueryActionButtons2(step.spl, {
             originKind: "summary_task_step",
             originLabel: task.title || `Task ${taskIndex + 1}`,
             sourceLabel: task.title || "Summary task",
             contextExcerpt: step.action,
             className: "sm:justify-end"
-          })), /* @__PURE__ */ React.createElement("pre", { className: "max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400" }, step.spl)));
-        })))), /* @__PURE__ */ React.createElement("div", { className: "space-y-4 min-w-0" }, task.verification_spl && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "border-blue-800 bg-blue-950/40" : "border-blue-200 bg-blue-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h5", { className: `font-semibold flex items-center ${isDarkTheme ? "text-blue-200" : "text-blue-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle mr-2" }), "Verification"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 rounded-lg border px-3 py-3 text-sm ${isDarkTheme ? "border-blue-900 bg-gray-950 text-blue-100" : "border-blue-100 bg-white text-blue-900"}` }, /* @__PURE__ */ React.createElement("strong", null, "Expected Outcome:"), " ", task.expected_outcome)), /* @__PURE__ */ React.createElement(
+          })), /* @__PURE__ */ React.createElement("pre", { className: `max-h-48 overflow-auto rounded-md border p-3 text-xs font-mono ${summaryCodeClass}` }, step.spl)));
+        })))), /* @__PURE__ */ React.createElement("div", { className: `space-y-4 min-w-0 ${hasTaskFollowUp ? "" : "hidden"}` }, task.verification_spl && /* @__PURE__ */ React.createElement("div", { className: taskSurfaceClass }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h5", { className: `text-sm font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-check-circle mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "Verification"), task.expected_outcome && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: `font-semibold ${headingClass}` }, "Expected result:"), " ", task.expected_outcome)), /* @__PURE__ */ React.createElement(
           "button",
           {
+            type: "button",
             onClick: () => runVerification(currentSessionId, taskIndex, task),
             disabled: verifyingTask === taskIndex,
-            className: `inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-all ${verifyingTask === taskIndex ? "bg-gray-400 text-white cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700 text-white shadow-sm hover:shadow"}`
+            "aria-busy": verifyingTask === taskIndex,
+            className: `inline-flex flex-shrink-0 items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${verifyingTask === taskIndex ? `border cursor-wait ${isDarkTheme ? "border-gray-700 bg-gray-800 text-gray-200" : "border-gray-300 bg-gray-100 text-gray-800"}` : "bg-indigo-600 hover:bg-indigo-700 text-white"}`
           },
-          verifyingTask === taskIndex ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-2" }), "Verifying...") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-play-circle mr-2" }), "Run Verification")
-        )), /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-xs font-semibold ${isDarkTheme ? "text-blue-300 hover:text-blue-200" : "text-blue-700 hover:text-blue-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-1" }), "View Verification SPL"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center justify-end gap-2 mb-2" }, renderSplQueryActionButtons2(task.verification_spl, {
+          verifyingTask === taskIndex ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-2", "aria-hidden": "true" }), "Verifying...") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-play-circle mr-2", "aria-hidden": "true" }), "Run Verification")
+        )), /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium ${isDarkTheme ? "text-indigo-300 hover:text-indigo-200" : "text-indigo-700 hover:text-indigo-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-1", "aria-hidden": "true" }), "Show verification SPL"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center justify-end gap-2 mb-2" }, renderSplQueryActionButtons2(task.verification_spl, {
           originKind: "summary_verification",
           originLabel: task.title || `Task ${taskIndex + 1}`,
           sourceLabel: task.title || "Verification task",
           contextExcerpt: task.expected_outcome,
           className: "justify-end"
-        })), /* @__PURE__ */ React.createElement("pre", { className: "max-h-48 overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-green-400" }, task.verification_spl)), (() => {
+        })), /* @__PURE__ */ React.createElement("pre", { className: `max-h-48 overflow-auto rounded-md border p-3 text-xs font-mono ${summaryCodeClass}` }, task.verification_spl)), (() => {
           const verResult = getVerificationResult(currentSessionId, taskIndex);
           if (!verResult) return null;
           const verificationResultSurfaceClass = verResult.status === "success" ? isDarkTheme ? "bg-green-950/40 border-green-700" : "bg-green-50 border-green-200" : verResult.status === "partial" ? isDarkTheme ? "bg-amber-950/40 border-amber-700" : "bg-amber-50 border-amber-200" : verResult.status === "failed" ? isDarkTheme ? "bg-red-950/40 border-red-700" : "bg-red-50 border-red-200" : isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200";
           const verificationResultTextClass = verResult.status === "success" ? isDarkTheme ? "text-green-100" : "text-green-900" : verResult.status === "partial" ? isDarkTheme ? "text-amber-100" : "text-amber-900" : verResult.status === "failed" ? isDarkTheme ? "text-red-100" : "text-red-900" : isDarkTheme ? "text-gray-100" : "text-gray-900";
-          return /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border p-4 fade-in ${verificationResultSurfaceClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 flex-wrap" }, verResult.status === "success" && /* @__PURE__ */ React.createElement("span", { className: "px-3 py-1 bg-green-600 text-white text-xs font-bold rounded-full" }, "✓ SUCCESS"), verResult.status === "partial" && /* @__PURE__ */ React.createElement("span", { className: "px-3 py-1 bg-yellow-500 text-gray-900 text-xs font-bold rounded-full" }, "⚠ PARTIAL SUCCESS"), verResult.status === "failed" && /* @__PURE__ */ React.createElement("span", { className: "px-3 py-1 bg-red-600 text-white text-xs font-bold rounded-full" }, "✗ FAILED"), verResult.status === "error" && /* @__PURE__ */ React.createElement("span", { className: "px-3 py-1 bg-gray-600 text-white text-xs font-bold rounded-full" }, "⚠ ERROR")), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, formatMissionDateTime(verResult.timestamp))), /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${verificationResultTextClass}` }, verResult.message), verResult.metrics && /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} mt-4 p-3` }, /* @__PURE__ */ React.createElement("h6", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Metrics"), /* @__PURE__ */ React.createElement("div", { className: "mt-3 grid gap-3 text-xs md:grid-cols-2" }, verResult.metrics.current_value && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Current:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium leading-5 ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, verResult.metrics.current_value)), verResult.metrics.expected_value && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Expected:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium leading-5 ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, verResult.metrics.expected_value)), verResult.metrics.gap && /* @__PURE__ */ React.createElement("div", { className: "md:col-span-2" }, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Gap:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium leading-5 ${isDarkTheme ? "text-amber-200" : "text-orange-700"}` }, verResult.metrics.gap)))), verResult.recommendations && verResult.recommendations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} mt-4 p-3` }, /* @__PURE__ */ React.createElement("h6", { className: `text-xs font-semibold uppercase tracking-wide flex items-center ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-lightbulb mr-2 text-yellow-500" }), "Recommendations"), /* @__PURE__ */ React.createElement("ul", { className: "mt-3 space-y-2" }, verResult.recommendations.map((rec, rIdx) => /* @__PURE__ */ React.createElement("li", { key: rIdx, className: `text-xs flex items-start leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-2 mt-0.5 text-blue-500" }), /* @__PURE__ */ React.createElement("span", null, rec))))), (verResult.status === "failed" || verResult.status === "partial") && /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
+          const verificationResultPillClass = verResult.status === "success" ? isDarkTheme ? "bg-green-950 text-green-200 border-green-800" : "bg-white text-green-800 border-green-300" : verResult.status === "partial" ? isDarkTheme ? "bg-amber-950 text-amber-200 border-amber-800" : "bg-white text-amber-800 border-amber-300" : verResult.status === "failed" ? isDarkTheme ? "bg-red-950 text-red-200 border-red-800" : "bg-white text-red-800 border-red-300" : isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-white text-gray-700 border-gray-300";
+          return /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border p-4 fade-in ${verificationResultSurfaceClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 flex-wrap" }, /* @__PURE__ */ React.createElement("span", { className: `${taskStatusPillClass} ${verificationResultPillClass}` }, getVerificationStatusLabel(verResult.status))), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${summaryLabelClass}` }, formatMissionDateTime(verResult.timestamp))), /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${verificationResultTextClass}` }, verResult.message), verResult.metrics && /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} mt-4 p-3` }, /* @__PURE__ */ React.createElement("h6", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Metrics"), /* @__PURE__ */ React.createElement("div", { className: "mt-3 grid gap-3 text-xs md:grid-cols-2" }, verResult.metrics.current_value && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Current:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium leading-5 ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, verResult.metrics.current_value)), verResult.metrics.expected_value && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Expected:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium leading-5 ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, verResult.metrics.expected_value)), verResult.metrics.gap && /* @__PURE__ */ React.createElement("div", { className: "md:col-span-2" }, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Gap:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium leading-5 ${isDarkTheme ? "text-amber-200" : "text-amber-800"}` }, verResult.metrics.gap)))), verResult.recommendations && verResult.recommendations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} mt-4 p-3` }, /* @__PURE__ */ React.createElement("h6", { className: `text-xs font-semibold uppercase tracking-wide flex items-center ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Recommendations"), /* @__PURE__ */ React.createElement("ul", { className: "mt-3 space-y-2" }, verResult.recommendations.map((rec, rIdx) => /* @__PURE__ */ React.createElement("li", { key: rIdx, className: `text-xs flex items-start leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-2 mt-1", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", null, rec))))), (verResult.status === "failed" || verResult.status === "partial") && /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
             "button",
             {
+              type: "button",
               onClick: () => getRemediation(currentSessionId, taskIndex, task, verResult),
               disabled: loadingRemediation === taskIndex,
-              className: "flex-1 min-w-[180px] px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              "aria-busy": loadingRemediation === taskIndex,
+              className: "inline-flex items-center justify-center rounded-md px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium disabled:cursor-wait"
             },
-            loadingRemediation === taskIndex ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-1" }), "Analyzing...") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-wrench mr-1" }), "Get Remediation Help")
+            loadingRemediation === taskIndex ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-1", "aria-hidden": "true" }), "Analyzing...") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-wrench mr-1", "aria-hidden": "true" }), "Suggest a Fix")
           ), /* @__PURE__ */ React.createElement(
             "button",
             {
+              type: "button",
               onClick: () => runVerification(currentSessionId, taskIndex, task),
               disabled: verifyingTask === taskIndex,
-              className: "px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-xs font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              className: `${summaryButtonClass} disabled:cursor-wait`
             },
-            /* @__PURE__ */ React.createElement("i", { className: "fas fa-redo mr-1" }),
-            "Re-verify"
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-redo", "aria-hidden": "true" }),
+            "Run Again"
           ), /* @__PURE__ */ React.createElement(
             "button",
             {
@@ -10918,9 +11003,11 @@ ${query.spl}`,
                 loadVerificationHistory(currentSessionId, taskIndex);
                 setShowHistory(showHistory === taskIndex ? null : taskIndex);
               },
-              className: "px-3 py-2 bg-gray-600 hover:bg-gray-700 text-white text-xs font-medium rounded"
+              type: "button",
+              "aria-expanded": showHistory === taskIndex,
+              className: summaryButtonClass
             },
-            /* @__PURE__ */ React.createElement("i", { className: "fas fa-history mr-1" }),
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-history", "aria-hidden": "true" }),
             "History"
           )), verResult.status === "success" && /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
             "button",
@@ -10929,38 +11016,45 @@ ${query.spl}`,
                 loadVerificationHistory(currentSessionId, taskIndex);
                 setShowHistory(showHistory === taskIndex ? null : taskIndex);
               },
-              className: "px-3 py-2 bg-gray-600 hover:bg-gray-700 text-white text-xs font-medium rounded"
+              type: "button",
+              "aria-expanded": showHistory === taskIndex,
+              className: summaryButtonClass
             },
-            /* @__PURE__ */ React.createElement("i", { className: "fas fa-history mr-1" }),
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-history", "aria-hidden": "true" }),
             "View History"
           )), (() => {
-            var _a3, _b3;
+            var _a2;
             const remediation = remediationData[`${currentSessionId}_task${taskIndex}`];
             if (!remediation) return null;
-            return /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-xl border p-4 fade-in ${isDarkTheme ? "border-indigo-700 bg-gradient-to-r from-purple-950 via-indigo-950 to-slate-950" : "border-indigo-200 bg-gradient-to-r from-purple-50 to-indigo-50"}` }, /* @__PURE__ */ React.createElement("h6", { className: `text-sm font-bold mb-3 flex items-center ${isDarkTheme ? "text-indigo-100" : "text-indigo-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-magic mr-2" }), "AI-Powered Remediation Guide"), /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3 mb-3` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold mb-1 flex items-center ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-search mr-1 text-red-600" }), "Root Cause"), /* @__PURE__ */ React.createElement("p", { className: `text-xs leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-800"}` }, remediation.root_cause)), /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3 mb-3` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold mb-2 flex items-center ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-list-ol mr-1 text-green-600" }), "Remediation Steps"), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, (_a3 = remediation.remediation_steps) == null ? void 0 : _a3.map((step, sIdx) => {
-              var _a4;
-              return /* @__PURE__ */ React.createElement("div", { key: sIdx, className: `border-l-2 pl-3 ${isDarkTheme ? "border-indigo-500" : "border-indigo-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium leading-5 ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, step.number, ". ", step.action), /* @__PURE__ */ React.createElement("span", { className: `px-2 py-0.5 text-xs rounded self-start ${step.risk === "low" ? "bg-green-100 text-green-800" : step.risk === "medium" ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"}` }, (_a4 = step.risk) == null ? void 0 : _a4.toUpperCase(), " RISK")), step.explanation && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, step.explanation), step.spl && /* @__PURE__ */ React.createElement("pre", { className: "mt-2 max-h-40 overflow-auto rounded bg-gray-950 p-2 text-xs font-mono text-green-400" }, step.spl));
-            }))), /* @__PURE__ */ React.createElement("div", { className: "grid gap-2 text-xs sm:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3` }, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Estimated Time:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, remediation.estimated_time)), /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3` }, /* @__PURE__ */ React.createElement("span", { className: `${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Success Probability:"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${remediation.success_probability === "high" ? "text-green-600" : remediation.success_probability === "medium" ? "text-yellow-600" : "text-red-600"}` }, (_b3 = remediation.success_probability) == null ? void 0 : _b3.toUpperCase()))), remediation.preventive_measures && remediation.preventive_measures.length > 0 && /* @__PURE__ */ React.createElement("details", { className: `${taskNestedSurfaceClass} mt-3 p-3` }, /* @__PURE__ */ React.createElement("summary", { className: `text-xs font-semibold cursor-pointer ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-shield-alt mr-1 text-blue-600" }), "Preventive Measures"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-1" }, remediation.preventive_measures.map((measure, mIdx) => /* @__PURE__ */ React.createElement("li", { key: mIdx, className: `text-xs flex items-start leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle mr-2 mt-0.5 text-green-500" }), /* @__PURE__ */ React.createElement("span", null, measure))))));
+            return /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border p-4 fade-in ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("h6", { className: `text-sm font-semibold mb-3 flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-wrench mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "Suggested Fix"), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-3 mb-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold mb-1 flex items-center ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Likely Cause"), /* @__PURE__ */ React.createElement("p", { className: `text-xs leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-800"}` }, remediation.root_cause)), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-3 mb-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold mb-2 flex items-center ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Steps"), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, (_a2 = remediation.remediation_steps) == null ? void 0 : _a2.map((step, sIdx) => /* @__PURE__ */ React.createElement("div", { key: sIdx, className: `border-l-2 pl-3 ${isDarkTheme ? "border-indigo-500" : "border-indigo-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium leading-5 ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, step.number, ". ", step.action), step.risk && /* @__PURE__ */ React.createElement("span", { className: `${taskStatusPillClass} self-start ${step.risk === "low" ? isDarkTheme ? "bg-green-950 text-green-200 border-green-800" : "bg-green-50 text-green-800 border-green-200" : step.risk === "medium" ? isDarkTheme ? "bg-amber-950 text-amber-200 border-amber-800" : "bg-amber-50 text-amber-800 border-amber-200" : isDarkTheme ? "bg-red-950 text-red-200 border-red-800" : "bg-red-50 text-red-800 border-red-200"}` }, formatSummaryLevel(step.risk), " risk")), step.explanation && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, step.explanation), step.spl && /* @__PURE__ */ React.createElement("pre", { className: `mt-2 max-h-40 overflow-auto rounded-md border p-2 text-xs font-mono ${summaryCodeClass}` }, step.spl))))), (remediation.estimated_time || remediation.success_probability) && /* @__PURE__ */ React.createElement("dl", { className: "grid gap-2 text-xs sm:grid-cols-2" }, remediation.estimated_time && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("dt", { className: summaryLabelClass }, "Estimated time"), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 font-medium ${headingClass}` }, remediation.estimated_time)), remediation.success_probability && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("dt", { className: summaryLabelClass }, "Chance of success"), /* @__PURE__ */ React.createElement("dd", { className: `mt-1 font-medium ${remediation.success_probability === "high" ? isDarkTheme ? "text-green-300" : "text-green-700" : remediation.success_probability === "medium" ? isDarkTheme ? "text-amber-300" : "text-amber-800" : isDarkTheme ? "text-red-300" : "text-red-700"}` }, formatSummaryLevel(remediation.success_probability)))), remediation.preventive_measures && remediation.preventive_measures.length > 0 && /* @__PURE__ */ React.createElement("details", { className: `mt-3 rounded-lg border p-3 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("summary", { className: `text-xs font-semibold cursor-pointer ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "How to Prevent It"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-1" }, remediation.preventive_measures.map((measure, mIdx) => /* @__PURE__ */ React.createElement("li", { key: mIdx, className: `text-xs flex items-start leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-check-circle mr-2 mt-1 ${isDarkTheme ? "text-green-300" : "text-green-700"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", null, measure))))));
           })(), showHistory === taskIndex && (() => {
-            var _a3;
+            var _a2, _b2, _c2;
             const history = verificationHistory[`${currentSessionId}_task${taskIndex}`];
             if (!history) {
-              return /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Loading history...");
+              return /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${summaryLabelClass}` }, "Loading history...");
             }
-            return /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} mt-4 p-4 fade-in` }, /* @__PURE__ */ React.createElement("h6", { className: `text-sm font-bold mb-3 flex items-center justify-between ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-history mr-2" }), "Verification History"), /* @__PURE__ */ React.createElement(
+            return /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} mt-4 p-4 fade-in` }, /* @__PURE__ */ React.createElement("div", { className: "mb-3 flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h6", { className: `text-sm font-semibold flex items-center ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-history mr-2", "aria-hidden": "true" }), "Verification History"), /* @__PURE__ */ React.createElement(
               "button",
               {
+                type: "button",
                 onClick: () => setShowHistory(null),
-                className: `${isDarkTheme ? "text-gray-400 hover:text-gray-200" : "text-gray-500 hover:text-gray-700"}`
+                "aria-label": "Close verification history",
+                className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-400 hover:text-gray-200 hover:bg-gray-800" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`
               },
-              /* @__PURE__ */ React.createElement("i", { className: "fas fa-times" })
-            )), /* @__PURE__ */ React.createElement("div", { className: "grid gap-2 mb-3 sm:grid-cols-2 lg:grid-cols-4" }, /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3 text-center` }, /* @__PURE__ */ React.createElement("div", { className: "text-lg font-bold text-blue-600" }, history.total_attempts), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Attempts")), /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3 text-center` }, /* @__PURE__ */ React.createElement("div", { className: "text-lg font-bold text-green-600" }, history.successful_attempts), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Successful")), /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3 text-center` }, /* @__PURE__ */ React.createElement("div", { className: "text-lg font-bold text-purple-600" }, Math.round(history.success_rate * 100), "%"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Success Rate")), /* @__PURE__ */ React.createElement("div", { className: `${taskNestedSurfaceClass} p-3 text-center` }, /* @__PURE__ */ React.createElement("div", { className: `text-lg font-bold ${history.improvement_trend === "improving" ? "text-green-600" : history.improvement_trend === "stable" ? "text-blue-600" : "text-red-600"}` }, history.improvement_trend === "improving" ? "↑" : history.improvement_trend === "stable" ? "→" : "↓"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Trend"))), history.time_to_success && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-2 mb-3 text-xs ${isDarkTheme ? "bg-green-950/40 border-green-700 text-green-200" : "bg-green-100 border-green-300 text-green-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-clock mr-1" }), "Time to success: ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, history.time_to_success)), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-64 overflow-y-auto pr-1" }, (_a3 = history.verifications) == null ? void 0 : _a3.map((ver, vIdx) => {
-              var _a4;
-              return /* @__PURE__ */ React.createElement("div", { key: vIdx, className: `rounded-lg p-3 border-l-4 ${ver.status === "success" ? isDarkTheme ? "bg-green-950/30 border-green-500" : "bg-green-50 border-green-500" : ver.status === "partial" ? isDarkTheme ? "bg-amber-950/30 border-amber-500" : "bg-amber-50 border-amber-500" : isDarkTheme ? "bg-red-950/30 border-red-500" : "bg-red-50 border-red-500"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-1" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold ${ver.status === "success" ? "text-green-700" : ver.status === "partial" ? "text-yellow-700" : "text-red-700"}` }, "Attempt #", vIdx + 1, " - ", (_a4 = ver.status) == null ? void 0 : _a4.toUpperCase()), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, formatMissionDateTime(ver.timestamp))), /* @__PURE__ */ React.createElement("p", { className: `text-xs leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, ver.message));
-            })));
+              /* @__PURE__ */ React.createElement("i", { className: "fas fa-times", "aria-hidden": "true" })
+            )), /* @__PURE__ */ React.createElement("dl", { className: "grid gap-2 mb-3 grid-cols-2 lg:grid-cols-4" }, [
+              { key: "attempts", label: "Attempts", value: (_a2 = history.total_attempts) != null ? _a2 : 0 },
+              { key: "passed", label: "Passed", value: (_b2 = history.successful_attempts) != null ? _b2 : 0 },
+              { key: "rate", label: "Pass rate", value: `${Math.round((history.success_rate || 0) * 100)}%` },
+              {
+                key: "trend",
+                label: "Trend",
+                value: history.improvement_trend === "improving" ? "Improving" : history.improvement_trend === "stable" ? "Stable" : history.improvement_trend ? "Declining" : "Not enough data"
+              }
+            ].map((stat) => /* @__PURE__ */ React.createElement("div", { key: stat.key, className: `flex flex-col-reverse rounded-lg border p-3 text-center ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("dt", { className: `text-xs ${summaryLabelClass}` }, stat.label), /* @__PURE__ */ React.createElement("dd", { className: `text-base font-semibold ${headingClass}` }, stat.value)))), history.time_to_success && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-2 mb-3 text-xs ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-clock mr-1", "aria-hidden": "true" }), "Time to success: ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, history.time_to_success)), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 max-h-64 overflow-y-auto pr-1" }, (_c2 = history.verifications) == null ? void 0 : _c2.map((ver, vIdx) => /* @__PURE__ */ React.createElement("div", { key: vIdx, className: `rounded-lg p-3 border-l-4 ${ver.status === "success" ? isDarkTheme ? "bg-green-950/30 border-green-500" : "bg-green-50 border-green-500" : ver.status === "partial" ? isDarkTheme ? "bg-amber-950/30 border-amber-500" : "bg-amber-50 border-amber-500" : isDarkTheme ? "bg-red-950/30 border-red-500" : "bg-red-50 border-red-500"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-1" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold ${ver.status === "success" ? isDarkTheme ? "text-green-300" : "text-green-800" : ver.status === "partial" ? isDarkTheme ? "text-amber-300" : "text-amber-800" : isDarkTheme ? "text-red-300" : "text-red-800"}` }, "Attempt ", vIdx + 1, ": ", getVerificationStatusLabel(ver.status)), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${summaryLabelClass}` }, formatMissionDateTime(ver.timestamp))), /* @__PURE__ */ React.createElement("p", { className: `text-xs leading-5 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, ver.message)))));
           })());
-        })()), task.rollback && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${isDarkTheme ? "border-yellow-700 bg-yellow-950/30" : "border-yellow-200 bg-yellow-50"}` }, /* @__PURE__ */ React.createElement("h5", { className: `font-semibold mb-2 flex items-center text-sm ${isDarkTheme ? "text-yellow-200" : "text-yellow-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-undo mr-2" }), "Rollback Instructions"), /* @__PURE__ */ React.createElement("p", { className: `text-sm leading-6 ${isDarkTheme ? "text-yellow-100" : "text-yellow-800"}` }, task.rollback)))))));
-      }) : /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-8 text-center ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-600"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-filter text-3xl text-indigo-500 mb-3" }), /* @__PURE__ */ React.createElement("p", { className: "text-base font-semibold" }, "No tasks match the current filter."), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "Switch the task filter to broaden the execution queue.")))) : /* @__PURE__ */ React.createElement("div", { className: "text-center py-20" }, /* @__PURE__ */ React.createElement("div", { className: "inline-block p-6 bg-gradient-to-br from-indigo-50 to-purple-50 rounded-2xl mb-6" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tools text-7xl text-indigo-400 mb-4" })), /* @__PURE__ */ React.createElement("h3", { className: "text-3xl font-bold text-gray-800 mb-3" }, "Generating Tasks..."), /* @__PURE__ */ React.createElement("p", { className: "text-lg text-gray-600 mb-6 max-w-2xl mx-auto" }, "Admin tasks are being generated based on your environment analysis")))) : /* @__PURE__ */ React.createElement("div", { className: "text-center text-gray-500 py-12" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-circle text-4xl mb-4" }), /* @__PURE__ */ React.createElement("p", null, "No summary data available")))))
+        })()), task.rollback && /* @__PURE__ */ React.createElement("div", { className: taskSurfaceClass }, /* @__PURE__ */ React.createElement("h5", { className: `font-semibold mb-1 flex items-center text-sm ${headingClass}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-undo mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), "How to Undo"), /* @__PURE__ */ React.createElement("p", { className: `text-sm leading-6 ${mutedTextClass}` }, task.rollback)))))));
+      }) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border border-dashed p-6 text-center ${isDarkTheme ? "border-gray-700 bg-gray-900 text-gray-300" : "border-gray-300 bg-gray-50 text-gray-600"}` }, /* @__PURE__ */ React.createElement("p", { className: `text-sm font-semibold ${headingClass}` }, "No tasks match this filter."), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "Choose another filter to see more tasks.")))) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border border-dashed p-8 text-center ${isDarkTheme ? "border-gray-700 bg-gray-900 text-gray-300" : "border-gray-300 bg-gray-50 text-gray-600"}` }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-tasks text-2xl mb-3 ${summaryLabelClass}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-sm font-semibold ${headingClass}` }, "No admin tasks for this run."), /* @__PURE__ */ React.createElement("p", { className: "mt-2 text-sm" }, "This summary did not include recommended tasks. Ask in Chat for next steps.")))) : /* @__PURE__ */ React.createElement("div", { className: `text-center py-12 ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-circle text-3xl mb-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", null, "No summary is available for this run.")))))
     ), isSettingsOpen && config && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50", onClick: closeSettings }, /* @__PURE__ */ React.createElement("div", { className: `settings-modal-shell rounded-xl shadow-2xl w-full max-w-5xl h-5/6 flex flex-col ${isDarkTheme ? "bg-gray-800" : "bg-white"}`, onClick: (e) => e.stopPropagation(), role: "dialog", "aria-modal": "true", "aria-labelledby": "settings-modal-title", onKeyDown: (event) => handleDialogKeyDown(event, closeSettings) }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b flex justify-between items-center ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog text-2xl text-indigo-600 mr-3" }), /* @__PURE__ */ React.createElement("h2", { id: "settings-modal-title", className: `text-xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Settings")), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: closeSettings, className: `${isDarkTheme ? "text-gray-400 hover:text-gray-200" : "text-gray-500 hover:text-gray-700"}`, "aria-label": "Close settings" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl" }))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 overflow-y-auto p-6 space-y-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "grid gap-2 grid-cols-2 sm:grid-cols-3 md:grid-cols-5" }, SETTINGS_MODAL_TABS.map((tab) => {
       const isActive = activeSettingsTab === tab.id;
       return /* @__PURE__ */ React.createElement(
@@ -11010,7 +11104,7 @@ ${query.spl}`,
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-rotate-left mr-2", "aria-hidden": "true" }),
       "Show Again Next Time"
-    )))), /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-connections-panel", className: "space-y-6", hidden: activeSettingsTab !== "connections" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border-2 ${isDarkTheme ? "bg-gray-800 border-green-700" : "bg-gradient-to-r from-green-50 to-emerald-50 border-green-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-green-600" }), "MCP Servers"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Saved connections to your Splunk MCP servers.")), (loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)) && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-emerald-600" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, "Active Configuration:"), /* @__PURE__ */ React.createElement("p", { className: "text-base font-bold text-gray-800" }, loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)))), /* @__PURE__ */ React.createElement(
+    )))), /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-connections-panel", className: "space-y-6", hidden: activeSettingsTab !== "connections" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-indigo-600", "aria-hidden": "true" }), "MCP Servers"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Saved connections to your Splunk MCP servers.")), (loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)) && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-emerald-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, "Active Configuration:"), /* @__PURE__ */ React.createElement("p", { className: "text-base font-bold text-gray-800" }, loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)))), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -11020,7 +11114,7 @@ ${query.spl}`,
         className: "text-emerald-700 hover:text-emerald-900 text-sm font-medium",
         title: "Clear and close editor"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times-circle mr-1" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times-circle mr-1", "aria-hidden": "true" }),
       "Close"
     ))), !showMCPConfigForm && /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement(
       "button",
@@ -11030,11 +11124,11 @@ ${query.spl}`,
           setLoadedMCPConfigName(null);
           setMCPTokenPlaceholder("Enter token");
         },
-        className: "w-full px-4 py-3 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
+        className: "w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2", "aria-hidden": "true" }),
       "Add MCP Server"
-    )), /* @__PURE__ */ React.createElement("div", { id: "mcp-configs-list", className: "space-y-2 max-h-96 overflow-y-auto" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500 text-center py-4 italic" }, "Loading configurations...")))), showMCPConfigForm && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-green-600" }), loadedMCPConfigName ? "Edit Configuration" : "New Configuration"), /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { id: "mcp-configs-list", className: "space-y-2 max-h-96 overflow-y-auto" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500 text-center py-4 italic" }, "Loading configurations...")))), showMCPConfigForm && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-indigo-600", "aria-hidden": "true" }), loadedMCPConfigName ? "Edit Configuration" : "New Configuration"), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -11043,7 +11137,7 @@ ${query.spl}`,
         },
         className: "px-3 py-1 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times mr-1" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times mr-1", "aria-hidden": "true" }),
       "Cancel"
     )), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "MCP URL"), /* @__PURE__ */ React.createElement(
       "input",
@@ -11099,7 +11193,7 @@ ${query.spl}`,
           const button = event.currentTarget;
           const originalHTML2 = button.innerHTML;
           button.disabled = true;
-          button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Testing...';
+          button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2" aria-hidden="true"></i>Testing...';
           try {
             const response = await fetch("/api/mcp-configs/test", {
               method: "POST",
@@ -11129,9 +11223,9 @@ ${query.spl}`,
             button.innerHTML = originalHTML2;
           }
         },
-        className: "w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
+        className: `w-full px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-network-wired mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-network-wired mr-2", "aria-hidden": "true" }),
       "Test Connection"
     ), /* @__PURE__ */ React.createElement(
       "button",
@@ -11139,35 +11233,35 @@ ${query.spl}`,
         type: "button",
         "data-testid": "mcp-troubleshoot",
         onClick: () => openSettingsTroubleshooter("mcp", readTroubleshootDraftFromForm("mcp"), { autoRun: true }),
-        className: "w-full px-4 py-2 bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 rounded-lg font-medium transition-all"
+        className: `w-full px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2", "aria-hidden": "true" }),
       "Troubleshoot"
     ), loadedMCPConfigName ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => openMCPSaveModal(""),
-        className: "w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
+        className: `w-full px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2", "aria-hidden": "true" }),
       "Save as New"
     ), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => openMCPSaveModal(loadedMCPConfigName),
-        className: "w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
+        className: "w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync-alt mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync-alt mr-2", "aria-hidden": "true" }),
       "Update Active Configuration"
     )) : /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => openMCPSaveModal(""),
-        className: "w-full px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all"
+        className: "w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2", "aria-hidden": "true" }),
       "Save as New Configuration"
-    )))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border-2 ${isDarkTheme ? "bg-gray-800 border-purple-700" : "bg-gradient-to-r from-purple-50 to-indigo-50 border-purple-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-key mr-2 text-purple-600" }), "AI Models"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Saved connections to AI model providers.")), (loadedCredentialName || (config == null ? void 0 : config.active_credential_name)) && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-amber-50 border-l-4 border-amber-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-amber-600" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, "Active Connection:"), /* @__PURE__ */ React.createElement("p", { className: "text-base font-bold text-gray-800" }, loadedCredentialName || (config == null ? void 0 : config.active_credential_name)))), /* @__PURE__ */ React.createElement(
+    )))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-key mr-2 text-indigo-600", "aria-hidden": "true" }), "AI Models"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Saved connections to AI model providers.")), (loadedCredentialName || (config == null ? void 0 : config.active_credential_name)) && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-amber-50 border-l-4 border-amber-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-amber-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, "Active Connection:"), /* @__PURE__ */ React.createElement("p", { className: "text-base font-bold text-gray-800" }, loadedCredentialName || (config == null ? void 0 : config.active_credential_name)))), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -11177,7 +11271,7 @@ ${query.spl}`,
         className: "text-amber-600 hover:text-amber-800 text-sm font-medium",
         title: "Clear and close editor"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times-circle mr-1" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times-circle mr-1", "aria-hidden": "true" }),
       "Close"
     ))), !showConfigForm && /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement(
       "button",
@@ -11187,11 +11281,11 @@ ${query.spl}`,
           setLoadedCredentialName(null);
           setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(selectedProvider));
         },
-        className: "w-full px-4 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition-all transform hover:scale-[1.02]"
+        className: "w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2", "aria-hidden": "true" }),
       "Add AI Model"
-    )), /* @__PURE__ */ React.createElement("div", { id: "credentials-list", className: "space-y-2 max-h-96 overflow-y-auto" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500 text-center py-4 italic" }, "Loading credentials...")))), showConfigForm && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain mr-2 text-purple-600" }), loadedCredentialName ? "Edit Connection" : "New Connection"), /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { id: "credentials-list", className: "space-y-2 max-h-96 overflow-y-auto" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500 text-center py-4 italic" }, "Loading credentials...")))), showConfigForm && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-brain mr-2 text-indigo-600", "aria-hidden": "true" }), loadedCredentialName ? "Edit Connection" : "New Connection"), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -11200,7 +11294,7 @@ ${query.spl}`,
         },
         className: "px-3 py-1 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times mr-1" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times mr-1", "aria-hidden": "true" }),
       "Cancel"
     )), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "Provider"), /* @__PURE__ */ React.createElement(
       "select",
@@ -11242,7 +11336,7 @@ ${query.spl}`,
         id: "llm-api-key",
         onChange: handleApiKeyChange
       }
-    )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "Model", /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "mb-1 flex flex-wrap items-center gap-y-1" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "llm-model", className: "text-sm font-medium text-gray-700" }, "Model"), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: async () => {
@@ -11283,11 +11377,11 @@ ${query.spl}`,
             setIsLoadingModels(false);
           }
         },
-        className: "ml-2 px-2 py-1 text-xs bg-purple-100 hover:bg-purple-200 text-purple-700 rounded disabled:opacity-50",
+        className: "ml-2 px-2 py-1 text-xs font-medium rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-100 disabled:opacity-50",
         disabled: isLoadingModels,
         type: "button"
       },
-      /* @__PURE__ */ React.createElement("i", { className: `fas ${isLoadingModels ? "fa-spinner fa-spin" : "fa-download"}` }),
+      /* @__PURE__ */ React.createElement("i", { className: `fas ${isLoadingModels ? "fa-spinner fa-spin" : "fa-download"}`, "aria-hidden": "true" }),
       " ",
       isLoadingModels ? "Fetching..." : "Fetch Models"
     )), availableModels.length > 0 ? /* @__PURE__ */ React.createElement(
@@ -11319,7 +11413,7 @@ ${query.spl}`,
           handleSettingsChange();
         }
       }
-    ), recommendedModelEntry && /* @__PURE__ */ React.createElement("div", { "data-testid": "llm-model-recommendation", className: "mt-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-star mr-1" }), /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Recommended:"), " ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, recommendedModelEntry.model), /* @__PURE__ */ React.createElement("span", { className: "ml-1 text-emerald-700" }, "(best balance of quality, speed, and cost)")), recommendedModelEntry.model !== selectedModel && /* @__PURE__ */ React.createElement(
+    ), recommendedModelEntry && /* @__PURE__ */ React.createElement("div", { "data-testid": "llm-model-recommendation", className: "mt-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("i", { className: "fas fa-star mr-1", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Recommended:"), " ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, recommendedModelEntry.model), /* @__PURE__ */ React.createElement("span", { className: "ml-1 text-emerald-700" }, "(best balance of quality, speed, and cost)")), recommendedModelEntry.model !== selectedModel && /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
@@ -11343,7 +11437,7 @@ ${query.spl}`,
           handleSettingsChange();
         }
       }
-    ), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Auto-tune for this model"), " (recommended)", /* @__PURE__ */ React.createElement("span", { className: "block text-xs text-indigo-700" }, "Sets output budget, temperature, context window, timeout, and reasoning effort from the model profile. Turn off to use the Max Tokens and Temperature values below exactly."))), activeLlmTuning && /* @__PURE__ */ React.createElement("div", { "data-testid": "llm-tuning-summary", className: "mt-2 text-xs text-indigo-800" }, /* @__PURE__ */ React.createElement("div", { className: "font-medium" }, describeLlmTuning(activeLlmTuning)), activeLlmTuning.source && /* @__PURE__ */ React.createElement("div", { className: "text-indigo-700" }, "Based on ", activeLlmTuning.source, "."), Array.isArray(activeLlmTuning.notes) && activeLlmTuning.notes.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-amber-700" }, activeLlmTuning.notes.join(" ")))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "Max Tokens", llmAutoTune && /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(used when auto-tune is off)"), /* @__PURE__ */ React.createElement(
+    ), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Auto-tune for this model"), " (recommended)", /* @__PURE__ */ React.createElement("span", { className: "block text-xs text-indigo-700" }, "Sets output budget, temperature, context window, timeout, and reasoning effort from the model profile. Turn off to use the Max Tokens and Temperature values below exactly."))), activeLlmTuning && /* @__PURE__ */ React.createElement("div", { "data-testid": "llm-tuning-summary", className: "mt-2 text-xs text-indigo-800" }, /* @__PURE__ */ React.createElement("div", { className: "font-medium" }, describeLlmTuning(activeLlmTuning)), activeLlmTuning.source && /* @__PURE__ */ React.createElement("div", { className: "text-indigo-700" }, "Based on ", activeLlmTuning.source, "."), Array.isArray(activeLlmTuning.notes) && activeLlmTuning.notes.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-amber-700" }, activeLlmTuning.notes.join(" ")))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "mb-1 flex flex-wrap items-center gap-y-1" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "llm-max-tokens", className: "text-sm font-medium text-gray-700" }, "Max Tokens", llmAutoTune && /* @__PURE__ */ React.createElement("span", { className: "ml-2 text-xs text-gray-500" }, "(used when auto-tune is off)")), /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
@@ -11351,7 +11445,7 @@ ${query.spl}`,
           var _a2, _b2, _c2, _d2, _e2;
           const btn = event.currentTarget;
           btn.disabled = true;
-          btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking...';
+          btn.innerHTML = '<i class="fas fa-spinner fa-spin" aria-hidden="true"></i> Checking...';
           try {
             const provider = ((_a2 = document.getElementById("llm-provider")) == null ? void 0 : _a2.value) || selectedProvider;
             const model = ((_b2 = document.getElementById("llm-model")) == null ? void 0 : _b2.value) || selectedModel || config.llm.model;
@@ -11384,23 +11478,23 @@ ${query.spl}`,
             if (result.tuning) {
               setLlmTuningSummary(result.tuning);
             }
-            btn.innerHTML = result.applicable === false ? '<i class="fas fa-image"></i> Not Required' : '<i class="fas fa-check"></i> Done';
+            btn.innerHTML = result.applicable === false ? '<i class="fas fa-image" aria-hidden="true"></i> Not Required' : '<i class="fas fa-check" aria-hidden="true"></i> Done';
             setTimeout(() => {
               btn.disabled = isOpenAIImageModelSelected;
-              btn.innerHTML = isOpenAIImageModelSelected ? '<i class="fas fa-image"></i> Not Used' : '<i class="fas fa-magic"></i> Auto-Assess';
+              btn.innerHTML = isOpenAIImageModelSelected ? '<i class="fas fa-image" aria-hidden="true"></i> Not Used' : '<i class="fas fa-magic" aria-hidden="true"></i> Auto-Assess';
             }, 2e3);
           } catch (error) {
-            btn.innerHTML = '<i class="fas fa-times"></i> Failed';
+            btn.innerHTML = '<i class="fas fa-times" aria-hidden="true"></i> Failed';
             setTimeout(() => {
               btn.disabled = isOpenAIImageModelSelected;
-              btn.innerHTML = isOpenAIImageModelSelected ? '<i class="fas fa-image"></i> Not Used' : '<i class="fas fa-magic"></i> Auto-Assess';
+              btn.innerHTML = isOpenAIImageModelSelected ? '<i class="fas fa-image" aria-hidden="true"></i> Not Used' : '<i class="fas fa-magic" aria-hidden="true"></i> Auto-Assess';
             }, 2e3);
           }
         },
-        className: "ml-2 px-2 py-1 text-xs bg-indigo-100 hover:bg-indigo-200 text-indigo-700 rounded disabled:opacity-50 disabled:cursor-not-allowed",
+        className: "ml-2 px-2 py-1 text-xs font-medium rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed",
         disabled: isOpenAIImageModelSelected
       },
-      /* @__PURE__ */ React.createElement("i", { className: `fas ${isOpenAIImageModelSelected ? "fa-image" : "fa-magic"}` }),
+      /* @__PURE__ */ React.createElement("i", { className: `fas ${isOpenAIImageModelSelected ? "fa-image" : "fa-magic"}`, "aria-hidden": "true" }),
       " ",
       isOpenAIImageModelSelected ? "Not Used" : "Auto-Assess"
     )), /* @__PURE__ */ React.createElement(
@@ -11467,14 +11561,14 @@ ${query.spl}`,
         onClick: async (event) => {
           const btn = event.currentTarget;
           const resultsDiv = document.getElementById("llm-test-results");
-          const idleLabel = '<i class="fas fa-plug mr-2"></i> Test Connection & Auto-Configure';
+          const idleLabel = '<i class="fas fa-plug mr-2" aria-hidden="true"></i> Test Connection & Auto-Configure';
           const resetButton = () => setTimeout(() => {
             btn.disabled = false;
             btn.innerHTML = idleLabel;
           }, 3e3);
           btn.disabled = true;
-          btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Testing Connection...';
-          resultsDiv.innerHTML = '<div class="text-blue-600"><i class="fas fa-spinner fa-spin mr-2"></i> Running tests...</div>';
+          btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2" aria-hidden="true"></i> Testing Connection...';
+          resultsDiv.innerHTML = '<div class="text-blue-600"><i class="fas fa-spinner fa-spin mr-2" aria-hidden="true"></i> Running tests...</div>';
           resultsDiv.style.display = "block";
           try {
             const provider = document.getElementById("llm-provider").value;
@@ -11500,7 +11594,7 @@ ${query.spl}`,
             let html = '<div class="space-y-2">';
             if (result.status === "success") {
               html += '<div class="bg-green-100 border border-green-300 rounded-lg p-3 mb-2">';
-              html += '<div class="font-semibold text-green-800"><i class="fas fa-check-circle mr-2"></i>All Tests Passed</div>';
+              html += '<div class="font-semibold text-green-800"><i class="fas fa-check-circle mr-2" aria-hidden="true"></i>All Tests Passed</div>';
               html += '<div class="text-sm text-green-700 mt-1">' + esc(result.message) + "</div>";
               html += "</div>";
               const recommended = result.recommended_config || {};
@@ -11514,7 +11608,7 @@ ${query.spl}`,
               if (result.tuning) {
                 setLlmTuningSummary(result.tuning);
                 html += '<div class="bg-indigo-50 border border-indigo-200 rounded-lg p-3 mb-2 text-xs text-indigo-900">';
-                html += '<div class="font-semibold"><i class="fas fa-sliders-h mr-1"></i>Recommended runtime settings</div>';
+                html += '<div class="font-semibold"><i class="fas fa-sliders-h mr-1" aria-hidden="true"></i>Recommended runtime settings</div>';
                 html += '<div class="mt-1">' + esc(describeLlmTuning(result.tuning)) + "</div>";
                 const rationale = Array.isArray(result.tuning.rationale) ? result.tuning.rationale : [];
                 if (rationale.length > 0) {
@@ -11525,7 +11619,7 @@ ${query.spl}`,
               }
             } else {
               html += '<div class="bg-red-100 border border-red-300 rounded-lg p-3 mb-2">';
-              html += '<div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2"></i>Test Failed</div>';
+              html += '<div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2" aria-hidden="true"></i>Test Failed</div>';
               html += '<div class="text-sm text-red-700 mt-1">' + esc(result.message || result.error || "Unknown error") + "</div>";
               html += '<div class="text-xs text-red-700 mt-1">Click Troubleshoot below to find out why.</div>';
               html += "</div>";
@@ -11537,7 +11631,7 @@ ${query.spl}`,
               const label = testName.replace(/_/g, " ");
               html += `<div class="bg-${statusColor}-50 border border-${statusColor}-200 rounded p-2 mb-1">`;
               html += `<div class="text-xs font-medium text-${statusColor}-800">`;
-              html += `<i class="fas fa-${statusIcon} mr-1"></i>${esc(label.charAt(0).toUpperCase() + label.slice(1))}: ${esc(testResult.message)}`;
+              html += `<i class="fas fa-${statusIcon} mr-1" aria-hidden="true"></i>${esc(label.charAt(0).toUpperCase() + label.slice(1))}: ${esc(testResult.message)}`;
               html += "</div>";
               if (testResult.response_preview) {
                 html += `<div class="text-xs text-gray-600 mt-1 italic">"${esc(testResult.response_preview)}"</div>`;
@@ -11546,20 +11640,20 @@ ${query.spl}`,
             }
             html += "</div>";
             resultsDiv.innerHTML = html;
-            btn.innerHTML = result.status === "success" ? '<i class="fas fa-check mr-2"></i> Test Complete' : '<i class="fas fa-times mr-2"></i> Test Failed';
+            btn.innerHTML = result.status === "success" ? '<i class="fas fa-check mr-2" aria-hidden="true"></i> Test Complete' : '<i class="fas fa-times mr-2" aria-hidden="true"></i> Test Failed';
             resetButton();
           } catch (error) {
             resultsDiv.innerHTML = `<div class="bg-red-100 border border-red-300 rounded-lg p-3">
-                                                                <div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2"></i>Error</div>
+                                                                <div class="font-semibold text-red-800"><i class="fas fa-times-circle mr-2" aria-hidden="true"></i>Error</div>
                                                                 <div class="text-sm text-red-700 mt-1">${escapeSettingsHtml(error.message)}</div>
                                                             </div>`;
-            btn.innerHTML = '<i class="fas fa-times mr-2"></i> Test Failed';
+            btn.innerHTML = '<i class="fas fa-times mr-2" aria-hidden="true"></i> Test Failed';
             resetButton();
           }
         },
-        className: "w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium"
+        className: `w-full px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plug mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plug mr-2", "aria-hidden": "true" }),
       " Test Connection & Auto-Configure"
     ), /* @__PURE__ */ React.createElement(
       "button",
@@ -11567,9 +11661,9 @@ ${query.spl}`,
         type: "button",
         "data-testid": "llm-troubleshoot",
         onClick: () => openSettingsTroubleshooter("llm", readTroubleshootDraftFromForm("llm"), { autoRun: true }),
-        className: "mt-2 w-full px-4 py-2 bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 rounded-lg font-medium transition-all"
+        className: `mt-2 w-full px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-stethoscope mr-2", "aria-hidden": "true" }),
       "Troubleshoot"
     ), /* @__PURE__ */ React.createElement("div", { id: "llm-test-results", className: "mt-3", style: { display: "none" } }), /* @__PURE__ */ React.createElement("div", { className: "mt-3 pt-3 border-t border-gray-200 space-y-2" }, loadedCredentialName ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
       "button",
@@ -11579,9 +11673,9 @@ ${query.spl}`,
           setCredentialName("");
           setIsCredentialModalOpen(true);
         },
-        className: "w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
+        className: `w-full px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2", "aria-hidden": "true" }),
       "Save as New"
     ), /* @__PURE__ */ React.createElement(
       "button",
@@ -11591,9 +11685,9 @@ ${query.spl}`,
           setCredentialName(loadedCredentialName);
           setIsCredentialModalOpen(true);
         },
-        className: "w-full px-4 py-2 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 rounded-lg font-bold border-2 border-amber-600 shadow-md hover:shadow-lg transition-all"
+        className: "w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync-alt mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-sync-alt mr-2", "aria-hidden": "true" }),
       "Update Active Connection"
     )) : /* @__PURE__ */ React.createElement(
       "button",
@@ -11603,9 +11697,9 @@ ${query.spl}`,
           setCredentialName("");
           setIsCredentialModalOpen(true);
         },
-        className: "w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all"
+        className: "w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium transition-colors"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2", "aria-hidden": "true" }),
       "Save Connection"
     ))))))), /* @__PURE__ */ React.createElement("div", { className: `p-6 border-t ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement(
       "button",
@@ -11641,7 +11735,7 @@ ${query.spl}`,
         },
         className: `px-4 py-2 text-sm rounded-lg font-medium ${isDarkTheme ? "bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-600" : "bg-gray-100 hover:bg-gray-200 text-gray-700"}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-list mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-list mr-2", "aria-hidden": "true" }),
       "View Dependencies"
     ), activeSettingsTab !== "appearance" && activeSettingsTab !== "troubleshoot" && /* @__PURE__ */ React.createElement(
       "button",
@@ -11691,293 +11785,323 @@ ${query.spl}`,
         },
         className: "px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2" }),
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2", "aria-hidden": "true" }),
       "Save Settings"
-    ))))), renderAuthEnableInfoModal(), renderWelcomeSplashModal(), isCredentialModalOpen && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 rounded-t-xl ${isUpdateMode ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600" : "bg-gradient-to-r from-purple-600 to-indigo-600 text-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("i", { className: `text-2xl ${isUpdateMode ? "fas fa-sync-alt" : "fas fa-save"}` }), /* @__PURE__ */ React.createElement("h2", { className: "text-xl font-bold" }, isUpdateMode ? "Update" : "Save", " LLM Credential")), /* @__PURE__ */ React.createElement(
-      "button",
+    ))))), renderAuthEnableInfoModal(), renderWelcomeSplashModal(), isCredentialModalOpen && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4" }, /* @__PURE__ */ React.createElement(
+      "div",
       {
-        onClick: () => {
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-labelledby": "credential-save-title",
+        onKeyDown: (event) => handleDialogKeyDown(event, () => {
           setIsCredentialModalOpen(false);
           setCredentialName("");
           setIsUpdateMode(false);
-        },
-        className: `transition-colors ${isUpdateMode ? "text-gray-900 hover:text-gray-600" : "text-white hover:text-gray-200"}`
+        }),
+        className: `rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white border border-gray-200"}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl" })
-    ))), /* @__PURE__ */ React.createElement("div", { className: "p-6" }, isUpdateMode ? /* @__PURE__ */ React.createElement("div", { className: "bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-bold text-gray-900 mb-1" }, "⚠️ Update Warning"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-800" }, 'You are about to overwrite the existing credential "', /* @__PURE__ */ React.createElement("strong", { className: "text-gray-900" }, credentialName), '". This will replace all settings with your current configuration. This action cannot be undone.')))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-4 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Save your current LLM settings as a named credential for quick access later."), /* @__PURE__ */ React.createElement("div", { className: "mb-6" }, /* @__PURE__ */ React.createElement("label", { className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Credential Name ", /* @__PURE__ */ React.createElement("span", { className: "text-red-500" }, "*")), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "text",
-        value: credentialName,
-        onChange: (e) => setCredentialName(e.target.value),
-        placeholder: "e.g., My OpenAI GPT-4, Local Llama Server",
-        className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`,
-        disabled: isUpdateMode,
-        autoFocus: !isUpdateMode
-      }
-    ), isUpdateMode && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 italic ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Credential name cannot be changed when updating")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Current Settings Preview"), /* @__PURE__ */ React.createElement("div", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Provider:"), " ", selectedProvider), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Model:"), " ", ((_Oa = document.getElementById("llm-model")) == null ? void 0 : _Oa.value) || "N/A"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Max Tokens:"), " ", ((_Pa = document.getElementById("llm-max-tokens")) == null ? void 0 : _Pa.value) || "N/A"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Temperature:"), " ", ((_Qa = document.getElementById("llm-temperature")) == null ? void 0 : _Qa.value) || "N/A"))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        onClick: () => {
-          setIsCredentialModalOpen(false);
-          setCredentialName("");
-          setIsUpdateMode(false);
+      /* @__PURE__ */ React.createElement("div", { className: `flex items-center justify-between gap-3 border-b px-6 py-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("h2", { id: "credential-save-title", className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, isUpdateMode ? "Update" : "Save", " AI Model Connection"), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => {
+            setIsCredentialModalOpen(false);
+            setCredentialName("");
+            setIsUpdateMode(false);
+          },
+          "aria-label": "Close",
+          className: `rounded-md p-1.5 transition-colors ${isDarkTheme ? "text-gray-400 hover:bg-gray-700 hover:text-gray-100" : "text-gray-500 hover:bg-gray-100 hover:text-gray-900"}`
         },
-        className: `flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-200 hover:bg-gray-300 text-gray-700"}`
-      },
-      "Cancel"
-    ), /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        onClick: async () => {
-          if (!credentialName.trim()) {
-            alert("Please enter a credential name");
-            return;
-          }
-          if (isUpdateMode) {
-            const confirmed = confirm(`⚠️ Confirm Update
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times", "aria-hidden": "true" })
+      )),
+      /* @__PURE__ */ React.createElement("div", { className: "p-6" }, isUpdateMode ? /* @__PURE__ */ React.createElement("div", { role: "note", className: `mb-4 rounded-md border px-4 py-3 text-sm ${isDarkTheme ? "border-amber-700 bg-amber-950 text-amber-100" : "border-amber-200 bg-amber-50 text-amber-900"}` }, /* @__PURE__ */ React.createElement("p", { className: "font-semibold" }, "This replaces a saved connection"), /* @__PURE__ */ React.createElement("p", { className: "mt-1" }, 'Saving overwrites every setting in "', /* @__PURE__ */ React.createElement("strong", null, credentialName), '" with the values in the form. You cannot undo this.')) : /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-4 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Save the current AI model settings with a name so you can load them again later."), /* @__PURE__ */ React.createElement("div", { className: "mb-6" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "credential-save-name", className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Name ", /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: isDarkTheme ? "text-red-300" : "text-red-600" }, "*")), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "credential-save-name",
+          type: "text",
+          required: true,
+          value: credentialName,
+          onChange: (e) => setCredentialName(e.target.value),
+          placeholder: "e.g., My OpenAI GPT-4, Local Llama Server",
+          "aria-describedby": isUpdateMode ? "credential-save-name-hint" : void 0,
+          className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100 disabled:bg-gray-800" : "bg-white border-gray-300 text-gray-900 disabled:bg-gray-100"}`,
+          disabled: isUpdateMode,
+          autoFocus: !isUpdateMode
+        }
+      ), isUpdateMode && /* @__PURE__ */ React.createElement("p", { id: "credential-save-name-hint", className: `text-xs mt-1 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "You cannot rename a connection while you update it.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Provider:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, formatProviderName(selectedProvider))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Model:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_Ha = document.getElementById("llm-model")) == null ? void 0 : _Ha.value) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Max response length:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_Ia = document.getElementById("llm-max-tokens")) == null ? void 0 : _Ia.value) ? `${document.getElementById("llm-max-tokens").value} tokens` : "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Temperature:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_Ja = document.getElementById("llm-temperature")) == null ? void 0 : _Ja.value) || "Not set")))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => {
+            setIsCredentialModalOpen(false);
+            setCredentialName("");
+            setIsUpdateMode(false);
+          },
+          type: "button",
+          className: `flex-1 px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
+        },
+        "Cancel"
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: async () => {
+            if (!credentialName.trim()) {
+              alert("Please enter a credential name");
+              return;
+            }
+            if (isUpdateMode) {
+              const confirmed = confirm(`Overwrite "${credentialName}"?
 
-Are you sure you want to overwrite "${credentialName}"?
-
-This will replace:
-• Provider & Model
-• API Key
-• Endpoint URL
-• Max Tokens & Temperature
-
-This action cannot be undone.`);
-            if (!confirmed) return;
-          } else if (savedCredentials == null ? void 0 : savedCredentials[credentialName.trim()]) {
-            const confirmed = confirm(`A credential named "${credentialName.trim()}" already exists.
+This replaces its provider, model, API key, endpoint URL, max response length, and temperature. You cannot undo this.`);
+              if (!confirmed) return;
+            } else if (savedCredentials == null ? void 0 : savedCredentials[credentialName.trim()]) {
+              const confirmed = confirm(`A credential named "${credentialName.trim()}" already exists.
 
 Overwrite it?`);
-            if (!confirmed) return;
-          }
-          try {
-            const provider = document.getElementById("llm-provider").value;
-            const endpointUrlInput = document.getElementById("llm-endpoint-url");
-            const response = await fetch("/api/credentials", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                name: credentialName.trim(),
-                provider,
-                api_key: document.getElementById("llm-api-key").value,
-                model: document.getElementById("llm-model").value,
-                endpoint_url: provider !== "openai" && endpointUrlInput ? endpointUrlInput.value : null,
-                max_tokens: parseInt(document.getElementById("llm-max-tokens").value),
-                temperature: parseFloat(document.getElementById("llm-temperature").value),
-                ...readLlmTuningFormValues(config.llm)
-              })
-            });
-            const { data: savedData, text: savedText } = await readApiResponse(response);
-            const result = savedData || {};
-            if (response.ok) {
-              setIsCredentialModalOpen(false);
-              setCredentialName("");
-              const wasUpdate = isUpdateMode;
-              setIsUpdateMode(false);
-              await loadCredentials();
-              if (result.activated) {
-                await loadConfig();
-              }
-              const successDiv = document.createElement("div");
-              successDiv.className = `fixed top-6 right-6 ${wasUpdate ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600" : "bg-green-600 text-white"} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
-              successDiv.innerHTML = `
+              if (!confirmed) return;
+            }
+            try {
+              const provider = document.getElementById("llm-provider").value;
+              const endpointUrlInput = document.getElementById("llm-endpoint-url");
+              const response = await fetch("/api/credentials", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  name: credentialName.trim(),
+                  provider,
+                  api_key: document.getElementById("llm-api-key").value,
+                  model: document.getElementById("llm-model").value,
+                  endpoint_url: provider !== "openai" && endpointUrlInput ? endpointUrlInput.value : null,
+                  max_tokens: parseInt(document.getElementById("llm-max-tokens").value),
+                  temperature: parseFloat(document.getElementById("llm-temperature").value),
+                  ...readLlmTuningFormValues(config.llm)
+                })
+              });
+              const { data: savedData, text: savedText } = await readApiResponse(response);
+              const result = savedData || {};
+              if (response.ok) {
+                setIsCredentialModalOpen(false);
+                setCredentialName("");
+                const wasUpdate = isUpdateMode;
+                setIsUpdateMode(false);
+                await loadCredentials();
+                if (result.activated) {
+                  await loadConfig();
+                }
+                const successDiv = document.createElement("div");
+                successDiv.className = "fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50";
+                successDiv.setAttribute("role", "status");
+                successDiv.innerHTML = `
                                                             <div class="flex items-center gap-3">
-                                                                <i class="fas ${wasUpdate ? "fa-sync-alt" : "fa-check-circle"} text-2xl"></i>
+                                                                <i class="fas fa-check-circle text-2xl" aria-hidden="true"></i>
                                                                 <div>
-                                                                    <p class="font-bold text-base">Credential ${wasUpdate ? "Updated" : "Saved"}!</p>
-                                                                    <p class="text-sm ${wasUpdate ? "opacity-80" : "opacity-90"}">${escapeSettingsHtml(credentialName)}</p>
+                                                                    <p class="font-bold text-base">AI model connection ${wasUpdate ? "updated" : "saved"}</p>
+                                                                    <p class="text-sm opacity-90">${escapeSettingsHtml(credentialName)}</p>
                                                                     ${result.warning ? `<p class="text-xs opacity-80">${escapeSettingsHtml(result.warning)}</p>` : ""}
                                                                 </div>
                                                             </div>
                                                         `;
-              document.body.appendChild(successDiv);
-              setTimeout(() => {
-                successDiv.style.animation = "none";
-                successDiv.style.opacity = "0";
-                successDiv.style.transition = "opacity 0.3s";
-                setTimeout(() => successDiv.remove(), 300);
-              }, result.warning ? 8e3 : 2500);
-            } else {
+                document.body.appendChild(successDiv);
+                setTimeout(() => {
+                  successDiv.style.animation = "none";
+                  successDiv.style.opacity = "0";
+                  successDiv.style.transition = "opacity 0.3s";
+                  setTimeout(() => successDiv.remove(), 300);
+                }, result.warning ? 8e3 : 2500);
+              } else {
+                offerTroubleshootAfterSaveFailure(
+                  "llm",
+                  "Failed to save credential: " + describeApiFailure(response, savedData, savedText),
+                  { ...readTroubleshootDraftFromForm("llm"), name: credentialName.trim() },
+                  () => setIsCredentialModalOpen(false)
+                );
+              }
+            } catch (error) {
               offerTroubleshootAfterSaveFailure(
                 "llm",
-                "Failed to save credential: " + describeApiFailure(response, savedData, savedText),
+                "Error saving credential: " + error.message,
                 { ...readTroubleshootDraftFromForm("llm"), name: credentialName.trim() },
                 () => setIsCredentialModalOpen(false)
               );
             }
-          } catch (error) {
-            offerTroubleshootAfterSaveFailure(
-              "llm",
-              "Error saving credential: " + error.message,
-              { ...readTroubleshootDraftFromForm("llm"), name: credentialName.trim() },
-              () => setIsCredentialModalOpen(false)
-            );
-          }
+          },
+          type: "button",
+          disabled: !credentialName.trim(),
+          className: "flex-1 px-4 py-2 rounded-lg font-medium transition-colors bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
         },
-        disabled: !credentialName.trim(),
-        className: `flex-1 px-4 py-2 ${isUpdateMode ? "bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600" : "bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white"} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`
-      },
-      /* @__PURE__ */ React.createElement("i", { className: `mr-2 ${isUpdateMode ? "fas fa-sync-alt" : "fas fa-save"}` }),
-      isUpdateMode ? "Update Credential" : "Save Credential"
-    ))))), isMCPSaveModalOpen && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 rounded-t-xl ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-b-4 border-amber-600" : "bg-gradient-to-r from-green-600 to-emerald-600 text-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("i", { className: `text-2xl ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "fas fa-sync-alt" : "fas fa-save"}` }), /* @__PURE__ */ React.createElement("h2", { className: "text-xl font-bold" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "Update" : "Save", " MCP Configuration")), /* @__PURE__ */ React.createElement(
-      "button",
+        isUpdateMode ? "Update Connection" : "Save Connection"
+      )))
+    )), isMCPSaveModalOpen && /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4" }, /* @__PURE__ */ React.createElement(
+      "div",
       {
-        onClick: () => {
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-labelledby": "mcp-save-title",
+        onKeyDown: (event) => handleDialogKeyDown(event, () => {
           setIsMCPSaveModalOpen(false);
           setMCPConfigName("");
           setMCPConfigDescription("");
           setMCPSaveDraft(null);
-        },
-        className: `transition-colors ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "text-gray-900 hover:text-gray-600" : "text-white hover:text-gray-200"}`
+        }),
+        className: `rounded-xl shadow-2xl w-full max-w-md ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white border border-gray-200"}`
       },
-      /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl" })
-    ))), /* @__PURE__ */ React.createElement("div", { className: "p-6" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? /* @__PURE__ */ React.createElement("div", { className: "bg-yellow-50 border-l-4 border-yellow-600 p-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle text-yellow-600 text-xl mr-3 mt-0.5" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-bold text-gray-900 mb-1" }, "⚠️ Update Warning"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-800" }, 'You are about to overwrite the existing configuration "', /* @__PURE__ */ React.createElement("strong", { className: "text-gray-900" }, mcpConfigName), '". This will replace all settings with your current configuration. This action cannot be undone.')))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-4 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Save your current MCP server settings as a named configuration for quick access later."), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("label", { className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Configuration Name ", /* @__PURE__ */ React.createElement("span", { className: "text-red-500" }, "*")), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "text",
-        value: mcpConfigName,
-        onChange: (e) => setMCPConfigName(e.target.value),
-        placeholder: "e.g., Production Splunk, Dev Environment",
-        className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`,
-        disabled: (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update",
-        autoFocus: !((mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update")
-      }
-    ), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 italic ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Configuration name cannot be changed when updating")), /* @__PURE__ */ React.createElement("div", { className: "mb-6" }, /* @__PURE__ */ React.createElement("label", { className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Description (Optional)"), /* @__PURE__ */ React.createElement(
-      "input",
-      {
-        type: "text",
-        value: mcpConfigDescription,
-        onChange: (e) => setMCPConfigDescription(e.target.value),
-        placeholder: "e.g., Main production Splunk server",
-        className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`
-      }
-    )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h4", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("div", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "URL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.url) || "N/A"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Token:"), " ", describeMCPDraftToken(mcpSaveDraft, mcpConfigName)), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Verify SSL:"), " ", (mcpSaveDraft == null ? void 0 : mcpSaveDraft.verify_ssl) ? "Yes" : "No"), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.ca_bundle_path) && /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "CA Bundle:"), " ", mcpSaveDraft.ca_bundle_path))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        onClick: () => {
-          setIsMCPSaveModalOpen(false);
-          setMCPConfigName("");
-          setMCPConfigDescription("");
-          setMCPSaveDraft(null);
+      /* @__PURE__ */ React.createElement("div", { className: `flex items-center justify-between gap-3 border-b px-6 py-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("h2", { id: "mcp-save-title", className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "Update" : "Save", " MCP Configuration"), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => {
+            setIsMCPSaveModalOpen(false);
+            setMCPConfigName("");
+            setMCPConfigDescription("");
+            setMCPSaveDraft(null);
+          },
+          "aria-label": "Close",
+          className: `rounded-md p-1.5 transition-colors ${isDarkTheme ? "text-gray-400 hover:bg-gray-700 hover:text-gray-100" : "text-gray-500 hover:bg-gray-100 hover:text-gray-900"}`
         },
-        className: `flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkTheme ? "bg-gray-700 hover:bg-gray-600 text-gray-100" : "bg-gray-200 hover:bg-gray-300 text-gray-700"}`
-      },
-      "Cancel"
-    ), /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        onClick: async () => {
-          const savedName = mcpConfigName.trim();
-          const isUpdate = (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update";
-          const draft = mcpSaveDraft || {};
-          if (!savedName) {
-            alert("Please enter a configuration name");
-            return;
-          }
-          if (!draft.url) {
-            alert("Please enter an MCP URL");
-            return;
-          }
-          if (isUpdate) {
-            const confirmed = confirm(`⚠️ Confirm Update
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times", "aria-hidden": "true" })
+      )),
+      /* @__PURE__ */ React.createElement("div", { className: "p-6" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? /* @__PURE__ */ React.createElement("div", { role: "note", className: `mb-4 rounded-md border px-4 py-3 text-sm ${isDarkTheme ? "border-amber-700 bg-amber-950 text-amber-100" : "border-amber-200 bg-amber-50 text-amber-900"}` }, /* @__PURE__ */ React.createElement("p", { className: "font-semibold" }, "This replaces a saved configuration"), /* @__PURE__ */ React.createElement("p", { className: "mt-1" }, 'Saving overwrites every setting in "', /* @__PURE__ */ React.createElement("strong", null, mcpConfigName), '" with the values in the form. You cannot undo this.')) : /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-4 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Save the current Splunk MCP server settings with a name so you can load them again later."), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "mcp-save-name", className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Name ", /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: isDarkTheme ? "text-red-300" : "text-red-600" }, "*")), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "mcp-save-name",
+          type: "text",
+          required: true,
+          value: mcpConfigName,
+          onChange: (e) => setMCPConfigName(e.target.value),
+          placeholder: "e.g., Production Splunk, Dev Environment",
+          "aria-describedby": (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "mcp-save-name-hint" : void 0,
+          className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100 disabled:bg-gray-800" : "bg-white border-gray-300 text-gray-900 disabled:bg-gray-100"}`,
+          disabled: (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update",
+          autoFocus: !((mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update")
+        }
+      ), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" && /* @__PURE__ */ React.createElement("p", { id: "mcp-save-name-hint", className: `text-xs mt-1 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "You cannot rename a configuration while you update it.")), /* @__PURE__ */ React.createElement("div", { className: "mb-6" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "mcp-save-description", className: `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, "Description (optional)"), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          id: "mcp-save-description",
+          type: "text",
+          value: mcpConfigDescription,
+          onChange: (e) => setMCPConfigDescription(e.target.value),
+          placeholder: "e.g., Main production Splunk server",
+          className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100 disabled:bg-gray-800" : "bg-white border-gray-300 text-gray-900 disabled:bg-gray-100"}`
+        }
+      )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "URL:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.url) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Token:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, describeMCPDraftToken(mcpSaveDraft, mcpConfigName))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Verify SSL:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.verify_ssl) ? "Yes" : "No")), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.ca_bundle_path) && /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "CA bundle:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, mcpSaveDraft.ca_bundle_path)))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => {
+            setIsMCPSaveModalOpen(false);
+            setMCPConfigName("");
+            setMCPConfigDescription("");
+            setMCPSaveDraft(null);
+          },
+          type: "button",
+          className: `flex-1 px-4 py-2 rounded-lg border font-medium transition-colors ${secondaryButtonClass}`
+        },
+        "Cancel"
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: async () => {
+            const savedName = mcpConfigName.trim();
+            const isUpdate = (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update";
+            const draft = mcpSaveDraft || {};
+            if (!savedName) {
+              alert("Please enter a configuration name");
+              return;
+            }
+            if (!draft.url) {
+              alert("Please enter an MCP URL");
+              return;
+            }
+            if (isUpdate) {
+              const confirmed = confirm(`Overwrite "${savedName}"?
 
-Are you sure you want to overwrite "${savedName}"?
-
-This will replace:
-• MCP URL
-• Token (a blank token keeps the saved one)
-• SSL Settings
-• Description
-
-This action cannot be undone.`);
-            if (!confirmed) return;
-          } else if (savedMCPConfigs == null ? void 0 : savedMCPConfigs[savedName]) {
-            const confirmed = confirm(`A configuration named "${savedName}" already exists.
+This replaces its MCP URL, token (a blank token keeps the saved one), SSL settings, and description. You cannot undo this.`);
+              if (!confirmed) return;
+            } else if (savedMCPConfigs == null ? void 0 : savedMCPConfigs[savedName]) {
+              const confirmed = confirm(`A configuration named "${savedName}" already exists.
 
 Overwrite it?`);
-            if (!confirmed) return;
-          }
-          try {
-            const response = await fetch("/api/mcp-configs", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                name: savedName,
-                url: draft.url,
-                token: draft.token || "",
-                verify_ssl: Boolean(draft.verify_ssl),
-                ca_bundle_path: draft.ca_bundle_path || null,
-                description: mcpConfigDescription.trim() || null
-              })
-            });
-            const { data: savedData, text: savedText } = await readApiResponse(response);
-            const result = savedData || {};
-            if (response.ok) {
-              setIsMCPSaveModalOpen(false);
-              setMCPSaveDraft(null);
-              setMCPConfigName("");
-              setMCPConfigDescription("");
-              if (result.activated) {
-                if (result.config) {
-                  setConfig(result.config);
+              if (!confirmed) return;
+            }
+            try {
+              const response = await fetch("/api/mcp-configs", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  name: savedName,
+                  url: draft.url,
+                  token: draft.token || "",
+                  verify_ssl: Boolean(draft.verify_ssl),
+                  ca_bundle_path: draft.ca_bundle_path || null,
+                  description: mcpConfigDescription.trim() || null
+                })
+              });
+              const { data: savedData, text: savedText } = await readApiResponse(response);
+              const result = savedData || {};
+              if (response.ok) {
+                setIsMCPSaveModalOpen(false);
+                setMCPSaveDraft(null);
+                setMCPConfigName("");
+                setMCPConfigDescription("");
+                if (result.activated) {
+                  if (result.config) {
+                    setConfig(result.config);
+                  }
+                  setLoadedMCPConfigName(savedName);
+                  const tokenInput = document.getElementById("mcp-token");
+                  if (tokenInput) {
+                    tokenInput.value = "";
+                  }
+                  await loadConfig();
                 }
-                setLoadedMCPConfigName(savedName);
-                const tokenInput = document.getElementById("mcp-token");
-                if (tokenInput) {
-                  tokenInput.value = "";
-                }
-                await loadConfig();
-              }
-              await loadMCPConfigs();
-              const detailLine = [
-                result.activated ? "Active MCP connection updated" : result.token_configured === false ? "Saved without a token" : "",
-                result.warning || ""
-              ].filter(Boolean).join(". ");
-              const successDiv = document.createElement("div");
-              successDiv.className = `fixed top-6 right-6 ${isUpdate ? "bg-gradient-to-r from-amber-400 to-yellow-400 text-gray-900 border-2 border-amber-600" : "bg-green-600 text-white"} px-6 py-4 rounded-xl shadow-2xl z-50 animate-bounce`;
-              successDiv.innerHTML = `
+                await loadMCPConfigs();
+                const detailLine = [
+                  result.activated ? "Active MCP connection updated" : result.token_configured === false ? "Saved without a token" : "",
+                  result.warning || ""
+                ].filter(Boolean).join(". ");
+                const successDiv = document.createElement("div");
+                successDiv.className = "fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50";
+                successDiv.setAttribute("role", "status");
+                successDiv.innerHTML = `
                                                             <div class="flex items-center gap-3">
-                                                                <i class="fas ${isUpdate ? "fa-sync-alt" : "fa-check-circle"} text-2xl"></i>
+                                                                <i class="fas fa-check-circle text-2xl" aria-hidden="true"></i>
                                                                 <div>
-                                                                    <p class="font-bold text-base">Configuration ${isUpdate ? "Updated" : "Saved"}!</p>
-                                                                    <p class="text-sm ${isUpdate ? "opacity-80" : "opacity-90"}">${escapeSettingsHtml(savedName)}</p>
+                                                                    <p class="font-bold text-base">MCP configuration ${isUpdate ? "updated" : "saved"}</p>
+                                                                    <p class="text-sm opacity-90">${escapeSettingsHtml(savedName)}</p>
                                                                     ${detailLine ? `<p class="text-xs opacity-80">${escapeSettingsHtml(detailLine)}</p>` : ""}
                                                                 </div>
                                                             </div>
                                                         `;
-              document.body.appendChild(successDiv);
-              setTimeout(() => {
-                successDiv.style.animation = "none";
-                successDiv.style.opacity = "0";
-                successDiv.style.transition = "opacity 0.3s";
-                setTimeout(() => successDiv.remove(), 300);
-              }, result.warning ? 8e3 : 2500);
-            } else {
+                document.body.appendChild(successDiv);
+                setTimeout(() => {
+                  successDiv.style.animation = "none";
+                  successDiv.style.opacity = "0";
+                  successDiv.style.transition = "opacity 0.3s";
+                  setTimeout(() => successDiv.remove(), 300);
+                }, result.warning ? 8e3 : 2500);
+              } else {
+                offerTroubleshootAfterSaveFailure(
+                  "mcp",
+                  "Failed to save configuration: " + describeApiFailure(response, savedData, savedText),
+                  { name: savedName, url: draft.url, token: draft.token || "", verify_ssl: Boolean(draft.verify_ssl), ca_bundle_path: draft.ca_bundle_path || "" },
+                  () => setIsMCPSaveModalOpen(false)
+                );
+              }
+            } catch (error) {
               offerTroubleshootAfterSaveFailure(
                 "mcp",
-                "Failed to save configuration: " + describeApiFailure(response, savedData, savedText),
+                "Error saving configuration: " + error.message,
                 { name: savedName, url: draft.url, token: draft.token || "", verify_ssl: Boolean(draft.verify_ssl), ca_bundle_path: draft.ca_bundle_path || "" },
                 () => setIsMCPSaveModalOpen(false)
               );
             }
-          } catch (error) {
-            offerTroubleshootAfterSaveFailure(
-              "mcp",
-              "Error saving configuration: " + error.message,
-              { name: savedName, url: draft.url, token: draft.token || "", verify_ssl: Boolean(draft.verify_ssl), ca_bundle_path: draft.ca_bundle_path || "" },
-              () => setIsMCPSaveModalOpen(false)
-            );
-          }
+          },
+          type: "button",
+          disabled: !mcpConfigName.trim(),
+          className: "flex-1 px-4 py-2 rounded-lg font-medium transition-colors bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
         },
-        disabled: !mcpConfigName.trim(),
-        className: `flex-1 px-4 py-2 ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-600 hover:to-yellow-600 text-gray-900 border-2 border-amber-600" : "bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white"} disabled:from-gray-400 disabled:to-gray-400 disabled:text-gray-300 rounded-lg font-bold transition-all shadow-md hover:shadow-lg disabled:cursor-not-allowed disabled:border-0`
-      },
-      /* @__PURE__ */ React.createElement("i", { className: `mr-2 ${(mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "fas fa-sync-alt" : "fas fa-save"}` }),
-      (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "Update Configuration" : "Save Configuration"
-    ))))));
+        (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update" ? "Update Configuration" : "Save Configuration"
+      )))
+    )));
   }
   window.addEventListener("error", (event) => {
     console.error("Global error caught:", event.error);

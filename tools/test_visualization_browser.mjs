@@ -1362,7 +1362,7 @@ async function runActiveSummaryWorkerRegression(baseUrl, seededRuntimeState) {
         const resumeSummaryButton = page.getByRole('button', { name: 'Reconnect', exact: true });
         await resumeSummaryButton.click();
 
-        await page.getByText('Analyzing Your Splunk Environment').waitFor({ state: 'visible' });
+        await page.getByText('Building Your Summary').waitFor({ state: 'visible' });
         await page.getByText('This summary keeps running if you close this window (process 424242). Come back later to see it, or stop it now.').waitFor({ state: 'visible' });
 
         const abortSummaryButton = page.getByRole('button', { name: 'Stop Summary' });
