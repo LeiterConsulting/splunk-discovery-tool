@@ -69,6 +69,7 @@ from llm.factory import (
 )
 from llm.model_profiles import (
     budget_tokens,
+    chat_budgets,
     describe_profile,
     parse_ollama_model_entry,
     parse_openai_compatible_model_entry,
@@ -83,6 +84,33 @@ from llm.runtime_tuning import (
 )
 from discovery.context_manager import get_context_manager
 from discovery.local_analyzer import metadata_recent_time_utc
+from chat_settings import (
+    CHAT_DATA_DIR_NAME,
+    ChatSettingsStore,
+    ChatSettingsView,
+    apply_custom_values,
+    model_defaults,
+    model_identity,
+    reset_custom_values,
+    resolve_chat_settings,
+)
+from chat_goals import (
+    MAX_GOAL_CHARS,
+    ChatGoalStore,
+    GoalLimitError,
+    GoalNotFoundError,
+    build_plan_messages,
+    build_progress_messages,
+    fallback_plan,
+    goal_detail,
+    owner_key,
+    parse_plan,
+    parse_progress,
+    progress_brief,
+)
+from chat_goals import clean_id as clean_goal_id
+from chat_goals import clean_text as clean_goal_text
+from chat_goals import pending_turns as pending_goal_turns
 from chat_agent import (
     announces_unexecuted_search,
     build_grounded_chat_prompt,
@@ -2559,35 +2587,6 @@ def should_enable_rag_context_by_default() -> bool:
     return False
 
 
-def build_default_chat_settings() -> Dict[str, Any]:
-    """Build default session chat settings, including capability-aware RAG defaults."""
-    return {
-        # Discovery Settings
-        "max_execution_time": 90,
-        "max_iterations": 5,
-        "discovery_freshness_days": 7,
-
-        # LLM Behavior
-        "max_tokens": 16000,
-        "temperature": 0.7,
-        "context_history": 6,
-
-        # Performance Tuning
-        "max_retry_delay": 300,
-        "max_retries": 5,
-        "query_sample_size": 2,
-
-        # Quality Control
-        "quality_threshold": 70,
-        "convergence_detection": 5,
-
-        # Demo Augmentation
-        "enable_splunk_augmentation": True,
-        "enable_rag_context": should_enable_rag_context_by_default(),
-        "rag_max_chunks": 3,
-    }
-
-
 def detect_chat_runtime_provider(config: Any, llm_client: Any = None) -> str:
     """Resolve the effective provider used by the active chat runtime."""
     configured_provider = normalize_provider_name(getattr(getattr(config, "llm", None), "provider", ""))
@@ -2646,33 +2645,31 @@ def llm_call_budget(config: Any, fraction: float, floor: int = 768, ceiling: Opt
 
 
 def build_chat_runtime_profile(config: Any, llm_client: Any = None) -> Dict[str, Any]:
-    """Return chat budgets and prompt behavior tuned to the active model."""
-    try:
-        session_max_tokens = int(chat_session_settings.get("max_tokens", 16000) or 16000)
-    except (TypeError, ValueError):
-        session_max_tokens = 16000
-    try:
-        context_history_limit = int(chat_session_settings.get("context_history", 6) or 6)
-    except (TypeError, ValueError):
-        context_history_limit = 6
-
+    """Return chat budgets and prompt behavior tuned to the active model, with custom chat values applied."""
     effective_provider = detect_chat_runtime_provider(config, llm_client)
     model_name = str(getattr(getattr(config, "llm", None), "model", "") or "").strip().lower()
     tuning = resolve_active_llm_tuning(config)
+    custom = chat_custom_settings()
+    context_window = int(tuning.get("context_window") or 0)
+    reasoning = bool(tuning.get("reasoning"))
     budgets = dict(tuning.get("chat") or {})
-    session_cap = max(256, session_max_tokens)
+    output_cap = max(256, int(tuning.get("max_tokens") or 4096))
+    if "max_tokens" in custom:
+        output_cap = max(256, int(custom["max_tokens"]))
+        model_output_limit = int(getattr(tuning.get("profile"), "max_output_tokens", 0) or 0)
+        if model_output_limit > 0:
+            output_cap = min(output_cap, model_output_limit)
+        budgets = chat_budgets(output_cap, context_window, reasoning)
 
     def _cap(value: Any) -> int:
-        return int(max(256, min(int(value or 1024), session_cap)))
+        return int(max(256, min(int(value or 1024), output_cap)))
 
     local_runtime = effective_provider in LOCAL_RUNTIME_PROVIDERS
-    small_context = int(tuning.get("context_window") or 0) <= 16384
+    small_context = context_window <= 16384
+    history_limit = int(custom.get("context_history") or budgets.get("history_turns") or 6)
     temperature = tuning.get("temperature")
-    if chat_settings_explicit_overrides.get("temperature") and tuning.get("supports_temperature", True):
-        try:
-            temperature = max(0.0, min(2.0, float(chat_session_settings.get("temperature"))))
-        except (TypeError, ValueError):
-            pass
+    if "temperature" in custom and tuning.get("supports_temperature", True) is not False:
+        temperature = float(custom["temperature"])
 
     return {
         "provider": effective_provider,
@@ -2680,7 +2677,7 @@ def build_chat_runtime_profile(config: Any, llm_client: Any = None) -> Dict[str,
         "auto_tune": bool(tuning.get("auto_tune", True)),
         "use_compact_prompt": local_runtime or small_context,
         "short_circuit_greetings": local_runtime,
-        "context_history_limit": max(1, min(context_history_limit, int(budgets.get("history_turns") or context_history_limit))),
+        "context_history_limit": max(1, history_limit),
         "initial_max_tokens": _cap(budgets.get("initial_max_tokens")),
         "followup_max_tokens": _cap(budgets.get("followup_max_tokens")),
         "final_max_tokens": _cap(budgets.get("final_max_tokens")),
@@ -2688,25 +2685,72 @@ def build_chat_runtime_profile(config: Any, llm_client: Any = None) -> Dict[str,
         "evidence_rows": int(budgets.get("evidence_rows") or 10),
         "evidence_chars": int(budgets.get("evidence_chars") or 6000),
         "prompt_budget_tokens": int(budgets.get("prompt_budget_tokens") or 6000),
-        "context_window": int(tuning.get("context_window") or 0),
+        "context_window": context_window,
         "supports_tools": bool(tuning.get("supports_tools")),
-        "reasoning": bool(tuning.get("reasoning")),
+        "reasoning": reasoning,
         "temperature": 0.2 if temperature is None else float(temperature),
         "temperature_multiplier": 1.0,
         "reasoning_guard": REASONING_MARKUP_GUARD if (local_runtime or tuning.get("reasoning")) else "",
     }
 
 
-chat_settings_explicit_overrides = {
-    "enable_rag_context": False,
-    "temperature": False,
-}
+CHAT_DATA_ROOT = Path("output") / CHAT_DATA_DIR_NAME
+chat_settings_store = ChatSettingsStore(CHAT_DATA_ROOT)
+chat_settings_view: Optional[ChatSettingsView] = None
 
 
-def sync_chat_settings_with_capability_defaults() -> None:
-    """Refresh capability-aware chat defaults unless explicitly changed this session."""
-    if not chat_settings_explicit_overrides.get("enable_rag_context", False):
-        chat_session_settings["enable_rag_context"] = should_enable_rag_context_by_default()
+def _chat_settings_inputs(config: Any = None) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    config = config if config is not None else config_manager.get()
+    try:
+        tuning = resolve_active_llm_tuning(config)
+    except Exception:
+        tuning = {}
+    identity = model_identity(getattr(config, "llm", None), str(tuning.get("provider") or ""))
+    return tuning, identity
+
+
+def _chat_settings_model_info(tuning: Dict[str, Any], identity: Dict[str, str]) -> Dict[str, Any]:
+    """What the Chat Settings dialog shows about the model the Auto values come from."""
+    return {
+        "label": identity["label"],
+        "provider": str(tuning.get("provider") or ""),
+        "auto_tune": bool(tuning.get("auto_tune", True)),
+        "supports_temperature": tuning.get("supports_temperature", True) is not False,
+        "reasoning": bool(tuning.get("reasoning")),
+        "context_window": int(tuning.get("context_window") or 0),
+        "request_timeout": int(tuning.get("request_timeout") or 0),
+        "max_output_tokens": int(getattr(tuning.get("profile"), "max_output_tokens", 0) or 0),
+    }
+
+
+def refresh_chat_session_settings(config: Any = None) -> ChatSettingsView:
+    """Recompute Auto values from the model's tuning and apply the saved custom values."""
+    global chat_settings_view
+    tuning, identity = _chat_settings_inputs(config)
+    view = resolve_chat_settings(
+        chat_settings_store,
+        tuning,
+        identity,
+        should_enable_rag_context_by_default(),
+        model_info=_chat_settings_model_info(tuning, identity),
+    )
+    chat_session_settings.clear()
+    chat_session_settings.update(view.effective)
+    chat_settings_view = view
+    return view
+
+
+def sync_chat_settings_for_request(config: Any = None) -> None:
+    """Pick up model, tuning, and Knowledge Base changes before a chat answer."""
+    try:
+        refresh_chat_session_settings(config)
+    except Exception as exc:
+        print(f"⚠️ [CHAT] Could not refresh chat settings: {exc}")
+
+
+def chat_custom_settings() -> Dict[str, Any]:
+    """Custom chat values for the current model; values left on Auto are absent."""
+    return dict(chat_settings_view.custom) if chat_settings_view is not None else {}
 
 def _llm_client_cache_key(llm_config: Any) -> int:
     fields = (
@@ -3255,8 +3299,9 @@ async def stop_runtime_state_bridge() -> None:
 debug_connections: List[WebSocket] = []  # WebSocket connections for debug log streaming
 debug_log_queue = asyncio.Queue()  # Queue for debug messages
 
-# Session-based chat settings (reset on server restart)
-chat_session_settings = build_default_chat_settings()
+# Effective chat settings: Auto values from the model's tuning plus saved custom values.
+# refresh_chat_session_settings() fills this in; these defaults only cover the time before that.
+chat_session_settings: Dict[str, Any] = model_defaults(None, False)
 
 MCP_TOOL_ALIASES = {
     "splunk_run_query": ["splunk_run_query", "run_splunk_query"],
@@ -5535,12 +5580,25 @@ def build_follow_on_actions(
                 ))
 
     if mission:
-        actions.insert(min(2, len(actions)), _make_follow_on_action(
-            "Next step for the mission",
-            (
-                f"Based on what we found so far, run the next most useful search for my mission: {mission[:200]}. "
+        open_goal_items = [
+            normalize_mission(item) for item in (memory.get("goal_open_items") or [])
+            if isinstance(item, str) and normalize_mission(item)
+        ] if isinstance(memory, dict) else []
+        if open_goal_items:
+            # Progress is judged after this answer, so the question to work on is picked when the prompt is sent,
+            # from the goal's open list at that time, rather than named here.
+            next_step_prompt = (
+                "Based on what we found so far, work on the most important question still open for my goal. "
+                "Run the most useful search, then say what it settles and what is still open."
+            )
+        else:
+            next_step_prompt = (
+                f"Based on what we found so far, run the next most useful search for my goal: {mission[:200]}. "
                 "Then summarize progress and what is still unknown."
-            ),
+            )
+        actions.insert(min(2, len(actions)), _make_follow_on_action(
+            "Next step for the goal",
+            next_step_prompt,
             "advance_mission",
         ))
 
@@ -7221,9 +7279,10 @@ def build_compact_chat_prompt(
     available_tools_text: str,
     discovery_age_warning: Optional[str],
     mission: str = "",
+    goal_progress: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Compact, deterministic-first prompt for local and small-context models."""
-    mission_block = format_mission_context(mission)
+    mission_block = format_mission_context(mission, goal_progress)
     mission_section = f"\n{mission_block}\n" if mission_block else ""
     return f"""You are a helpful, precise Splunk assistant. You help the user work with their own Splunk data through MCP tools. Prioritize correctness over creativity.
 {mission_section}
@@ -13566,39 +13625,314 @@ async def test_saved_mcp_connection(request: Request, name: str):
         'ca_bundle_path': mcp_config.ca_bundle_path,
     })
 
-# ==================== Chat Settings API (Session-based) ====================
+# ==================== Chat Settings API ====================
+
+def _chat_settings_response(view: ChatSettingsView) -> Dict[str, Any]:
+    return {"status": "success", "settings": view.payload()}
+
 
 @app.get("/api/chat/settings")
 async def get_chat_settings():
-    """Get current chat session settings"""
-    sync_chat_settings_with_capability_defaults()
-    return chat_session_settings.copy()
+    """Chat settings: Auto values from the AI model's tuning, with saved custom values applied."""
+    return refresh_chat_session_settings().payload()
+
 
 @app.post("/api/chat/settings")
 async def update_chat_settings(settings: Dict[str, Any]):
-    """Update chat session settings (not persisted, resets on restart)"""
-    global chat_session_settings
-    
-    # Validate and update only known settings
-    valid_keys = set(chat_session_settings.keys())
-    for key, value in settings.items():
-        if key in valid_keys:
-            chat_session_settings[key] = value
-            if key in chat_settings_explicit_overrides:
-                chat_settings_explicit_overrides[key] = True
-    
-    return {"status": "success", "settings": chat_session_settings.copy()}
+    """Save custom chat values; null puts a setting back on Auto. Kept until the AI model changes."""
+    tuning, identity = _chat_settings_inputs()
+    if settings.get("temperature") is not None and tuning.get("supports_temperature", True) is False:
+        raise HTTPException(status_code=400, detail=f"{identity['label']} uses a fixed temperature, so it cannot be changed.")
+    try:
+        apply_custom_values(chat_settings_store, settings, identity)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save chat settings: {exc}") from None
+    return _chat_settings_response(refresh_chat_session_settings())
+
 
 @app.post("/api/chat/settings/reset")
 async def reset_chat_settings():
-    """Reset chat settings to defaults"""
-    global chat_session_settings
-    
-    for key in chat_settings_explicit_overrides:
-        chat_settings_explicit_overrides[key] = False
-    chat_session_settings = build_default_chat_settings()
-    
-    return {"status": "success", "settings": chat_session_settings.copy()}
+    """Put every chat setting back on Auto."""
+    _, identity = _chat_settings_inputs()
+    try:
+        reset_custom_values(chat_settings_store, identity)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save chat settings: {exc}") from None
+    return _chat_settings_response(refresh_chat_session_settings())
+
+# ==================== Chat Goals API ====================
+
+chat_goal_store = ChatGoalStore(CHAT_DATA_ROOT)
+
+
+def chat_goal_owner(request: Request) -> str:
+    """The signed-in user's goal library, or the shared one when sign-in is off."""
+    if not is_auth_enabled():
+        return owner_key(None)
+    return owner_key(require_authenticated_user(request))
+
+
+def load_active_chat_goal(goal_owner: Optional[str], goal_id: Any) -> Optional[Dict[str, Any]]:
+    key = clean_goal_id(goal_id) if isinstance(goal_id, str) else ""
+    if not key:
+        return None
+    try:
+        return chat_goal_store.get_raw_goal(goal_owner or owner_key(None), key)
+    except (GoalNotFoundError, OSError):
+        return None
+
+
+def record_chat_goal_turn(goal_owner: Optional[str], request: Any, result: Any) -> None:
+    """Keep the question and answer with the goal so its progress can be checked next."""
+    if not isinstance(request, dict) or not isinstance(result, dict) or result.get("error"):
+        return
+    goal_id = clean_goal_id(request.get("goal_id")) if isinstance(request.get("goal_id"), str) else ""
+    answer = result.get("response")
+    if not goal_id or not isinstance(answer, str) or not answer.strip():
+        return
+    try:
+        recorded = chat_goal_store.record_turn(
+            goal_owner or owner_key(None), goal_id, request.get("message"), answer, request.get("chat_session_id")
+        )
+    except OSError as exc:
+        print(f"⚠️ [CHAT] Could not record the goal turn: {exc}")
+        return
+    if recorded:
+        result["goal_turn_recorded"] = True
+
+
+def _goal_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, GoalNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, GoalLimitError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail=f"Could not save the goal library: {exc}")
+
+
+async def _goal_payload(request: Request) -> Dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def _ask_llm_for_goal_json(messages: List[Dict[str, str]], fraction: float, ceiling: int) -> Tuple[Optional[Dict[str, Any]], str]:
+    """One JSON answer from the AI model for goal planning or progress, with a reason when there is none."""
+    config = config_manager.get()
+    available, reason = _is_llm_available_for_m26_14_advisory(config)
+    if not available:
+        return None, reason
+    try:
+        llm_client = get_or_create_llm_client(config)
+        raw_response = await llm_client.generate_response(
+            messages=messages,
+            max_tokens=llm_call_budget(config, fraction, floor=400, ceiling=ceiling),
+            temperature=0.2,
+        )
+    except Exception as exc:
+        return None, f"The AI model could not answer: {exc}"
+    parsed = _extract_json_object_from_llm_text(raw_response)
+    if parsed is None:
+        return None, "The AI model did not return a usable answer."
+    return parsed, ""
+
+
+def _goal_environment_brief() -> str:
+    try:
+        knowledge = load_latest_report_knowledge(chat_session_settings.get("discovery_freshness_days", 7))
+    except Exception:
+        return ""
+    if not isinstance(knowledge, dict):
+        return ""
+    return str(knowledge.get("prompt_context_compact") or knowledge.get("greeting_context") or "")
+
+
+async def _plan_chat_goal(goal_text: str) -> Tuple[Dict[str, Any], str, str]:
+    """Plan from the AI model, or the starter plan when it is unavailable. Returns (plan, planned_by, message)."""
+    data, reason = await _ask_llm_for_goal_json(
+        build_plan_messages(goal_text, _goal_environment_brief()), fraction=0.25, ceiling=1200
+    )
+    plan = parse_plan(data, goal_text) if data else None
+    if plan is not None:
+        return plan, "model", ""
+    message = reason or "The AI model did not return a usable plan."
+    return fallback_plan(goal_text), "starter", f"{message} Starter questions are shown instead."
+
+
+@app.get("/api/chat/goals")
+async def list_chat_goals(request: Request):
+    owner = chat_goal_owner(request)
+    return {"goals": chat_goal_store.list_goals(owner)}
+
+
+@app.post("/api/chat/goals")
+async def create_chat_goal(request: Request):
+    """Add a goal to the library, with questions to track and first questions to ask."""
+    owner = chat_goal_owner(request)
+    payload = await _goal_payload(request)
+    goal_text = clean_goal_text(payload.get("goal"), MAX_GOAL_CHARS)
+    if not goal_text:
+        raise HTTPException(status_code=400, detail="Describe the goal first.")
+    plan, planned_by, message = await _plan_chat_goal(goal_text)
+    try:
+        goal = chat_goal_store.create_goal(
+            owner,
+            goal_text,
+            title=payload.get("title") or plan["title"],
+            items=plan["items"],
+            questions=plan["questions"],
+            planned_by=planned_by,
+        )
+    except (GoalLimitError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"goal": goal, "message": message}
+
+
+@app.get("/api/chat/goals/{goal_id}")
+async def get_chat_goal(goal_id: str, request: Request):
+    try:
+        return {"goal": chat_goal_store.get_goal(chat_goal_owner(request), goal_id)}
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+
+
+@app.patch("/api/chat/goals/{goal_id}")
+async def update_chat_goal(goal_id: str, request: Request):
+    """Rename a goal, change its text, or mark it done or active again."""
+    owner = chat_goal_owner(request)
+    payload = await _goal_payload(request)
+    try:
+        goal = chat_goal_store.update_goal(
+            owner, goal_id, title=payload.get("title"), goal=payload.get("goal"), status=payload.get("status")
+        )
+    except (GoalNotFoundError, GoalLimitError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"goal": goal}
+
+
+@app.delete("/api/chat/goals/{goal_id}")
+async def delete_chat_goal(goal_id: str, request: Request):
+    try:
+        chat_goal_store.delete_goal(chat_goal_owner(request), goal_id)
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"status": "deleted"}
+
+
+@app.post("/api/chat/goals/{goal_id}/plan")
+async def replan_chat_goal(goal_id: str, request: Request):
+    """Plan the goal again; answered questions are kept and open ones are replaced."""
+    owner = chat_goal_owner(request)
+    try:
+        goal = chat_goal_store.get_raw_goal(owner, goal_id)
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    plan, planned_by, message = await _plan_chat_goal(str(goal.get("goal") or ""))
+    try:
+        detail = chat_goal_store.replace_plan(owner, goal_id, plan["items"], plan["questions"], planned_by)
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"goal": detail, "message": message}
+
+
+@app.post("/api/chat/goals/{goal_id}/items")
+async def add_chat_goal_item(goal_id: str, request: Request):
+    payload = await _goal_payload(request)
+    try:
+        return {"goal": chat_goal_store.add_item(chat_goal_owner(request), goal_id, payload.get("text"))}
+    except (GoalNotFoundError, GoalLimitError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+
+
+@app.patch("/api/chat/goals/{goal_id}/items/{item_id}")
+async def update_chat_goal_item(goal_id: str, item_id: str, request: Request):
+    payload = await _goal_payload(request)
+    try:
+        goal = chat_goal_store.update_item(
+            chat_goal_owner(request), goal_id, item_id,
+            text=payload.get("text"), status=payload.get("status"), note=payload.get("note"),
+        )
+    except (GoalNotFoundError, GoalLimitError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"goal": goal}
+
+
+@app.delete("/api/chat/goals/{goal_id}/items/{item_id}")
+async def delete_chat_goal_item(goal_id: str, item_id: str, request: Request):
+    try:
+        return {"goal": chat_goal_store.delete_item(chat_goal_owner(request), goal_id, item_id)}
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+
+
+@app.post("/api/chat/goals/{goal_id}/progress")
+async def check_chat_goal_progress(goal_id: str, request: Request):
+    """Judge the answers recorded since the last check against the goal's open questions."""
+    owner = chat_goal_owner(request)
+    try:
+        goal = chat_goal_store.get_raw_goal(owner, goal_id)
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    turns = pending_goal_turns(goal)
+    if not turns:
+        return {"goal": goal_detail(goal), "updated": False, "message": ""}
+    data, reason = await _ask_llm_for_goal_json(build_progress_messages(goal, turns), fraction=0.25, ceiling=1500)
+    evaluation = parse_progress(data, goal) if data else None
+    if evaluation is None:
+        return {
+            "goal": goal_detail(goal),
+            "updated": False,
+            "message": reason or "The AI model did not return a usable progress check.",
+        }
+    turn_ids = [turn.get("id") for turn in goal.get("turns") or [] if isinstance(turn, dict) and not turn.get("evaluated")]
+    try:
+        detail = chat_goal_store.apply_progress(owner, goal_id, evaluation, turn_ids)
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"goal": detail, "updated": True, "message": ""}
+
+
+@app.get("/api/chat/goals/{goal_id}/chats/{chat_id}")
+async def get_chat_goal_chat(goal_id: str, chat_id: str, request: Request):
+    try:
+        return {"chat": chat_goal_store.get_chat(chat_goal_owner(request), goal_id, chat_id)}
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+
+
+@app.put("/api/chat/goals/{goal_id}/chats/{chat_id}")
+async def save_chat_goal_chat(goal_id: str, chat_id: str, request: Request):
+    """Save (or update) one conversation under a goal."""
+    payload = await _goal_payload(request)
+    try:
+        chat = chat_goal_store.save_chat(
+            chat_goal_owner(request), goal_id, chat_id, payload.get("messages"), title=payload.get("title")
+        )
+    except (GoalNotFoundError, GoalLimitError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"chat": chat}
+
+
+@app.patch("/api/chat/goals/{goal_id}/chats/{chat_id}")
+async def rename_chat_goal_chat(goal_id: str, chat_id: str, request: Request):
+    payload = await _goal_payload(request)
+    try:
+        chat = chat_goal_store.rename_chat(chat_goal_owner(request), goal_id, chat_id, payload.get("title"))
+    except (GoalNotFoundError, GoalLimitError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"chat": chat}
+
+
+@app.delete("/api/chat/goals/{goal_id}/chats/{chat_id}")
+async def delete_chat_goal_chat(goal_id: str, chat_id: str, request: Request):
+    try:
+        chat_goal_store.delete_chat(chat_goal_owner(request), goal_id, chat_id)
+    except (GoalNotFoundError, OSError) as exc:
+        raise _goal_http_error(exc) from None
+    return {"status": "deleted"}
 
 def _model_listing_response(
     provider: str,
@@ -16463,13 +16797,14 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
     # Create a queue for status updates
     status_queue = asyncio.Queue()
     runtime_config = resolve_effective_runtime_config(request=http_request)
+    goal_owner = chat_goal_owner(http_request)
     
     async def generate_sse():
         """Generator for Server-Sent Events."""
         try:
             # Process chat in background task
             chat_task = asyncio.create_task(
-                process_chat_with_streaming(request, status_queue, runtime_config=runtime_config)
+                process_chat_with_streaming(request, status_queue, runtime_config=runtime_config, goal_owner=goal_owner)
             )
             
             # Stream status updates as they come in
@@ -18134,7 +18469,7 @@ def extract_suggested_spl_from_answer(text: Any) -> Optional[str]:
             candidate = generic.group(1).strip()
     return candidate or None
 
-async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue, runtime_config: Any = None):
+async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue, runtime_config: Any = None, goal_owner: Optional[str] = None):
     """Process chat request and push status updates to queue."""
     try:
         # Define callback that pushes to queue
@@ -18147,22 +18482,23 @@ async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue
             })
         
         # Call chat logic with streaming callback
-        result = await chat_with_splunk_logic(request, status_callback, runtime_config=runtime_config)
+        result = await chat_with_splunk_logic(request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner)
+        record_chat_goal_turn(goal_owner, request, result)
         await status_queue.put({'type': 'done', 'data': result})
     except Exception as e:
         await status_queue.put({'type': 'error', 'error': str(e)})
 
 
-async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_config: Any = None):
+async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_config: Any = None, goal_owner: Optional[str] = None):
     """Core chat logic that can optionally stream status updates.
     
     Args:
         request: The chat request dict
         status_callback: Optional async function to call with status updates
                         Signature: async def callback(action: str, iteration: int, time: float)
+        goal_owner: Whose goal library a goal_id in the request belongs to (see chat_goals.owner_key)
     """
     try:
-        sync_chat_settings_with_capability_defaults()
         print(f"🔵 [CHAT] Request received: {request.get('message', '')[:50]}")
         user_message = request.get('message', '')
         history = request.get('history', [])
@@ -18185,6 +18521,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         
         # Load configuration
         config = runtime_config or config_manager.get()
+        sync_chat_settings_for_request(config)
         request_started_at = time.time()
 
         async def push_status(timeline: List[Dict[str, Any]], action: str, iteration: int = 0):
@@ -18197,10 +18534,14 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         # Load and update persistent chat memory for this session
         update_chat_memory(chat_session_id, user_message)
         chat_memory = load_chat_memory(chat_session_id)
-        if "mission" in request:
-            requested_mission = normalize_mission(request.get("mission"))
-            if requested_mission != str(chat_memory.get("mission") or ""):
+        active_goal = load_active_chat_goal(goal_owner, request.get("goal_id"))
+        goal_progress = progress_brief(active_goal) if active_goal else None
+        if active_goal or "mission" in request or "goal_id" in request:
+            requested_mission = normalize_mission(active_goal.get("goal") if active_goal else request.get("mission"))
+            requested_open_items = list((goal_progress or {}).get("open") or [])
+            if requested_mission != str(chat_memory.get("mission") or "") or requested_open_items != list(chat_memory.get("goal_open_items") or []):
                 chat_memory["mission"] = requested_mission
+                chat_memory["goal_open_items"] = requested_open_items
                 save_chat_memory(chat_session_id, chat_memory)
         mission = normalize_mission(chat_memory.get("mission"))
         memory_context = build_chat_memory_context(chat_memory)
@@ -19218,10 +19559,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         max_iterations = max(1, _safe_int(chat_session_settings.get("max_iterations", 5)) or 5)
         max_execution_time = max(10, _safe_int(chat_session_settings.get("max_execution_time", 90)) or 90)
         stall_limit = max(2, _safe_int(chat_session_settings.get("convergence_detection", 3)) or 3)
-        evidence_rows = max(
-            int(chat_runtime_profile.get("evidence_rows") or 10),
-            _safe_int(chat_session_settings.get("query_sample_size", 0)),
-        )
+        evidence_rows = int(chat_runtime_profile.get("evidence_rows") or 10)
         evidence_chars = int(chat_runtime_profile.get("evidence_chars") or 6000)
         followup_max_tokens = chat_runtime_profile["followup_max_tokens"]
 
@@ -19234,6 +19572,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 available_tools_text=available_tools_text,
                 discovery_age_warning=discovery_age_warning,
                 mission=mission,
+                goal_progress=goal_progress,
             )
         else:
             system_prompt = build_grounded_chat_prompt(
@@ -19244,6 +19583,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 memory_context=memory_context,
                 discovery_age_warning=discovery_age_warning,
                 mission=mission,
+                goal_progress=goal_progress,
                 blocked_commands=SPL_BLOCKED_COMMANDS,
                 max_tool_steps=max_iterations,
             )
@@ -19267,7 +19607,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 "You are the Splunk Discovery Tool assistant. Reply warmly in one or two sentences and offer to help "
                 "the user explore or troubleshoot their Splunk data."
             )
-            mission_block = format_mission_context(mission)
+            mission_block = format_mission_context(mission, goal_progress)
             if mission_block:
                 greeting_prompt = f"{greeting_prompt}\n{mission_block}"
             if chat_runtime_profile["reasoning_guard"]:
@@ -19693,7 +20033,10 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
 async def chat_with_splunk(http_request: Request, request: dict):
     """Handle chat requests (non-streaming version for backward compatibility)."""
     runtime_config = resolve_effective_runtime_config(request=http_request)
-    return await chat_with_splunk_logic(request, status_callback=None, runtime_config=runtime_config)
+    goal_owner = chat_goal_owner(http_request)
+    result = await chat_with_splunk_logic(request, status_callback=None, runtime_config=runtime_config, goal_owner=goal_owner)
+    record_chat_goal_turn(goal_owner, request, result)
+    return result
 
 
 MCP_QUERY_TOOL_NAMES = frozenset({"splunk_run_query", "run_splunk_query"})

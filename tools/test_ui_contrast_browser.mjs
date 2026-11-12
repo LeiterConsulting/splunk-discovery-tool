@@ -41,6 +41,7 @@ const themeNames = (process.env.UI_CONTRAST_THEMES || Object.keys(THEMES).join('
     .map((name) => name.trim())
     .filter(Boolean);
 // A navigation change that silently skips a surface would otherwise let the gate pass.
+const SEEDED_GOAL_TITLE = 'Sensor data gap';
 const REQUIRED_SURFACES = [
     'welcome',
     'tab-overview',
@@ -52,6 +53,8 @@ const REQUIRED_SURFACES = [
     'discovery-report-open',
     'chat',
     'chat-settings',
+    'chat-goal-library',
+    'chat-goal',
     'connection-details',
     'settings-connections',
     'settings-connection-forms',
@@ -348,6 +351,26 @@ async function clickIfPresent(locator, options = {}) {
     return false;
 }
 
+// A goal with one answered and one open question and a saved chat, so the goal bar, its checklist, and the Goal Library are audited.
+async function seedChatGoal(baseUrl) {
+    const send = async (method, route, body) => {
+        const response = await fetch(`${baseUrl}${route}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+        if (!response.ok) throw new Error(`Could not seed the chat goal (${method} ${route}): HTTP ${response.status}`);
+        return response.json();
+    };
+    const { goal } = await send('POST', '/api/chat/goals', { goal: 'Find out why sensor data stopped arriving', title: SEEDED_GOAL_TITLE });
+    const goalRoute = `/api/chat/goals/${encodeURIComponent(goal.id)}`;
+    const firstItem = goal.items[0];
+    await send('PATCH', `${goalRoute}/items/${encodeURIComponent(firstItem.id)}`, { status: 'answered', note: 'The sensors index holds the data.' });
+    await send('POST', `${goalRoute}/items`, { text: 'When did the last sensor event arrive?' });
+    await send('PUT', `${goalRoute}/chats/chat_contrast_seed`, {
+        messages: [
+            { id: 1, type: 'user', content: 'Which index holds the sensor data?' },
+            { id: 2, type: 'assistant', content: 'Sensor data is in the sensors index.' },
+        ],
+    });
+}
+
 async function closeDialogs(page) {
     for (let attempt = 0; attempt < 4; attempt += 1) {
         if (!(await page.locator('[role="dialog"]:visible').count())) return;
@@ -433,6 +456,22 @@ async function auditTheme(browser, baseUrl, themeName) {
             if (await clickIfPresent(page.getByRole('button', { name: 'Open chat settings' }))) {
                 await settle(page, 600);
                 await capture('chat-settings', '[role="dialog"]');
+            }
+            await closeDialogs(page);
+        }
+        if (await clickIfPresent(page.getByRole('button', { name: 'Open chat', exact: true }))) {
+            await settle(page, 1000);
+            if (await clickIfPresent(page.getByRole('button', { name: 'Open the goal library' }))) {
+                await settle(page, 800);
+                await clickIfPresent(page.getByTestId('chat-goal-library').getByRole('button', { name: new RegExp(SEEDED_GOAL_TITLE) }));
+                await settle(page, 800);
+                await capture('chat-goal-library', '[data-testid="chat-goal-library"]');
+                if (await clickIfPresent(page.getByTestId('chat-goal-library').getByRole('button', { name: 'Use in chat' }))) {
+                    await settle(page, 800);
+                    await clickIfPresent(page.getByTestId('chat-goal-progress-toggle'));
+                    await settle(page, 400);
+                    await capture('chat-goal', '[role="dialog"]');
+                }
             }
             await closeDialogs(page);
         }
@@ -566,6 +605,7 @@ async function main() {
             const response = await fetch(`${baseUrl}/api/capabilities/m26_14_advisor/${action}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
             if (!response.ok) throw new Error(`Could not ${action} the M-26-14 module: HTTP ${response.status}`);
         }
+        await seedChatGoal(baseUrl);
         browser = await chromium.launch({ headless: true });
         problems.push(...await checkThemeSwitching(browser, baseUrl));
         for (const themeName of themeNames) {

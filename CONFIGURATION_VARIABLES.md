@@ -135,11 +135,13 @@ Behavior notes:
 
 ## 3. Discovery Agent & Chat
 
-### 3.1 Execution Limits (src/web_app.py)
+### 3.1 Execution Limits (src/chat_settings.py)
+Chat settings start from the active AI model's tuning (`model_defaults()`). A value changed in Chat Settings becomes Custom, is saved in `output/chat_data/chat_settings.json`, and is cleared when the AI model changes.
 ```python
-max_execution_time: int = 90           # Chat tool-loop time limit (seconds)
-max_iterations: int = 5                # Maximum tool steps for one chat request
-convergence_detection: int = 5         # Stop after this many steps without new data (minimum 2)
+max_execution_time: int                # Model request timeout, kept between 120 and 900 seconds (Custom: 30-1800)
+max_iterations: int = 5                # Search rounds per answer; 3 when the context window is 16K tokens or less (Custom: 1-10)
+convergence_detection: int = 3         # Stop after this many rounds without new data; 2 when max_iterations is 3 (Custom: 2-10)
+discovery_freshness_days: int = 7      # Use discovery results up to this many days old (Custom: 1-30)
 convergence_check_threshold: int = 5   # Minimum iterations before checking for convergence
 ```
 
@@ -149,7 +151,6 @@ Chat searches that name no index run with `index=*` added. A search that repeats
 ```python
 # Result Sampling
 metadata_full_data: bool = True        # Send all metadata (indexes, sourcetypes)
-query_sample_size: int = 2             # Sample size for large query results (first N rows)
 summary_sample_size: int = 5           # Summary context size (first N rows)
 
 # Context Windows

@@ -527,3 +527,59 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("const [isSummaryFullscreen, setIsSummaryFullscreen] = useState(false);", template_source)
         self.assertIn("const isSummaryTab = isSummaryFullscreen && workspaceTab === 'summary-workspace';", template_source)
         self.assertIn("const enterSummaryFullscreen = () => {", template_source)
+
+    def test_chat_goal_bar_library_and_progress_wiring_is_declared(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        # The goal applies only after Set goal; the chat request carries the goal id.
+        self.assertIn("createChatGoal(chatMission, { activate: true });", template_source)
+        self.assertIn("goal_id: goalIdForRequest || null", template_source)
+        self.assertNotIn("mission: chatMission.trim()", template_source)
+        # Each recorded answer saves the chat under the goal and checks progress.
+        self.assertIn("if (result.goal_turn_recorded && goalIdForRequest) {", template_source)
+        self.assertIn("checkChatGoalProgress(goalIdForRequest);", template_source)
+        self.assertIn("saveChatToGoal(pending.goalId, pending.chatId, chatMessages, { quiet: true });", template_source)
+        self.assertIn("chatGoalPath(goalId, '/progress')", template_source)
+        # Goal bar, kickoff, suggested questions, and the library with full editing.
+        for test_id in (
+            "chat-goal-bar",
+            "chat-goal-progress-toggle",
+            "chat-goal-progress",
+            "chat-goal-empty-state",
+            "chat-goal-questions",
+            "chat-goal-library",
+            "chat-goal-detail",
+        ):
+            self.assertIn(f'data-testid="{test_id}"', template_source)
+        self.assertIn("Start on this goal", template_source)
+        self.assertIn("const startOnChatGoal = () => {", template_source)
+        for handler in (
+            "const updateChatGoal = async (goalId, changes) => {",
+            "const deleteChatGoal = async (goal) => {",
+            "const replanChatGoal = async (goalId) => {",
+            "const addChatGoalItem = (goalId, text) =>",
+            "const updateChatGoalItem = (goalId, itemId, changes) =>",
+            "const deleteChatGoalItem = (goalId, itemId) =>",
+            "const openSavedGoalChat = async (goal, chat) => {",
+            "const renameSavedGoalChat = async (goalId, chatId, title) => {",
+            "const deleteSavedGoalChat = async (goalId, chat) => {",
+        ):
+            self.assertIn(handler, template_source)
+        # Two goals never share one chat, and the "already saved" marker survives a reload.
+        self.assertIn("const notice = prepareChatForGoal(goal.id);", template_source)
+        self.assertIn("const savedGoalChatRef = useRef(loadSavedGoalChatMarker());", template_source)
+        self.assertIn("saved.lastMessageId === lastChatMessageId(chatMessages)", template_source)
+        # The goal's next-step suggestion is hidden once the chat has no goal.
+        self.assertIn("{visibleFollowOnActions(msg).map((action, idx) => {", template_source)
+
+    def test_chat_settings_modal_declares_auto_and_custom_modes(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        self.assertIn("data-testid={`chat-setting-mode-${settingKey}`}", template_source)
+        self.assertIn("const returnChatSettingToAuto = (key) => {", template_source)
+        self.assertIn("fetch('/api/chat/settings/reset'", template_source)
+        self.assertIn('data-testid="chat-settings-model-notice"', template_source)
+        self.assertIn("Custom values are saved and stay until the AI model changes.", template_source)
+        for retired_setting in ("max_retry_delay", "max_retries", "quality_threshold", "query_sample_size"):
+            for usage in (f"settingKey: '{retired_setting}'", f"chatSettings.{retired_setting}", f"chatSettings?.{retired_setting}"):
+                self.assertFalse(usage in template_source, f"retired chat setting still in the modal: {usage}")
