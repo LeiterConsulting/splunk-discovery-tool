@@ -72,13 +72,13 @@ class CapabilityManager:
         self.health_service = health_service or CapabilityHealthService(config_manager=self.config_manager)
         if getattr(self.health_service, "config_manager", None) is None:
             self.health_service.config_manager = self.config_manager
-        self._bootstrap_known_capabilities()
+        self._bootstrap_known_capabilities(at_startup=True)
 
     def refresh(self) -> None:
         """Re-apply registry defaults after the underlying config reloads."""
         self._bootstrap_known_capabilities()
 
-    def _bootstrap_known_capabilities(self) -> None:
+    def _bootstrap_known_capabilities(self, at_startup: bool = False) -> None:
         changed = False
         for definition in self.registry.list_definitions():
             config = self.config_manager.get_capability(definition.name)
@@ -103,9 +103,19 @@ class CapabilityManager:
                 config.config = normalized_config
                 changed = True
 
-            if config.restart_required and definition.runtime_available and self._dependencies_available(definition):
-                config.restart_required = False
-                changed = True
+            if config.restart_required and definition.runtime_available:
+                if self._dependencies_available(definition):
+                    config.restart_required = False
+                    changed = True
+                elif at_startup and config.installed and definition.install_method == "pip":
+                    # The app has restarted and the packages still do not import, so another restart will not
+                    # help. Marking the capability not installed brings back Install, which repairs the packages.
+                    self._mark_not_installed(config)
+                    print(
+                        f"Warning: {definition.title} packages did not load after a restart; "
+                        "it is shown as not installed so it can be installed again."
+                    )
+                    changed = True
 
             if not config.health_message:
                 config.health_message = "Capability is not installed." if not config.installed else "Capability state not tested yet."
@@ -245,6 +255,12 @@ class CapabilityManager:
         if not config.installed and not config.enabled:
             return self._result(definition.name, "uninstall", True, "Capability is not installed.")
 
+        self._mark_not_installed(config)
+        self.config_manager.save_capability(config)
+        return self._result(definition.name, "uninstall", True, "Capability removed.")
+
+    @staticmethod
+    def _mark_not_installed(config: CapabilityConfig) -> None:
         config.enabled = False
         config.installed = False
         config.version = None
@@ -253,8 +269,6 @@ class CapabilityManager:
         config.last_error = None
         config.health_status = "not_installed"
         config.health_message = "Capability is not installed."
-        self.config_manager.save_capability(config)
-        return self._result(definition.name, "uninstall", True, "Capability removed.")
 
     def test_capability(self, name: str, action: str = "test") -> CapabilityActionResult:
         definition = self.registry.get_definition(name)

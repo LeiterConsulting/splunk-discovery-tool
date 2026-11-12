@@ -181,6 +181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Nine elements used `shrink-0`, which Tailwind 2 does not generate; they now use `flex-shrink-0`
 - Advanced settings in Dark sat on a near-black bar that stood out from its card
 - Installing the Knowledge Base on a Python version that onnxruntime does not support yet (such as 3.15) quietly fell back to chromadb 0.3.23, which fails on import. The install now requires chromadb 1.x, and when pip cannot install onnxruntime it installs chromadb and its other dependencies without it. The Knowledge Base uses its own embedding function, so it never needs onnxruntime
+- A Knowledge Base install whose packages cannot load (such as that chromadb 0.3.23) kept saying "Restart Splunk Discovery Tool to finish installing", and restarting never finished it. At startup, a capability that is still waiting for a restart and whose packages still do not import is shown as not installed, so Install can repair it
 - Install guidance quotes package version ranges so the copied pip command works in a shell
 - The README and installers asked for Python 3.8 or newer; they now say 3.11 or newer, the oldest version the test suite has been run on
 
