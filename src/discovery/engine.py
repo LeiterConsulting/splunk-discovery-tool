@@ -20,6 +20,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 import aiohttp
 
 from mcp_tool_args import adapt_tool_arguments
+from discovery.environment_profile import detect_deployment_type, normalize_installed_app_rows
 from discovery.local_analyzer import (
     KIND_ANALYTICS,
     KIND_HOST,
@@ -47,6 +48,7 @@ ROW_LIMITS: Dict[str, int] = {
     "sources": 1000,
     "knowledge_objects": 500,
     "kv_collections": 500,
+    "apps": 1000,
 }
 # Names follow the GA splunk_get_knowledge_objects "type" enum; dashboards are "views".
 KNOWLEDGE_OBJECT_TYPES: List[str] = ["saved_searches", "alerts", "views", "macros", "lookups", "data_models"]
@@ -66,6 +68,11 @@ LICENSE_USAGE_24H_QUERY = "index=_internal source=*license_usage.log* type=Usage
 SOURCETYPE_METADATA_QUERY = "| metadata type=sourcetypes index=* | sort - totalCount"
 RECENT_INDEX_ACTIVITY_QUERY = "| tstats count where index=* OR index=_* by index"
 DAILY_EVENT_TREND_QUERY = "| tstats count where index=* by _time span=1d"
+# Fallback for MCP servers whose knowledge object tool does not offer type=apps.
+INSTALLED_APPS_QUERY = (
+    "| rest /services/apps/local splunk_server=local count=0 "
+    "| fields title label version author disabled visible core details"
+)
 
 STEP_LABELS: Dict[str, str] = {
     "platform_info": "Platform information",
@@ -77,6 +84,7 @@ STEP_LABELS: Dict[str, str] = {
     "kv_collections": "KV store collections",
     "license_usage_24h": "24h license usage",
     "index_details": "Index configuration details",
+    "installed_apps": "Installed apps and add-ons",
 }
 
 SURFACE_STEPS: Dict[str, str] = {
@@ -143,6 +151,8 @@ class EnvironmentOverview:
     user_scope: str = "authenticated_user_context"
     authenticated_user: str = ""
     authenticated_user_roles: List[str] = None
+    deployment_type: str = ""
+    total_apps: int = 0
 
     def __post_init__(self):
         """Ensure collections are always initialized."""
@@ -285,6 +295,7 @@ class DiscoveryEngine:
         self.ca_bundle_path = ca_bundle_path
         self.discovery_results: List[DiscoveryResult] = []
         self.environment_overview: Optional[EnvironmentOverview] = None
+        self.installed_apps: List[Dict[str, Any]] = []
         self.discovery_data: Dict[str, Any] = {}
         self.local_analyzer = LocalDataAnalyzer()
         self._available_tools: set = set()
@@ -964,6 +975,13 @@ class DiscoveryEngine:
                 None,
                 "results",
             ),
+            (
+                "installed_apps",
+                "splunk_get_knowledge_objects",
+                {"type": "apps", "row_limit": ROW_LIMITS["apps"]},
+                ROW_LIMITS["apps"],
+                "results",
+            ),
         ]
 
     async def _fetch_spec(self, name: str) -> StepOutcome:
@@ -1054,6 +1072,8 @@ class DiscoveryEngine:
             by_name: Dict[str, StepOutcome] = {spec[0]: outcome for spec, outcome in zip(specs, outcomes)}
             if by_name["sourcetypes"].status in {"error", "unsupported"}:
                 by_name["sourcetypes"] = await self._fetch_sourcetypes()
+            if by_name["installed_apps"].status in {"error", "unsupported"}:
+                by_name["installed_apps"] = await self._fetch_installed_apps_fallback(by_name["installed_apps"])
 
         index_outcome = by_name["indexes"]
         if index_outcome.status != "ok":
@@ -1072,6 +1092,23 @@ class DiscoveryEngine:
             server_roles = [r.strip() for r in server_roles.split(",") if r.strip()]
         elif not isinstance(server_roles, list):
             server_roles = []
+        deployment_type, deployment_basis = detect_deployment_type(system_info, self.mcp_url)
+        self._platform_facts = {
+            "deployment_type": deployment_type,
+            "deployment_basis": deployment_basis,
+            "instance_type": str(system_info.get("instance_type") or ""),
+            "product_type": str(system_info.get("product_type") or ""),
+        }
+        apps_outcome = by_name["installed_apps"]
+        self.installed_apps = normalize_installed_app_rows(apps_outcome.rows) if apps_outcome.status == "ok" else []
+        apps_status = dict(getattr(self, "_step_status", {}).get("installed_apps") or {})
+        self._installed_apps_status = {
+            "status": apps_outcome.status,
+            "tool": apps_status.get("tool", ""),
+            "fallback": apps_status.get("fallback", ""),
+            "error": apps_outcome.error[:300],
+            "truncated": bool(apps_outcome.truncated),
+        }
 
         indexes_list = index_outcome.rows
         sourcetypes_list = by_name["sourcetypes"].rows
@@ -1150,10 +1187,48 @@ class DiscoveryEngine:
             knowledge_object_counts={"saved_searches": counts["knowledge_objects"]},
             authenticated_user=authenticated_user,
             authenticated_user_roles=authenticated_roles,
+            deployment_type=deployment_type,
+            total_apps=len(self.installed_apps),
         )
 
         self.environment_overview = overview
         return overview
+
+    async def _fetch_installed_apps_fallback(self, primary: StepOutcome) -> StepOutcome:
+        fallback = await self._fetch(
+            "installed_apps",
+            "splunk_run_query",
+            {"query": INSTALLED_APPS_QUERY, "earliest_time": "-15m", "latest_time": "now", "row_limit": ROW_LIMITS["apps"]},
+            row_limit=ROW_LIMITS["apps"],
+        )
+        if fallback.status == "ok":
+            status = getattr(self, "_step_status", {}).get("installed_apps")
+            if isinstance(status, dict):
+                status["fallback"] = "rest search of /services/apps/local"
+                status["primary_error"] = primary.error[:200]
+            return fallback
+        return primary
+
+    def get_environment_profile(self) -> Dict[str, Any]:
+        """Facts the knowledge library maps to documentation: platform, deployment, apps, and sourcetype volume."""
+        overview = getattr(self, "environment_overview", None)
+        if overview is None:
+            return {}
+        inventory = getattr(self, "_inventory", {}) or {}
+        return {
+            "schema_version": 1,
+            "splunk_version": overview.splunk_version,
+            "splunk_build": overview.splunk_build,
+            **dict(getattr(self, "_platform_facts", {}) or {}),
+            "server_roles": list(overview.server_roles or []),
+            "installed_apps": {
+                **dict(getattr(self, "_installed_apps_status", {}) or {}),
+                "items": list(getattr(self, "installed_apps", []) or []),
+            },
+            "sourcetypes": self._compact_metadata_rows(
+                inventory.get("sourcetypes", []), "sourcetype", limit=ROW_LIMITS["sourcetypes"]
+            ),
+        }
 
     @staticmethod
     def _compact_index_rows(rows: List[Dict[str, Any]], limit: int = 50) -> List[Dict[str, Any]]:

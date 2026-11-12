@@ -6,7 +6,7 @@ animated progress indicators, and comprehensive report management.
 """
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -53,6 +53,10 @@ from discovery.m26_14_advisor import (
     summarize_validation_results as summarize_m26_14_validation_results,
 )
 from discovery.v2_pipeline import DiscoveryV2Pipeline
+from knowledge_library import LIBRARY_DIR_NAME
+from knowledge_library.profile import build_environment_profile
+from knowledge_library.service import KnowledgeLibraryService, LibraryBusyError
+from knowledge_library.sources import MAX_PACK_BYTES, LibraryPackError
 from llm.factory import (
     DEFAULT_OLLAMA_ENDPOINT_URL,
     LLMClientFactory,
@@ -12854,6 +12858,99 @@ async def build_rag_context_preview(build_request: RAGContextPreviewRequest):
     ).to_dict()
     _raise_for_capability_result(result)
     return result
+
+
+knowledge_library_service = KnowledgeLibraryService(Path("output") / LIBRARY_DIR_NAME)
+
+
+class KnowledgeLibrarySettingsUpdate(BaseModel):
+    allow_online_sources: bool
+
+
+def _knowledge_library_can_manage(request: Request) -> bool:
+    if not is_auth_enabled():
+        return True
+    current_user = getattr(request.state, "auth_user", None)
+    return isinstance(current_user, dict) and str(current_user.get("role") or "").strip().lower() == "admin"
+
+
+def _knowledge_library_kb_assets() -> Optional[List[Dict[str, Any]]]:
+    try:
+        result = capability_manager.list_rag_assets("rag_chromadb").to_dict()
+    except Exception:
+        return None
+    if not result.get("ok"):
+        return None
+    assets = (result.get("details") or {}).get("assets")
+    return assets if isinstance(assets, list) else []
+
+
+def _knowledge_library_blueprint(request: Request) -> Optional[Dict[str, Any]]:
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return load_latest_v2_blueprint(scope_key=scope_key)
+
+
+def _knowledge_library_status_payload(request: Request, auto_refresh: bool = True) -> Dict[str, Any]:
+    return knowledge_library_service.build_status(
+        _knowledge_library_blueprint(request),
+        _knowledge_library_kb_assets(),
+        allow_online=bool(config_manager.get().library.allow_online_sources),
+        can_manage=_knowledge_library_can_manage(request),
+        auto_refresh=auto_refresh,
+    )
+
+
+@app.get("/api/knowledge-library/status")
+async def get_knowledge_library_status(request: Request):
+    """Score how well the library covers the latest discovery and list the gaps."""
+    return _knowledge_library_status_payload(request)
+
+
+@app.post("/api/knowledge-library/settings")
+async def update_knowledge_library_settings(request: Request, update: KnowledgeLibrarySettingsUpdate):
+    """Turn online library sources on or off."""
+    require_admin_user(request)
+    if not config_manager.update_library(allow_online_sources=bool(update.allow_online_sources)):
+        raise HTTPException(status_code=500, detail=config_manager.last_save_error or "Could not save the library settings.")
+    return _knowledge_library_status_payload(request)
+
+
+@app.post("/api/knowledge-library/refresh")
+async def refresh_knowledge_library(request: Request):
+    """Download the library sources again in the background."""
+    require_admin_user(request)
+    if not config_manager.get().library.allow_online_sources:
+        raise HTTPException(status_code=409, detail="Online library sources are turned off. Turn them on first, or import a library pack.")
+    profile = build_environment_profile(_knowledge_library_blueprint(request))
+    knowledge_library_service.start_refresh(profile, reason="manual")
+    return _knowledge_library_status_payload(request, auto_refresh=False)
+
+
+@app.post("/api/knowledge-library/pack/import")
+async def import_knowledge_library_pack(request: Request, file: UploadFile = File(...)):
+    """Load library sources from a pack exported on another installation."""
+    require_admin_user(request)
+    data = await file.read(MAX_PACK_BYTES + 1)
+    try:
+        result = knowledge_library_service.import_pack(data)
+    except LibraryBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except LibraryPackError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    payload = _knowledge_library_status_payload(request, auto_refresh=False)
+    payload["import_result"] = result
+    return payload
+
+
+@app.get("/api/knowledge-library/pack/export")
+async def export_knowledge_library_pack():
+    """Download the loaded library sources as a pack for installations without internet access."""
+    try:
+        data = knowledge_library_service.export_pack()
+    except LibraryPackError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    filename = f"dt4sms_library_pack_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    return Response(content=data, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.post("/api/capabilities/{name}/install")

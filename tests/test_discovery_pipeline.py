@@ -63,6 +63,12 @@ TREND = [
     for day in range(1, 8)
 ]
 
+APPS = [
+    {"name": "search", "label": "Search & Reporting", "version": "9.3.1", "disabled": "0", "core": "1"},
+    {"name": "Splunk_TA_windows", "label": "Splunk Add-on for Microsoft Windows", "version": "8.9.0", "disabled": "0", "author": "Splunk"},
+    {"name": "TA-legacy", "label": "Legacy add-on", "version": "1.0", "disabled": "1"},
+]
+
 TOOL_NAMES = [
     "splunk_get_info",
     "splunk_get_indexes",
@@ -82,10 +88,13 @@ def text_content(obj):
 class FakeSplunkMCP:
     """In-memory JSON-RPC MCP server returning varied but realistic response shapes."""
 
-    def __init__(self, license_bytes=2.5 * 1024 ** 3, hosts=None, failing_ko_types=("macros",)):
+    def __init__(self, license_bytes=2.5 * 1024 ** 3, hosts=None, failing_ko_types=("macros",), apps=None, version="9.3.1", block_rest=False):
         self.license_bytes = license_bytes
         self.hosts = hosts
         self.failing_ko_types = set(failing_ko_types)
+        self.apps = APPS if apps is None else apps
+        self.version = version
+        self.block_rest = block_rest
         self.calls = []
         self.tools_list_calls = 0
         self.rpc_ids = []
@@ -108,7 +117,7 @@ class FakeSplunkMCP:
 
     def tool_result(self, name, args):
         if name == "splunk_get_info":
-            return text_content({"version": "9.3.1", "build": "abc123", "licenseState": "OK", "server_roles": ["indexer", "search_head"]})
+            return text_content({"version": self.version, "build": "abc123", "licenseState": "OK", "server_roles": ["indexer", "search_head"]})
         if name == "splunk_get_indexes":
             return {"structuredContent": {"results": [dict(row) for row in INDEXES]}, "content": []}
         if name == "splunk_get_metadata":
@@ -129,6 +138,8 @@ class FakeSplunkMCP:
                 return text_content({"results": [
                     {"name": "Errors by host", "search": "index=main error | stats count by host", "is_scheduled": "1"},
                 ]})
+            if ko_type == "apps":
+                return text_content({"results": [dict(row) for row in self.apps]})
             return text_content({"results": []})
         if name == "splunk_get_user_info":
             return text_content({"name": "svc_discovery", "roles": ["power", "user"]})
@@ -154,6 +165,10 @@ class FakeSplunkMCP:
                 return text_content({"results": [dict(row) for row in RECENT_ACTIVITY]})
             if query == engine_module.DAILY_EVENT_TREND_QUERY:
                 return text_content({"results": [dict(row) for row in TREND]})
+            if query == engine_module.INSTALLED_APPS_QUERY:
+                if self.block_rest:
+                    return {"isError": True, "content": [{"type": "text", "text": "The rest command is not allowed"}]}
+                return text_content({"results": [{"title": row["name"], **{k: v for k, v in row.items() if k != "name"}} for row in self.apps]})
             return text_content({"results": []})
         return {"isError": True, "content": [{"type": "text", "text": f"Unknown tool {name}"}]}
 
@@ -417,6 +432,73 @@ class OverviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overview.authenticated_user, "svc_discovery")
         self.assertFalse(any(overview.truncated.values()))
         self.assertEqual(fake.tools_list_calls, 1)
+
+    async def test_installed_apps_and_deployment_type_are_recorded(self):
+        fake = FakeSplunkMCP()
+        engine = make_engine(fake)
+        overview = await engine.get_quick_overview()
+        profile = engine.get_environment_profile()
+        await engine.aclose()
+
+        self.assertEqual(overview.deployment_type, "enterprise")
+        self.assertEqual(overview.total_apps, 3)
+        self.assertEqual(profile["schema_version"], 1)
+        self.assertEqual(profile["splunk_version"], "9.3.1")
+        self.assertEqual(profile["deployment_type"], "enterprise")
+        apps = profile["installed_apps"]
+        self.assertEqual(apps["status"], "ok")
+        self.assertEqual(apps["fallback"], "")
+        by_name = {app["name"]: app for app in apps["items"]}
+        self.assertTrue(by_name["search"]["builtin"])
+        self.assertFalse(by_name["Splunk_TA_windows"]["builtin"])
+        self.assertEqual(by_name["Splunk_TA_windows"]["version"], "8.9.0")
+        self.assertTrue(by_name["TA-legacy"]["disabled"])
+        sourcetypes = {row["name"]: row["events"] for row in profile["sourcetypes"]}
+        self.assertEqual(sourcetypes["WinEventLog:Security"], 1500)
+        self.assertIn(("splunk_get_knowledge_objects", json.dumps({"row_limit": engine_module.ROW_LIMITS["apps"], "type": "apps"}, sort_keys=True)), fake.calls)
+
+    async def test_cloud_release_numbering_marks_the_stack_as_cloud(self):
+        engine = make_engine(FakeSplunkMCP(version="9.3.2408.104"))
+        overview = await engine.get_quick_overview()
+        await engine.aclose()
+        self.assertEqual(overview.deployment_type, "cloud")
+        self.assertIn("release numbering", engine.get_environment_profile()["deployment_basis"])
+
+    async def test_installed_apps_fall_back_to_rest_search_when_the_tool_lacks_the_type(self):
+        fake = SchemaAwareFakeMCP()
+        engine = make_engine(fake)
+        overview = await engine.get_quick_overview()
+        profile = engine.get_environment_profile()
+        await engine.aclose()
+
+        requested = {json.loads(args).get("type") for name, args in fake.calls if name == "splunk_get_knowledge_objects"}
+        self.assertNotIn("apps", requested)
+        self.assertIn(("splunk_run_query", engine_module.INSTALLED_APPS_QUERY), [(name, json.loads(args).get("query")) for name, args in fake.calls])
+        self.assertEqual(profile["installed_apps"]["status"], "ok")
+        self.assertIn("rest", profile["installed_apps"]["fallback"])
+        self.assertEqual(overview.total_apps, 3)
+        self.assertEqual(engine.get_step_status()["installed_apps"]["status"], "ok")
+
+    async def test_failed_app_collection_is_recorded_and_does_not_lower_readiness(self):
+        fake = FakeSplunkMCP(failing_ko_types=("apps",), block_rest=True)
+        engine = make_engine(fake)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        pipeline = DiscoveryV2Pipeline(engine, output_root=Path(tmp.name))
+        overview = await engine.get_quick_overview()
+        profile = engine.get_environment_profile()
+        status = engine.get_step_status()
+        await engine.aclose()
+
+        self.assertEqual(profile["installed_apps"]["status"], "error")
+        self.assertEqual(profile["installed_apps"]["items"], [])
+        self.assertIn("permissions", profile["installed_apps"]["error"])
+        self.assertEqual(overview.total_apps, 0)
+        self.assertEqual(status["installed_apps"]["status"], "error")
+        metrics = engine.get_discovery_metrics()
+        without = pipeline._compute_readiness(overview, {k: v for k, v in status.items() if k != "installed_apps"}, metrics)
+        with_failure = pipeline._compute_readiness(overview, status, metrics)
+        self.assertEqual(without["score"], with_failure["score"])
 
     async def test_data_volume_is_unknown_without_license_usage(self):
         fake = FakeSplunkMCP(license_bytes=None)
@@ -687,9 +769,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             "readiness_score", "score_basis", "overview", "capability_graph", "finding_ledger",
             "finding_ledger_summary", "discovered_inventory", "classification_map", "coverage_gaps",
             "risk_register", "trend_signals", "recommendations", "suggested_use_cases", "llm_status",
-            "discovery_step_status", "discovery_metrics", "pipeline_errors",
+            "discovery_step_status", "discovery_metrics", "pipeline_errors", "environment_profile",
         ):
             self.assertIn(key, blueprint)
+        self.assertEqual(blueprint["environment_profile"]["installed_apps"]["status"], "ok")
+        self.assertEqual(len(blueprint["environment_profile"]["installed_apps"]["items"]), len(APPS))
         self.assertEqual(blueprint["pipeline_errors"], [])
         self.assertEqual(result["pipeline_errors"], [])
         self.assertTrue(0 <= blueprint["readiness_score"] <= 100)

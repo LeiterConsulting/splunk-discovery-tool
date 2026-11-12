@@ -149,12 +149,18 @@ class SecurityConfig:
             self.oidc = OIDCConfig()
 
 @dataclass
+class LibraryConfig:
+    """Knowledge library settings. Online sources stay off until an admin turns them on."""
+    allow_online_sources: bool = False
+
+@dataclass
 class AppConfig:
     """Complete application configuration"""
     mcp: MCPConfig
     llm: LLMConfig
     server: ServerConfig
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    library: LibraryConfig = field(default_factory=LibraryConfig)
     saved_credentials: Dict[str, LLMCredential] = None  # name -> credential mapping
     saved_mcp_configs: Dict[str, MCPCredential] = None  # name -> MCP config mapping
     capabilities: Dict[str, CapabilityConfig] = field(default_factory=dict)
@@ -165,6 +171,8 @@ class AppConfig:
     def __post_init__(self):
         if self.security is None:
             self.security = SecurityConfig()
+        if self.library is None:
+            self.library = LibraryConfig()
         if self.saved_credentials is None:
             self.saved_credentials = {}
         if self.saved_mcp_configs is None:
@@ -242,6 +250,7 @@ class ConfigManager:
             llm = LLMConfig(**_known_fields(LLMConfig, config_dict.get('llm', {})))
             server = ServerConfig(**_known_fields(ServerConfig, config_dict.get('server', {})))
             security = SecurityConfig(**_known_fields(SecurityConfig, config_dict.get('security', {})))
+            library = LibraryConfig(**_known_fields(LibraryConfig, config_dict.get('library', {})))
             
             # Reconstruct saved credentials
             saved_creds_dict = config_dict.get('saved_credentials', {})
@@ -268,6 +277,7 @@ class ConfigManager:
                 llm=llm,
                 server=server,
                 security=security,
+                library=library,
                 saved_credentials=saved_credentials,
                 saved_mcp_configs=saved_mcp_configs,
                 capabilities=capabilities,
@@ -323,6 +333,7 @@ class ConfigManager:
             'llm': asdict(config.llm),
             'server': asdict(config.server),
             'security': asdict(config.security),
+            'library': asdict(config.library),
             'saved_credentials': {name: asdict(cred) for name, cred in config.saved_credentials.items()},
             'saved_mcp_configs': {name: asdict(mcp_config) for name, mcp_config in config.saved_mcp_configs.items()},
             'capabilities': {name: asdict(capability) for name, capability in config.capabilities.items()},
@@ -434,6 +445,13 @@ class ConfigManager:
                 continue
             if hasattr(self._config.security, key):
                 setattr(self._config.security, key, value)
+        return self.save(self._config)
+
+    def update_library(self, **kwargs) -> bool:
+        """Update knowledge library settings."""
+        for key, value in kwargs.items():
+            if hasattr(self._config.library, key):
+                setattr(self._config.library, key, value)
         return self.save(self._config)
 
     def get_capability(self, name: str) -> Optional[CapabilityConfig]:

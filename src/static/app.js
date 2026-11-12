@@ -1282,6 +1282,9 @@
     const [ragContextQuery, setRagContextQuery] = useState("");
     const [ragContextLimit, setRagContextLimit] = useState(4);
     const [ragLibraryFilter, setRagLibraryFilter] = useState("all");
+    const [knowledgeLibrary, setKnowledgeLibrary] = useState({ status: "idle", data: null, error: "", action: "", message: null });
+    const [showAllLibraryGaps, setShowAllLibraryGaps] = useState(false);
+    const libraryPackInputRef = useRef(null);
     const [headerHeight, setHeaderHeight] = useState(88);
     const [savedMCPConfigs, setSavedMCPConfigs] = useState({});
     const [loadedMCPConfigName, setLoadedMCPConfigName] = useState(null);
@@ -2673,6 +2676,19 @@
       }
     }, [workspaceTab]);
     useEffect(() => {
+      if (isCapabilitiesRagView) {
+        loadKnowledgeLibrary();
+      }
+    }, [isCapabilitiesRagView]);
+    useEffect(() => {
+      var _a2, _b2;
+      if (!isCapabilitiesRagView || ((_b2 = (_a2 = knowledgeLibrary.data) == null ? void 0 : _a2.refresh) == null ? void 0 : _b2.state) !== "running") {
+        return void 0;
+      }
+      const timer = setTimeout(() => loadKnowledgeLibrary({ silent: true }), 3e3);
+      return () => clearTimeout(timer);
+    }, [isCapabilitiesRagView, knowledgeLibrary.data]);
+    useEffect(() => {
       if (!showM2614WorkspaceTab && workspaceTab === "m26-14") {
         setWorkspaceTab("mission");
       }
@@ -3295,6 +3311,78 @@
           ...prev,
           status: "error",
           error: error.message || "Could not load the library."
+        }));
+      }
+    };
+    const LIBRARY_SOURCE_LABELS = {
+      security_content: "Splunk Security Content",
+      splunkbase: "Splunkbase",
+      help_docs: "help.splunk.com"
+    };
+    const getLibraryErrorMessage = (result, fallback) => {
+      if (typeof (result == null ? void 0 : result.detail) === "string" && result.detail) {
+        return result.detail;
+      }
+      if (typeof (result == null ? void 0 : result.message) === "string" && result.message) {
+        return result.message;
+      }
+      return fallback;
+    };
+    const loadKnowledgeLibrary = async (options = {}) => {
+      if (!options.silent) {
+        setKnowledgeLibrary((prev) => ({ ...prev, status: "loading", error: "" }));
+      }
+      try {
+        const response = await fetch("/api/knowledge-library/status");
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(getLibraryErrorMessage(result, `HTTP ${response.status}`));
+        }
+        setKnowledgeLibrary((prev) => ({ ...prev, status: "success", data: result, error: "" }));
+      } catch (error) {
+        console.error("Failed to load library health:", error);
+        setKnowledgeLibrary((prev) => ({ ...prev, status: "error", error: error.message || "Could not check library health." }));
+      }
+    };
+    const runKnowledgeLibraryRequest = async (action, url, options = {}) => {
+      setKnowledgeLibrary((prev) => ({ ...prev, action, message: null }));
+      try {
+        const response = await fetch(url, options);
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(getLibraryErrorMessage(result, `HTTP ${response.status}`));
+        }
+        setKnowledgeLibrary((prev) => ({ ...prev, status: "success", data: result, error: "", action: "" }));
+        return result;
+      } catch (error) {
+        console.error(`Library request failed (${action}):`, error);
+        setKnowledgeLibrary((prev) => ({
+          ...prev,
+          action: "",
+          message: { type: "error", text: error.message || "That did not work. Try again." }
+        }));
+        return null;
+      }
+    };
+    const setKnowledgeLibraryOnline = (allowOnline) => runKnowledgeLibraryRequest("settings", "/api/knowledge-library/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allow_online_sources: !!allowOnline })
+    });
+    const refreshKnowledgeLibrarySources = () => runKnowledgeLibraryRequest("refresh", "/api/knowledge-library/refresh", { method: "POST" });
+    const importKnowledgeLibraryPack = async (file) => {
+      var _a2;
+      if (!file) {
+        return;
+      }
+      const formData = new FormData();
+      formData.append("file", file);
+      const result = await runKnowledgeLibraryRequest("import", "/api/knowledge-library/pack/import", { method: "POST", body: formData });
+      const imported = Array.isArray((_a2 = result == null ? void 0 : result.import_result) == null ? void 0 : _a2.imported) ? result.import_result.imported : [];
+      if (imported.length > 0) {
+        setKnowledgeLibrary((prev) => ({
+          ...prev,
+          message: { type: "success", text: `Imported ${imported.map((name) => LIBRARY_SOURCE_LABELS[name] || name).join(", ")}.` }
         }));
       }
     };
@@ -4649,6 +4737,9 @@
         setRagLibraryFilter(options.libraryFilter);
       }
       loadCapabilities();
+      if (isCapabilitiesRagView) {
+        loadKnowledgeLibrary({ silent: true });
+      }
     };
     const openCapabilityDetail = (name) => {
       if (!name) {
@@ -5229,6 +5320,159 @@
         })), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2 text-xs" }, (reuseTier || knownGood) && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplReuseTierClasses(reuseTier, knownGood)}` }, "Reuse: ", knownGood ? "Known Good" : formatSplIntelligenceLabel(reuseTier, "Candidate")), fitStatus && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplEnvironmentFitClasses(fitStatus)}` }, "Environment Fit: ", formatSplIntelligenceLabel(fitStatus, "Unknown")), validationStatus && /* @__PURE__ */ React.createElement("span", { className: `rounded-full px-2 py-0.5 border ${getSplValidationClasses(validationStatus)}` }, "Validation: ", formatSplIntelligenceLabel(validationStatus, "Unknown"))), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 max-h-32 overflow-auto ${m2614CodeClass}` }, query));
       }))), m2614ValidationLlmAnalysis && /* @__PURE__ */ React.createElement("div", { "data-testid": "m2614-validation-advisory-panel", className: m2614CardClass }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold mb-2 ${headingClass}` }, "AI Review"), m2614ValidationLlmAnalysis.message && m2614ValidationLlmAnalysis.status !== "ready" && /* @__PURE__ */ React.createElement("p", { className: `mb-2 text-sm ${mutedTextClass}` }, m2614ValidationLlmAnalysis.message), m2614ValidationLlmAnalysis.summary && /* @__PURE__ */ React.createElement("p", { className: `text-sm leading-6 ${subtextClass}` }, m2614ValidationLlmAnalysis.summary), /* @__PURE__ */ React.createElement("dl", { className: "mt-2 space-y-1.5" }, renderLabeledLine("Why this matters here:", m2614ValidationLlmAnalysis.environment_relevance)), Array.isArray(m2614ValidationLlmAnalysis.recommended_adjustments) && m2614ValidationLlmAnalysis.recommended_adjustments.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, /* @__PURE__ */ React.createElement("h5", { className: `mb-2 text-xs font-semibold uppercase tracking-wider ${mutedTextClass}` }, "Suggested changes"), renderBulletList(m2614ValidationLlmAnalysis.recommended_adjustments.slice(0, 4), "m2614-adjustment")), /* @__PURE__ */ React.createElement("dl", { className: "mt-3 space-y-1.5" }, renderLabeledLine("Follow-up:", firstItem(m2614ValidationLlmAnalysis.suggested_follow_ups)), renderLabeledLine("Missing evidence:", firstItem(m2614ValidationLlmAnalysis.evidence_gaps), mutedTextClass), renderLabeledLine("Confidence note:", firstItem(m2614ValidationLlmAnalysis.confidence_notes), mutedTextClass)))))));
     };
+    const getLibraryScoreClass = (score) => {
+      if (typeof score !== "number") {
+        return mutedTextClass;
+      }
+      if (score >= 80) {
+        return isDarkTheme ? "text-emerald-300" : "text-emerald-700";
+      }
+      if (score >= 50) {
+        return isDarkTheme ? "text-amber-300" : "text-amber-700";
+      }
+      return isDarkTheme ? "text-rose-300" : "text-rose-700";
+    };
+    const getLibraryPriorityClass = (priority) => {
+      switch (priority) {
+        case "high":
+          return isDarkTheme ? "bg-rose-950 text-rose-100 border border-rose-800" : "bg-rose-50 text-rose-700 border border-rose-200";
+        case "medium":
+          return isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-800 border border-amber-200";
+        default:
+          return isDarkTheme ? "bg-slate-800 text-slate-200 border border-slate-600" : "bg-slate-100 text-slate-700 border border-slate-300";
+      }
+    };
+    const LIBRARY_DIMENSION_STATUS_LABELS = {
+      needs_sources: "Needs sources",
+      needs_discovery: "Run discovery again",
+      not_applicable: "Not applicable",
+      unavailable: "Unavailable"
+    };
+    const describeLibraryRefresh = (refresh) => {
+      if (!refresh || !refresh.state || refresh.state === "idle") {
+        return "";
+      }
+      if (refresh.state === "running") {
+        const stage = LIBRARY_SOURCE_LABELS[refresh.stage] || "sources";
+        const progress2 = refresh.total ? ` (${refresh.done || 0} of ${refresh.total})` : "";
+        return `Refreshing ${stage}${progress2}. This can take a few minutes.`;
+      }
+      const label = {
+        completed: "Last refresh finished",
+        partial: "Last refresh finished with errors",
+        failed: "Last refresh failed"
+      }[refresh.state] || "Last refresh";
+      return refresh.finished_at ? `${label} ${formatMissionDateTime(refresh.finished_at)}.` : `${label}.`;
+    };
+    const isSafeLibraryLink = (url) => typeof url === "string" && url.startsWith("https://");
+    const renderKnowledgeLibraryPanel = () => {
+      var _a2, _b2, _c2;
+      const data = knowledgeLibrary.data;
+      const tileClass = `rounded-lg p-3 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}`;
+      const linkClass = isDarkTheme ? "text-indigo-300 hover:text-indigo-200 underline" : "text-indigo-700 hover:text-indigo-900 underline";
+      if (!data) {
+        return /* @__PURE__ */ React.createElement("section", { "data-testid": "knowledge-library-panel", "aria-labelledby": "knowledge-library-title", className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("h3", { id: "knowledge-library-title", className: `text-base font-semibold ${headingClass}` }, "Library health"), knowledgeLibrary.status === "error" ? /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-3" }, /* @__PURE__ */ React.createElement("p", { className: `text-sm ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, knowledgeLibrary.error || "Could not check library health."), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => loadKnowledgeLibrary(), className: getCapabilityActionButtonClass(false, false) }, "Try again")) : /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${subtextClass}` }, "Checking library health..."));
+      }
+      const scorecard = data.scorecard || {};
+      const profile = data.profile || {};
+      const splunk = profile.splunk || {};
+      const apps = profile.apps || {};
+      const refresh = data.refresh || {};
+      const settings = data.settings || {};
+      const isRefreshing = refresh.state === "running";
+      const busyAction = knowledgeLibrary.action;
+      const canManage = !!data.can_manage;
+      const allowOnline = !!settings.allow_online_sources;
+      const dimensions = Array.isArray(scorecard.dimensions) ? scorecard.dimensions : [];
+      const gaps = Array.isArray(scorecard.gaps) ? scorecard.gaps : [];
+      const gapCounts = scorecard.gap_counts || {};
+      const visibleGaps = showAllLibraryGaps ? gaps : gaps.slice(0, 6);
+      const sources = Array.isArray(data.sources) ? data.sources : [];
+      const anySourceLoaded = sources.some((source) => source.available);
+      const platformDocs = ((_a2 = data.catalog) == null ? void 0 : _a2.platform_docs) || {};
+      const docLinks = [
+        ...Array.isArray(platformDocs.manuals) ? platformDocs.manuals : [],
+        ...Array.isArray((_b2 = data.catalog) == null ? void 0 : _b2.app_docs) ? data.catalog.app_docs : []
+      ].filter((entry) => isSafeLibraryLink(entry == null ? void 0 : entry.url));
+      const deploymentLabel = { cloud: "Splunk Cloud Platform", enterprise: "Splunk Enterprise" }[splunk.deployment_type] || "Splunk";
+      const refreshText = describeLibraryRefresh(refresh);
+      const failedResults = isRefreshing ? [] : Object.entries(refresh.results || {}).filter(([, result]) => (result == null ? void 0 : result.status) === "error");
+      const profileFacts = profile.available ? [
+        `${deploymentLabel}${splunk.version ? ` ${splunk.version}` : ""}`,
+        apps.collected ? `${apps.total || 0} apps (${apps.addons || 0} not built in)` : null,
+        `${profile.sourcetype_count || 0} sourcetypes`,
+        ((_c2 = profile.discovery) == null ? void 0 : _c2.generated_at) ? `Discovery ${formatMissionDateTime(profile.discovery.generated_at)}` : null
+      ].filter(Boolean) : [];
+      return /* @__PURE__ */ React.createElement("section", { "data-testid": "knowledge-library-panel", "aria-labelledby": "knowledge-library-title", className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { id: "knowledge-library-title", className: `text-base font-semibold ${headingClass}` }, "Library health"), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm ${subtextClass}` }, "How well the reference library covers the Splunk environment from your latest discovery, and what to fix first."), profileFacts.length > 0 && /* @__PURE__ */ React.createElement("p", { "data-testid": "knowledge-library-profile", className: `mt-1 text-xs ${mutedTextClass}` }, profileFacts.join(" · "))), /* @__PURE__ */ React.createElement("div", { className: "lg:flex-shrink-0 lg:text-right" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Overall score"), /* @__PURE__ */ React.createElement("div", { "data-testid": "knowledge-library-score", className: `text-3xl font-semibold mt-1 ${getLibraryScoreClass(scorecard.overall_score)}` }, typeof scorecard.overall_score === "number" ? `${scorecard.overall_score}%` : "Not scored"))), dimensions.length > 0 && /* @__PURE__ */ React.createElement("div", { "data-testid": "knowledge-library-dimensions", className: "grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-5" }, dimensions.map((dimension) => /* @__PURE__ */ React.createElement("div", { key: dimension.key, className: tileClass }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, dimension.label), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${typeof dimension.score === "number" ? `text-2xl font-semibold ${getLibraryScoreClass(dimension.score)}` : `text-sm font-semibold ${headingClass}`}` }, typeof dimension.score === "number" ? `${dimension.score}%` : LIBRARY_DIMENSION_STATUS_LABELS[dimension.status] || "Not scored"), dimension.basis && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, dimension.basis)))), /* @__PURE__ */ React.createElement("div", { className: "mt-5" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold ${headingClass}` }, "What to fix"), gaps.length > 0 && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, gapCounts.high || 0, " high, ", gapCounts.medium || 0, " medium, ", gapCounts.low || 0, " low")), gaps.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${subtextClass}` }, "Nothing to fix right now.") : /* @__PURE__ */ React.createElement("ul", { "data-testid": "knowledge-library-gaps", className: "mt-2 space-y-2" }, visibleGaps.map((gap) => /* @__PURE__ */ React.createElement("li", { key: gap.id, className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getLibraryPriorityClass(gap.priority)}` }, gap.priority === "high" ? "High" : gap.priority === "medium" ? "Medium" : "Low"), /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium break-words ${headingClass}` }, gap.title)), gap.detail && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs break-words ${subtextClass}` }, gap.detail), gap.action && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs font-medium break-words ${headingClass}` }, gap.action), isSafeLibraryLink(gap.url) && /* @__PURE__ */ React.createElement("a", { href: gap.url, target: "_blank", rel: "noopener noreferrer", className: `mt-1 inline-block text-xs ${linkClass}` }, "Open on Splunkbase")))), gaps.length > 6 && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => setShowAllLibraryGaps((prev) => !prev),
+          className: `mt-2 text-xs font-medium ${linkClass}`
+        },
+        showAllLibraryGaps ? "Show fewer" : `Show all ${gaps.length}`
+      )), docLinks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-5" }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold ${headingClass}` }, "Documentation for your environment"), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs ${mutedTextClass}` }, platformDocs.doc_version ? `${platformDocs.product_title || deploymentLabel} ${platformDocs.doc_version} manuals on help.splunk.com.` : "Manuals on help.splunk.com."), /* @__PURE__ */ React.createElement("ul", { "data-testid": "knowledge-library-docs", className: "mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2" }, docLinks.map((entry) => /* @__PURE__ */ React.createElement("li", { key: entry.entry_id || entry.url, className: `rounded-lg border px-3 py-2 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("a", { href: entry.url, target: "_blank", rel: "noopener noreferrer", className: `text-sm font-medium ${linkClass}` }, entry.title), /* @__PURE__ */ React.createElement("div", { className: `mt-0.5 text-xs ${subtextClass}` }, [entry.reason, entry.version ? `Version ${entry.version}` : null, entry.page_count ? `${Number(entry.page_count).toLocaleString()} pages` : null].filter(Boolean).join(" · ")))))), /* @__PURE__ */ React.createElement("div", { className: "mt-5" }, /* @__PURE__ */ React.createElement("h4", { className: `text-sm font-semibold ${headingClass}` }, "Sources"), /* @__PURE__ */ React.createElement("div", { "data-testid": "knowledge-library-sources", className: "mt-2 grid grid-cols-1 xl:grid-cols-3 gap-3" }, sources.map((source) => /* @__PURE__ */ React.createElement("div", { key: source.name, className: tileClass }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-medium ${headingClass}` }, source.title), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${source.available ? subtextClass : mutedTextClass}` }, source.available ? [
+        source.fetched_at ? `Updated ${formatMissionDateTime(source.fetched_at)}` : "Loaded",
+        typeof source.count === "number" ? `${source.count.toLocaleString()} ${source.name === "help_docs" ? "pages" : source.name === "splunkbase" ? "apps" : "data sources"}` : null,
+        source.version ? `Release ${source.version}` : null
+      ].filter(Boolean).join(" · ") : "Not loaded"), source.available && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, source.origin === "pack" ? `From a library pack${source.pack_created_at ? ` created ${formatMissionDateTime(source.pack_created_at)}` : ""}` : "Downloaded online"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${mutedTextClass}` }, source.license)))), canManage ? /* @__PURE__ */ React.createElement("div", { className: "mt-4 space-y-3" }, /* @__PURE__ */ React.createElement("label", { className: "flex items-start gap-2 text-sm cursor-pointer" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "checkbox",
+          "data-testid": "knowledge-library-online-toggle",
+          checked: allowOnline,
+          disabled: !!busyAction,
+          onChange: (event) => setKnowledgeLibraryOnline(event.target.checked),
+          className: "mt-1"
+        }
+      ), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: `font-medium ${headingClass}` }, "Download sources from the internet"), /* @__PURE__ */ React.createElement("span", { className: `block text-xs ${subtextClass}` }, "Connects only to ", (Array.isArray(settings.online_hosts) ? settings.online_hosts : []).join(", "), ". Sources download when you turn this on and update every ", settings.auto_refresh_days || 7, " days. On networks without internet access, leave this off and import a library pack."))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "knowledge-library-refresh-button",
+          onClick: refreshKnowledgeLibrarySources,
+          disabled: !allowOnline || isRefreshing || !!busyAction,
+          title: allowOnline ? void 0 : "Turn on internet downloads first.",
+          className: getCapabilityActionButtonClass(true, !allowOnline || isRefreshing || !!busyAction)
+        },
+        isRefreshing || busyAction === "refresh" ? "Refreshing..." : "Refresh sources"
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "knowledge-library-import-button",
+          onClick: () => {
+            var _a3;
+            return (_a3 = libraryPackInputRef.current) == null ? void 0 : _a3.click();
+          },
+          disabled: isRefreshing || !!busyAction,
+          className: getCapabilityActionButtonClass(false, isRefreshing || !!busyAction)
+        },
+        busyAction === "import" ? "Importing..." : "Import library pack"
+      ), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          ref: libraryPackInputRef,
+          type: "file",
+          accept: ".zip,application/zip",
+          className: "hidden",
+          "data-testid": "knowledge-library-import-input",
+          onChange: (event) => {
+            const file = event.target.files && event.target.files[0];
+            event.target.value = "";
+            importKnowledgeLibraryPack(file);
+          }
+        }
+      ), anySourceLoaded && /* @__PURE__ */ React.createElement("a", { href: "/api/knowledge-library/pack/export", download: true, "data-testid": "knowledge-library-export-link", className: getCapabilityActionButtonClass(false, false) }, "Export library pack"))) : /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex flex-wrap items-center gap-3" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs ${subtextClass}` }, "Only admins can change library sources."), anySourceLoaded && /* @__PURE__ */ React.createElement("a", { href: "/api/knowledge-library/pack/export", download: true, "data-testid": "knowledge-library-export-link", className: getCapabilityActionButtonClass(false, false) }, "Export library pack")), refreshText && /* @__PURE__ */ React.createElement("p", { "data-testid": "knowledge-library-refresh-status", className: `mt-3 text-xs ${isRefreshing ? headingClass : mutedTextClass}` }, refreshText), failedResults.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: `mt-1 space-y-1 text-xs ${isDarkTheme ? "text-amber-200" : "text-amber-800"}` }, failedResults.map(([name, result]) => /* @__PURE__ */ React.createElement("li", { key: name, className: "break-words" }, LIBRARY_SOURCE_LABELS[name] || "Refresh", ": ", result.error || "failed"))), knowledgeLibrary.message && /* @__PURE__ */ React.createElement(
+        "p",
+        {
+          "data-testid": "knowledge-library-message",
+          role: knowledgeLibrary.message.type === "error" ? "alert" : "status",
+          className: `mt-3 text-sm ${knowledgeLibrary.message.type === "error" ? isDarkTheme ? "text-red-300" : "text-red-700" : isDarkTheme ? "text-emerald-300" : "text-emerald-700"}`
+        },
+        knowledgeLibrary.message.text
+      )));
+    };
     const renderRagWorkspaceView = () => {
       var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2;
       if (!ragCapability) {
@@ -5256,7 +5500,7 @@
           className: `mt-3 w-full px-3 py-2 rounded text-sm font-semibold ${!isRagBusy ? "bg-amber-500 hover:bg-amber-600 text-gray-950" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
         },
         ragActionInProgress === "install" ? `Trying alternate method... ${formatCapabilityActionElapsed(ragInstallElapsedSeconds)}` : ragPreferredInstallAlternativeMethod.app_action_label || "Try Alternate Method"
-      ), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, ragPreferredInstallAlternativeMethod.label || "Force public PyPI for the active environment")))), ragInstallAlternativeMethods.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-1 xl:grid-cols-2 gap-3" }, ragInstallAlternativeMethods.map((method, index) => /* @__PURE__ */ React.createElement("div", { key: `rag-install-alt-method-${index}`, className: `rounded-xl border p-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, (method == null ? void 0 : method.label) || "Alternate install method"), (method == null ? void 0 : method.description) && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, method.description), Array.isArray(method == null ? void 0 : method.commands) && method.commands.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-2" }, method.commands.map((command, commandIndex) => /* @__PURE__ */ React.createElement("pre", { key: `rag-install-alt-command-${index}-${commandIndex}`, className: `max-w-full overflow-x-auto whitespace-pre-wrap break-all rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "bg-slate-950 border-slate-800 text-slate-100" : "bg-white border-slate-200 text-slate-800"}` }, command))))))), ragCapability.installed && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Index Status"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, "Last indexed: ", formatMissionDateTime(ragIndexSummary == null ? void 0 : ragIndexSummary.last_indexed_at, "Not indexed yet")), Array.isArray(ragIndexSummary == null ? void 0 : ragIndexSummary.sample_sources) && ragIndexSummary.sample_sources.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Sample sources: ", ragIndexSummary.sample_sources.join(", "))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Imported Items"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, "Stored in: ", ragDisplayedAssetDir), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, "Checked in: ", ragCheckedInAssetCount, ". Checked out: ", ragCheckedOutAssetCount, "."), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, canUseRagContextPreview ? "Checked-in items are ready for chat." : "Chat can use imports after the Knowledge Base is turned on and reindexed."))), (Array.isArray(ragCapability.dependency_packages) && ragCapability.dependency_packages.length > 0 || ragIndexSourceTypes.length > 0 || ragKnowledgeAssetTypeCounts.length > 0) && /* @__PURE__ */ React.createElement("div", { className: "space-y-3 mt-4" }, Array.isArray(ragCapability.dependency_packages) && ragCapability.dependency_packages.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Dependencies"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragCapability.dependency_packages.map((pkg) => /* @__PURE__ */ React.createElement("span", { key: pkg, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, pkg)))), ragIndexSourceTypes.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Indexed by Source"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragIndexSourceTypes.map(([sourceType, count]) => /* @__PURE__ */ React.createElement("span", { key: sourceType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, formatCapabilitySourceTypeLabel(sourceType), ": ", count)))), ragKnowledgeAssetTypeCounts.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Imported by Type"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragKnowledgeAssetTypeCounts.map(([assetType, count]) => /* @__PURE__ */ React.createElement("span", { key: assetType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, formatKnowledgeAssetTypeLabel(assetType), ": ", count)))))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-2 gap-6" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold mb-2 ${headingClass}` }, "Import a Document"), /* @__PURE__ */ React.createElement("p", { className: `text-xs mb-3 ${subtextClass}` }, "Add documentation, environment notes, or runbook steps the assistant should know about. New imports are checked in, so chat can use them."), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-2 gap-2 mb-2" }, /* @__PURE__ */ React.createElement(
+      ), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, ragPreferredInstallAlternativeMethod.label || "Force public PyPI for the active environment")))), ragInstallAlternativeMethods.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-1 xl:grid-cols-2 gap-3" }, ragInstallAlternativeMethods.map((method, index) => /* @__PURE__ */ React.createElement("div", { key: `rag-install-alt-method-${index}`, className: `rounded-xl border p-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${headingClass}` }, (method == null ? void 0 : method.label) || "Alternate install method"), (method == null ? void 0 : method.description) && /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, method.description), Array.isArray(method == null ? void 0 : method.commands) && method.commands.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-2" }, method.commands.map((command, commandIndex) => /* @__PURE__ */ React.createElement("pre", { key: `rag-install-alt-command-${index}-${commandIndex}`, className: `max-w-full overflow-x-auto whitespace-pre-wrap break-all rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "bg-slate-950 border-slate-800 text-slate-100" : "bg-white border-slate-200 text-slate-800"}` }, command))))))), ragCapability.installed && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Index Status"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, "Last indexed: ", formatMissionDateTime(ragIndexSummary == null ? void 0 : ragIndexSummary.last_indexed_at, "Not indexed yet")), Array.isArray(ragIndexSummary == null ? void 0 : ragIndexSummary.sample_sources) && ragIndexSummary.sample_sources.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Sample sources: ", ragIndexSummary.sample_sources.join(", "))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-3 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Imported Items"), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${subtextClass}` }, "Stored in: ", ragDisplayedAssetDir), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, "Checked in: ", ragCheckedInAssetCount, ". Checked out: ", ragCheckedOutAssetCount, "."), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${subtextClass}` }, canUseRagContextPreview ? "Checked-in items are ready for chat." : "Chat can use imports after the Knowledge Base is turned on and reindexed."))), (Array.isArray(ragCapability.dependency_packages) && ragCapability.dependency_packages.length > 0 || ragIndexSourceTypes.length > 0 || ragKnowledgeAssetTypeCounts.length > 0) && /* @__PURE__ */ React.createElement("div", { className: "space-y-3 mt-4" }, Array.isArray(ragCapability.dependency_packages) && ragCapability.dependency_packages.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Dependencies"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragCapability.dependency_packages.map((pkg) => /* @__PURE__ */ React.createElement("span", { key: pkg, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, pkg)))), ragIndexSourceTypes.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Indexed by Source"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragIndexSourceTypes.map(([sourceType, count]) => /* @__PURE__ */ React.createElement("span", { key: sourceType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, formatCapabilitySourceTypeLabel(sourceType), ": ", count)))), ragKnowledgeAssetTypeCounts.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-medium mb-1 ${headingClass}` }, "Imported by Type"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, ragKnowledgeAssetTypeCounts.map(([assetType, count]) => /* @__PURE__ */ React.createElement("span", { key: assetType, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-50 text-gray-700 border-gray-300"}` }, formatKnowledgeAssetTypeLabel(assetType), ": ", count)))))), renderKnowledgeLibraryPanel(), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-2 gap-6" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold mb-2 ${headingClass}` }, "Import a Document"), /* @__PURE__ */ React.createElement("p", { className: `text-xs mb-3 ${subtextClass}` }, "Add documentation, environment notes, or runbook steps the assistant should know about. New imports are checked in, so chat can use them."), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-2 gap-2 mb-2" }, /* @__PURE__ */ React.createElement(
         "input",
         {
           value: ragAssetDraft.title || "",
