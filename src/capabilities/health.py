@@ -174,7 +174,7 @@ class CapabilityHealthService:
             return CapabilityHealthReport(
                 name=definition.name,
                 status="degraded",
-                message="Chroma index is empty. Run reindex after enabling the capability.",
+                message="The Knowledge Base has not been indexed yet. Select Reindex so chat can search your reports and imported documents.",
                 checked_at=checked_at,
                 details={
                     "source_dir": str(source_dir),
@@ -183,12 +183,23 @@ class CapabilityHealthService:
                 },
             )
 
+        freshness = indexer.get_index_freshness(summary)
+        message = "Ready. Chat can search the Knowledge Base."
+        if freshness.get("reason") == "index_format":
+            message = "Chat can search the Knowledge Base, but its index uses an older format. Select Reindex to rebuild it."
+        elif freshness.get("state") == "outdated":
+            changed = self._safe_positive_int(freshness.get("changed_count"), 0)
+            message = (
+                f"Chat can search the Knowledge Base, but {changed} {'file' if changed == 1 else 'files'} changed since the last index. "
+                "Select Reindex to include them."
+            )
         return CapabilityHealthReport(
             name=definition.name,
             status="ready",
-            message="Indexed artifact search is ready.",
+            message=message,
             checked_at=checked_at,
             details={
+                "index_freshness": freshness,
                 "source_dir": str(source_dir),
                 "storage_dir": str(storage_dir),
                 "document_count": document_count,

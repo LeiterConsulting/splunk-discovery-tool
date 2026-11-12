@@ -25,6 +25,11 @@ from knowledge_library.ranking import query_terms as ranking_query_terms
 
 # Hashed-vector similarity and BM25 count equally when ranking Knowledge Base passages.
 KB_FUSION_WEIGHTS = (1.0, 1.0)
+# Chat memory changes after every chat turn, and searches reindex changed imports first, so neither makes the index outdated.
+FRESHNESS_EXEMPT_SOURCE_TYPES = frozenset({"chat_memory_derived", "knowledge_asset"})
+# The web app rewrites its runtime state and job request files while it runs; they are bookkeeping, not new knowledge.
+FRESHNESS_EXEMPT_FILENAMES = frozenset({"runtime_state.json"})
+FRESHNESS_EXEMPT_DIRS = frozenset({"runtime_jobs"})
 MAX_LEXICAL_SCAN_DOCUMENTS = 5000
 _LEXICAL_CORPUS_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
@@ -534,20 +539,18 @@ class ArtifactSourceIndexer:
             return self.reindex()
         return index_summary
 
-    def collect_documents(self) -> List[IndexedArtifactDocument]:
+    def _select_source_files(self) -> List[Path]:
+        """The newest source files a reindex reads, up to `max_files`."""
         source_dir = self.get_source_dir()
         storage_dir = self.get_storage_dir()
         if not source_dir.exists():
             return []
-
-        self._invalidate_asset_caches()
 
         allowed_extensions = {
             str(extension).lower()
             for extension in (self.config.config.get("allowed_extensions") or self.definition.default_config.get("allowed_extensions") or [".md", ".txt", ".json"])
         }
         max_files = _safe_positive_int(self.config.config.get("max_files"), self.definition.default_config.get("max_files", 24))
-        max_documents = _safe_positive_int(self.config.config.get("max_documents"), self.definition.default_config.get("max_documents", 80))
 
         files = []
         for path in sorted(source_dir.rglob("*"), key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True):
@@ -562,6 +565,56 @@ class ArtifactSourceIndexer:
             files.append(path)
             if len(files) >= max_files:
                 break
+        return files
+
+    def get_index_freshness(self, summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Whether the index is missing, or older than the source files a reindex would read."""
+        summary = summary if isinstance(summary, dict) else self.get_index_summary()
+        last_indexed_value = summary.get("last_indexed_at")
+        last_indexed_at = _parse_iso_timestamp(last_indexed_value)
+        source_dir = self.get_source_dir()
+        try:
+            files = [
+                path for path in self._select_source_files()
+                if path.name.lower() not in FRESHNESS_EXEMPT_FILENAMES
+                and not FRESHNESS_EXEMPT_DIRS.intersection(path.relative_to(source_dir).parts[:-1])
+            ]
+        except OSError:
+            files = []
+        result: Dict[str, Any] = {"state": "current", "reason": "", "changed_count": 0, "changed_by_type": {}, "last_indexed_at": last_indexed_value}
+        if last_indexed_at is None or int(summary.get("document_count") or 0) <= 0 or not self.get_storage_dir().exists():
+            result["state"] = "not_indexed" if files else "nothing_to_index"
+            return result
+        if int(summary.get("index_schema_version") or 0) < self.INDEX_SCHEMA_VERSION:
+            result.update(state="outdated", reason="index_format")
+            return result
+        if last_indexed_at.tzinfo is None:
+            last_indexed_at = last_indexed_at.replace(tzinfo=timezone.utc)
+        cutoff = last_indexed_at.timestamp()
+        changed_by_type: Dict[str, int] = {}
+        for path in files:
+            source_type = _artifact_source_type(path)
+            if source_type in FRESHNESS_EXEMPT_SOURCE_TYPES:
+                continue
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            if modified > cutoff:
+                changed_by_type[source_type] = changed_by_type.get(source_type, 0) + 1
+        if changed_by_type:
+            result.update(state="outdated", reason="changed_files", changed_count=sum(changed_by_type.values()), changed_by_type=changed_by_type)
+        return result
+
+    def collect_documents(self) -> List[IndexedArtifactDocument]:
+        source_dir = self.get_source_dir()
+        if not source_dir.exists():
+            return []
+
+        self._invalidate_asset_caches()
+
+        max_documents = _safe_positive_int(self.config.config.get("max_documents"), self.definition.default_config.get("max_documents", 80))
+        files = self._select_source_files()
 
         documents: List[IndexedArtifactDocument] = []
         for file_path in files:

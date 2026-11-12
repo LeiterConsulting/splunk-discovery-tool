@@ -1398,9 +1398,11 @@ class CapabilityManager:
         if definition.name == "rag_chromadb":
             provider = ChromaRAGProvider(config=config, definition=definition)
             asset_summary = provider.get_knowledge_asset_summary()
+            index_summary = provider.get_index_summary()
             return {
                 "install_guidance": self._build_install_guidance(definition, config),
-                "index_summary": provider.get_index_summary(),
+                "index_summary": index_summary,
+                "index_freshness": provider.get_index_freshness(index_summary),
                 "knowledge_asset_summary": {
                     key: value
                     for key, value in asset_summary.items()

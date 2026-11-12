@@ -147,7 +147,7 @@ Every button should communicate purpose:
 - `POST /api/capabilities/deeplinks/build` → Build a Splunk Web search deeplink through the optional deeplink capability
 - `GET /api/knowledge-library/status` → Environment profile, loaded library sources, refresh job, coverage scorecard, gaps, and the matched catalog for the latest discovery
 - `POST /api/knowledge-library/settings` → Turn online library sources on or off (admin)
-- `POST /api/knowledge-library/refresh` → Download the library sources again in the background (admin; 409 while online sources are off)
+- `POST /api/knowledge-library/refresh` → Download the library sources again in the background, or only those named in an optional `{"sources": [...]}` body (admin; 400 when no named source is valid, 409 while online sources are off)
 - `POST /api/knowledge-library/pack/import` → Load sources and documentation text from a library pack zip (admin; 400 for an unusable pack, 409 during a refresh or another import)
 - `GET /api/knowledge-library/pack/export` → Download the loaded sources and documentation text as a library pack zip (404 when none are loaded)
 - `POST /api/knowledge-library/search` → Rank downloaded Splunk documentation passages for a question, as chat does (400 for an empty question)
@@ -156,6 +156,7 @@ Every button should communicate purpose:
 ### Capability notes
 
 - `rag_chromadb` persists an `index_summary` alongside the local Chroma storage and surfaces that summary through `GET /api/capabilities`
+- `rag_chromadb` also reports `index_freshness` (`ArtifactSourceIndexer.get_index_freshness`): `not_indexed`, `nothing_to_index`, `current`, or `outdated` with reason `index_format` or `changed_files` and a count per source type. It compares source-file modification times with `last_indexed_at`. Files the app rewrites as bookkeeping (`FRESHNESS_EXEMPT_FILENAMES`, `FRESHNESS_EXEMPT_DIRS`), chat memory, and imports do not count. The UI shows a Reindex needed notice from it; nothing reindexes automatically
 - `rag_chromadb` now also supports managed knowledge assets stored under a capability-controlled asset directory, with catalog/list/delete behavior exposed through dedicated RAG endpoints
 - managed knowledge assets now persist deterministic focus terms, key points, and usage guidance so preview results can explain why an asset matched and how it should be used
 - managed knowledge assets refresh stored derived sections on load, and preview/search requests auto-reindex before retrieval if managed-asset timestamps are newer than the last Chroma index build
@@ -176,6 +177,7 @@ Every button should communicate purpose:
 - Keep documentation downloads polite: `DOC_FETCH_CONCURRENCY`, `DOC_REQUEST_INTERVAL`, and `DOC_REFUSAL_LIMIT` bound the request rate, and `LibraryRefusedError` (HTTP 403 or 429) stops the run. help.splunk.com answers 403 to non-browser requests whose Accept header names `text/html`, so page requests send the HTTP client's default Accept header. Do not send a browser User-Agent
 - `ranking.py` holds the shared BM25, reciprocal rank fusion, `coverage_weight`, and `EnvironmentTerms`. The documentation ranker (`docs.rank_doc_results`) and the Knowledge Base indexer (`ArtifactSourceIndexer._hybrid_scores`) both use it, so scores stay comparable in the preview
 - Chat adds documentation through `get_optional_rag_context`, which runs only when the chat setting `enable_rag_context` is on
+- Documentation has its own index, so it never needs a Knowledge Base reindex. `plan_coverage` lists each planned manual through `manual_status` (`missing`, `partial`, `changed`, `downloaded`), and `KnowledgeLibraryService.resolve_refresh_sources` validates the sources a refresh request names
 
 ## 9) Quality Gates
 

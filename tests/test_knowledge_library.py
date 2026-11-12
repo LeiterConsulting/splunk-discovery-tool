@@ -977,8 +977,19 @@ class KnowledgeLibraryApiTests(unittest.TestCase):
         with mock.patch.object(web_app.knowledge_library_service, "start_refresh", return_value={}) as start:
             response = self.client.post("/api/knowledge-library/refresh")
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(start.call_args.kwargs, {"reason": "manual"})
+        self.assertEqual(start.call_args.kwargs, {"sources": None, "reason": "manual"})
 
+        with mock.patch.object(web_app.knowledge_library_service, "start_refresh", return_value={}) as start:
+            response = self.client.post("/api/knowledge-library/refresh", json={"sources": ["docs"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        # The help.splunk.com page list is not loaded yet, so downloading documentation loads it first.
+        self.assertEqual(start.call_args.kwargs, {"sources": ["help_docs", "docs"], "reason": "manual"})
+
+        with mock.patch.object(web_app.knowledge_library_service, "start_refresh", return_value={}) as start:
+            response = self.client.post("/api/knowledge-library/refresh", json={"sources": ["everything"]})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("Choose at least one", response.json()["detail"])
+        start.assert_not_called()
     def test_pack_import_scores_the_latest_discovery_and_exports_again(self):
         self._write_discovery(make_blueprint())
         self.assertEqual(self.client.get("/api/knowledge-library/pack/export").status_code, 404)
@@ -1238,6 +1249,36 @@ class DocPlanTests(unittest.TestCase):
         changed["manuals"][0]["lastmod"] = "2026-04-01"
         self.assertNotEqual(plan_signature(changed), plan_signature(plan))
 
+    def test_coverage_lists_each_manual_with_its_download_state(self):
+        plan = default_doc_plan()
+        first, second, third = plan["manuals"][:3]
+        states = {
+            first["key"]: {"complete": 1, "lastmod": first["lastmod"], "page_total": len(first["pages"]), "page_done": len(first["pages"])},
+            second["key"]: {"complete": 0, "lastmod": second["lastmod"], "page_total": len(second["pages"]), "page_done": 1},
+            third["key"]: {"complete": 1, "lastmod": "2025-01-01", "page_total": len(third["pages"]), "page_done": len(third["pages"])},
+        }
+        manuals = plan_coverage(plan, states)["manuals"]
+        self.assertEqual([manual["key"] for manual in manuals], [manual["key"] for manual in plan["manuals"]])
+        self.assertEqual([manual["status"] for manual in manuals], ["downloaded", "partial", "changed", "missing", "missing", "missing"])
+        self.assertEqual(manuals[0], {
+            "key": "splunk-enterprise/administer/admin-manual/9.4",
+            "title": first["title"],
+            "group": "Splunk Enterprise 9.4",
+            "reason": first["reason"],
+            "version": "9.4",
+            "pages": len(first["pages"]),
+            "downloaded_pages": len(first["pages"]),
+            "status": "downloaded",
+            "url": f"{HELP}splunk-enterprise/administer/admin-manual/9.4/{first['pages'][0]}",
+        })
+        self.assertEqual((manuals[1]["downloaded_pages"], manuals[3]["downloaded_pages"]), (1, 0))
+        # A manual that gained pages on the site after a complete download still has pages to fetch.
+        grown = copy.deepcopy(plan)
+        grown["manuals"][0]["pages"] = [*first["pages"], "new/page"]
+        self.assertEqual(plan_coverage(grown, states)["manuals"][0]["status"], "partial")
+        self.assertEqual(manuals[-1]["group"], "Supported add-on overviews")
+        with mock.patch.object(docs_module, "MAX_STATUS_MANUALS", 2):
+            self.assertEqual(len(plan_coverage(plan, states)["manuals"]), 2)
 
 class DocIndexTests(unittest.TestCase):
     def setUp(self):
@@ -1519,6 +1560,27 @@ class DocServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.start_refresh(self.profile, sources=["docs"], transport=server.transport())
         again = await self.service.wait_for_refresh()
         self.assertEqual((again["results"]["docs"]["manuals_current"], server.page_fetches), (6, []))
+
+    def test_refresh_sources_load_the_doc_index_when_documentation_needs_it(self):
+        self.assertIsNone(self.service.resolve_refresh_sources(None))
+        self.assertEqual(self.service.resolve_refresh_sources(["docs"]), ["help_docs", "docs"])
+        for empty in ([], ["everything"]):
+            with self.assertRaises(ValueError):
+                self.service.resolve_refresh_sources(empty)
+        self._save_sources()
+        self.assertEqual(self.service.resolve_refresh_sources(["docs", "docs", "everything"]), ["docs"])
+        self.assertEqual(self.service.resolve_refresh_sources(["splunkbase"]), ["splunkbase"])
+
+    async def test_documentation_only_refresh_loads_the_doc_index_and_skips_other_sources(self):
+        server = FakeSourceServer()
+        self.service.start_refresh(self.profile, sources=self.service.resolve_refresh_sources(["docs"]), transport=server.transport())
+        result = await self.service.wait_for_refresh()
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(sorted(result["results"]), ["docs", "help_docs"])
+        self.assertEqual(result["results"]["docs"]["count"], 7)
+        status = self.service.build_status(make_blueprint(), [], allow_online=False, can_manage=True)
+        self.assertEqual({manual["status"] for manual in status["docs"]["coverage"]["manuals"]}, {"downloaded"})
+        self.assertFalse(self.service.store.load_source("splunkbase"))
 
     async def test_documentation_waits_for_discovery(self):
         self._save_sources()

@@ -1,4 +1,5 @@
 import importlib.util
+from datetime import datetime, timezone
 from io import BytesIO
 import json
 import os
@@ -802,6 +803,103 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 self.assertIn("OPTIONAL CHROMADB RAG CONTEXT", rag_result["context_text"])
                 self.assertGreaterEqual(len(rag_result["chunks"]), 1)
                 self.assertIn("source_type", rag_result["chunks"][0]["metadata"])
+            finally:
+                os.chdir(original_cwd)
+
+    def test_rag_index_freshness_flags_missing_and_changed_sources_but_not_bookkeeping(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            storage_dir = output_dir / "rag" / "chromadb"
+            output_dir.mkdir(parents=True)
+            definition = CapabilityRegistry().get_definition("rag_chromadb")
+            config = CapabilityConfig(
+                name="rag_chromadb",
+                installed=True,
+                enabled=True,
+                config={**definition.default_config, "source_dir": str(output_dir), "storage_dir": str(storage_dir)},
+            )
+            indexer = ArtifactSourceIndexer(config, definition)
+
+            self.assertEqual(indexer.get_index_freshness({})["state"], "nothing_to_index")
+            (output_dir / "runtime_state.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(indexer.get_index_freshness({})["state"], "nothing_to_index")
+            runbook = output_dir / "v2_operator_runbook_20260101_000000.md"
+            runbook.write_text("Check queue pressure first.", encoding="utf-8")
+            self.assertEqual(indexer.get_index_freshness({})["state"], "not_indexed")
+
+            storage_dir.mkdir(parents=True)
+            indexed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            summary = {
+                "last_indexed_at": indexed_at.isoformat(),
+                "document_count": 2,
+                "index_schema_version": ArtifactSourceIndexer.INDEX_SCHEMA_VERSION,
+            }
+            before, after = indexed_at.timestamp() - 60, indexed_at.timestamp() + 60
+            os.utime(runbook, (before, before))
+            self.assertEqual(
+                indexer.get_index_freshness(summary),
+                {"state": "current", "reason": "", "changed_count": 0, "changed_by_type": {}, "last_indexed_at": indexed_at.isoformat()},
+            )
+
+            # Runtime bookkeeping, chat memory, and imports (reindexed by the next search) do not make the index outdated.
+            for relative in ("runtime_state.json", "runtime_jobs/request.json", "chat_memory/session.json", "rag/assets/note.md"):
+                path = output_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+                os.utime(path, (after, after))
+            self.assertEqual(indexer.get_index_freshness(summary)["state"], "current")
+
+            os.utime(runbook, (after, after))
+            freshness = indexer.get_index_freshness(summary)
+            self.assertEqual((freshness["state"], freshness["reason"], freshness["changed_count"]), ("outdated", "changed_files", 1))
+            self.assertEqual(freshness["changed_by_type"], {"runbook": 1})
+
+            older_format = {**summary, "index_schema_version": ArtifactSourceIndexer.INDEX_SCHEMA_VERSION - 1}
+            self.assertEqual(indexer.get_index_freshness(older_format)["reason"], "index_format")
+
+    def test_rag_chromadb_tells_the_user_to_reindex_when_the_index_is_missing_or_outdated(self):
+        if importlib.util.find_spec("chromadb") is None:
+            self.skipTest("chromadb is not installed in the active environment")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "v2_operator_runbook_test.md").write_text(
+                "Queue pressure and ingestion delays require validation in _internal.",
+                encoding="utf-8",
+            )
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_path)
+                manager = CapabilityManager(ConfigManager(str(temp_path / "config.encrypted")), registry=CapabilityRegistry())
+                self.assertTrue(manager.install_capability("rag_chromadb").ok)
+                manager.update_capability_config(
+                    "rag_chromadb",
+                    {"source_dir": str(output_dir), "storage_dir": str(output_dir / "rag" / "chromadb")},
+                )
+                self.assertTrue(manager.enable_capability("rag_chromadb").ok)
+
+                state = manager.get_capability_state("rag_chromadb", refresh_health=True)
+                self.assertEqual(state["index_freshness"]["state"], "not_indexed")
+                self.assertIn("has not been indexed yet. Select Reindex", state["health_message"])
+
+                self.assertTrue(manager.reindex_capability("rag_chromadb").ok)
+                state = manager.get_capability_state("rag_chromadb", refresh_health=True)
+                self.assertEqual(state["index_freshness"]["state"], "current")
+                self.assertEqual(state["health_status"], "ready")
+                self.assertEqual(state["health_message"], "Ready. Chat can search the Knowledge Base.")
+
+                indexed_at = datetime.fromisoformat(state["index_summary"]["last_indexed_at"]).timestamp()
+                brief = output_dir / "v2_insights_brief_test.md"
+                brief.write_text("Scheduler backlog grew after the last change window.", encoding="utf-8")
+                os.utime(brief, (indexed_at + 5, indexed_at + 5))
+                state = manager.get_capability_state("rag_chromadb", refresh_health=True)
+                self.assertEqual(state["index_freshness"]["state"], "outdated")
+                self.assertEqual(state["index_freshness"]["changed_by_type"], {"generated_summary": 1})
+                self.assertEqual(state["health_status"], "ready")
+                self.assertIn("1 file changed since the last index. Select Reindex", state["health_message"])
             finally:
                 os.chdir(original_cwd)
 
