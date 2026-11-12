@@ -360,6 +360,80 @@ class ChromaInstallWithoutOnnxruntimeTests(unittest.TestCase):
         self.assertTrue(any(command.endswith('--no-cache-dir "chromadb>=1.0,<2"') for command in alternative_commands))
 
 
+class CapabilityRestartRecoveryTests(unittest.TestCase):
+    """A pip capability waiting for a restart whose packages still fail to import after one."""
+
+    def _seed_install_waiting_for_restart(self, config_path: Path) -> CapabilityManager:
+        manager = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+        config = manager._get_or_create_config(manager.registry.get_definition("rag_chromadb"))
+        config.installed = True
+        config.restart_required = True
+        config.version = "0.3.23"
+        config.installed_at = "2026-11-12T14:00:00+00:00"
+        manager.config_manager.save_capability(config)
+        return manager
+
+    def _run_in_temp_dir(self, test):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            temp_path = Path(temp_dir)
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(temp_path)
+                test(temp_path / "config.encrypted")
+            finally:
+                os.chdir(original_cwd)
+
+    def test_startup_offers_install_again_when_packages_still_do_not_load(self):
+        def test(config_path):
+            self._seed_install_waiting_for_restart(config_path)
+
+            with patch.object(CapabilityManager, "_dependencies_available", return_value=False):
+                with patch("builtins.print") as mock_print:
+                    restarted = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+
+            state = restarted.get_capability_state("rag_chromadb")
+            self.assertFalse(state["installed"])
+            self.assertFalse(state["enabled"])
+            self.assertFalse(state["restart_required"])
+            self.assertIsNone(state["version"])
+            self.assertEqual(state["health_status"], "not_installed")
+            self.assertIn("did not load after a restart", mock_print.call_args.args[0])
+
+            saved = ConfigManager(str(config_path)).get_capability("rag_chromadb")
+            self.assertFalse(saved.installed)
+            self.assertFalse(saved.restart_required)
+
+        self._run_in_temp_dir(test)
+
+    def test_refresh_without_a_restart_keeps_waiting_for_the_restart(self):
+        def test(config_path):
+            manager = self._seed_install_waiting_for_restart(config_path)
+
+            with patch.object(manager, "_dependencies_available", return_value=False):
+                manager.refresh()
+
+            state = manager.get_capability_state("rag_chromadb")
+            self.assertTrue(state["installed"])
+            self.assertTrue(state["restart_required"])
+            self.assertEqual(state["version"], "0.3.23")
+
+        self._run_in_temp_dir(test)
+
+    def test_startup_finishes_the_install_when_packages_load(self):
+        def test(config_path):
+            self._seed_install_waiting_for_restart(config_path)
+
+            with patch.object(CapabilityManager, "_dependencies_available", return_value=True):
+                restarted = CapabilityManager(ConfigManager(str(config_path)), registry=CapabilityRegistry())
+
+            state = restarted.get_capability_state("rag_chromadb")
+            self.assertTrue(state["installed"])
+            self.assertFalse(state["restart_required"])
+            self.assertEqual(state["version"], "0.3.23")
+
+        self._run_in_temp_dir(test)
+
+
 class ConfigManagerSecurityFoundationTests(unittest.TestCase):
     def test_default_config_exports_demo_mode_security_defaults(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
