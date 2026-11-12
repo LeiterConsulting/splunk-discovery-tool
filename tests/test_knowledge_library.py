@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import io
 import json
 import os
@@ -24,8 +25,25 @@ from capabilities.rag import indexer as indexer_module  # noqa: E402
 from capabilities.rag.indexer import ArtifactSourceIndexer  # noqa: E402
 from config_manager import ConfigManager  # noqa: E402
 from discovery.environment_profile import detect_deployment_type, normalize_installed_app_rows, splunk_version_line  # noqa: E402
+from knowledge_library import docs as docs_module  # noqa: E402
 from knowledge_library import sources as sources_module  # noqa: E402
 from knowledge_library.catalog import build_catalog, choose_doc_version, match_addon_doc  # noqa: E402
+from knowledge_library.docs import (  # noqa: E402
+    CHUNK_MAX_CHARS,
+    DocIndex,
+    _parse_and_chunk,
+    build_doc_plan,
+    chunk_page,
+    extract_doc_page,
+    fts5_available,
+    needs_fetch,
+    plan_coverage,
+    plan_signature,
+    rank_doc_results,
+    sanitize_docs_payload,
+    sync_docs,
+)
+from knowledge_library.ranking import BM25, EnvironmentTerms, query_terms, reciprocal_rank_fusion  # noqa: E402
 from knowledge_library.profile import build_environment_profile  # noqa: E402
 from knowledge_library.scorecard import build_scorecard  # noqa: E402
 from knowledge_library.service import KnowledgeLibraryService, LibraryBusyError  # noqa: E402
@@ -47,6 +65,17 @@ from knowledge_library.sources import (  # noqa: E402
 )
 from security_manager import SecurityManager  # noqa: E402
 import web_app  # noqa: E402
+
+
+_NO_REQUEST_SPACING = mock.patch.object(docs_module, "DOC_REQUEST_INTERVAL", 0)
+
+
+def setUpModule():
+    _NO_REQUEST_SPACING.start()
+
+
+def tearDownModule():
+    _NO_REQUEST_SPACING.stop()
 
 
 DATA_SOURCE_FILES = {
@@ -144,6 +173,55 @@ CLOUD_PAGES = [
 ADDON_PAGES = ["supported-add-ons/splunk-supported-add-ons/microsoft-windows/install"]
 
 
+DOC_PAGE_TEXT = {
+    "splunk-enterprise/search/spl-search-reference/9.4/introduction/welcome": (
+        "Welcome to the Search Reference",
+        [("Search commands", "The stats command calculates aggregate statistics such as count, sum, and average over the search results.")],
+    ),
+    "splunk-enterprise/administer/admin-manual/9.4/configuration-files/about": (
+        "About configuration files",
+        [
+            ("Where settings live", "Splunk Enterprise stores settings in configuration files such as inputs.conf and props.conf."),
+            ("Change parsing", "Edit props.conf to change how the WinEventLog:Security sourcetype is parsed at index time."),
+        ],
+    ),
+    "splunk-enterprise/administer/admin-manual/9.4/configuration-files/list": (
+        "List of configuration files",
+        [("Forwarding", "outputs.conf holds forwarding settings and indexes.conf defines index paths and retention.")],
+    ),
+    "splunk-enterprise/administer/distributed-search/9.4/overview/about": (
+        "About distributed search",
+        [("Search heads", "A search head distributes searches to search peers and merges the results.")],
+    ),
+    "splunk-enterprise/administer/manage-indexers-and-indexer-clusters/9.4/overview/about": (
+        "About indexer clusters",
+        [("Replication", "An indexer cluster replicates data across peer nodes. The manager node enforces the replication factor and search factor.")],
+    ),
+    "splunk-enterprise/common-information-model/6.0/introduction/overview": (
+        "Overview of the Common Information Model",
+        [("Data models", "The CIM normalizes fields such as src and dest so the Authentication data model works across sources.")],
+    ),
+    "supported-add-ons/splunk-supported-add-ons/microsoft-windows/install": (
+        "Install the Splunk Add-on for Microsoft Windows",
+        [("Forwarders", "Deploy the add-on to universal forwarders to collect WinEventLog data from Windows hosts.")],
+    ),
+}
+
+
+def doc_html(title, sections, lastmod="2026-02-01T00:00:00Z"):
+    body = "".join(f"<h2>{heading}</h2><p>{text}</p>" for heading, text in sections)
+    return (
+        f'<html><head><title>{title} | Splunk Docs</title><meta name="lastModifiedISO" content="{lastmod}">'
+        f"<script>var tracking = 1;</script></head><body><nav>Menu Products Search</nav>"
+        f"<main><article><h1>{title}</h1>{body}</article></main><footer>Copyright Splunk</footer></body></html>"
+    )
+
+
+def doc_page_html(page):
+    title, sections = DOC_PAGE_TEXT.get(page, (page.rsplit("/", 1)[-1].replace("-", " ").capitalize() or "Overview", [("Details", f"Reference text for {page}.")]))
+    return doc_html(title, sections)
+
+
 def sitemap(pages):
     blocks = "".join(f"<url><loc>{HELP}{page}</loc><lastmod>2026-02-0{index % 9 + 1}</lastmod></url>" for index, page in enumerate(pages))
     return f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{blocks}</urlset>'
@@ -159,12 +237,17 @@ SITEMAPS = {
 class FakeSourceServer:
     """Answers the GitHub, Splunkbase, and help.splunk.com requests the library makes."""
 
-    def __init__(self, release_tag="v9.9.0", sitemaps=None, gate=None, github_status=None):
+    def __init__(self, release_tag="v9.9.0", sitemaps=None, gate=None, github_status=None, missing_pages=(), pdf_pages=(), refuse_after=None):
         self.release_tag = release_tag
         self.sitemaps = SITEMAPS if sitemaps is None else sitemaps
         self.gate = gate
         self.github_status = github_status
+        self.missing_pages = set(missing_pages)
+        self.pdf_pages = set(pdf_pages)
+        self.refuse_after = refuse_after
+        self.refused_pages = []
         self.calls = []
+        self.page_fetches = []
 
     def transport(self):
         return httpx.MockTransport(self.handle)
@@ -197,10 +280,23 @@ class FakeSourceServer:
                 return httpx.Response(200, json=SPLUNKBASE_RECORDS[int(match.group(1))])
             return httpx.Response(404, json={})
         if host == "help.splunk.com":
-            product = path.split("/")[2]
-            if product in self.sitemaps:
-                return httpx.Response(200, text=self.sitemaps[product])
-            return httpx.Response(404, text="")
+            if path.endswith("/sitemap.xml"):
+                product = path.split("/")[2]
+                if product in self.sitemaps:
+                    return httpx.Response(200, text=self.sitemaps[product])
+                return httpx.Response(404, text="")
+            page = path[len("/en/"):]
+            if page in self.missing_pages:
+                return httpx.Response(404, text="")
+            # Like the real site, page requests that ask for text/html are refused; the default Accept header is served.
+            refuse_html = "text/html" in request.headers.get("accept", "")
+            if refuse_html or (self.refuse_after is not None and len(self.page_fetches) >= self.refuse_after):
+                self.refused_pages.append(page)
+                return httpx.Response(403, html="<html><head><title>Error</title></head><body><main><h1>You don't have access to this page.</h1></main></body></html>")
+            self.page_fetches.append(page)
+            if page in self.pdf_pages:
+                return httpx.Response(200, content=b"%PDF-1.7 binary", headers={"Content-Type": "application/pdf"})
+            return httpx.Response(200, html=doc_page_html(page))
         return httpx.Response(500)
 
 
@@ -252,6 +348,27 @@ def make_blueprint(version="9.4.2", deployment="enterprise", apps_status="ok", a
             "sourcetypes": sourcetypes or DEFAULT_SOURCETYPES,
         }
     return blueprint
+
+
+def doc_page_path(manual, page):
+    return "/".join(part for part in (manual["product"], manual["manual"], manual["version"], page) if part)
+
+
+def default_doc_plan(blueprint=None):
+    return build_doc_plan(build_environment_profile(blueprint or make_blueprint()), library_sources()["help_docs"])
+
+
+def fill_doc_index(index, plan=None):
+    """Store every planned page the way a sync would, without the network."""
+    plan = plan or default_doc_plan()
+    for manual in plan["manuals"]:
+        pages = []
+        for page in manual["pages"]:
+            parsed, chunks = _parse_and_chunk(doc_page_html(doc_page_path(manual, page)))
+            url = sources_module.help_doc_url(manual["product"], manual["manual"], manual["version"], page)
+            pages.append({"page": page, "url": url, "title": parsed["title"], "lastmod": parsed["lastmod"], "chunks": chunks})
+        index.replace_manual(manual, pages, failed=0, complete=True)
+    return plan
 
 
 def loaded_summary(stamp=None):
@@ -525,6 +642,27 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual((windows["latest_version"], windows["status"]), ("9.0.1", "current"))
         docs = catalog["platform_docs"]
         self.assertEqual((docs["product"], docs["doc_version"], docs["version_match"]), ("splunk-cloud-platform", "10.1.2507", "exact"))
+
+    def test_app_documentation_uses_the_installed_version_only(self):
+        product = "splunk-enterprise-security-8"
+        pages = [
+            "administer/8.1/overview/about",
+            "administer/8.1/overview/roles",
+            "administer/8.2/overview/about",
+            "user-guide/8.1/start/welcome",
+            *[f"ai-toolkit/ai-toolkit-user-guide/6.2.0/chapter/page-{number}" for number in range(5)],
+            "splunk-app-for-pci-compliance/user-manual/6.4/start/welcome",
+            "splunk-app-for-pci-compliance/user-manual/8.8/start/welcome",
+        ]
+        sources = library_sources()
+        sources["help_docs"]["products"][product] = build_docs_product_index(product, [(f"{HELP}{product}/{page}", "2026-02-01") for page in pages])
+        apps = [*DEFAULT_APPS, {"name": "SplunkEnterpriseSecuritySuite", "label": "Enterprise Security", "version": "8.1.0", "disabled": "0"}]
+        profile = build_environment_profile(make_blueprint(apps=apps))
+        catalog = build_catalog(profile, sources)
+        es_docs = [(entry["manual"], entry["version"]) for entry in catalog["app_docs"] if entry["app"] == "SplunkEnterpriseSecuritySuite"]
+        self.assertEqual(es_docs, [("administer", "8.1"), ("user-guide", "8.1")])
+        plan = build_doc_plan(profile, sources["help_docs"])
+        self.assertEqual([manual["key"] for manual in plan["manuals"] if manual["product"] == product], [f"{product}/administer/8.1", f"{product}/user-guide/8.1"])
 
     def test_unknown_apps_wait_for_a_splunkbase_lookup(self):
         apps = [*DEFAULT_APPS, {"name": "TA-brand-new", "version": "1.0"}]
@@ -887,6 +1025,560 @@ class KnowledgeLibraryApiTests(unittest.TestCase):
         self.assertEqual(upload.status_code, 403)
         self.assertFalse(self.config_manager.get().library.allow_online_sources)
 
+
+    def _pack_with_docs(self):
+        service = KnowledgeLibraryService(self.temp_path / "pack-source-docs")
+        for name, payload in library_sources().items():
+            service.store.save_source(name, payload)
+        fill_doc_index(service.docs)
+        return service.export_pack()
+
+    def test_pack_with_documentation_fills_the_searchable_library(self):
+        self._write_discovery(make_blueprint())
+        response = self.client.post(
+            "/api/knowledge-library/pack/import",
+            files={"file": ("library.zip", self._pack_with_docs(), "application/zip")},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["import_result"]["imported"], ["help_docs", "security_content", "splunkbase", "docs"])
+        self.assertEqual(body["import_result"]["docs_pages"], 7)
+        self.assertEqual(body["docs"]["coverage"]["pct"], 100)
+        self.assertEqual(body["docs"]["summary"]["groups"][0]["origin"], "pack")
+        dimension = next(entry for entry in body["scorecard"]["dimensions"] if entry["key"] == "doc_text")
+        self.assertEqual(dimension["score"], 100)
+
+    def test_documentation_search_endpoint(self):
+        self.assertEqual(self.client.post("/api/knowledge-library/search", json={"query": "   "}).status_code, 400)
+        empty = self.client.post("/api/knowledge-library/search", json={"query": "replication factor"})
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual((empty.json()["results"], empty.json()["docs_available"]), ([], False))
+
+        self._write_discovery(make_blueprint())
+        fill_doc_index(web_app.knowledge_library_service.docs)
+        response = self.client.post("/api/knowledge-library/search", json={"query": "How does the manager node enforce the replication factor?", "limit": 3})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["docs_available"])
+        top = body["results"][0]
+        self.assertEqual(top["url"], HELP + "splunk-enterprise/administer/manage-indexers-and-indexer-clusters/9.4/overview/about")
+        self.assertEqual(top["group"], "Splunk Enterprise 9.4")
+        self.assertIn("replication", top["matched_terms"])
+        self.assertNotIn("context", top)
+        self.assertTrue(top["why"])
+        self.assertLessEqual(len(body["results"]), 3)
+
+    def test_context_preview_shows_documentation_while_the_knowledge_base_is_not_ready(self):
+        fill_doc_index(web_app.knowledge_library_service.docs)
+        response = self.client.post("/api/capabilities/rag/context/build", json={"query": "where do props.conf settings live", "limit": 4})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        matches = body["details"]["library_matches"]
+        self.assertEqual(matches[0]["url"], HELP + "splunk-enterprise/administer/admin-manual/9.4/configuration-files/about")
+        self.assertNotIn("context", matches[0])
+        self.assertIn("not ready", body["details"]["message"])
+
+    def test_chat_context_adds_matching_documentation_only(self):
+        self._write_discovery(make_blueprint())
+        fill_doc_index(web_app.knowledge_library_service.docs)
+        with mock.patch.object(web_app.capability_manager, "get_rag_context", return_value={}):
+            context_text, usage = web_app.get_optional_rag_context("How do I change parsing for the WinEventLog:Security sourcetype in props.conf?")
+            unrelated_text, unrelated_usage = web_app.get_optional_rag_context("Show failed logins for user bob over the last hour")
+        self.assertIn("SPLUNK DOCUMENTATION", context_text)
+        self.assertIn(HELP + "splunk-enterprise/administer/admin-manual/9.4/configuration-files/about", context_text)
+        self.assertIn("Edit props.conf", context_text)
+        self.assertEqual([entry["name"] for entry in usage], ["knowledge_library_docs"])
+        chunk = usage[0]["chunks"][0]
+        self.assertEqual(chunk["source_type"], "splunk_docs")
+        self.assertTrue(chunk["url"].startswith(HELP))
+        self.assertIn("Mentions your sourcetype wineventlog:security", chunk["why"])
+        self.assertEqual((unrelated_text, unrelated_usage), ("", []))
+
+
+class DocTextTests(unittest.TestCase):
+    def test_page_text_comes_from_the_article_only(self):
+        html = (
+            '<html><head><title>Configure inputs | Splunk Docs</title><meta name="lastModifiedISO" content="2026-03-04T05:06:07Z">'
+            "<style>.hidden{}</style></head><body><header>Header links</header><nav>Product menu</nav>"
+            "<main><article><h1>Configure inputs</h1><p>Inputs bring data into Splunk.</p>"
+            "<h2>Monitor files</h2><p>Use the <code>monitor</code> stanza.</p>"
+            "<pre>[monitor:///var/log]\nindex = main\n</pre>"
+            "<ul><li>First item</li><li>Second item</li></ul>"
+            "<table><tr><th>Setting</th><th>Default</th></tr><tr><td>index</td><td>default</td></tr></table>"
+            "<aside>Related topics</aside><button>Copy code</button><script>track()</script>"
+            "</article></main><footer>Legal notice</footer></body></html>"
+        )
+        parsed = extract_doc_page(html)
+        self.assertEqual((parsed["title"], parsed["lastmod"]), ("Configure inputs", "2026-03-04T05:06:07Z"))
+        self.assertEqual([(section["heading"], section["lines"]) for section in parsed["sections"]], [
+            ("Configure inputs", ["Inputs bring data into Splunk."]),
+            ("Monitor files", [
+                "Use the monitor stanza.",
+                "```\n[monitor:///var/log]\nindex = main\n```",
+                "- First item",
+                "- Second item",
+                "Setting | Default",
+                "index | default",
+            ]),
+        ])
+        flat = json.dumps(parsed)
+        for hidden in ("Header links", "Product menu", "Related topics", "Copy code", "track()", "Legal notice", ".hidden"):
+            self.assertNotIn(hidden, flat)
+
+    def test_pages_without_a_main_element_use_the_body(self):
+        parsed = extract_doc_page("<html><head><title>Plain page | Splunk Docs</title></head><body><nav>Skip</nav><p>Body text only.</p></body></html>")
+        self.assertEqual(parsed["title"], "Plain page")
+        self.assertEqual([(section["heading"], section["lines"]) for section in parsed["sections"]], [("", ["Body text only."])])
+
+    def test_long_sections_split_under_their_heading(self):
+        long_text = " ".join(f"Sentence {number} explains the setting." for number in range(400))
+        chunks = chunk_page("Guide", [{"heading": "Details", "lines": [long_text]}])
+        self.assertGreater(len(chunks), 3)
+        self.assertTrue(all(heading == "Details" for heading, _ in chunks))
+        self.assertTrue(all(len(body) <= CHUNK_MAX_CHARS for _, body in chunks))
+        self.assertTrue(chunks[0][1].startswith("Sentence 0 "))
+        self.assertTrue(chunks[-1][1].endswith("Sentence 399 explains the setting."))
+
+    def test_small_sections_join_the_previous_chunk_and_the_title_heading_is_dropped(self):
+        chunks = chunk_page("Guide", [
+            {"heading": "Guide", "lines": ["A" * 300]},
+            {"heading": "Note", "lines": ["Short note."]},
+        ])
+        self.assertEqual(chunks, [("", "A" * 300 + "\nNote\nShort note.")])
+
+
+class DocPlanTests(unittest.TestCase):
+    def test_plan_follows_the_platform_version_and_installed_apps(self):
+        plan = default_doc_plan()
+        self.assertEqual(plan["status"], "ok")
+        self.assertEqual([manual["key"] for manual in plan["manuals"]], [
+            "splunk-enterprise/administer/admin-manual/9.4",
+            "splunk-enterprise/administer/distributed-search/9.4",
+            "splunk-enterprise/administer/manage-indexers-and-indexer-clusters/9.4",
+            "splunk-enterprise/search/spl-search-reference/9.4",
+            "splunk-enterprise/common-information-model/6.0",
+            "supported-add-ons/splunk-supported-add-ons/microsoft-windows/current",
+        ])
+        self.assertEqual(plan["page_total"], 7)
+        self.assertEqual([(group["label"], group["manuals"], group["pages"]) for group in plan["groups"]], [
+            ("Splunk Enterprise 9.4", 4, 5),
+            ("Common Information Model 6.0", 1, 1),
+            ("Supported add-on overviews", 1, 1),
+        ])
+        self.assertEqual(plan["platform"]["doc_version"], "9.4")
+
+    def test_cloud_stacks_get_cloud_manuals(self):
+        plan = default_doc_plan(make_blueprint(version="10.1.2507.3", deployment="cloud"))
+        self.assertEqual([manual["key"] for manual in plan["manuals"]][:2], [
+            "splunk-cloud-platform/administer/admin-manual/10.1.2507",
+            "splunk-cloud-platform/search/spl-search-reference/10.1.2507",
+        ])
+
+    def test_duplicate_manual_paths_and_pdf_exports_are_skipped(self):
+        pages = [
+            "splunk-enterprise/search/spl-search-reference/9.4/introduction/welcome",
+            "splunk-enterprise/search/spl-search-reference/9.4/commands/stats",
+            "splunk-enterprise/spl-search-reference/9.4/introduction/welcome",
+            "splunk-enterprise/spl-search-reference/9.4/commands/stats",
+            "splunk-enterprise/administer/install-and-upgrade/9.4/overview/install",
+            "splunk-enterprise/administer/install-and-upgrade/9.4/overview/upgrade",
+            "splunk-enterprise/administer/install-and-upgrade/9.4/splunk_installation.pdf",
+            "splunk-enterprise/get-started/install-and-upgrade/9.4/overview/install",
+            "splunk-enterprise/get-started/install-and-upgrade/9.4/overview/upgrade",
+            "splunk-enterprise/get-started/install-and-upgrade/9.4/splunk_installation.pdf",
+            "splunk-enterprise/get-started/overview/9.4",
+            "splunk-enterprise/translated-documentation/9.4",
+            "splunk-enterprise/administer/admin_guide.pdf/9.4",
+        ]
+        help_docs = {"products": {"splunk-enterprise": build_docs_product_index("splunk-enterprise", [(HELP + page, "2026-02-01") for page in pages])}}
+        plan = build_doc_plan(build_environment_profile(make_blueprint(apps=[])), help_docs)
+        self.assertEqual([manual["key"] for manual in plan["manuals"]], [
+            "splunk-enterprise/administer/install-and-upgrade/9.4",
+            "splunk-enterprise/get-started/overview/9.4",
+            "splunk-enterprise/search/spl-search-reference/9.4",
+            "splunk-enterprise/translated-documentation/9.4",
+        ])
+        self.assertEqual(plan["manuals"][0]["pages"], ["overview/install", "overview/upgrade"])
+        self.assertEqual(plan["page_total"], 6)
+
+    def test_plan_needs_discovery_and_the_doc_index(self):
+        help_docs = library_sources()["help_docs"]
+        self.assertEqual(build_doc_plan(build_environment_profile(None), help_docs)["status"], "needs_discovery")
+        self.assertEqual(build_doc_plan(build_environment_profile(make_blueprint()), None)["status"], "needs_source")
+
+    def test_platform_manuals_come_first_within_the_page_budget(self):
+        with mock.patch.object(docs_module, "MAX_DOC_PAGES", 3):
+            plan = default_doc_plan()
+        self.assertEqual([manual["key"] for manual in plan["manuals"]], [
+            "splunk-enterprise/administer/admin-manual/9.4",
+            "splunk-enterprise/administer/distributed-search/9.4",
+        ])
+        self.assertEqual(plan["page_total"], 3)
+
+    def test_coverage_and_signature_track_changes(self):
+        plan = default_doc_plan()
+        empty = plan_coverage(plan, {})
+        self.assertEqual((empty["pct"], empty["missing_manuals"], empty["planned_pages"]), (0, 6, 7))
+        states = {
+            manual["key"]: {"complete": 1, "lastmod": manual["lastmod"], "page_total": len(manual["pages"]), "page_done": len(manual["pages"])}
+            for manual in plan["manuals"]
+        }
+        full = plan_coverage(plan, states)
+        self.assertEqual((full["pct"], full["current_manuals"], full["outdated_manuals"]), (100, 6, 0))
+        self.assertEqual(full["groups"][0], {"label": "Splunk Enterprise 9.4", "manuals": 4, "pages": 5, "downloaded_pages": 5})
+        first = plan["manuals"][0]
+        self.assertFalse(needs_fetch(first, states[first["key"]]))
+        states[first["key"]]["lastmod"] = "2025-01-01"
+        self.assertTrue(needs_fetch(first, states[first["key"]]))
+        self.assertEqual(plan_coverage(plan, states)["outdated_manuals"], 1)
+
+        changed = copy.deepcopy(plan)
+        self.assertEqual(plan_signature(changed), plan_signature(plan))
+        changed["manuals"][0]["lastmod"] = "2026-04-01"
+        self.assertNotEqual(plan_signature(changed), plan_signature(plan))
+
+
+class DocIndexTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_search_with_and_without_fts5(self):
+        engines = [True, False] if fts5_available() else [False]
+        for use_fts in engines:
+            with self.subTest(use_fts=use_fts):
+                index = DocIndex(self.root / f"docs-{use_fts}.sqlite3", use_fts=use_fts)
+                fill_doc_index(index)
+                summary = index.summary()
+                self.assertTrue(summary["available"])
+                self.assertEqual((summary["manuals"], summary["pages"], summary["search_engine"]), (6, 7, "fts5" if use_fts else "python"))
+                self.assertGreater(summary["size_bytes"], 0)
+                query = "where do props.conf settings live"
+                results = rank_doc_results(query, index.search_candidates(query_terms(query)))
+                top = results[0]
+                self.assertEqual(top["url"], HELP + "splunk-enterprise/administer/admin-manual/9.4/configuration-files/about")
+                self.assertEqual(top["title"], "About configuration files")
+                self.assertEqual(top["kind"], "splunk_docs")
+                self.assertEqual(top["matched_terms"], ["props", "conf", "settings", "live"])
+                self.assertIn("Title or heading match", top["why"])
+                self.assertIn("props.conf", top["context"])
+                self.assertTrue(1 <= top["score"] <= 100)
+                self.assertEqual(index.search_candidates(["it's"]), [])
+
+    @unittest.skipUnless(fts5_available(), "SQLite was built without FTS5")
+    def test_text_saved_without_fts5_is_indexed_when_fts5_is_used(self):
+        path = self.root / "docs.sqlite3"
+        fill_doc_index(DocIndex(path, use_fts=False))
+        rows = DocIndex(path, use_fts=True).search_candidates(["replication"])
+        self.assertEqual([row["title"] for row in rows], ["About indexer clusters"])
+
+    def test_removed_manuals_leave_the_index(self):
+        index = DocIndex(self.root / "docs.sqlite3")
+        plan = fill_doc_index(index)
+        self.assertEqual(index.remove_manuals([plan["manuals"][2]["key"]]), 1)
+        self.assertEqual(index.search_candidates(["replication"]), [])
+        self.assertEqual(index.summary()["pages"], 6)
+
+
+class DocSyncTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.index = DocIndex(Path(self.temp_dir.name) / "docs.sqlite3")
+        self.plan = default_doc_plan()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    async def _sync(self, server, plan=None, progress=None):
+        async with create_library_http_client(server.transport()) as client:
+            return await sync_docs(client, self.index, plan or self.plan, progress)
+
+    async def test_sync_downloads_once_then_only_what_changed(self):
+        server = FakeSourceServer()
+        progress = []
+        first = await self._sync(server, progress=lambda *update: progress.append(update))
+        self.assertEqual((first["manuals_updated"], first["pages_fetched"], first["pages_failed"]), (6, 7, 0))
+        expected = sorted(doc_page_path(manual, page) for manual in self.plan["manuals"] for page in manual["pages"])
+        self.assertEqual(sorted(server.page_fetches), expected)
+        self.assertEqual((progress[0], progress[-1]), (("docs", 0, 7), ("docs", 7, 7)))
+
+        server.page_fetches.clear()
+        second = await self._sync(server)
+        self.assertEqual((second["manuals_updated"], second["manuals_current"], server.page_fetches), (0, 6, []))
+
+        changed = copy.deepcopy(self.plan)
+        admin = changed["manuals"][0]
+        admin["lastmod"] = "2026-04-01"
+        third = await self._sync(server, changed)
+        self.assertEqual(third["manuals_updated"], 1)
+        self.assertEqual(sorted(server.page_fetches), [doc_page_path(admin, page) for page in admin["pages"]])
+        self.assertEqual(self.index.manual_states()[admin["key"]]["lastmod"], "2026-04-01")
+
+        smaller = {**changed, "manuals": changed["manuals"][1:]}
+        fourth = await self._sync(server, smaller)
+        self.assertEqual(fourth["manuals_removed"], 1)
+        self.assertNotIn(admin["key"], self.index.manual_states())
+        self.assertEqual(self.index.search_candidates(["props"]), [])
+
+    async def test_missing_and_non_html_pages_are_counted(self):
+        admin, cim = self.plan["manuals"][0], self.plan["manuals"][4]
+        server = FakeSourceServer(missing_pages={doc_page_path(admin, admin["pages"][1])}, pdf_pages={doc_page_path(cim, cim["pages"][0])})
+        result = await self._sync(server)
+        self.assertEqual((result["pages_fetched"], result["pages_failed"], result["manuals_updated"]), (5, 2, 5))
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertTrue(any("not an HTML page (application/pdf)" in error for error in result["errors"]))
+        states = self.index.manual_states()
+        self.assertEqual((states[admin["key"]]["page_done"], states[admin["key"]]["page_failed"]), (1, 1))
+        self.assertNotIn(cim["key"], states)
+        self.assertEqual(plan_coverage(self.plan, states)["pct"], 71)
+
+    async def test_a_failed_download_keeps_the_previous_text(self):
+        await self._sync(FakeSourceServer())
+        changed = copy.deepcopy(self.plan)
+        admin = changed["manuals"][0]
+        admin["lastmod"] = "2026-04-01"
+        server = FakeSourceServer(missing_pages={doc_page_path(admin, page) for page in admin["pages"]})
+        with self.assertRaisesRegex(LibrarySourceError, "Could not download documentation pages"):
+            await self._sync(server, changed)
+        state = self.index.manual_states()[admin["key"]]
+        self.assertEqual((state["page_done"], state["lastmod"]), (2, "2026-02-01"))
+        self.assertTrue(needs_fetch(admin, state))
+        self.assertTrue(self.index.search_candidates(["props"]))
+
+    async def test_downloads_stop_when_the_site_refuses_them(self):
+        server = FakeSourceServer(refuse_after=1)
+        with self.assertRaisesRegex(LibrarySourceError, r"stopped allowing documentation downloads .*HTTP 403.*1 downloaded page was saved"):
+            await self._sync(server)
+        self.assertEqual(len(server.page_fetches) + len(server.refused_pages), 1 + docs_module.DOC_REFUSAL_LIMIT)
+        states = self.index.manual_states()
+        self.assertEqual(list(states), [self.plan["manuals"][0]["key"]])
+        self.assertEqual((states[self.plan["manuals"][0]["key"]]["page_done"], states[self.plan["manuals"][0]["key"]]["complete"]), (1, 0))
+
+        later = FakeSourceServer()
+        result = await self._sync(later)
+        self.assertEqual((result["manuals_updated"], result["pages_fetched"]), (6, 7))
+
+    async def test_an_empty_plan_is_refused(self):
+        with self.assertRaises(LibrarySourceError):
+            await self._sync(FakeSourceServer(), {"manuals": []})
+
+
+class RankingTests(unittest.TestCase):
+    def test_bm25_and_rank_fusion(self):
+        index = BM25([["stats", "count"], ["eval", "field"], ["stats", "stats", "sum"]])
+        self.assertEqual([position for position, _ in index.top(["stats"], 5)], [2, 0])
+        self.assertEqual(index.scores(["missing"]), {})
+        fused = reciprocal_rank_fusion([(["a", "b"], 1.0), (["b", "a"], 2.0)])
+        self.assertGreater(fused["b"], fused["a"])
+
+    def test_environment_names_skip_generic_words(self):
+        terms = EnvironmentTerms(sourcetypes=["pan:traffic", "csv"], indexes=["main", "firewall"], apps=["Splunk_TA_windows"])
+        self.assertEqual([(kind, name) for kind, name, _ in terms.entities], [
+            ("sourcetype", "pan:traffic"), ("index", "firewall"), ("app", "splunk_ta_windows"),
+        ])
+        self.assertEqual(terms.mentioned_in("Parse PAN:traffic in the firewall index"), [("sourcetype", "pan:traffic"), ("index", "firewall")])
+        self.assertEqual(terms.mentioned_in("pan:traffic_extra and firewalls"), [])
+        self.assertEqual(query_terms("How do I use the stats command?"), ["stats", "command"])
+
+    def _candidate(self, chunk_id, body, lexical):
+        return {
+            "chunk_id": chunk_id, "page_id": chunk_id, "title": "Props", "heading": "", "body": body, "url": f"{HELP}page-{chunk_id}",
+            "product": "splunk-enterprise", "version": "9.4", "manual_title": "Admin Manual", "grp": "Splunk Enterprise 9.4", "lexical": lexical,
+        }
+
+    def test_results_about_the_users_data_rank_higher(self):
+        candidates = [
+            self._candidate(1, "Configure props.conf for the pan:threat sourcetype and traffic logs.", 9.0),
+            self._candidate(2, "Configure props.conf for the pan:traffic sourcetype.", 8.0),
+        ]
+        query = "configure props for pan:traffic"
+        plain = rank_doc_results(query, candidates)
+        self.assertEqual(plain[0]["url"], f"{HELP}page-1")
+        boosted = rank_doc_results(query, candidates, EnvironmentTerms(sourcetypes=["pan:traffic"]))
+        self.assertEqual(boosted[0]["url"], f"{HELP}page-2")
+        self.assertIn("Mentions your sourcetype pan:traffic", boosted[0]["why"])
+        self.assertIn("Splunk Enterprise 9.4 documentation", boosted[0]["why"])
+
+    def test_weak_matches_can_be_filtered_and_pages_are_capped(self):
+        candidates = [
+            self._candidate(1, "The stats command counts events.", 5.0),
+            {**self._candidate(2, "The stats command sums values.", 4.0), "page_id": 1},
+            {**self._candidate(3, "The stats command averages values.", 3.0), "page_id": 1},
+            self._candidate(4, "Unrelated text about lookups.", 1.0),
+        ]
+        results = rank_doc_results("stats command lookups", candidates, limit=10, per_page=2)
+        self.assertEqual([result["id"] for result in results].count("doc:3"), 0)
+        filtered = rank_doc_results("stats command lookups", candidates, limit=10, min_coverage=0.6)
+        self.assertEqual({result["id"] for result in filtered}, {"doc:1", "doc:2"})
+        self.assertEqual(rank_doc_results("the and of", candidates), [])
+
+
+class DocPackTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _service(self, name):
+        return KnowledgeLibraryService(self.root / name)
+
+    def test_documentation_travels_in_the_pack_and_is_not_downloaded_again(self):
+        source = self._service("source")
+        for name, payload in library_sources().items():
+            source.store.save_source(name, payload)
+        plan = fill_doc_index(source.docs)
+        data = source.export_pack()
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            self.assertIn(sources_module.PACK_DOCS_MEMBER, archive.namelist())
+            manifest = json.loads(archive.read(sources_module.PACK_MANIFEST_NAME))
+        self.assertEqual((manifest["docs"]["manuals"], manifest["docs"]["pages"]), (6, 7))
+
+        target = self._service("target")
+        result = target.import_pack(data)
+        self.assertEqual(result["imported"], ["help_docs", "security_content", "splunkbase", "docs"])
+        self.assertEqual(result["docs_pages"], 7)
+        states = target.docs.manual_states()
+        self.assertTrue(all(not needs_fetch(manual, states.get(manual["key"])) for manual in plan["manuals"]))
+        self.assertEqual({row["origin"] for row in states.values()}, {"pack"})
+        top = target.search_docs("indexer cluster replication factor")[0]
+        self.assertEqual(top["url"], HELP + "splunk-enterprise/administer/manage-indexers-and-indexer-clusters/9.4/overview/about")
+
+    def test_imported_documentation_is_rebuilt_from_known_fields(self):
+        key = "splunk-enterprise/administer/admin-manual/9.4"
+        payload = {
+            "manuals": [
+                {"product": "splunk-enterprise", "manual": "administer/admin-manual", "version": "9.4", "title": "Admin Manual", "page_total": 99999, "complete": True},
+                {"product": "evil-product", "manual": "x", "version": ""},
+                {"product": "splunk-enterprise", "manual": "../escape", "version": "9.4"},
+            ],
+            "pages": [
+                {"manual_key": key, "page": "configuration-files/about", "url": "https://attacker.example/", "title": "About",
+                 "chunks": [["Heading", "Body text"], ["only one"], [1, "number heading"], ["Blank", "   "]]},
+                {"manual_key": key, "page": "../../etc", "chunks": [["h", "b"]]},
+                {"manual_key": "evil-product/x/current", "page": "a", "chunks": [["h", "b"]]},
+                "not a page",
+            ],
+        }
+        manuals, pages = sanitize_docs_payload(payload)
+        self.assertEqual([manual["manual_key"] for manual in manuals], [key])
+        self.assertEqual((manuals[0]["page_total"], manuals[0]["page_failed"]), (1, 0))
+        self.assertEqual(pages[key][0]["url"], HELP + "splunk-enterprise/administer/admin-manual/9.4/configuration-files/about")
+        self.assertEqual(pages[key][0]["chunks"], [("Heading", "Body text")])
+        self.assertIsNone(sanitize_docs_payload({"manuals": "x", "pages": []}))
+        self.assertIsNone(sanitize_docs_payload({"manuals": payload["manuals"], "pages": []}))
+
+    def test_unusable_documentation_is_skipped_but_sources_import(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(sources_module.PACK_MANIFEST_NAME, json.dumps({"format": sources_module.PACK_FORMAT, "format_version": 1}))
+            archive.writestr("sources/splunkbase.json", json.dumps(library_sources()["splunkbase"]))
+            archive.writestr(sources_module.PACK_DOCS_MEMBER, json.dumps({"manuals": [], "pages": []}))
+        target = self._service("target")
+        result = target.import_pack(buffer.getvalue())
+        self.assertEqual((result["imported"], result["skipped"], result["docs_pages"]), (["splunkbase"], ["docs"], 0))
+        self.assertFalse(target.docs_available())
+
+
+class DocServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.service = KnowledgeLibraryService(Path(self.temp_dir.name) / "knowledge_library")
+        self.profile = build_environment_profile(make_blueprint())
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _save_sources(self, stamp=None):
+        for name, payload in library_sources(stamp).items():
+            self.service.store.save_source(name, payload)
+
+    async def test_refresh_downloads_documentation_and_reports_coverage(self):
+        server = FakeSourceServer()
+        self.service.start_refresh(self.profile, transport=server.transport())
+        result = await self.service.wait_for_refresh()
+        self.assertEqual(result["state"], "completed")
+        docs = result["results"]["docs"]
+        self.assertEqual((docs["status"], docs["count"], docs["manuals_updated"]), ("ok", 7, 6))
+
+        status = self.service.build_status(make_blueprint(), [], allow_online=False, can_manage=True)
+        self.assertEqual(status["docs"]["plan_status"], "ok")
+        self.assertEqual(status["docs"]["coverage"]["pct"], 100)
+        self.assertEqual(status["docs"]["summary"]["pages"], 7)
+        self.assertEqual(status["docs"]["addon_overviews"], 1)
+        dimension = next(entry for entry in status["scorecard"]["dimensions"] if entry["key"] == "doc_text")
+        self.assertEqual(dimension["score"], 100)
+        self.assertFalse({"docs_not_downloaded", "docs_missing", "docs_outdated"} & {gap["id"] for gap in status["scorecard"]["gaps"]})
+
+        server.page_fetches.clear()
+        self.service.start_refresh(self.profile, sources=["docs"], transport=server.transport())
+        again = await self.service.wait_for_refresh()
+        self.assertEqual((again["results"]["docs"]["manuals_current"], server.page_fetches), (6, []))
+
+    async def test_documentation_waits_for_discovery(self):
+        self._save_sources()
+        self.service.start_refresh(build_environment_profile(None), sources=["docs"], transport=FakeSourceServer().transport())
+        result = await self.service.wait_for_refresh()
+        self.assertEqual(result["results"]["docs"]["status"], "skipped")
+        self.assertIn("discovery", result["results"]["docs"]["reason"])
+        self.assertEqual(result["state"], "completed")
+
+    async def test_documentation_download_starts_automatically_once_per_plan(self):
+        now = datetime.now(timezone.utc)
+        self._save_sources(now.replace(microsecond=0).isoformat())
+        before = self.service.build_status(make_blueprint(), [], allow_online=False, can_manage=True)
+        self.assertIn("docs_not_downloaded", [gap["id"] for gap in before["scorecard"]["gaps"]])
+
+        with mock.patch.object(self.service, "start_refresh") as start:
+            self.assertEqual(self.service.maybe_auto_refresh(self.profile, True, [], now=now, docs_due=True), "docs")
+            self.assertEqual(start.call_args.kwargs, {"sources": ["docs"], "reason": "docs"})
+            later = now + timedelta(minutes=61)
+            self.assertEqual(self.service.maybe_auto_refresh(self.profile, True, ["TA-brand-new"], now=later, docs_due=True), "apps")
+            self.assertEqual(start.call_args.kwargs, {"sources": ["splunkbase", "docs"], "reason": "apps"})
+
+        plan, docs_status = self.service._docs_status(self.profile, self.service.store.load_source("help_docs"))
+        self.assertTrue(self.service._docs_due(plan, docs_status["coverage"]))
+        self.service._last_auto_attempt = None
+        with mock.patch.object(self.service, "start_refresh") as start:
+            status = self.service.build_status(make_blueprint(), [], allow_online=True, can_manage=True)
+        self.assertEqual(status["refresh"]["auto_started"], "docs")
+        # A download that keeps failing is not retried until the plan changes.
+        self.service._update_state(docs_plan_attempted=plan_signature(plan))
+        self.assertFalse(self.service._docs_due(plan, docs_status["coverage"]))
+        fill_doc_index(self.service.docs, plan)
+        self.service._update_state(docs_plan_attempted="")
+        _plan, filled = self.service._docs_status(self.profile, self.service.store.load_source("help_docs"))
+        self.assertFalse(self.service._docs_due(plan, filled["coverage"]))
+
+
+class DocScorecardTests(unittest.TestCase):
+    def _run(self, doc_text, summary=None):
+        profile = build_environment_profile(make_blueprint())
+        loaded = library_sources()
+        scorecard = build_scorecard(profile, build_catalog(profile, loaded), [], summary or loaded_summary(), doc_text=doc_text)
+        dimension = next(entry for entry in scorecard["dimensions"] if entry["key"] == "doc_text")
+        gaps = [gap["id"] for gap in scorecard["gaps"] if gap["id"] in {"docs_not_downloaded", "docs_missing", "docs_outdated"}]
+        return dimension, gaps
+
+    def test_documentation_text_dimension(self):
+        coverage = {"planned_pages": 7, "planned_manuals": 6, "downloaded_pages": 0, "pct": 0, "missing_manuals": 6, "outdated_manuals": 0}
+        dimension, gaps = self._run({"plan_status": "ok", "coverage": coverage})
+        self.assertEqual((dimension["score"], gaps), (0, ["docs_not_downloaded"]))
+
+        partial = {**coverage, "downloaded_pages": 6, "pct": 86, "missing_manuals": 0, "outdated_manuals": 1}
+        dimension, gaps = self._run({"plan_status": "ok", "coverage": partial})
+        self.assertEqual((dimension["score"], gaps), (86, ["docs_outdated"]))
+        self.assertIn("6 of 7 pages", dimension["basis"])
+
+        dimension, _ = self._run({"plan_status": "needs_source", "coverage": {}})
+        self.assertEqual(dimension["status"], "needs_sources")
+        dimension, _ = self._run({"plan_status": "empty", "coverage": {"planned_pages": 0}})
+        self.assertEqual(dimension["status"], "not_applicable")
 
 if __name__ == "__main__":
     unittest.main()

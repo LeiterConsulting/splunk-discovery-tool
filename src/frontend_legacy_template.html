@@ -974,6 +974,8 @@
                                     score: typeof chunk?.score === 'number' ? chunk.score : undefined,
                                     snippet: typeof chunk?.snippet === 'string' ? chunk.snippet : '',
                                     source_type: typeof chunk?.source_type === 'string' ? chunk.source_type : undefined,
+                                    url: typeof chunk?.url === 'string' && chunk.url.startsWith('https://') ? chunk.url : undefined,
+                                    why: Array.isArray(chunk?.why) ? chunk.why.filter((item) => typeof item === 'string').slice(0, 3) : undefined,
                                 })).filter((chunk) => chunk.snippet)
                                 : [],
                         }))
@@ -2187,6 +2189,7 @@
             const [knowledgeLibrary, setKnowledgeLibrary] = useState({ status: 'idle', data: null, error: '', action: '', message: null });
             const [showAllLibraryGaps, setShowAllLibraryGaps] = useState(false);
             const libraryPackInputRef = useRef(null);
+            const [libraryDocSearch, setLibraryDocSearch] = useState({ query: '', status: 'idle', results: [], error: '', searched: '' });
             const [headerHeight, setHeaderHeight] = useState(88);
 
             // MCP Configuration Vault State
@@ -2862,11 +2865,13 @@
                 ? `${workflowTab.charAt(0).toUpperCase()}${workflowTab.slice(1)}`
                 : 'Persona';
             const packageTargetLabel = `${selectedPackageSessionLabel} reports, ${packagePersonaLabel} runbook, ${operatorVoiceDefinition.label} style`;
-            const canUseRagContextPreview = !!ragCapability?.installed
+            const isRagContextPreviewReady = !!ragCapability?.installed
                 && !!ragCapability?.enabled
                 && !ragCapability?.restart_required
                 && String(ragCapability?.health_status || '').toLowerCase() === 'ready'
                 && ragIndexedDocumentCount > 0;
+            const libraryDocsAvailable = !!knowledgeLibrary.data?.docs?.summary?.available;
+            const canUseRagContextPreview = isRagContextPreviewReady || libraryDocsAvailable;
             const activeDetailPreviewTrace = (() => {
                 const detailAssetId = ragAssetWorkspace.assetDetail?.asset?.asset_id || ragAssetWorkspace.detailAssetId;
                 if (!detailAssetId) {
@@ -4653,6 +4658,7 @@
                 security_content: 'Splunk Security Content',
                 splunkbase: 'Splunkbase',
                 help_docs: 'help.splunk.com',
+                docs: 'Splunk documentation text',
             };
 
             const getLibraryErrorMessage = (result, fallback) => {
@@ -4710,6 +4716,31 @@
             });
 
             const refreshKnowledgeLibrarySources = () => runKnowledgeLibraryRequest('refresh', '/api/knowledge-library/refresh', { method: 'POST' });
+
+            const searchLibraryDocs = async (event) => {
+                if (event) {
+                    event.preventDefault();
+                }
+                const query = String(libraryDocSearch.query || '').trim();
+                if (!query) {
+                    return;
+                }
+                setLibraryDocSearch(prev => ({ ...prev, status: 'loading', error: '' }));
+                try {
+                    const response = await fetch('/api/knowledge-library/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query, limit: 5 }),
+                    });
+                    const result = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(getLibraryErrorMessage(result, 'Could not search the documentation.'));
+                    }
+                    setLibraryDocSearch(prev => ({ ...prev, status: 'success', results: Array.isArray(result.results) ? result.results : [], error: '', searched: query }));
+                } catch (error) {
+                    setLibraryDocSearch(prev => ({ ...prev, status: 'error', results: [], error: error.message || 'Could not search the documentation.' }));
+                }
+            };
 
             const importKnowledgeLibraryPack = async (file) => {
                 if (!file) {
@@ -7356,7 +7387,7 @@
                                 </div>
                                 <div className={ragTileClass}>
                                     <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>Ready for Chat</div>
-                                    <div className={`text-sm font-semibold mt-2 ${headingClass}`}>{canUseRagContextPreview ? 'Yes' : 'Not yet'}</div>
+                                    <div className={`text-sm font-semibold mt-2 ${headingClass}`}>{isRagContextPreviewReady ? 'Yes' : 'Not yet'}</div>
                                     <div className={`mt-1 text-xs ${mutedTextClass}`}>Last indexed: {lastIndexedLabel}</div>
                                 </div>
                             </div>
@@ -7957,8 +7988,10 @@
                 }
                 if (refresh.state === 'running') {
                     const stage = LIBRARY_SOURCE_LABELS[refresh.stage] || 'sources';
-                    const progress = refresh.total ? ` (${refresh.done || 0} of ${refresh.total})` : '';
-                    return `Refreshing ${stage}${progress}. This can take a few minutes.`;
+                    const progress = refresh.total ? ` (${Number(refresh.done || 0).toLocaleString()} of ${Number(refresh.total).toLocaleString()}${refresh.stage === 'docs' ? ' pages' : ''})` : '';
+                    return refresh.stage === 'docs'
+                        ? `Downloading ${stage}${progress}. The first download can take several minutes.`
+                        : `Refreshing ${stage}${progress}. This can take a few minutes.`;
                 }
                 const label = {
                     completed: 'Last refresh finished',
@@ -8015,6 +8048,14 @@
                 const deploymentLabel = { cloud: 'Splunk Cloud Platform', enterprise: 'Splunk Enterprise' }[splunk.deployment_type] || 'Splunk';
                 const refreshText = describeLibraryRefresh(refresh);
                 const failedResults = isRefreshing ? [] : Object.entries(refresh.results || {}).filter(([, result]) => result?.status === 'error');
+                const skippedResults = isRefreshing ? [] : Object.entries(refresh.results || {}).filter(([, result]) => result?.status === 'skipped' && result?.reason);
+                const docsStatus = data.docs || {};
+                const docsCoverage = docsStatus.coverage || {};
+                const docsSummary = docsStatus.summary || {};
+                const docsGroups = Array.isArray(docsCoverage.groups) ? docsCoverage.groups : [];
+                const docsPlannedPages = Number(docsCoverage.planned_pages || 0);
+                const docsDownloadedPages = Number(docsCoverage.downloaded_pages || 0);
+                const docSearchResults = Array.isArray(libraryDocSearch.results) ? libraryDocSearch.results.filter((result) => isSafeLibraryLink(result?.url)) : [];
                 const profileFacts = profile.available ? [
                     `${deploymentLabel}${splunk.version ? ` ${splunk.version}` : ''}`,
                     apps.collected ? `${apps.total || 0} apps (${apps.addons || 0} not built in)` : null,
@@ -8118,6 +8159,108 @@
                             </div>
                         )}
 
+                        {profile.available && docsStatus.plan_status && (
+                            <div data-testid="knowledge-library-doc-text" className="mt-5">
+                                <h4 className={`text-sm font-semibold ${headingClass}`}>Searchable documentation</h4>
+                                <p data-testid="knowledge-library-doc-coverage" className={`mt-1 text-xs ${subtextClass}`}>
+                                    {docsPlannedPages > 0
+                                        ? `${docsDownloadedPages.toLocaleString()} of ${docsPlannedPages.toLocaleString()} pages${typeof docsCoverage.pct === 'number' ? ` (${docsCoverage.pct}%)` : ''} from the ${Number(docsCoverage.planned_manuals || 0).toLocaleString()} manuals that match your environment are downloaded.`
+                                        : (docsStatus.plan_status === 'needs_source'
+                                            ? 'Load the help.splunk.com source so the library can plan which manuals to download.'
+                                            : 'No manuals on help.splunk.com match this environment.')}
+                                    {docsSummary.available
+                                        ? ` ${formatByteSize(docsSummary.size_bytes)} on disk${docsSummary.last_fetched_at ? `, updated ${formatMissionDateTime(docsSummary.last_fetched_at)}` : ''}.`
+                                        : ''}
+                                </p>
+                                <p className={`mt-1 text-xs ${mutedTextClass}`}>Chat searches these pages when Search the Knowledge Base is turned on in chat settings, and links to the page it used.</p>
+                                {docsGroups.length > 0 && (
+                                    <ul data-testid="knowledge-library-doc-groups" className="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2">
+                                        {docsGroups.map((group) => {
+                                            const pages = Number(group.pages || 0);
+                                            const done = Number(group.downloaded_pages || 0);
+                                            const pct = pages ? Math.round((100 * done) / pages) : 0;
+                                            return (
+                                                <li key={group.label} className={`rounded-lg border px-3 py-2 ${panelMutedClass}`}>
+                                                    <div className={`text-sm font-medium ${headingClass}`}>{group.label}</div>
+                                                    <div className={`mt-0.5 text-xs ${subtextClass}`}>
+                                                        {`${Number(group.manuals || 0).toLocaleString()} manual${group.manuals === 1 ? '' : 's'} · ${done.toLocaleString()} of ${pages.toLocaleString()} pages`}
+                                                    </div>
+                                                    <div
+                                                        role="progressbar"
+                                                        aria-label={`${group.label} pages downloaded`}
+                                                        aria-valuemin={0}
+                                                        aria-valuemax={100}
+                                                        aria-valuenow={pct}
+                                                        className={`mt-1.5 h-1.5 rounded-full overflow-hidden ${isDarkTheme ? 'bg-gray-700' : 'bg-gray-200'}`}
+                                                    >
+                                                        <div className={`h-full ${pct >= 100 ? 'bg-emerald-500' : 'bg-indigo-500'}`} style={{ width: `${pct}%` }}></div>
+                                                    </div>
+                                                </li>
+                                            );
+                                        })}
+                                    </ul>
+                                )}
+                                {docsStatus.addon_overviews > 0 && (
+                                    <p className={`mt-2 text-xs ${mutedTextClass}`}>
+                                        Full manuals for Splunk supported add-ons are on docs.splunk.com, which does not allow automated downloads. The library keeps the overview page for each installed add-on, and that page links to the full manual.
+                                    </p>
+                                )}
+                                {docsSummary.search_engine === 'python' && docsSummary.available && (
+                                    <p className={`mt-2 text-xs ${mutedTextClass}`}>This Python build does not include SQLite full-text search, so documentation searches use a slower built-in method.</p>
+                                )}
+                                {docsSummary.available && (
+                                    <form onSubmit={searchLibraryDocs} className="mt-3" role="search" aria-label="Search the downloaded documentation">
+                                        <div className="flex flex-col sm:flex-row gap-2">
+                                            <label htmlFor="knowledge-library-doc-search" className="sr-only">Search the downloaded documentation</label>
+                                            <input
+                                                id="knowledge-library-doc-search"
+                                                data-testid="knowledge-library-doc-search"
+                                                value={libraryDocSearch.query}
+                                                onChange={(event) => setLibraryDocSearch(prev => ({ ...prev, query: event.target.value }))}
+                                                placeholder="Try a question, such as how to configure an indexer cluster"
+                                                className={`flex-1 rounded-lg border px-3 py-2 text-sm ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                            />
+                                            <button
+                                                type="submit"
+                                                data-testid="knowledge-library-doc-search-button"
+                                                disabled={libraryDocSearch.status === 'loading' || !String(libraryDocSearch.query || '').trim()}
+                                                className={getCapabilityActionButtonClass(false, libraryDocSearch.status === 'loading' || !String(libraryDocSearch.query || '').trim())}
+                                            >
+                                                {libraryDocSearch.status === 'loading' ? 'Searching...' : 'Search documentation'}
+                                            </button>
+                                        </div>
+                                    </form>
+                                )}
+                                {libraryDocSearch.status === 'error' && (
+                                    <p role="alert" className={`mt-2 text-xs ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{libraryDocSearch.error}</p>
+                                )}
+                                {libraryDocSearch.status === 'success' && docSearchResults.length === 0 && (
+                                    <p role="status" className={`mt-2 text-xs ${subtextClass}`}>No downloaded pages match "{libraryDocSearch.searched}".</p>
+                                )}
+                                {docSearchResults.length > 0 && (
+                                    <ul data-testid="knowledge-library-doc-results" className="mt-2 space-y-2">
+                                        {docSearchResults.map((result) => (
+                                            <li key={result.id || result.url} className={`rounded-lg border px-3 py-2 ${panelMutedClass}`}>
+                                                <div className="flex flex-wrap items-start justify-between gap-2">
+                                                    <a href={result.url} target="_blank" rel="noopener noreferrer" className={`text-sm font-medium break-words ${linkClass}`}>{result.label || result.title}</a>
+                                                    {typeof result.score === 'number' && (
+                                                        <span className={`text-xs ${mutedTextClass}`}>Match score {result.score}</span>
+                                                    )}
+                                                </div>
+                                                <div className={`mt-0.5 text-xs ${mutedTextClass}`}>{[result.group, result.manual].filter(Boolean).join(' · ')}</div>
+                                                {Array.isArray(result.why) && result.why.length > 0 && (
+                                                    <div className={`mt-1 text-xs ${subtextClass}`}>{result.why.slice(0, 3).join(' · ')}</div>
+                                                )}
+                                                {result.snippet && (
+                                                    <div className={`mt-1 text-xs whitespace-pre-wrap break-words ${subtextClass}`} style={{ overflowWrap: 'anywhere' }}>{result.snippet}</div>
+                                                )}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                )}
+                            </div>
+                        )}
+
                         <div className="mt-5">
                             <h4 className={`text-sm font-semibold ${headingClass}`}>Sources</h4>
                             <div data-testid="knowledge-library-sources" className="mt-2 grid grid-cols-1 xl:grid-cols-3 gap-3">
@@ -8159,7 +8302,7 @@
                                         <span>
                                             <span className={`font-medium ${headingClass}`}>Download sources from the internet</span>
                                             <span className={`block text-xs ${subtextClass}`}>
-                                                Connects only to {(Array.isArray(settings.online_hosts) ? settings.online_hosts : []).join(', ')}. Sources download when you turn this on and update every {settings.auto_refresh_days || 7} days. On networks without internet access, leave this off and import a library pack.
+                                                Connects only to {(Array.isArray(settings.online_hosts) ? settings.online_hosts : []).join(', ')}. Sources and the documentation that matches your environment download when you turn this on and update every {settings.auto_refresh_days || 7} days. On networks without internet access, leave this off and import a library pack.
                                             </span>
                                         </span>
                                     </label>
@@ -8220,6 +8363,13 @@
                                 <ul className={`mt-1 space-y-1 text-xs ${isDarkTheme ? 'text-amber-200' : 'text-amber-800'}`}>
                                     {failedResults.map(([name, result]) => (
                                         <li key={name} className="break-words">{LIBRARY_SOURCE_LABELS[name] || 'Refresh'}: {result.error || 'failed'}</li>
+                                    ))}
+                                </ul>
+                            )}
+                            {skippedResults.length > 0 && (
+                                <ul className={`mt-1 space-y-1 text-xs ${mutedTextClass}`}>
+                                    {skippedResults.map(([name, result]) => (
+                                        <li key={name} className="break-words">{LIBRARY_SOURCE_LABELS[name] || 'Refresh'} skipped: {result.reason}</li>
                                     ))}
                                 </ul>
                             )}
@@ -8303,7 +8453,7 @@
                                     </div>
                                     <div className={`rounded-lg p-3 border ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
                                         <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>Ready for Chat</div>
-                                        <div className={`text-sm font-semibold mt-2 ${headingClass}`}>{canUseRagContextPreview
+                                        <div className={`text-sm font-semibold mt-2 ${headingClass}`}>{isRagContextPreviewReady
                                             ? 'Yes'
                                             : (!ragCapability.enabled ? 'Not yet. Turn it on.' : 'Not yet. Select Reindex.')}</div>
                                     </div>
@@ -8397,7 +8547,7 @@
                                         <div className={`text-xs font-medium mb-1 ${headingClass}`}>Imported Items</div>
                                         <div className={`text-xs ${subtextClass}`}>Stored in: {ragDisplayedAssetDir}</div>
                                         <div className={`mt-1 text-xs ${subtextClass}`}>Checked in: {ragCheckedInAssetCount}. Checked out: {ragCheckedOutAssetCount}.</div>
-                                        <div className={`mt-1 text-xs ${subtextClass}`}>{canUseRagContextPreview ? 'Checked-in items are ready for chat.' : 'Chat can use imports after the Knowledge Base is turned on and reindexed.'}</div>
+                                        <div className={`mt-1 text-xs ${subtextClass}`}>{isRagContextPreviewReady ? 'Checked-in items are ready for chat.' : 'Chat can use imports after the Knowledge Base is turned on and reindexed.'}</div>
                                     </div>
                                 </div>
                             )}
@@ -8543,11 +8693,13 @@
                                     <div className="mb-3">
                                         <div className={`text-sm font-semibold ${headingClass}`}>Preview Chat Context</div>
                                         <div className={`text-xs ${subtextClass}`}>See which passages the assistant would use to answer a question.</div>
-                                        {!canUseRagContextPreview && (
+                                        {!isRagContextPreviewReady && (
                                             <div data-testid="rag-context-preview-unavailable" className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                {!ragCapability.installed
-                                                    ? 'Available after you install the Knowledge Base, turn it on, and reindex.'
-                                                    : (!ragCapability.enabled ? 'Available after you turn on the Knowledge Base and reindex.' : 'Available after you reindex.')}
+                                                {libraryDocsAvailable
+                                                    ? 'Shows downloaded Splunk documentation now. Knowledge Base passages appear after you install the Knowledge Base, turn it on, and reindex.'
+                                                    : (!ragCapability.installed
+                                                        ? 'Available after you install the Knowledge Base, turn it on, and reindex.'
+                                                        : (!ragCapability.enabled ? 'Available after you turn on the Knowledge Base and reindex.' : 'Available after you reindex.'))}
                                             </div>
                                         )}
                                     </div>
@@ -8682,6 +8834,31 @@
                                         <pre className={`mt-3 rounded-lg border px-3 py-3 text-xs whitespace-pre-wrap font-mono ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}>
                                             {ragAssetWorkspace.contextPreview.context_text}
                                         </pre>
+                                    )}
+                                    {Array.isArray(ragAssetWorkspace.contextPreview?.library_matches) && ragAssetWorkspace.contextPreview.library_matches.length > 0 && (
+                                        <div data-testid="rag-context-preview-docs" className="mt-3">
+                                            <div className={`text-sm font-medium ${headingClass}`}>Splunk documentation</div>
+                                            <div className={`text-xs ${subtextClass}`}>Downloaded pages chat would add, ranked by matching terms, headings, and names from your environment.</div>
+                                            <div className="space-y-2 mt-2">
+                                                {ragAssetWorkspace.contextPreview.library_matches.filter((match) => isSafeLibraryLink(match?.url)).map((match) => (
+                                                    <div key={match.id || match.url} className={`rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'bg-gray-900 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-800'}`}>
+                                                        <div className="flex flex-wrap items-center gap-2 mb-1">
+                                                            <a href={match.url} target="_blank" rel="noopener noreferrer" className={`font-medium break-words ${isDarkTheme ? 'text-indigo-300 hover:text-indigo-200 underline' : 'text-indigo-700 hover:text-indigo-900 underline'}`}>{match.label || match.title}</a>
+                                                            {match.score != null && (
+                                                                <span className={`rounded-full px-2 py-0.5 border ${isDarkTheme ? 'bg-violet-950 border-violet-800 text-violet-100' : 'bg-violet-50 border-violet-200 text-violet-800'}`}>
+                                                                    score {match.score}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <div className={mutedTextClass}>{[match.group, match.manual].filter(Boolean).join(' · ')}</div>
+                                                        {Array.isArray(match.why) && match.why.length > 0 && (
+                                                            <div className={`mt-1 ${subtextClass}`}>{match.why.slice(0, 3).join(' · ')}</div>
+                                                        )}
+                                                        {match.snippet && <div className={`mt-1 whitespace-pre-wrap break-words ${subtextClass}`} style={{ overflowWrap: 'anywhere' }}>{match.snippet}</div>}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
                                     )}
                                     {Array.isArray(ragAssetWorkspace.contextPreview?.chunks) && ragAssetWorkspace.contextPreview.chunks.length > 0 && (
                                         <div className="space-y-2 mt-3">
@@ -16521,7 +16698,11 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                                             <div key={chunkIdx} className={`rounded border p-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
                                                                                                 <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
                                                                                                     <div className="flex flex-wrap items-center gap-2">
-                                                                                                        <span className={`text-xs font-medium ${headingClass}`}>{chunk.source || `artifact_${chunkIdx + 1}`}</span>
+                                                                                                        {isSafeLibraryLink(chunk.url) ? (
+                                                                                                            <a href={chunk.url} target="_blank" rel="noopener noreferrer" className="text-xs font-medium ui-link break-words">{chunk.source || 'Splunk documentation'}</a>
+                                                                                                        ) : (
+                                                                                                            <span className={`text-xs font-medium ${headingClass}`}>{chunk.source || `artifact_${chunkIdx + 1}`}</span>
+                                                                                                        )}
                                                                                                         {chunk.source_type && (
                                                                                                             <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-white text-gray-700 border border-gray-200'}`}>
                                                                                                                 {formatCapabilitySourceTypeLabel(chunk.source_type)}
@@ -16532,6 +16713,9 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                                                         <span className={`text-xs ${mutedTextClass}`}>Match score {chunk.score}</span>
                                                                                                     )}
                                                                                                 </div>
+                                                                                                {Array.isArray(chunk.why) && chunk.why.length > 0 && (
+                                                                                                    <div className={`text-xs mb-1 ${mutedTextClass}`}>{chunk.why.slice(0, 3).join(' · ')}</div>
+                                                                                                )}
                                                                                                 <div className={`text-xs whitespace-pre-wrap break-words ${subtextClass}`} style={{ overflowWrap: 'anywhere' }}>{chunk.snippet}</div>
                                                                                             </div>
                                                                                         ))}
@@ -16923,7 +17107,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 </h3>
                                                 <div className="space-y-4">
                                                     {renderToggle({ id: 'chat-setting-splunk-augmentation', label: 'Built-in Splunk Answers', description: 'Answer common Splunk questions with built-in routines instead of the AI model', settingKey: 'enable_splunk_augmentation' })}
-                                                    {renderToggle({ id: 'chat-setting-rag-context', label: 'Search the Knowledge Base', description: 'Add matching passages from your reports and imported documents to chat answers', settingKey: 'enable_rag_context' })}
+                                                    {renderToggle({ id: 'chat-setting-rag-context', label: 'Search the Knowledge Base', description: 'Add matching passages from your reports, imported documents, and downloaded Splunk documentation to chat answers', settingKey: 'enable_rag_context' })}
                                                     {renderRange({
                                                         id: 'chat-setting-rag-max-chunks',
                                                         label: `Passages per answer: ${chatSettings.rag_max_chunks || 3}`,

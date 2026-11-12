@@ -283,7 +283,11 @@ def select_app_docs(profile: Dict[str, Any], docs: Optional[Dict[str, Any]]) -> 
         if product and product in products and product not in seen:
             seen.add(product)
             manuals = products[product].get("manuals") or {}
-            ranked = sorted(manuals.items(), key=lambda item: -max(len(b.get("pages") or []) for b in item[1].values()))[:6]
+            # A product also lists related apps with their own version numbers (for example the AI Toolkit under
+            # Enterprise Security), so only manuals published for the installed app's documentation version count.
+            doc_version, _match = choose_doc_version({v for versions in manuals.values() for v in versions if v}, version)
+            matching = [(manual, versions) for manual, versions in manuals.items() if (doc_version or "") in versions]
+            ranked = sorted(matching, key=lambda item: -len((item[1][doc_version or ""] or {}).get("pages") or []))[:6]
             for manual, versions in ranked:
                 title = manual.rsplit("/", 1)[-1].replace("-", " ").capitalize()
                 entry = _manual_entry(product, manual, versions, version, title, f"Installed app {app.get('label') or name}")

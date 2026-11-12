@@ -55,6 +55,7 @@ MAX_DATA_SOURCES = 5000
 PACK_FORMAT = "dt4sms-knowledge-library-pack"
 PACK_FORMAT_VERSION = 1
 PACK_MANIFEST_NAME = "library-pack.json"
+PACK_DOCS_MEMBER = "docs/library_docs.json"
 
 _SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 _FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\.ya?ml$")
@@ -71,6 +72,10 @@ ProgressCallback = Callable[[str, int, int], None]
 
 class LibrarySourceError(Exception):
     """A library source could not be fetched or parsed."""
+
+
+class LibraryRefusedError(LibrarySourceError):
+    """The site refused the request (HTTP 403 or 429); keep sending requests and it may block the client for longer."""
 
 
 class LibraryPackError(ValueError):
@@ -475,6 +480,8 @@ async def _get(client: httpx.AsyncClient, url: str, *, accept: str = "") -> http
         raise LibrarySourceError(f"Response from {response.url.host} is larger than {MAX_RESPONSE_BYTES // (1024 * 1024)} MB")
     if response.status_code == 403 and response.url.host == "api.github.com":
         raise LibrarySourceError("GitHub refused the request (usually the hourly limit for anonymous requests). Try again later or import a library pack.")
+    if response.status_code in (403, 429):
+        raise LibraryRefusedError(f"{response.url.host} refused the request (HTTP {response.status_code}) for {response.url.path}")
     if response.status_code >= 400:
         raise LibrarySourceError(f"{response.url.host} returned HTTP {response.status_code} for {response.url.path}")
     return response
@@ -643,11 +650,12 @@ async def fetch_help_docs(
 # Offline packs
 # ---------------------------------------------------------------------------
 
-def export_pack(store: LibraryStore) -> bytes:
+def export_pack(store: LibraryStore, docs: Optional[Dict[str, Any]] = None) -> bytes:
+    """Zip the loaded sources, plus the downloaded documentation text when `docs` is given."""
     sources = {name: payload for name, payload in store.load_sources().items() if payload}
-    if not sources:
+    if not sources and not docs:
         raise LibraryPackError("There are no library sources to export yet.")
-    manifest = {
+    manifest: Dict[str, Any] = {
         "format": PACK_FORMAT,
         "format_version": PACK_FORMAT_VERSION,
         "created_at": utc_now_iso(),
@@ -660,11 +668,19 @@ def export_pack(store: LibraryStore) -> bytes:
             for name, payload in sources.items()
         },
     }
+    if docs:
+        manifest["docs"] = {
+            "manuals": len(docs.get("manuals") or []),
+            "pages": len(docs.get("pages") or []),
+            "license": SOURCE_LICENSES["help_docs"],
+        }
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(PACK_MANIFEST_NAME, json.dumps(manifest, indent=2))
         for name, payload in sources.items():
             archive.writestr(f"sources/{name}.json", json.dumps(payload, separators=(",", ":")))
+        if docs:
+            archive.writestr(PACK_DOCS_MEMBER, json.dumps(docs, separators=(",", ":")))
     return buffer.getvalue()
 
 
@@ -685,7 +701,8 @@ def _read_pack_member(archive: zipfile.ZipFile, name: str) -> Optional[Any]:
         raise LibraryPackError(f"{name} is not valid JSON.") from exc
 
 
-def import_pack(store: LibraryStore, data: bytes) -> Dict[str, Any]:
+def read_pack(data: bytes) -> Dict[str, Any]:
+    """Validate a pack and return its sanitized sources and the raw documentation member, without saving anything."""
     if not data:
         raise LibraryPackError("The uploaded file is empty.")
     if len(data) > MAX_PACK_BYTES:
@@ -714,8 +731,15 @@ def import_pack(store: LibraryStore, data: bytes) -> Dict[str, Any]:
             sanitized["origin"] = "pack"
             sanitized["pack_created_at"] = created_at
             accepted[name] = sanitized
+        docs = _read_pack_member(archive, PACK_DOCS_MEMBER)
+    return {"sources": accepted, "skipped": skipped, "pack_created_at": created_at, "docs": docs}
+
+
+def import_pack(store: LibraryStore, data: bytes) -> Dict[str, Any]:
+    contents = read_pack(data)
+    accepted = contents["sources"]
     if not accepted:
         raise LibraryPackError("The library pack did not contain any usable sources.")
     for name, payload in accepted.items():
         store.save_source(name, payload)
-    return {"imported": sorted(accepted), "skipped": skipped, "pack_created_at": created_at}
+    return {"imported": sorted(accepted), "skipped": contents["skipped"], "pack_created_at": contents["pack_created_at"]}

@@ -55,6 +55,7 @@ from discovery.m26_14_advisor import (
 from discovery.v2_pipeline import DiscoveryV2Pipeline
 from knowledge_library import LIBRARY_DIR_NAME
 from knowledge_library.profile import build_environment_profile
+from knowledge_library.ranking import query_terms as library_query_terms
 from knowledge_library.service import KnowledgeLibraryService, LibraryBusyError
 from knowledge_library.sources import MAX_PACK_BYTES, LibraryPackError
 from llm.factory import (
@@ -5986,7 +5987,8 @@ def build_capability_usage_brief(capability_usage: Optional[List[Dict[str, Any]]
         for chunk in chunks[:limit]:
             if not isinstance(chunk, dict):
                 continue
-            source = Path(str(chunk.get("source") or "artifact")).name or "artifact"
+            raw_source = str(chunk.get("source") or "artifact")
+            source = raw_source if chunk.get("url") else (Path(raw_source).name or "artifact")
             snippet = _compact_memory_text(chunk.get("snippet"), limit=180)
             if snippet:
                 lines.append(f"- {source}: {snippet}")
@@ -5999,11 +6001,74 @@ def build_capability_usage_brief(capability_usage: Optional[List[Dict[str, Any]]
     return "Indexed context signals:\n" + "\n".join(lines)
 
 
+LIBRARY_DOCS_USAGE_NAME = "knowledge_library_docs"
+MAX_LIBRARY_DOCS_CHAT_PASSAGES = 3
+
+
+def search_library_docs(query: str, limit: int = 5, min_coverage: float = 0.0) -> List[Dict[str, Any]]:
+    """Rank downloaded Splunk documentation passages for a question, favoring the latest discovery's names."""
+    try:
+        environment = knowledge_library_service.environment_terms(load_latest_v2_blueprint)
+        return knowledge_library_service.search_docs(query, limit=limit, environment=environment, min_coverage=min_coverage)
+    except Exception as exc:
+        print(f"⚠️ [LIBRARY] Documentation search failed: {type(exc).__name__}: {exc}")
+        return []
+
+
+def public_library_doc_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in result.items() if key not in {"text", "context"}}
+
+
+def get_library_docs_context(user_message: str, max_chunks: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return documentation passages for the prompt and their capability usage entry."""
+    terms = library_query_terms(user_message)
+    if not terms:
+        return "", []
+    # Questions about the user's own data rarely need documentation, so most of the question must match.
+    results = search_library_docs(
+        user_message,
+        limit=max(1, min(_safe_int(max_chunks) or 3, MAX_LIBRARY_DOCS_CHAT_PASSAGES)),
+        min_coverage=0.5 if len(terms) > 1 else 1.0,
+    )
+    if not results:
+        return "", []
+    lines = ["📘 SPLUNK DOCUMENTATION (help.splunk.com pages for this environment's versions; cite the link when an answer relies on one):"]
+    for index, result in enumerate(results, 1):
+        source = " > ".join(part for part in [result.get("group") or result.get("manual"), result.get("label")] if part)
+        lines.append(f"{index}. [{source}] {result.get('url')}")
+        lines.append(f"   {result.get('context') or result.get('snippet')}")
+    count = len(results)
+    usage = {
+        "name": LIBRARY_DOCS_USAGE_NAME,
+        "title": "Splunk documentation",
+        "category": "knowledge_library",
+        "used_in": "llm_prompt",
+        "contribution": f"Added {count} passage{'s' if count != 1 else ''} from the downloaded Splunk documentation to the LLM prompt context.",
+        "chunks": [
+            {
+                "source": " > ".join(part for part in [result.get("group"), result.get("label")] if part) or "Splunk documentation",
+                "score": _safe_int(result.get("score")),
+                "snippet": str(result.get("snippet") or ""),
+                "source_type": "splunk_docs",
+                "url": str(result.get("url") or ""),
+                "why": [str(item) for item in (result.get("why") or [])[:3]],
+            }
+            for result in results
+        ],
+        "reusable_queries": [],
+    }
+    return "\n".join(lines), [usage]
+
+
 def get_optional_rag_context(user_message: str, max_chunks: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
-    """Return optional RAG context and normalized capability usage details."""
+    """Return optional RAG context and normalized capability usage details, including downloaded documentation."""
     rag_result = capability_manager.get_rag_context(user_message=user_message, max_chunks=max_chunks)
     context_text = str(rag_result.get("context_text") or "") if isinstance(rag_result, dict) else ""
     capability_usage = build_capability_usage_from_rag_result(rag_result)
+    docs_text, docs_usage = get_library_docs_context(user_message, max_chunks=max_chunks)
+    if docs_text:
+        context_text = f"{context_text}\n\n{docs_text}" if context_text else docs_text
+        capability_usage.extend(docs_usage)
     return context_text, capability_usage
 
 
@@ -12850,13 +12915,30 @@ async def check_out_rag_asset(asset_id: str):
 
 @app.post("/api/capabilities/rag/context/build")
 async def build_rag_context_preview(build_request: RAGContextPreviewRequest):
-    """Build a retrieval context preview from managed RAG knowledge assets."""
+    """Build a retrieval context preview from managed RAG knowledge assets and the downloaded documentation."""
     result = capability_manager.build_rag_context_preview(
         "rag_chromadb",
         build_request.query,
         max_chunks=build_request.limit,
     ).to_dict()
+    doc_matches = await asyncio.to_thread(search_library_docs, build_request.query, max(1, min(_safe_int(build_request.limit) or 4, 6)))
+    library_matches = [public_library_doc_result(match) for match in doc_matches]
+    if not result.get("ok") and library_matches:
+        count = len(library_matches)
+        return {
+            "ok": True,
+            "capability": "rag_chromadb",
+            "action": "build-context",
+            "message": f"Found {count} documentation passage{'s' if count != 1 else ''}. The Knowledge Base is not ready, so its passages are not included.",
+            "details": {
+                "query": build_request.query,
+                "message": "The Knowledge Base is not installed or not ready, so this preview shows only Splunk documentation.",
+                "library_matches": library_matches,
+            },
+        }
     _raise_for_capability_result(result)
+    if isinstance(result.get("details"), dict):
+        result["details"]["library_matches"] = library_matches
     return result
 
 
@@ -12926,13 +13008,33 @@ async def refresh_knowledge_library(request: Request):
     return _knowledge_library_status_payload(request, auto_refresh=False)
 
 
+class KnowledgeLibrarySearchRequest(BaseModel):
+    query: str
+    limit: int = 5
+
+
+@app.post("/api/knowledge-library/search")
+async def search_knowledge_library(search_request: KnowledgeLibrarySearchRequest):
+    """Search the downloaded Splunk documentation the way chat does."""
+    query = str(search_request.query or "").strip()[:500]
+    if not query:
+        raise HTTPException(status_code=400, detail="Enter a question to search for.")
+    results = await asyncio.to_thread(search_library_docs, query, max(1, min(_safe_int(search_request.limit) or 5, 10)))
+    return {
+        "status": "success",
+        "query": query,
+        "results": [public_library_doc_result(result) for result in results],
+        "docs_available": knowledge_library_service.docs_available(),
+    }
+
+
 @app.post("/api/knowledge-library/pack/import")
 async def import_knowledge_library_pack(request: Request, file: UploadFile = File(...)):
     """Load library sources from a pack exported on another installation."""
     require_admin_user(request)
     data = await file.read(MAX_PACK_BYTES + 1)
     try:
-        result = knowledge_library_service.import_pack(data)
+        result = await asyncio.to_thread(knowledge_library_service.import_pack, data)
     except LibraryBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except LibraryPackError as exc:
@@ -12944,9 +13046,9 @@ async def import_knowledge_library_pack(request: Request, file: UploadFile = Fil
 
 @app.get("/api/knowledge-library/pack/export")
 async def export_knowledge_library_pack():
-    """Download the loaded library sources as a pack for installations without internet access."""
+    """Download the loaded library sources and documentation text as a pack for installations without internet access."""
     try:
-        data = knowledge_library_service.export_pack()
+        data = await asyncio.to_thread(knowledge_library_service.export_pack)
     except LibraryPackError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     filename = f"dt4sms_library_pack_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
