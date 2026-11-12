@@ -7,12 +7,26 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from capabilities.models import CapabilityConfig, CapabilityDefinition
 from capabilities.rag.asset_manager import KnowledgeAssetManager, normalize_knowledge_asset_attributes
 from capabilities.rag.base import RetrievalChunk
 from knowledge_library import LIBRARY_DIR_NAME
+from knowledge_library.ranking import (
+    BM25,
+    best_possible_fusion,
+    coverage_weight,
+    matched_terms,
+    reciprocal_rank_fusion,
+    tokenize,
+)
+from knowledge_library.ranking import query_terms as ranking_query_terms
+
+# Hashed-vector similarity and BM25 count equally when ranking Knowledge Base passages.
+KB_FUSION_WEIGHTS = (1.0, 1.0)
+MAX_LEXICAL_SCAN_DOCUMENTS = 5000
+_LEXICAL_CORPUS_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
 
 QUERY_TERM_STOPWORDS = {
@@ -282,6 +296,11 @@ def _query_terms(text: Any) -> List[str]:
         if len(terms) >= 12:
             break
     return terms
+
+
+def _lexical_tokens(document: str, metadata: Dict[str, Any]) -> List[str]:
+    heading = f"{metadata.get('section') or ''} {metadata.get('asset_title') or ''}"
+    return tokenize(heading) * 2 + tokenize(document)
 
 
 @dataclass
@@ -966,9 +985,10 @@ class ArtifactSourceIndexer:
             return summary, []
 
         requested_results = max(1, min(int(max_chunks or 3), 6))
+        candidate_count = max(requested_results, min(12, requested_results * 3))
         query_kwargs: Dict[str, Any] = {
             "query_texts": [user_message],
-            "n_results": max(requested_results, min(12, requested_results * 3)),
+            "n_results": candidate_count,
             "include": ["documents", "metadatas", "distances"],
         }
         if source_type:
@@ -976,24 +996,41 @@ class ArtifactSourceIndexer:
 
         raw = collection.query(**query_kwargs)
 
+        ids = raw.get("ids", [[]])
         documents = raw.get("documents", [[]])
         metadatas = raw.get("metadatas", [[]])
         distances = raw.get("distances", [[]])
+        result_ids = ids[0] if ids and isinstance(ids[0], list) else []
         result_documents = documents[0] if documents and isinstance(documents[0], list) else []
         result_metadatas = metadatas[0] if metadatas and isinstance(metadatas[0], list) else []
         result_distances = distances[0] if distances and isinstance(distances[0], list) else []
 
-        chunks: List[RetrievalChunk] = []
+        candidates: Dict[str, Dict[str, Any]] = {}
+        vector_order: List[str] = []
         for index, snippet in enumerate(result_documents):
             if not isinstance(snippet, str) or not snippet.strip():
                 continue
-            metadata = result_metadatas[index] if index < len(result_metadatas) and isinstance(result_metadatas[index], dict) else {}
-            metadata = self._merge_live_asset_metadata(metadata)
-            distance = result_distances[index] if index < len(result_distances) else None
+            key = str(result_ids[index]) if index < len(result_ids) else f"vector-{index}"
+            vector_order.append(key)
+            candidates[key] = {
+                "snippet": snippet,
+                "metadata": result_metadatas[index] if index < len(result_metadatas) and isinstance(result_metadatas[index], dict) else {},
+                "distance": result_distances[index] if index < len(result_distances) else None,
+                "vector_rank": index,
+            }
+        hybrid_scores = self._hybrid_scores(collection, summary, user_message, candidates, vector_order, candidate_count, source_type)
+
+        chunks: List[RetrievalChunk] = []
+        for key, candidate in candidates.items():
+            snippet = candidate["snippet"]
+            metadata = self._merge_live_asset_metadata(candidate["metadata"])
             section = str(metadata.get("section") or "").strip()
             source_name = str(metadata.get("source_name") or metadata.get("source_path") or "artifact").strip() or "artifact"
             source_label = f"{source_name} :: {section}" if section and section != source_name else source_name
-            base_score = self._distance_to_score(distance, index)
+            if hybrid_scores is not None:
+                base_score = hybrid_scores.get(key, 1)
+            else:
+                base_score = self._distance_to_score(candidate["distance"], candidate["vector_rank"])
             reuse_bonus, reuse_reason = self._score_reusable_spl_bonus(user_message=user_message, metadata=metadata)
             if reuse_bonus:
                 metadata = dict(metadata)
@@ -1009,6 +1046,85 @@ class ArtifactSourceIndexer:
             )
         chunks.sort(key=lambda chunk: -(chunk.score or 0))
         return summary, chunks[:requested_results]
+
+    def _lexical_corpus(self, collection: Any, summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        count = int(summary.get("document_count") or 0)
+        if count <= 0 or count > MAX_LEXICAL_SCAN_DOCUMENTS:
+            return None
+        try:
+            summary_stamp = self.get_summary_path().stat().st_mtime_ns
+        except OSError:
+            summary_stamp = 0
+        key = (str(self.get_storage_dir()), self.get_collection_name(), str(summary.get("last_indexed_at") or ""), summary_stamp, count)
+        cached = _LEXICAL_CORPUS_CACHE.get(key)
+        if cached is not None:
+            return cached
+        try:
+            raw = collection.get(include=["documents", "metadatas"])
+        except Exception:
+            return None
+        ids = [str(item) for item in raw.get("ids") or []]
+        documents = [item if isinstance(item, str) else "" for item in raw.get("documents") or []]
+        metadatas = [item if isinstance(item, dict) else {} for item in raw.get("metadatas") or []]
+        if not ids or not len(ids) == len(documents) == len(metadatas):
+            return None
+        tokens = [_lexical_tokens(document, metadata) for document, metadata in zip(documents, metadatas)]
+        corpus = {"ids": ids, "documents": documents, "metadatas": metadatas, "tokens": tokens, "bm25": BM25(tokens)}
+        _LEXICAL_CORPUS_CACHE.clear()
+        _LEXICAL_CORPUS_CACHE[key] = corpus
+        return corpus
+
+    def _hybrid_scores(
+        self,
+        collection: Any,
+        summary: Dict[str, Any],
+        user_message: str,
+        candidates: Dict[str, Dict[str, Any]],
+        vector_order: List[str],
+        candidate_count: int,
+        source_type: Optional[str],
+    ) -> Optional[Dict[str, int]]:
+        """Fuse the hashed-vector ranking with BM25 so exact names and rare terms count; adds lexical-only matches to `candidates`."""
+        terms = ranking_query_terms(user_message)
+        if not terms:
+            return None
+        corpus = self._lexical_corpus(collection, summary)
+        lexical_order: List[str] = []
+        token_sets: Dict[str, set] = {}
+        if corpus is not None:
+            scores = corpus["bm25"].scores(terms)
+            eligible = [
+                position for position in scores
+                if not source_type or corpus["metadatas"][position].get("source_type") == source_type
+            ]
+            for position in sorted(eligible, key=lambda item: (-scores[item], item))[:candidate_count]:
+                key = corpus["ids"][position]
+                if key not in candidates:
+                    if not corpus["documents"][position].strip():
+                        continue
+                    candidates[key] = {
+                        "snippet": corpus["documents"][position],
+                        "metadata": corpus["metadatas"][position],
+                        "distance": None,
+                        "vector_rank": len(vector_order) + len(lexical_order),
+                    }
+                lexical_order.append(key)
+            positions = {key: position for position, key in enumerate(corpus["ids"])}
+            for key, candidate in candidates.items():
+                position = positions.get(key)
+                token_sets[key] = set(corpus["tokens"][position] if position is not None else _lexical_tokens(candidate["snippet"], candidate["metadata"]))
+        else:
+            keys = list(candidates)
+            tokens = [_lexical_tokens(candidates[key]["snippet"], candidates[key]["metadata"]) for key in keys]
+            lexical_order = [keys[position] for position, _score in BM25(tokens).top(terms, candidate_count)]
+            token_sets = {key: set(token_list) for key, token_list in zip(keys, tokens)}
+        fused = reciprocal_rank_fusion([(vector_order, KB_FUSION_WEIGHTS[0]), (lexical_order, KB_FUSION_WEIGHTS[1])])
+        best = best_possible_fusion(KB_FUSION_WEIGHTS)
+        result: Dict[str, int] = {}
+        for key in candidates:
+            coverage = len(matched_terms(terms, token_sets.get(key, set()))) / len(terms)
+            result[key] = max(1, min(100, int(round(100 * fused.get(key, 0.0) / best * coverage_weight(coverage)))))
+        return result
 
     def _documents_from_path(self, file_path: Path, source_root: Path) -> List[IndexedArtifactDocument]:
         if file_path.suffix.lower() == ".json":

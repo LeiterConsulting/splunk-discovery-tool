@@ -136,7 +136,7 @@ Every button should communicate purpose:
 - `POST /api/capabilities/rag/assets/import/text` → Import pasted text as a managed knowledge asset
 - `POST /api/capabilities/rag/assets/import/file` → Import a supported text-based file as a managed knowledge asset
 - `POST /api/capabilities/rag/assets/{asset_id}/delete` → Delete a managed knowledge asset
-- `POST /api/capabilities/rag/context/build` → Build an operator-facing context preview from indexed managed knowledge assets, including traceable chunk references for matched assets
+- `POST /api/capabilities/rag/context/build` → Build an operator-facing context preview from indexed managed knowledge assets, including traceable chunk references for matched assets, plus matching downloaded documentation in `details.library_matches` (documentation alone when the Knowledge Base is not ready)
 - `POST /api/capabilities/{name}/install` → Install or prepare a capability
 - `POST /api/capabilities/{name}/enable` → Enable an installed capability
 - `POST /api/capabilities/{name}/disable` → Disable a capability
@@ -148,8 +148,9 @@ Every button should communicate purpose:
 - `GET /api/knowledge-library/status` → Environment profile, loaded library sources, refresh job, coverage scorecard, gaps, and the matched catalog for the latest discovery
 - `POST /api/knowledge-library/settings` → Turn online library sources on or off (admin)
 - `POST /api/knowledge-library/refresh` → Download the library sources again in the background (admin; 409 while online sources are off)
-- `POST /api/knowledge-library/pack/import` → Load sources from a library pack zip (admin; 400 for an unusable pack, 409 during a refresh)
-- `GET /api/knowledge-library/pack/export` → Download the loaded sources as a library pack zip (404 when none are loaded)
+- `POST /api/knowledge-library/pack/import` → Load sources and documentation text from a library pack zip (admin; 400 for an unusable pack, 409 during a refresh or another import)
+- `GET /api/knowledge-library/pack/export` → Download the loaded sources and documentation text as a library pack zip (404 when none are loaded)
+- `POST /api/knowledge-library/search` → Rank downloaded Splunk documentation passages for a question, as chat does (400 for an empty question)
 - `GET /reports` → Report/session list
 
 ### Capability notes
@@ -166,11 +167,15 @@ Every button should communicate purpose:
 
 ### Knowledge library notes
 
-- `src/knowledge_library/` has no FastAPI dependency: `sources.py` fetches, sanitizes, stores, and packs the sources; `profile.py` reads the blueprint's `environment_profile`; `catalog.py` matches sourcetypes, apps, and documentation; `scorecard.py` scores coverage and lists gaps; `service.py` runs one background refresh at a time and builds the status payload
+- `src/knowledge_library/` has no FastAPI dependency: `sources.py` fetches, sanitizes, stores, and packs the sources; `profile.py` reads the blueprint's `environment_profile`; `catalog.py` matches sourcetypes, apps, and documentation; `docs.py` downloads, indexes, and ranks documentation text; `ranking.py` holds the shared ranking helpers; `scorecard.py` scores coverage and lists gaps; `service.py` runs one background refresh at a time and builds the status payload
 - Sources live under `output/knowledge_library/` as one JSON file per source, and the RAG indexer skips that folder
 - Online fetching is off by default (`config.library.allow_online_sources`). The HTTP client rejects any host outside `ALLOWED_HOSTS` and any non-HTTPS URL, including redirects
 - Pack imports rebuild each source with `sanitize_source_payload`, which reuses the fetchers' normalizers, so a pack cannot store fields or links that a download would not produce
 - When a scorecard dimension gains a new input, return `None` with a status (`needs_sources`, `needs_discovery`, `not_applicable`, `unavailable`) when the input is missing rather than a score of 0, and add a case in `tests/test_knowledge_library.py`
+- `docs.py` plans which help.splunk.com manuals to download from the environment profile (`build_doc_plan`), downloads them (`sync_docs`), and stores sections in `output/knowledge_library/docs/library_docs.sqlite3` (`DocIndex`). The index uses FTS5 when SQLite has it and a LIKE scan plus in-memory BM25 otherwise; it rebuilds the FTS table when chunks were written without it
+- Keep documentation downloads polite: `DOC_FETCH_CONCURRENCY`, `DOC_REQUEST_INTERVAL`, and `DOC_REFUSAL_LIMIT` bound the request rate, and `LibraryRefusedError` (HTTP 403 or 429) stops the run. help.splunk.com answers 403 to non-browser requests whose Accept header names `text/html`, so page requests send the HTTP client's default Accept header. Do not send a browser User-Agent
+- `ranking.py` holds the shared BM25, reciprocal rank fusion, `coverage_weight`, and `EnvironmentTerms`. The documentation ranker (`docs.rank_doc_results`) and the Knowledge Base indexer (`ArtifactSourceIndexer._hybrid_scores`) both use it, so scores stay comparable in the preview
+- Chat adds documentation through `get_optional_rag_context`, which runs only when the chat setting `enable_rag_context` is on
 
 ## 9) Quality Gates
 

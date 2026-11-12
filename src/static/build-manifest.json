@@ -1,13 +1,13 @@
 {
-  "built_at_utc": "2026-11-12T17:23:09.984Z",
+  "built_at_utc": "2026-11-12T20:00:41.434Z",
   "source": {
-    "legacy_html_sha256": "d54d686d543f131a698c8da5df7c16287c337a223ab75127c9981f61fe5adde3",
-    "app_source_sha256": "6ceee2ad37622c839369b8076a2a6f1337d90358a571dbdd184bc5134d048b20",
+    "legacy_html_sha256": "0a522bc7f6b2216056e871eb1dc3f7ffba3f319c6d71f42ef451458da7e7b782",
+    "app_source_sha256": "bc972466a12d47f588d31422e4484494076c06a66d954ce2187cf630268419f6",
     "tailwind_config_sha256": "2e0a2f943e914cff4e33e5da53b32c49dc451ea2653f94172808994f3b1d2809"
   },
   "artifacts": {
     "index_html_sha256": "26e8e1199fa7cc1b94495fb9176d20b779bf5bc41c60ca449307faedecb8cd54",
-    "app_js_sha256": "c14adcc2dc4c569be26d07412762e49156882dd37b8be12ad095a1e16b4fa181",
+    "app_js_sha256": "91c08913d98a549cf0123bbaf4abd5a6097f9bb363d3fb7be22fe42d6f7361cc",
     "app_css_sha256": "cc66314a826e852baeea62f3b3edd37d95866e838dbab811f2776d0c4a4ea811"
   },
   "runtime": {

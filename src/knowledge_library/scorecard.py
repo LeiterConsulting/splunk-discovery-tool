@@ -94,6 +94,7 @@ def build_scorecard(
     kb_assets: Optional[List[Dict[str, Any]]],
     sources_summary: Dict[str, Dict[str, Any]],
     now: Optional[datetime] = None,
+    doc_text: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     gaps: List[Dict[str, Any]] = []
@@ -317,6 +318,45 @@ def build_scorecard(
                 f"The library uses {docs.get('doc_version')}, the closest version it has. Some steps or settings can differ.",
                 "Confirm details against your version, or plan an upgrade to a version Splunk still documents.",
             ))
+
+    # Downloaded documentation text
+    if doc_text is not None:
+        coverage = doc_text.get("coverage") or {}
+        planned = int(coverage.get("planned_pages") or 0)
+        downloaded = int(coverage.get("downloaded_pages") or 0)
+        if "help_docs" not in loaded or doc_text.get("plan_status") == "needs_source":
+            dimensions.append(_dimension("doc_text", "Searchable documentation", None, "needs_sources", "Load the help.splunk.com source to plan which manuals to download."))
+        elif not planned:
+            dimensions.append(_dimension("doc_text", "Searchable documentation", None, "not_applicable", "No manuals on help.splunk.com match this environment."))
+        else:
+            dimensions.append(_dimension(
+                "doc_text", "Searchable documentation", coverage.get("pct") or 0, "ok",
+                f"{downloaded:,} of {planned:,} pages from {coverage.get('planned_manuals') or 0} manuals for your environment are downloaded for chat to search.",
+                downloaded, planned,
+            ))
+            if not downloaded:
+                gaps.append(_gap(
+                    "docs_not_downloaded", "medium", "documentation", "Splunk documentation text is not downloaded",
+                    f"Chat can search {planned:,} pages from the manuals for your version and installed apps once they are downloaded.",
+                    "Turn on online library sources and select Refresh sources, or import a library pack that includes documentation.",
+                ))
+            else:
+                missing_manuals = int(coverage.get("missing_manuals") or 0)
+                outdated_manuals = int(coverage.get("outdated_manuals") or 0)
+                if missing_manuals:
+                    gaps.append(_gap(
+                        "docs_missing", "low", "documentation",
+                        f"{missing_manuals} manual{'s are' if missing_manuals != 1 else ' is'} not downloaded yet",
+                        "They match your environment, but chat cannot search them until they are downloaded.",
+                        "Select Refresh sources, or import a newer library pack.",
+                    ))
+                if outdated_manuals:
+                    gaps.append(_gap(
+                        "docs_outdated", "low", "documentation",
+                        f"{outdated_manuals} downloaded manual{'s have' if outdated_manuals != 1 else ' has'} changes or missing pages",
+                        "help.splunk.com updated them after the download, or some pages could not be downloaded.",
+                        "Select Refresh sources to download them again.",
+                    ))
 
     # Knowledge Base coverage
     if kb_assets is None:
