@@ -216,7 +216,7 @@ install_deps() {
     elif command -v python &> /dev/null; then
         PYTHON_CMD="python"
     else
-        print_msg "$RED" "✗ Python 3 not found. Please install Python 3.8+"
+        print_msg "$RED" "✗ Python 3 not found. Please install Python 3.11+"
         exit 1
     fi
     

@@ -1,7 +1,7 @@
 # 🔍 Splunk Discovery Tool
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Version](https://img.shields.io/badge/version-1.1.0--dev-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases)
 
 > AI-powered Splunk environment discovery, operator workspaces, secured external access, and MCP-backed investigation.
@@ -23,7 +23,7 @@
 
 ### Required
 
-- Python 3.8+
+- Python 3.11+
 - pip
 - PowerShell 7+ (Windows only, if using `install.ps1`)
 

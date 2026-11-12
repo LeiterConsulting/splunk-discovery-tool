@@ -30,6 +30,8 @@ class CapabilityDefinition:
     install_method: str = "internal"
     dependency_packages: List[str] = field(default_factory=list)
     module_probes: List[str] = field(default_factory=list)
+    # Transitive packages the capability never imports; if pip cannot install them, install without them.
+    skippable_dependencies: List[str] = field(default_factory=list)
     default_config: Dict[str, Any] = field(default_factory=dict)
     runtime_available: bool = True
     requires_restart_on_install: bool = False

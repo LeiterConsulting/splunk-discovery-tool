@@ -157,6 +157,8 @@ class CapabilityInstallGuidanceTests(unittest.TestCase):
             self.assertIsInstance(guidance, dict)
             self.assertIn("pip appears to be missing a required wheel or native build toolchain", guidance.get("likely_issue", ""))
             self.assertIn("Upgrade pip, setuptools, and wheel", " ".join(guidance.get("next_steps", [])))
+            pip_install_calls = [call for call in mock_run.call_args_list if call.args[0][3:4] == ["install"]]
+            self.assertEqual(len(pip_install_calls), 1)
             self.assertTrue(any("chromadb" in command for command in guidance.get("install_commands", [])))
             self.assertIn("Could not build wheels for chromadb", guidance.get("diagnostic_excerpt", ""))
             self.assertIn("install_guidance", result.state)
@@ -191,6 +193,171 @@ class CapabilityInstallGuidanceTests(unittest.TestCase):
             self.assertIn("private mirror or offline repository", " ".join(guidance.get("next_steps", [])))
             self.assertTrue(any("pip config list" in command for command in guidance.get("install_commands", [])))
             self.assertIn("Looking in indexes: http://127.0.0.1:9/simple", guidance.get("diagnostic_excerpt", ""))
+
+
+ONNXRUNTIME_RESOLUTION_FAILURE = (
+    "ERROR: Cannot install chromadb==1.5.8 and chromadb==1.5.9 because these package versions have conflicting dependencies.\n"
+    "The conflict is caused by:\n"
+    "    chromadb 1.5.9 depends on onnxruntime>=1.14.1\n"
+    "    chromadb 1.5.8 depends on onnxruntime>=1.14.1\n"
+    "Additionally, some packages in these conflicts have no matching distributions available for your environment:\n"
+    "    onnxruntime\n"
+    "ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/\n"
+)
+
+CHROMADB_DECLARED_REQUIREMENTS = [
+    "pydantic>=2.0",
+    "uvicorn[standard]>=0.18.3",
+    "onnxruntime>=1.14.1",
+    "numpy>=1.22.5",
+    "graphlib-backport>=1.0.3 ; python_full_version < '3.9'",
+    "chroma-hnswlib==0.7.6 ; extra == 'dev'",
+]
+
+
+class ChromaInstallWithoutOnnxruntimeTests(unittest.TestCase):
+    def _manager(self, temp_dir: str) -> CapabilityManager:
+        manager = ConfigManager(str(Path(temp_dir) / "config.encrypted"))
+        return CapabilityManager(config_manager=manager, registry=CapabilityRegistry())
+
+    def _completed(self, returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=[sys.executable, "-m", "pip", "install"], returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _install(self, capability_manager: CapabilityManager, run_results: list, strategy=None):
+        with patch.object(capability_manager, "_dependencies_available", return_value=False):
+            with patch.object(capability_manager, "_load_pip_config_values", return_value={}):
+                with patch.object(capability_manager, "_resolve_version", return_value="1.5.9"):
+                    with patch("capabilities.install_manager.metadata.requires", return_value=list(CHROMADB_DECLARED_REQUIREMENTS)) as mock_requires:
+                        with patch("capabilities.install_manager.subprocess.run", side_effect=run_results) as mock_run:
+                            result = capability_manager.install_capability("rag_chromadb", strategy=strategy)
+        return result, mock_run, mock_requires
+
+    def test_retries_without_onnxruntime_when_pip_cannot_install_it(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            capability_manager = self._manager(temp_dir)
+            result, mock_run, mock_requires = self._install(
+                capability_manager,
+                [
+                    self._completed(1, stdout="Collecting chromadb\n", stderr=ONNXRUNTIME_RESOLUTION_FAILURE),
+                    self._completed(0, stdout="Successfully installed chromadb-1.5.9\n"),
+                    self._completed(0, stdout="Successfully installed pydantic numpy\n"),
+                ],
+            )
+
+        self.assertTrue(result.ok)
+        self.assertIn("Skipped onnxruntime", result.message)
+        self.assertEqual(result.details.get("skipped_dependencies"), ["onnxruntime"])
+        self.assertTrue(result.details.get("restart_required"))
+        self.assertEqual(mock_run.call_count, 3)
+        mock_requires.assert_called_once_with("chromadb")
+
+        first_command = mock_run.call_args_list[0].args[0]
+        self.assertIn("chromadb>=1.0,<2", first_command)
+        self.assertNotIn("--no-deps", first_command)
+
+        no_deps_command = mock_run.call_args_list[1].args[0]
+        self.assertEqual(no_deps_command[-2:], ["--no-deps", "chromadb>=1.0,<2"])
+
+        remaining_command = mock_run.call_args_list[2].args[0]
+        self.assertEqual(remaining_command[:4], [sys.executable, "-m", "pip", "install"])
+        self.assertEqual(
+            remaining_command[4:],
+            [
+                "pydantic>=2.0",
+                "uvicorn[standard]>=0.18.3",
+                "numpy>=1.22.5",
+                "graphlib-backport>=1.0.3 ; python_full_version < '3.9'",
+            ],
+        )
+
+    def test_does_not_retry_when_a_different_package_is_missing(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            capability_manager = self._manager(temp_dir)
+            result, mock_run, _ = self._install(
+                capability_manager,
+                [
+                    self._completed(
+                        1,
+                        stdout="Collecting onnxruntime>=1.14.1\n  Using cached onnxruntime-1.31.1.whl\nCollecting pybase64>=1.4.1\n",
+                        stderr=(
+                            "ERROR: Could not find a version that satisfies the requirement pybase64>=1.4.1 (from chromadb) (from versions: none)\n"
+                            "ERROR: No matching distribution found for pybase64>=1.4.1\n"
+                        ),
+                    ),
+                ],
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(result.details.get("skipped_dependencies"), [])
+        self.assertNotIn("skipped_dependencies", result.details.get("install_guidance", {}))
+
+    def test_failed_retry_reports_the_retry_output(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            capability_manager = self._manager(temp_dir)
+            result, mock_run, mock_requires = self._install(
+                capability_manager,
+                [
+                    self._completed(1, stderr=ONNXRUNTIME_RESOLUTION_FAILURE),
+                    self._completed(1, stderr="ERROR: Could not install packages due to an OSError: Connection reset by peer\n"),
+                ],
+                strategy="public_pypi",
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(mock_run.call_count, 2)
+        mock_requires.assert_not_called()
+        for call in mock_run.call_args_list:
+            self.assertIn("https://pypi.org/simple", call.args[0])
+            self.assertEqual(call.kwargs["env"].get("PIP_CONFIG_FILE"), os.devnull)
+        self.assertIn("--no-deps", mock_run.call_args_list[1].args[0])
+        self.assertEqual(result.details.get("skipped_dependencies"), ["onnxruntime"])
+        self.assertIn("Connection reset by peer", result.details.get("stderr", ""))
+        guidance = result.details.get("install_guidance")
+        self.assertEqual(guidance.get("skipped_dependencies"), ["onnxruntime"])
+        self.assertIn("retried without it", guidance.get("next_steps", [""])[0])
+        self.assertIn("Connection reset by peer", guidance.get("diagnostic_excerpt", ""))
+        self.assertNotIn("ResolutionImpossible", guidance.get("diagnostic_excerpt", ""))
+
+    def test_detects_each_pip_report_of_an_unavailable_onnxruntime(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            capability_manager = self._manager(temp_dir)
+            definition = capability_manager.registry.get_definition("rag_chromadb")
+            unavailable_outputs = [
+                ONNXRUNTIME_RESOLUTION_FAILURE,
+                "ERROR: Could not find a version that satisfies the requirement onnxruntime>=1.14.1 (from chromadb) (from versions: none)\n",
+                "ERROR: No matching distribution found for onnxruntime>=1.14.1\n",
+                "The conflict is caused by:\n    chromadb 1.0.0 depends on onnxruntime>=1.14.1\nERROR: ResolutionImpossible\n",
+            ]
+            available_outputs = [
+                "ERROR: No matching distribution found for onnxruntime-gpu>=1.14.1\n",
+                "Collecting onnxruntime>=1.14.1\nERROR: Could not build wheels for numpy\n",
+            ]
+            for output in unavailable_outputs:
+                with self.subTest(output=output):
+                    self.assertEqual(
+                        capability_manager._unavailable_skippable_dependencies(definition, self._completed(1, stderr=output)),
+                        ["onnxruntime"],
+                    )
+            for output in available_outputs:
+                with self.subTest(output=output):
+                    self.assertEqual(
+                        capability_manager._unavailable_skippable_dependencies(definition, self._completed(1, stderr=output)),
+                        [],
+                    )
+
+    def test_install_guidance_quotes_the_version_range(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            capability_manager = self._manager(temp_dir)
+            with patch.dict(os.environ, {"PIP_INDEX_URL": "https://repo.example.invalid/simple"}, clear=False):
+                with patch.object(capability_manager, "_load_pip_config_values", return_value={}):
+                    definition = capability_manager.registry.get_definition("rag_chromadb")
+                    config = capability_manager._get_or_create_config(definition)
+                    guidance = capability_manager._build_install_guidance(definition, config, failure_text="failed")
+
+        self.assertIn(f'"{sys.executable}" -m pip install "chromadb>=1.0,<2"', guidance.get("install_commands", []))
+        alternative_commands = [command for method in guidance.get("alternative_methods", []) for command in method.get("commands", [])]
+        self.assertTrue(any(command.endswith('--no-cache-dir "chromadb>=1.0,<2"') for command in alternative_commands))
 
 
 class ConfigManagerSecurityFoundationTests(unittest.TestCase):

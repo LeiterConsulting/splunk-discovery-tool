@@ -82,8 +82,11 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
             "Shows which passages chat would use before you ask.",
         ],
         install_method="pip",
-        dependency_packages=["chromadb"],
+        dependency_packages=["chromadb>=1.0,<2"],
         module_probes=["chromadb"],
+        # chromadb needs onnxruntime only for its default embedding model, and the indexer supplies its own
+        # embedding function. onnxruntime often lags new Python releases.
+        skippable_dependencies=["onnxruntime"],
         default_config={
             "source_dir": "output",
             "allowed_extensions": [".md", ".txt", ".json"],
