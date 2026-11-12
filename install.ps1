@@ -45,9 +45,9 @@ if ($psVersion -lt 7) {
 # Check for Python immediately
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Host ""
-    Write-Host "ERROR: Python 3.8+ is required but not found" -ForegroundColor Red
+    Write-Host "ERROR: Python 3.11+ is required but not found" -ForegroundColor Red
     Write-Host ""
-    Write-Host "Please install Python 3.8+ using one of these methods:" -ForegroundColor Cyan
+    Write-Host "Please install Python 3.11+ using one of these methods:" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Option 1 - Install via Microsoft Store (easiest):" -ForegroundColor White
     Write-Host "    1. Open Microsoft Store" -ForegroundColor Gray

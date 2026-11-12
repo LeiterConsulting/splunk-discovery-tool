@@ -1,5 +1,6 @@
 """Capability install, state, and health orchestration."""
 
+import importlib
 import os
 import re
 import subprocess
@@ -54,6 +55,15 @@ class CapabilityManager:
             re.compile(r"permission denied|access is denied|not permitted|winerror 5", re.IGNORECASE),
             "The install failed because the current Python environment does not have permission to modify packages.",
         ),
+    ]
+
+    # pip reports a dependency it cannot install in several forms, depending on the pip version and on how many
+    # versions of the parent package it tried.
+    _unavailable_dependency_patterns = [
+        r"no matching distribution found for\s+{name}(?![\w.-])",
+        r"could not find a version that satisfies the requirement\s+{name}(?![\w.-])",
+        r"no matching distributions available for your environment:(?:\s+[\w.-]+)*?\s+{name}(?![\w.-])",
+        r"(?s)depends on\s+{name}(?![\w.-]).*resolutionimpossible",
     ]
 
     def __init__(self, config_manager, registry: Optional[CapabilityRegistry] = None, health_service: Optional[CapabilityHealthService] = None):
@@ -893,9 +903,14 @@ class CapabilityManager:
 
         command, install_env = self._build_python_install_command(definition, strategy=strategy)
         strategy_label = " using the alternate public PyPI method" if strategy == "public_pypi" else ""
+        skipped_dependencies: list[str] = []
 
         try:
             completed = subprocess.run(command, capture_output=True, text=True, timeout=600, check=False, env=install_env)
+            if completed.returncode != 0:
+                skipped_dependencies = self._unavailable_skippable_dependencies(definition, completed)
+                if skipped_dependencies:
+                    completed = self._install_without_dependencies(definition, skipped_dependencies, strategy=strategy)
         except Exception as exc:
             config.last_error = str(exc)
             config.health_message = "Capability is not installed. The last install attempt failed; review the install guidance and retry."
@@ -909,7 +924,13 @@ class CapabilityManager:
                 details={
                     "error": str(exc),
                     "strategy": strategy,
-                    "install_guidance": self._build_install_guidance(definition, config, failure_text=str(exc)),
+                    "skipped_dependencies": skipped_dependencies,
+                    "install_guidance": self._build_install_guidance(
+                        definition,
+                        config,
+                        failure_text=str(exc),
+                        skipped_dependencies=skipped_dependencies,
+                    ),
                 },
             )
 
@@ -928,12 +949,14 @@ class CapabilityManager:
                     "stderr": completed.stderr[-4000:],
                     "stdout": completed.stdout[-4000:],
                     "strategy": strategy,
+                    "skipped_dependencies": skipped_dependencies,
                     "install_guidance": self._build_install_guidance(
                         definition,
                         config,
                         return_code=completed.returncode,
                         stdout=completed.stdout,
                         stderr=completed.stderr,
+                        skipped_dependencies=skipped_dependencies,
                     ),
                 },
             )
@@ -944,21 +967,110 @@ class CapabilityManager:
         config.restart_required = bool(definition.requires_restart_on_install)
         config.last_error = None
         self.config_manager.save_capability(config)
+        message = f"Capability installed successfully{strategy_label}."
+        if skipped_dependencies:
+            message = f"{message} {self._describe_skipped_dependencies(skipped_dependencies)}"
         return CapabilityActionResult(
             ok=True,
             capability=definition.name,
             action="install",
-            message=f"Capability installed successfully{strategy_label}.",
+            message=message,
             state=self.get_capability_state(definition.name),
             details={
                 "restart_required": config.restart_required,
                 "stdout": completed.stdout[-4000:],
                 "strategy": strategy,
+                "skipped_dependencies": skipped_dependencies,
             },
         )
 
-    def _build_python_install_command(self, definition: CapabilityDefinition, strategy: Optional[str] = None) -> tuple[list[str], Optional[Dict[str, str]]]:
-        command = [sys.executable, "-m", "pip", "install", *definition.dependency_packages]
+    def _unavailable_skippable_dependencies(
+        self,
+        definition: CapabilityDefinition,
+        completed: subprocess.CompletedProcess,
+    ) -> list[str]:
+        output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+        unavailable: list[str] = []
+        for name in definition.skippable_dependencies:
+            escaped_name = re.escape(name)
+            if any(
+                re.search(pattern.format(name=escaped_name), output, re.IGNORECASE)
+                for pattern in self._unavailable_dependency_patterns
+            ):
+                unavailable.append(name)
+        return unavailable
+
+    def _install_without_dependencies(
+        self,
+        definition: CapabilityDefinition,
+        skipped_dependencies: list[str],
+        strategy: Optional[str] = None,
+    ) -> subprocess.CompletedProcess:
+        command, install_env = self._build_python_install_command(definition, strategy=strategy, extra_args=["--no-deps"])
+        steps = [subprocess.run(command, capture_output=True, text=True, timeout=600, check=False, env=install_env)]
+        if steps[-1].returncode == 0:
+            remaining = self._remaining_requirements(definition, skipped_dependencies)
+            if remaining:
+                command, install_env = self._build_python_install_command(definition, strategy=strategy, packages=remaining)
+                steps.append(subprocess.run(command, capture_output=True, text=True, timeout=600, check=False, env=install_env))
+        return subprocess.CompletedProcess(
+            args=steps[-1].args,
+            returncode=steps[-1].returncode,
+            stdout="".join(step.stdout or "" for step in steps),
+            stderr="".join(step.stderr or "" for step in steps),
+        )
+
+    def _remaining_requirements(self, definition: CapabilityDefinition, skipped_dependencies: list[str]) -> list[str]:
+        """Return what the installed packages declare, minus skipped dependencies and optional extras."""
+        importlib.invalidate_caches()
+        skipped_names = {self._normalize_distribution_name(name) for name in skipped_dependencies}
+        remaining: list[str] = []
+        for package in definition.dependency_packages:
+            for declared in metadata.requires(self._requirement_name(package)) or []:
+                name = self._requirement_name(declared)
+                if not name or self._normalize_distribution_name(name) in skipped_names:
+                    continue
+                if re.search(r";.*\bextra\s*==", declared):
+                    continue
+                if declared not in remaining:
+                    remaining.append(declared)
+        return remaining
+
+    @staticmethod
+    def _requirement_name(requirement: str) -> str:
+        match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", str(requirement or ""))
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _normalize_distribution_name(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", str(name or "")).lower()
+
+    @staticmethod
+    def _describe_skipped_dependencies(skipped_dependencies: list[str], retry_failed: bool = False) -> str:
+        names = ", ".join(skipped_dependencies)
+        pronoun = "it" if len(skipped_dependencies) == 1 else "them"
+        if retry_failed:
+            return (
+                f"pip could not install {names} in this environment, so the app retried without {pronoun}. "
+                f"This capability does not use {pronoun}. The retry also failed, and the output below comes from the retry."
+            )
+        return f"Skipped {names} because pip could not install {pronoun} in this environment. This capability does not use {pronoun}."
+
+    @staticmethod
+    def _format_install_target(definition: CapabilityDefinition) -> str:
+        packages = definition.dependency_packages or [definition.name]
+        # Quote version specifiers so shells do not treat < or > as redirection.
+        return " ".join(package if re.fullmatch(r"[A-Za-z0-9._-]+", package) else f'"{package}"' for package in packages)
+
+    def _build_python_install_command(
+        self,
+        definition: CapabilityDefinition,
+        strategy: Optional[str] = None,
+        packages: Optional[list[str]] = None,
+        extra_args: Optional[list[str]] = None,
+    ) -> tuple[list[str], Optional[Dict[str, str]]]:
+        targets = [*(extra_args or []), *(definition.dependency_packages if packages is None else packages)]
+        command = [sys.executable, "-m", "pip", "install", *targets]
         install_env: Optional[Dict[str, str]] = None
 
         if strategy == "public_pypi":
@@ -970,7 +1082,7 @@ class CapabilityManager:
                 "--index-url",
                 "https://pypi.org/simple",
                 "--no-cache-dir",
-                *definition.dependency_packages,
+                *targets,
             ]
             install_env = os.environ.copy()
             install_env.pop("PIP_INDEX_URL", None)
@@ -988,11 +1100,12 @@ class CapabilityManager:
         return_code: Optional[int] = None,
         stdout: str = "",
         stderr: str = "",
+        skipped_dependencies: Optional[list[str]] = None,
     ) -> Dict[str, Any]:
         if definition.install_method != "pip":
             return {}
 
-        install_target = " ".join(definition.dependency_packages) or definition.name
+        install_target = self._format_install_target(definition)
         runtime_profile = self._build_pip_install_preflight(definition)
         combined_output = "\n".join(
             part.strip()
@@ -1066,6 +1179,13 @@ class CapabilityManager:
             guidance["likely_issue"] = likely_issue
             guidance["next_steps"] = [likely_issue, *guidance["next_steps"]]
 
+        if skipped_dependencies:
+            guidance["skipped_dependencies"] = list(skipped_dependencies)
+            guidance["next_steps"] = [
+                self._describe_skipped_dependencies(skipped_dependencies, retry_failed=True),
+                *guidance["next_steps"],
+            ]
+
         diagnostic_excerpt = combined_output[-1600:] if combined_output else ""
         if diagnostic_excerpt:
             guidance["diagnostic_excerpt"] = diagnostic_excerpt
@@ -1114,7 +1234,7 @@ class CapabilityManager:
         return "no matching distribution found" in normalized_excerpt or "could not find a version" in normalized_excerpt
 
     def _build_pip_install_preflight(self, definition: CapabilityDefinition) -> Dict[str, Any]:
-        install_target = " ".join(definition.dependency_packages) or definition.name
+        install_target = self._format_install_target(definition)
         env_index = str(os.environ.get("PIP_INDEX_URL") or "").strip()
         env_extra_indexes = self._split_pip_index_value(os.environ.get("PIP_EXTRA_INDEX_URL") or "")
         env_no_index = _coerce_bool(os.environ.get("PIP_NO_INDEX"), False)
