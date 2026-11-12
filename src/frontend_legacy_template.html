@@ -2184,6 +2184,9 @@
             const [ragContextQuery, setRagContextQuery] = useState('');
             const [ragContextLimit, setRagContextLimit] = useState(4);
             const [ragLibraryFilter, setRagLibraryFilter] = useState('all');
+            const [knowledgeLibrary, setKnowledgeLibrary] = useState({ status: 'idle', data: null, error: '', action: '', message: null });
+            const [showAllLibraryGaps, setShowAllLibraryGaps] = useState(false);
+            const libraryPackInputRef = useRef(null);
             const [headerHeight, setHeaderHeight] = useState(88);
 
             // MCP Configuration Vault State
@@ -3894,6 +3897,20 @@
             }, [workspaceTab]);
 
             useEffect(() => {
+                if (isCapabilitiesRagView) {
+                    loadKnowledgeLibrary();
+                }
+            }, [isCapabilitiesRagView]);
+
+            useEffect(() => {
+                if (!isCapabilitiesRagView || knowledgeLibrary.data?.refresh?.state !== 'running') {
+                    return undefined;
+                }
+                const timer = setTimeout(() => loadKnowledgeLibrary({ silent: true }), 3000);
+                return () => clearTimeout(timer);
+            }, [isCapabilitiesRagView, knowledgeLibrary.data]);
+
+            useEffect(() => {
                 if (!showM2614WorkspaceTab && workspaceTab === 'm26-14') {
                     setWorkspaceTab('mission');
                 }
@@ -4628,6 +4645,84 @@
                         ...prev,
                         status: 'error',
                         error: error.message || 'Could not load the library.'
+                    }));
+                }
+            };
+
+            const LIBRARY_SOURCE_LABELS = {
+                security_content: 'Splunk Security Content',
+                splunkbase: 'Splunkbase',
+                help_docs: 'help.splunk.com',
+            };
+
+            const getLibraryErrorMessage = (result, fallback) => {
+                if (typeof result?.detail === 'string' && result.detail) {
+                    return result.detail;
+                }
+                if (typeof result?.message === 'string' && result.message) {
+                    return result.message;
+                }
+                return fallback;
+            };
+
+            const loadKnowledgeLibrary = async (options = {}) => {
+                if (!options.silent) {
+                    setKnowledgeLibrary(prev => ({ ...prev, status: 'loading', error: '' }));
+                }
+                try {
+                    const response = await fetch('/api/knowledge-library/status');
+                    const result = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(getLibraryErrorMessage(result, `HTTP ${response.status}`));
+                    }
+                    setKnowledgeLibrary(prev => ({ ...prev, status: 'success', data: result, error: '' }));
+                } catch (error) {
+                    console.error('Failed to load library health:', error);
+                    setKnowledgeLibrary(prev => ({ ...prev, status: 'error', error: error.message || 'Could not check library health.' }));
+                }
+            };
+
+            const runKnowledgeLibraryRequest = async (action, url, options = {}) => {
+                setKnowledgeLibrary(prev => ({ ...prev, action, message: null }));
+                try {
+                    const response = await fetch(url, options);
+                    const result = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(getLibraryErrorMessage(result, `HTTP ${response.status}`));
+                    }
+                    setKnowledgeLibrary(prev => ({ ...prev, status: 'success', data: result, error: '', action: '' }));
+                    return result;
+                } catch (error) {
+                    console.error(`Library request failed (${action}):`, error);
+                    setKnowledgeLibrary(prev => ({
+                        ...prev,
+                        action: '',
+                        message: { type: 'error', text: error.message || 'That did not work. Try again.' },
+                    }));
+                    return null;
+                }
+            };
+
+            const setKnowledgeLibraryOnline = (allowOnline) => runKnowledgeLibraryRequest('settings', '/api/knowledge-library/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ allow_online_sources: !!allowOnline }),
+            });
+
+            const refreshKnowledgeLibrarySources = () => runKnowledgeLibraryRequest('refresh', '/api/knowledge-library/refresh', { method: 'POST' });
+
+            const importKnowledgeLibraryPack = async (file) => {
+                if (!file) {
+                    return;
+                }
+                const formData = new FormData();
+                formData.append('file', file);
+                const result = await runKnowledgeLibraryRequest('import', '/api/knowledge-library/pack/import', { method: 'POST', body: formData });
+                const imported = Array.isArray(result?.import_result?.imported) ? result.import_result.imported : [];
+                if (imported.length > 0) {
+                    setKnowledgeLibrary(prev => ({
+                        ...prev,
+                        message: { type: 'success', text: `Imported ${imported.map((name) => LIBRARY_SOURCE_LABELS[name] || name).join(', ')}.` },
                     }));
                 }
             };
@@ -6227,6 +6322,9 @@
                     setRagLibraryFilter(options.libraryFilter);
                 }
                 loadCapabilities();
+                if (isCapabilitiesRagView) {
+                    loadKnowledgeLibrary({ silent: true });
+                }
             };
 
             const openCapabilityDetail = (name) => {
@@ -7822,6 +7920,323 @@
                 );
             };
 
+            const getLibraryScoreClass = (score) => {
+                if (typeof score !== 'number') {
+                    return mutedTextClass;
+                }
+                if (score >= 80) {
+                    return isDarkTheme ? 'text-emerald-300' : 'text-emerald-700';
+                }
+                if (score >= 50) {
+                    return isDarkTheme ? 'text-amber-300' : 'text-amber-700';
+                }
+                return isDarkTheme ? 'text-rose-300' : 'text-rose-700';
+            };
+
+            const getLibraryPriorityClass = (priority) => {
+                switch (priority) {
+                    case 'high':
+                        return isDarkTheme ? 'bg-rose-950 text-rose-100 border border-rose-800' : 'bg-rose-50 text-rose-700 border border-rose-200';
+                    case 'medium':
+                        return isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-50 text-amber-800 border border-amber-200';
+                    default:
+                        return isDarkTheme ? 'bg-slate-800 text-slate-200 border border-slate-600' : 'bg-slate-100 text-slate-700 border border-slate-300';
+                }
+            };
+
+            const LIBRARY_DIMENSION_STATUS_LABELS = {
+                needs_sources: 'Needs sources',
+                needs_discovery: 'Run discovery again',
+                not_applicable: 'Not applicable',
+                unavailable: 'Unavailable',
+            };
+
+            const describeLibraryRefresh = (refresh) => {
+                if (!refresh || !refresh.state || refresh.state === 'idle') {
+                    return '';
+                }
+                if (refresh.state === 'running') {
+                    const stage = LIBRARY_SOURCE_LABELS[refresh.stage] || 'sources';
+                    const progress = refresh.total ? ` (${refresh.done || 0} of ${refresh.total})` : '';
+                    return `Refreshing ${stage}${progress}. This can take a few minutes.`;
+                }
+                const label = {
+                    completed: 'Last refresh finished',
+                    partial: 'Last refresh finished with errors',
+                    failed: 'Last refresh failed',
+                }[refresh.state] || 'Last refresh';
+                return refresh.finished_at ? `${label} ${formatMissionDateTime(refresh.finished_at)}.` : `${label}.`;
+            };
+
+            const isSafeLibraryLink = (url) => typeof url === 'string' && url.startsWith('https://');
+
+            const renderKnowledgeLibraryPanel = () => {
+                const data = knowledgeLibrary.data;
+                const tileClass = `rounded-lg p-3 border ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`;
+                const linkClass = isDarkTheme ? 'text-indigo-300 hover:text-indigo-200 underline' : 'text-indigo-700 hover:text-indigo-900 underline';
+
+                if (!data) {
+                    return (
+                        <section data-testid="knowledge-library-panel" aria-labelledby="knowledge-library-title" className={`rounded-lg shadow-sm p-6 border ${panelClass}`}>
+                            <h3 id="knowledge-library-title" className={`text-base font-semibold ${headingClass}`}>Library health</h3>
+                            {knowledgeLibrary.status === 'error' ? (
+                                <div className="mt-2 flex flex-wrap items-center gap-3">
+                                    <p className={`text-sm ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{knowledgeLibrary.error || 'Could not check library health.'}</p>
+                                    <button type="button" onClick={() => loadKnowledgeLibrary()} className={getCapabilityActionButtonClass(false, false)}>Try again</button>
+                                </div>
+                            ) : (
+                                <p className={`mt-2 text-sm ${subtextClass}`}>Checking library health...</p>
+                            )}
+                        </section>
+                    );
+                }
+
+                const scorecard = data.scorecard || {};
+                const profile = data.profile || {};
+                const splunk = profile.splunk || {};
+                const apps = profile.apps || {};
+                const refresh = data.refresh || {};
+                const settings = data.settings || {};
+                const isRefreshing = refresh.state === 'running';
+                const busyAction = knowledgeLibrary.action;
+                const canManage = !!data.can_manage;
+                const allowOnline = !!settings.allow_online_sources;
+                const dimensions = Array.isArray(scorecard.dimensions) ? scorecard.dimensions : [];
+                const gaps = Array.isArray(scorecard.gaps) ? scorecard.gaps : [];
+                const gapCounts = scorecard.gap_counts || {};
+                const visibleGaps = showAllLibraryGaps ? gaps : gaps.slice(0, 6);
+                const sources = Array.isArray(data.sources) ? data.sources : [];
+                const anySourceLoaded = sources.some((source) => source.available);
+                const platformDocs = data.catalog?.platform_docs || {};
+                const docLinks = [
+                    ...(Array.isArray(platformDocs.manuals) ? platformDocs.manuals : []),
+                    ...(Array.isArray(data.catalog?.app_docs) ? data.catalog.app_docs : []),
+                ].filter((entry) => isSafeLibraryLink(entry?.url));
+                const deploymentLabel = { cloud: 'Splunk Cloud Platform', enterprise: 'Splunk Enterprise' }[splunk.deployment_type] || 'Splunk';
+                const refreshText = describeLibraryRefresh(refresh);
+                const failedResults = isRefreshing ? [] : Object.entries(refresh.results || {}).filter(([, result]) => result?.status === 'error');
+                const profileFacts = profile.available ? [
+                    `${deploymentLabel}${splunk.version ? ` ${splunk.version}` : ''}`,
+                    apps.collected ? `${apps.total || 0} apps (${apps.addons || 0} not built in)` : null,
+                    `${profile.sourcetype_count || 0} sourcetypes`,
+                    profile.discovery?.generated_at ? `Discovery ${formatMissionDateTime(profile.discovery.generated_at)}` : null,
+                ].filter(Boolean) : [];
+
+                return (
+                    <section data-testid="knowledge-library-panel" aria-labelledby="knowledge-library-title" className={`rounded-lg shadow-sm p-6 border ${panelClass}`}>
+                        <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                            <div className="min-w-0 max-w-3xl">
+                                <h3 id="knowledge-library-title" className={`text-base font-semibold ${headingClass}`}>Library health</h3>
+                                <p className={`mt-1 text-sm ${subtextClass}`}>How well the reference library covers the Splunk environment from your latest discovery, and what to fix first.</p>
+                                {profileFacts.length > 0 && (
+                                    <p data-testid="knowledge-library-profile" className={`mt-1 text-xs ${mutedTextClass}`}>{profileFacts.join(' · ')}</p>
+                                )}
+                            </div>
+                            <div className="lg:flex-shrink-0 lg:text-right">
+                                <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>Overall score</div>
+                                <div data-testid="knowledge-library-score" className={`text-3xl font-semibold mt-1 ${getLibraryScoreClass(scorecard.overall_score)}`}>
+                                    {typeof scorecard.overall_score === 'number' ? `${scorecard.overall_score}%` : 'Not scored'}
+                                </div>
+                            </div>
+                        </div>
+
+                        {dimensions.length > 0 && (
+                            <div data-testid="knowledge-library-dimensions" className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-5">
+                                {dimensions.map((dimension) => (
+                                    <div key={dimension.key} className={tileClass}>
+                                        <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>{dimension.label}</div>
+                                        <div className={`mt-1 ${typeof dimension.score === 'number' ? `text-2xl font-semibold ${getLibraryScoreClass(dimension.score)}` : `text-sm font-semibold ${headingClass}`}`}>
+                                            {typeof dimension.score === 'number' ? `${dimension.score}%` : (LIBRARY_DIMENSION_STATUS_LABELS[dimension.status] || 'Not scored')}
+                                        </div>
+                                        {dimension.basis && (
+                                            <div className={`mt-1 text-xs ${subtextClass}`}>{dimension.basis}</div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        <div className="mt-5">
+                            <div className="flex flex-wrap items-center gap-2">
+                                <h4 className={`text-sm font-semibold ${headingClass}`}>What to fix</h4>
+                                {gaps.length > 0 && (
+                                    <span className={`text-xs ${mutedTextClass}`}>
+                                        {gapCounts.high || 0} high, {gapCounts.medium || 0} medium, {gapCounts.low || 0} low
+                                    </span>
+                                )}
+                            </div>
+                            {gaps.length === 0 ? (
+                                <p className={`mt-2 text-sm ${subtextClass}`}>Nothing to fix right now.</p>
+                            ) : (
+                                <ul data-testid="knowledge-library-gaps" className="mt-2 space-y-2">
+                                    {visibleGaps.map((gap) => (
+                                        <li key={gap.id} className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getLibraryPriorityClass(gap.priority)}`}>
+                                                    {gap.priority === 'high' ? 'High' : (gap.priority === 'medium' ? 'Medium' : 'Low')}
+                                                </span>
+                                                <span className={`text-sm font-medium break-words ${headingClass}`}>{gap.title}</span>
+                                            </div>
+                                            {gap.detail && <div className={`mt-1 text-xs break-words ${subtextClass}`}>{gap.detail}</div>}
+                                            {gap.action && <div className={`mt-1 text-xs font-medium break-words ${headingClass}`}>{gap.action}</div>}
+                                            {isSafeLibraryLink(gap.url) && (
+                                                <a href={gap.url} target="_blank" rel="noopener noreferrer" className={`mt-1 inline-block text-xs ${linkClass}`}>Open on Splunkbase</a>
+                                            )}
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                            {gaps.length > 6 && (
+                                <button
+                                    type="button"
+                                    onClick={() => setShowAllLibraryGaps(prev => !prev)}
+                                    className={`mt-2 text-xs font-medium ${linkClass}`}
+                                >
+                                    {showAllLibraryGaps ? 'Show fewer' : `Show all ${gaps.length}`}
+                                </button>
+                            )}
+                        </div>
+
+                        {docLinks.length > 0 && (
+                            <div className="mt-5">
+                                <h4 className={`text-sm font-semibold ${headingClass}`}>Documentation for your environment</h4>
+                                <p className={`mt-1 text-xs ${mutedTextClass}`}>
+                                    {platformDocs.doc_version
+                                        ? `${platformDocs.product_title || deploymentLabel} ${platformDocs.doc_version} manuals on help.splunk.com.`
+                                        : 'Manuals on help.splunk.com.'}
+                                </p>
+                                <ul data-testid="knowledge-library-docs" className="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2">
+                                    {docLinks.map((entry) => (
+                                        <li key={entry.entry_id || entry.url} className={`rounded-lg border px-3 py-2 ${panelMutedClass}`}>
+                                            <a href={entry.url} target="_blank" rel="noopener noreferrer" className={`text-sm font-medium ${linkClass}`}>{entry.title}</a>
+                                            <div className={`mt-0.5 text-xs ${subtextClass}`}>
+                                                {[entry.reason, entry.version ? `Version ${entry.version}` : null, entry.page_count ? `${Number(entry.page_count).toLocaleString()} pages` : null].filter(Boolean).join(' · ')}
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+
+                        <div className="mt-5">
+                            <h4 className={`text-sm font-semibold ${headingClass}`}>Sources</h4>
+                            <div data-testid="knowledge-library-sources" className="mt-2 grid grid-cols-1 xl:grid-cols-3 gap-3">
+                                {sources.map((source) => (
+                                    <div key={source.name} className={tileClass}>
+                                        <div className={`text-sm font-medium ${headingClass}`}>{source.title}</div>
+                                        <div className={`mt-1 text-xs ${source.available ? subtextClass : mutedTextClass}`}>
+                                            {source.available
+                                                ? [
+                                                    source.fetched_at ? `Updated ${formatMissionDateTime(source.fetched_at)}` : 'Loaded',
+                                                    typeof source.count === 'number' ? `${source.count.toLocaleString()} ${source.name === 'help_docs' ? 'pages' : (source.name === 'splunkbase' ? 'apps' : 'data sources')}` : null,
+                                                    source.version ? `Release ${source.version}` : null,
+                                                ].filter(Boolean).join(' · ')
+                                                : 'Not loaded'}
+                                        </div>
+                                        {source.available && (
+                                            <div className={`mt-1 text-xs ${mutedTextClass}`}>
+                                                {source.origin === 'pack'
+                                                    ? `From a library pack${source.pack_created_at ? ` created ${formatMissionDateTime(source.pack_created_at)}` : ''}`
+                                                    : 'Downloaded online'}
+                                            </div>
+                                        )}
+                                        <div className={`mt-1 text-xs ${mutedTextClass}`}>{source.license}</div>
+                                    </div>
+                                ))}
+                            </div>
+
+                            {canManage ? (
+                                <div className="mt-4 space-y-3">
+                                    <label className="flex items-start gap-2 text-sm cursor-pointer">
+                                        <input
+                                            type="checkbox"
+                                            data-testid="knowledge-library-online-toggle"
+                                            checked={allowOnline}
+                                            disabled={!!busyAction}
+                                            onChange={(event) => setKnowledgeLibraryOnline(event.target.checked)}
+                                            className="mt-1"
+                                        />
+                                        <span>
+                                            <span className={`font-medium ${headingClass}`}>Download sources from the internet</span>
+                                            <span className={`block text-xs ${subtextClass}`}>
+                                                Connects only to {(Array.isArray(settings.online_hosts) ? settings.online_hosts : []).join(', ')}. Sources download when you turn this on and update every {settings.auto_refresh_days || 7} days. On networks without internet access, leave this off and import a library pack.
+                                            </span>
+                                        </span>
+                                    </label>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <button
+                                            type="button"
+                                            data-testid="knowledge-library-refresh-button"
+                                            onClick={refreshKnowledgeLibrarySources}
+                                            disabled={!allowOnline || isRefreshing || !!busyAction}
+                                            title={allowOnline ? undefined : 'Turn on internet downloads first.'}
+                                            className={getCapabilityActionButtonClass(true, !allowOnline || isRefreshing || !!busyAction)}
+                                        >
+                                            {isRefreshing || busyAction === 'refresh' ? 'Refreshing...' : 'Refresh sources'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            data-testid="knowledge-library-import-button"
+                                            onClick={() => libraryPackInputRef.current?.click()}
+                                            disabled={isRefreshing || !!busyAction}
+                                            className={getCapabilityActionButtonClass(false, isRefreshing || !!busyAction)}
+                                        >
+                                            {busyAction === 'import' ? 'Importing...' : 'Import library pack'}
+                                        </button>
+                                        <input
+                                            ref={libraryPackInputRef}
+                                            type="file"
+                                            accept=".zip,application/zip"
+                                            className="hidden"
+                                            data-testid="knowledge-library-import-input"
+                                            onChange={(event) => {
+                                                const file = event.target.files && event.target.files[0];
+                                                event.target.value = '';
+                                                importKnowledgeLibraryPack(file);
+                                            }}
+                                        />
+                                        {anySourceLoaded && (
+                                            <a href="/api/knowledge-library/pack/export" download data-testid="knowledge-library-export-link" className={getCapabilityActionButtonClass(false, false)}>
+                                                Export library pack
+                                            </a>
+                                        )}
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="mt-4 flex flex-wrap items-center gap-3">
+                                    <p className={`text-xs ${subtextClass}`}>Only admins can change library sources.</p>
+                                    {anySourceLoaded && (
+                                        <a href="/api/knowledge-library/pack/export" download data-testid="knowledge-library-export-link" className={getCapabilityActionButtonClass(false, false)}>
+                                            Export library pack
+                                        </a>
+                                    )}
+                                </div>
+                            )}
+
+                            {refreshText && (
+                                <p data-testid="knowledge-library-refresh-status" className={`mt-3 text-xs ${isRefreshing ? headingClass : mutedTextClass}`}>{refreshText}</p>
+                            )}
+                            {failedResults.length > 0 && (
+                                <ul className={`mt-1 space-y-1 text-xs ${isDarkTheme ? 'text-amber-200' : 'text-amber-800'}`}>
+                                    {failedResults.map(([name, result]) => (
+                                        <li key={name} className="break-words">{LIBRARY_SOURCE_LABELS[name] || 'Refresh'}: {result.error || 'failed'}</li>
+                                    ))}
+                                </ul>
+                            )}
+                            {knowledgeLibrary.message && (
+                                <p
+                                    data-testid="knowledge-library-message"
+                                    role={knowledgeLibrary.message.type === 'error' ? 'alert' : 'status'}
+                                    className={`mt-3 text-sm ${knowledgeLibrary.message.type === 'error' ? (isDarkTheme ? 'text-red-300' : 'text-red-700') : (isDarkTheme ? 'text-emerald-300' : 'text-emerald-700')}`}
+                                >
+                                    {knowledgeLibrary.message.text}
+                                </p>
+                            )}
+                        </div>
+                    </section>
+                );
+            };
+
             const renderRagWorkspaceView = () => {
                 if (!ragCapability) {
                     return (
@@ -8031,6 +8446,8 @@
                             )}
 
                         </div>
+
+                        {renderKnowledgeLibraryPanel()}
 
                         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                             <div className="space-y-6">

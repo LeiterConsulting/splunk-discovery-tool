@@ -55,6 +55,9 @@ SURFACE_WEIGHTS: Dict[str, int] = {
 FRESHNESS_WEIGHT = 30
 RELIABILITY_WEIGHT = 20
 RELIABILITY_PENALTY_PER_GROUP = 4
+# Collected only for the knowledge library; many MCP servers block the fallback search, so a gap here
+# says nothing about how well discovery covered the environment.
+RELIABILITY_EXEMPT_STEPS = {"installed_apps"}
 
 SURFACE_OVERVIEW_KEYS: Dict[str, str] = {
     "indexes": "total_indexes",
@@ -355,7 +358,7 @@ class DiscoveryV2Pipeline:
         failed_groups = sorted({
             name.split(":", 1)[0]
             for name, status in (step_status or {}).items()
-            if isinstance(status, dict) and status.get("status") in {"error", "skipped"}
+            if isinstance(status, dict) and status.get("status") in {"error", "skipped"} and name not in RELIABILITY_EXEMPT_STEPS
         })
         reliability_points = max(0, RELIABILITY_WEIGHT - RELIABILITY_PENALTY_PER_GROUP * len(failed_groups))
 
@@ -517,6 +520,7 @@ class DiscoveryV2Pipeline:
             "finding_ledger": finding_ledger,
             "finding_ledger_summary": ledger_bundle["summary"],
             "discovered_inventory": self._build_inventory(discovery_results),
+            "environment_profile": self._engine_dict(self.discovery_engine, "get_environment_profile"),
             "classification_map": classifications if isinstance(classifications, dict) else {},
             "coverage_gaps": coverage_gaps,
             "risk_register": risk_register[:20],

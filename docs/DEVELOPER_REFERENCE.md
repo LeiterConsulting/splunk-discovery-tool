@@ -145,6 +145,11 @@ Every button should communicate purpose:
 - `POST /api/capabilities/{name}/reindex` → Rebuild indexed retrieval content for capabilities that support it
 - `POST /api/capabilities/{name}/config` → Persist capability-specific config
 - `POST /api/capabilities/deeplinks/build` → Build a Splunk Web search deeplink through the optional deeplink capability
+- `GET /api/knowledge-library/status` → Environment profile, loaded library sources, refresh job, coverage scorecard, gaps, and the matched catalog for the latest discovery
+- `POST /api/knowledge-library/settings` → Turn online library sources on or off (admin)
+- `POST /api/knowledge-library/refresh` → Download the library sources again in the background (admin; 409 while online sources are off)
+- `POST /api/knowledge-library/pack/import` → Load sources from a library pack zip (admin; 400 for an unusable pack, 409 during a refresh)
+- `GET /api/knowledge-library/pack/export` → Download the loaded sources as a library pack zip (404 when none are loaded)
 - `GET /reports` → Report/session list
 
 ### Capability notes
@@ -158,6 +163,14 @@ Every button should communicate purpose:
 - managed knowledge assets currently support pasted text plus `.md`, `.txt`, `.json`, `.log`, `.csv`, `.pdf`, and `.docx` uploads; richer document ingestion is intentionally deferred beyond staged PDF and DOCX extraction
 - Chroma indexing uses a deterministic local hash-based embedding function so optional retrieval works without downloading an external embedding model
 - `splunk_deeplink_tools` derives a Splunk Web base URL from `config.mcp.url` by default, supports a `web_base_url` override in capability config, and currently ships search deeplinks first
+
+### Knowledge library notes
+
+- `src/knowledge_library/` has no FastAPI dependency: `sources.py` fetches, sanitizes, stores, and packs the sources; `profile.py` reads the blueprint's `environment_profile`; `catalog.py` matches sourcetypes, apps, and documentation; `scorecard.py` scores coverage and lists gaps; `service.py` runs one background refresh at a time and builds the status payload
+- Sources live under `output/knowledge_library/` as one JSON file per source, and the RAG indexer skips that folder
+- Online fetching is off by default (`config.library.allow_online_sources`). The HTTP client rejects any host outside `ALLOWED_HOSTS` and any non-HTTPS URL, including redirects
+- Pack imports rebuild each source with `sanitize_source_payload`, which reuses the fetchers' normalizers, so a pack cannot store fields or links that a download would not produce
+- When a scorecard dimension gains a new input, return `None` with a status (`needs_sources`, `needs_discovery`, `not_applicable`, `unavailable`) when the input is missing rather than a score of 0, and add a case in `tests/test_knowledge_library.py`
 
 ## 9) Quality Gates
 

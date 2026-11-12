@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from capabilities.models import CapabilityConfig, CapabilityDefinition
 from capabilities.rag.asset_manager import KnowledgeAssetManager, normalize_knowledge_asset_attributes
 from capabilities.rag.base import RetrievalChunk
+from knowledge_library import LIBRARY_DIR_NAME
 
 
 QUERY_TERM_STOPWORDS = {
@@ -536,6 +537,8 @@ class ArtifactSourceIndexer:
             if allowed_extensions and path.suffix.lower() not in allowed_extensions:
                 continue
             if _path_is_within(path, storage_dir):
+                continue
+            if LIBRARY_DIR_NAME in path.relative_to(source_dir).parts:
                 continue
             files.append(path)
             if len(files) >= max_files:

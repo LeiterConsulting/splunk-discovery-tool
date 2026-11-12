@@ -154,6 +154,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Discovery steps tile in the environment profile, which showed the estimate made before the run
 - Cards that repeated the same next steps: Mission's Admin tasks, Investigations, and Executive summary cards, and Intelligence's Top priorities, Coverage gaps, and Suggested investigations cards. Findings now lists each step once
 
+### 📚 Knowledge Library & Coverage Scorecard
+
+#### Added
+- **Environment profile from discovery** (`src/discovery/environment_profile.py`): a new "Installed apps and add-ons" step lists apps through the MCP knowledge-object tool, or `| rest /services/apps/local` when that tool cannot. The v2 blueprint gains `environment_profile` with the Splunk version, the matching documentation version, the deployment type (Splunk Cloud Platform or Splunk Enterprise, with the reason), and the installed apps with built-in apps marked. A failed app listing does not lower the discovery reliability score
+- **Knowledge library sources** (`src/knowledge_library/`), stored under `output/knowledge_library/` and kept out of the Knowledge Base index:
+  - Splunk Security Content data sources (latest release of `splunk/security_content`): the sourcetypes each data source produces and the add-on that supports it
+  - Splunkbase records for the installed apps: latest release, archived state, and Splunk Cloud Platform compatibility
+  - help.splunk.com sitemaps: an index of documentation pages by product, manual, and version, so links point at the release you run. Pages are linked, not downloaded
+- **Online sources are off by default.** An admin turns them on in Knowledge Base > Library health. The server then refreshes in the background when a source is missing or more than a week old, or when discovery finds an app that has not been looked up. Requests go only to `api.github.com`, `raw.githubusercontent.com`, `splunkbase.splunk.com`, and `help.splunk.com` over HTTPS
+- **Library packs** for servers without internet access: Export pack downloads the loaded sources as a zip, and Import pack loads one (up to 100 MB; every file is checked before anything is saved)
+- **Library health panel and coverage scorecard** on the Knowledge Base tab: an overall score averaged from Environment facts, Data source references, Add-ons for your data, App versions, Documentation for your version, and Knowledge Base coverage. Prioritized gaps come with a next action: add-ons that your sourcetypes need but are missing or turned off, outdated or archived apps, apps not marked Cloud compatible on Splunk Cloud Platform, and busy sourcetypes no public reference describes. The panel also lists the matched references, apps, and documentation links. A dimension whose source is not loaded says what it needs instead of scoring 0
+- `GET /api/knowledge-library/status` and `GET /api/knowledge-library/pack/export`, plus admin-only `POST /api/knowledge-library/settings`, `POST /api/knowledge-library/refresh`, and `POST /api/knowledge-library/pack/import`
+- Unit suite `tests/test_knowledge_library.py` and installed-apps cases in `tests/test_discovery_pipeline.py`
+
 ### 📄 Discovery, Capabilities & Knowledge Base Pages
 
 #### Added

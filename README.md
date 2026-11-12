@@ -78,7 +78,7 @@ The header holds the connection status, Chat, sign-in, and Settings. Each tab ke
 - **Overview**: Discovery status, key numbers, the top three next steps, run comparison, the runbook, and report packages
 - **Findings**: The full next-step lists for admins, analysts, and executives, the environment profile, key evidence, and patterns
 - **Discovery**: Run discovery, follow each stage, and open saved reports and summaries
-- **Knowledge Base**: Managed knowledge assets, the SPL Library, reusable query evidence, and context previews
+- **Knowledge Base**: Library health (how well public Splunk references, Splunkbase, and versioned docs cover your environment, with gaps to fix), managed knowledge assets, the SPL Library, reusable query evidence, and context previews
 - **Capabilities**: Optional add-ons for the knowledge base, exports, charts, and Splunk search links
 - **Capability tabs**: An enabled capability can add its own tab after the core tabs. The M-26-14 Readiness Advisor adds an M-26-14 tab
 - **Chat and Summary**: Full-screen investigation chat plus the runbook and summary views when you need more detail
