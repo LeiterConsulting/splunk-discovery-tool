@@ -13,6 +13,7 @@ from capabilities.models import CapabilityConfig, CapabilityDefinition
 from capabilities.rag.asset_manager import KnowledgeAssetManager, normalize_knowledge_asset_attributes
 from capabilities.rag.base import RetrievalChunk
 from knowledge_library import LIBRARY_DIR_NAME
+from chat_settings import CHAT_DATA_DIR_NAME
 from knowledge_library.ranking import (
     BM25,
     best_possible_fusion,
@@ -560,7 +561,9 @@ class ArtifactSourceIndexer:
                 continue
             if _path_is_within(path, storage_dir):
                 continue
-            if LIBRARY_DIR_NAME in path.relative_to(source_dir).parts:
+            relative_parts = path.relative_to(source_dir).parts
+            # The library and saved chat data have their own stores; indexing them would crowd out reports.
+            if LIBRARY_DIR_NAME in relative_parts or CHAT_DATA_DIR_NAME in relative_parts:
                 continue
             files.append(path)
             if len(files) >= max_files:

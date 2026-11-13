@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New LLM settings: `auto_tune`, `context_window`, `request_timeout`, `reasoning_effort` (also stored on saved credentials)
   - Settings UI: auto-tune toggle, recommended model, and optional context/timeout/reasoning overrides
 - **Grounded chat agent helpers** (`src/chat_agent.py`): system prompts built from the live MCP tool catalog, normalized tool outcomes (`error` / `no_data` / `data`), evidence rendering within the tuned budget, and tool feedback that always shows the SPL and time range that ran
-- **Chat mission**: a mission field in the chat panel (kept when chat history is cleared) is sent with each request, stored in chat memory, shapes the prompts, and adds a "Next step for the mission" follow-on
+- **Chat mission**: a mission field in the chat panel (kept when chat history is cleared) is sent with each request, stored in chat memory, shapes the prompts, and adds a "Next step for the mission" follow-on (the chat panel now calls it the goal; see Chat Goals & Model-Tuned Chat Settings)
 - **MCP argument adaptation** (`src/mcp_tool_args.py`): maps tool arguments onto each tool's advertised input schema (for example `index_name`, knowledge-object `type` enums) and parses JSON-RPC errors
 - **SPL utilities** (`src/spl/spl_utils.py`): read-only safety checks, entity extraction, validation against discovered indexes/sourcetypes/hosts, index scoping, time bounds, and JSON extraction from LLM output
 - **Discovery facts in chat**: when the request or mission names an index, sourcetype, source, or host, the plan hints include what discovery recorded about it (event totals, last event time, stale-data findings)
@@ -226,7 +226,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Admin Tasks use plain labels: Checklist, Expected result, Suggest a Fix (was Get Remediation Help), Run Again (was Re-verify), Likely Cause, Chance of success, How to Prevent It, and How to Undo (was Rollback Instructions). Verification history reads "Attempt 2: Passed" instead of "Attempt #2 - SUCCESS"
   - While a summary builds, the dialog says Building Your Summary with a solid progress bar, and Stop Summary is a standard red button
 - **Chat**: searches are labeled "Search that ran" or "Suggested search (not run)", the step list reads "Steps taken (3 rounds, 12s)" instead of "Investigation Timeline (3 iterations, 12s)", and View Raw Data is now Show raw data. The typing dots move only when the system allows motion, and screen readers hear "The assistant is working."
-- **Chat Settings**: groups settings into Answer Limits, AI Model, Retries and Sampling, Answer Quality, and Extras. Max response length is a number field that explains when the AI connection allows fewer tokens (for example "allows up to 8,192 tokens, so answers stop at 8,192"), and the footer says changes apply right away and reset when the server restarts
+- **Chat Settings**: groups settings into Answer Limits, AI Model, and Extras. Max response length is a number field that explains when the AI connection allows fewer tokens (for example "allows up to 8,192 tokens, so answers stop at 8,192"), and the footer says changes apply right away and that Custom values stay until the AI model changes
 - **Connection Details**: the header shows the overall status. The Splunk MCP server and AI model sections are each marked Set up or Not set up and list the address, saved name, provider, model, and endpoint, with a hint when something is missing. A load error shows a plain message with Try Again, and Open Settings sits at the bottom (the main action while the app is not connected)
 - **M-26-14 tab**: renamed M-26-14 Readiness Advisor to M-26-14 Readiness and rewrote its text in plain language
   - Priority objectives spell out Continuous Event Monitoring (CEM) and Threat Hunting, Investigation, Response, and Forensics (THIRF)
@@ -248,6 +248,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fetch Models and Auto-Assess sat inside the Model and Max Tokens labels, so screen readers announced them as "Model" and "Max Tokens" buttons and clicking either label ran the action. The labels now name their fields
 - The required-field asterisk in the save dialogs was dark red on a dark background in dark themes
 - Icons in the Settings connection forms were part of the button names that screen readers and browser tests see; they are now hidden from assistive technology
+
+### 🎯 Chat Goals & Model-Tuned Chat Settings
+
+#### Added
+- **Chat goals** (`src/chat_goals.py`): the goal field in the chat panel applies only after Set goal. The AI model breaks the goal into 3 to 6 questions that settle it and suggests the first 3 questions to ask. Without a model, the goal itself is tracked and starter questions are offered. Start on this goal sends a first message that asks what to check first and runs the first search
+- **Progress after each answer**: chat requests carry the goal's id, the server keeps each question and answer with the goal, and the chat panel then asks the model which tracked questions the answer settled, counting only answers backed by search evidence. The check can add up to 2 new open questions and refreshes the Next questions for your goal suggestions. The goal bar shows progress such as "1 of 4 answered" and opens a checklist you can tick by hand, with Plan again and Check progress now
+- **Goal Library**: lists goals with their progress, saved chats, and last update. You can add, rename, rewrite, mark done or active, and delete goals; add, edit, tick, and delete tracked questions; and save, open, rename, and delete chats. A chat is saved under its goal after each recorded answer. Setting or switching to another goal starts a new chat when the chat on screen is saved under a different goal, so two goals never share one conversation. Opening a saved chat asks first when the chat on screen is not saved
+- Goals are kept per user when sign-in is on and in one shared library when it is off, under `output/chat_data/goals/`, which the Knowledge Base index skips. Limits: 100 goals, 10 tracked questions per goal, 50 saved chats per goal, and 200 messages per saved chat
+- `GET` and `POST /api/chat/goals`; `GET`, `PATCH`, and `DELETE /api/chat/goals/{goal_id}`; `POST /api/chat/goals/{goal_id}/plan` and `/progress`; `POST`, `PATCH`, and `DELETE` for `/items`; and `GET`, `PUT`, `PATCH`, and `DELETE` for `/chats/{chat_id}`
+- Unit suites `tests/test_chat_goals.py` and `tests/test_chat_settings.py`. The contrast check seeds a goal and opens the goal bar with its checklist and the Goal Library, so it covers 130 surfaces across five themes
+
+#### Changed
+- **Chat Settings start from the AI model's tuning** (`src/chat_settings.py`): each setting shows Auto with its value and where the value came from, or Custom with a button that returns it to Auto. The time limit follows the model's request timeout (120 to 900 seconds). Search rounds are 3 for models with a context window of 16K tokens or less and 5 otherwise. The stall limit, max response length, temperature, messages remembered, and Knowledge Base passages also come from the tuning, and Search the Knowledge Base is on when the Knowledge Base is installed. Reset all to Auto clears every Custom value
+- Custom values are saved in `output/chat_data/chat_settings.json` and stay across restarts. They are cleared, with a notice in Chat Settings, when the AI model changes
+- The chat panel calls the mission the goal. Internal names such as the `mission` request field and the `advance_mission` follow-on are unchanged. "Next step for the goal" no longer names a specific question, because progress is judged after the answer, and it is hidden once the chat has no goal
+
+#### Removed
+- Chat settings that had no effect or are now covered by the model's tuning: max retry delay, max retries, answer quality threshold, and query sample size. The Retries and Sampling and Answer Quality groups are gone
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added

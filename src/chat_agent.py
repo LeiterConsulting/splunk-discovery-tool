@@ -121,16 +121,32 @@ def normalize_mission(value: Any) -> str:
     return cleaned
 
 
-def format_mission_context(mission: Any) -> str:
+def format_mission_context(mission: Any, progress: Optional[Mapping[str, Any]] = None) -> str:
+    """The user's goal for the chat prompt, with what is settled and still open when the goal is tracked."""
     mission_text = normalize_mission(mission)
     if not mission_text:
         return ""
-    return (
-        "USER MISSION (the outcome the user is working toward in this chat):\n"
-        f"{mission_text}\n"
-        "- Keep searches, answers, and suggested next steps aligned with this mission.\n"
-        "- If a request is unrelated to the mission, still help with it; do not force the mission into the answer."
-    )
+    progress = progress if isinstance(progress, Mapping) else {}
+
+    def _items(key: str) -> List[str]:
+        values = progress.get(key) if isinstance(progress.get(key), (list, tuple)) else []
+        cleaned = [normalize_mission(value)[:240] for value in values]
+        return [value for value in cleaned if value][:5]
+
+    settled = _items("answered")
+    still_open = _items("open")
+    lines = ["USER GOAL (the outcome the user is working toward in this chat):", mission_text]
+    if settled:
+        lines.append("Settled so far:")
+        lines.extend(f"  * {value}" for value in settled)
+    if still_open:
+        lines.append("Still open:")
+        lines.extend(f"  * {value}" for value in still_open)
+    lines.append("- Keep searches, answers, and suggested next steps aligned with this goal.")
+    if still_open:
+        lines.append("- When the user asks to start or continue, work on the first open question; do not redo settled ones unless asked.")
+    lines.append("- If a request is unrelated to the goal, still help with it; do not force the goal into the answer.")
+    return "\n".join(lines)
 
 
 def _first_sentence(text: str, limit: int = 180) -> str:
@@ -191,12 +207,13 @@ def build_grounded_chat_prompt(
     memory_context: str = "",
     discovery_age_warning: Optional[str] = None,
     mission: Any = "",
+    goal_progress: Optional[Mapping[str, Any]] = None,
     blocked_commands: Iterable[str] = (),
     max_tool_steps: int = 5,
 ) -> str:
     """Full system prompt for models with enough context for detailed guidance."""
 
-    mission_block = format_mission_context(mission)
+    mission_block = format_mission_context(mission, goal_progress)
     blocked = ", ".join(sorted(blocked_commands)) or "write, export, alert, or script commands"
     context_sections = [
         section.strip()

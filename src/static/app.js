@@ -9,6 +9,9 @@
   const CHAT_STATE_STORAGE_KEY = "dt4sms_chat_state_v1";
   const CHAT_MISSION_STORAGE_KEY = "dt4sms_chat_mission_v1";
   const CHAT_MISSION_MAX_CHARS = 600;
+  const CHAT_GOAL_STORAGE_KEY = "dt4sms_chat_goal_v1";
+  const CHAT_GOAL_SAVED_CHAT_STORAGE_KEY = "dt4sms_chat_goal_saved_chat_v1";
+  const CHAT_GOAL_SAVED_MESSAGE_LIMIT = 200;
   const WELCOME_SPLASH_PREFERENCE_KEY = "dt4sms_welcome_splash_dismissed_v1";
   const THEME_PREFERENCE_OPTIONS = [
     { value: "light", label: "Light" },
@@ -259,9 +262,9 @@
     })).filter((action) => action.prompt) : [];
     return dedupeAssistantFollowOnActions([...responseActions, ...normalizedExistingActions], 3);
   };
-  const compactPersistedChatMessages = (items) => {
+  const compactPersistedChatMessages = (items, limit = 24) => {
     if (!Array.isArray(items)) return [];
-    return items.slice(-24).map((msg, idx) => {
+    return items.slice(-limit).map((msg, idx) => {
       var _a, _b, _c, _d, _e, _f, _g;
       const messageType = (msg == null ? void 0 : msg.type) || "assistant";
       const messageContent = typeof (msg == null ? void 0 : msg.content) === "string" ? msg.content : "";
@@ -396,6 +399,63 @@
       }
     } catch (error) {
       console.warn("Failed to save chat mission", error);
+    }
+  };
+  const loadActiveChatGoalId = () => {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) {
+        return "";
+      }
+      const value = window.localStorage.getItem(CHAT_GOAL_STORAGE_KEY);
+      return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : "";
+    } catch (error) {
+      return "";
+    }
+  };
+  const saveActiveChatGoalId = (value) => {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) {
+        return;
+      }
+      if (value) {
+        window.localStorage.setItem(CHAT_GOAL_STORAGE_KEY, value);
+      } else {
+        window.localStorage.removeItem(CHAT_GOAL_STORAGE_KEY);
+      }
+    } catch (error) {
+      console.warn("Failed to save the chat goal", error);
+    }
+  };
+  const lastChatMessageId = (messages) => {
+    const last = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : null;
+    return last && last.id !== void 0 && last.id !== null ? String(last.id) : "";
+  };
+  const loadSavedGoalChatMarker = () => {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) {
+        return null;
+      }
+      const parsed = JSON.parse(window.localStorage.getItem(CHAT_GOAL_SAVED_CHAT_STORAGE_KEY) || "null");
+      if (!parsed || typeof parsed.goalId !== "string" || typeof parsed.chatId !== "string" || typeof parsed.lastMessageId !== "string") {
+        return null;
+      }
+      return { goalId: parsed.goalId, chatId: parsed.chatId, lastMessageId: parsed.lastMessageId };
+    } catch (error) {
+      return null;
+    }
+  };
+  const saveSavedGoalChatMarker = (marker) => {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) {
+        return;
+      }
+      if (marker) {
+        window.localStorage.setItem(CHAT_GOAL_SAVED_CHAT_STORAGE_KEY, JSON.stringify(marker));
+      } else {
+        window.localStorage.removeItem(CHAT_GOAL_SAVED_CHAT_STORAGE_KEY);
+      }
+    } catch (error) {
+      console.warn("Failed to remember the saved goal chat", error);
     }
   };
   const loadWelcomeSplashDismissed = () => {
@@ -1131,10 +1191,35 @@
     const [chatMessages, setChatMessages] = useState(() => Array.isArray(initialChatState.chatMessages) ? initialChatState.chatMessages : []);
     const [chatInput, setChatInput] = useState("");
     const [chatMission, setChatMission] = useState(() => loadChatMission());
+    const [activeChatGoalId, setActiveChatGoalId] = useState(() => loadActiveChatGoalId());
+    const [activeChatGoal, setActiveChatGoal] = useState(null);
+    const [chatGoalActivity, setChatGoalActivity] = useState("");
+    const [chatGoalCheckingId, setChatGoalCheckingId] = useState("");
+    const [chatGoalNotice, setChatGoalNotice] = useState(null);
+    const [isChatGoalEditing, setIsChatGoalEditing] = useState(false);
+    const [chatGoalEditDraft, setChatGoalEditDraft] = useState({ title: "", goal: "" });
+    const [isChatGoalProgressOpen, setIsChatGoalProgressOpen] = useState(false);
+    const [isChatGoalLibraryOpen, setIsChatGoalLibraryOpen] = useState(false);
+    const [chatGoalLibrary, setChatGoalLibrary] = useState([]);
+    const [isChatGoalLibraryLoading, setIsChatGoalLibraryLoading] = useState(false);
+    const [chatGoalLibrarySelectedId, setChatGoalLibrarySelectedId] = useState("");
+    const [chatGoalLibraryDetail, setChatGoalLibraryDetail] = useState(null);
+    const [chatGoalLibraryDraft, setChatGoalLibraryDraft] = useState("");
+    const [chatGoalLibraryEdit, setChatGoalLibraryEdit] = useState(null);
+    const [chatGoalNewItemText, setChatGoalNewItemText] = useState("");
+    const activeChatGoalIdRef = useRef(activeChatGoalId);
+    const chatGoalProgressRef = useRef({ running: false, queued: "" });
+    const chatGoalDetailRequestRef = useRef(0);
+    const pendingGoalChatSaveRef = useRef(null);
+    const savedGoalChatRef = useRef(loadSavedGoalChatMarker());
+    const isTypingRef = useRef(false);
     const [isTyping, setIsTyping] = useState(false);
     const [chatStatus, setChatStatus] = useState("");
     const [isChatSettingsOpen, setIsChatSettingsOpen] = useState(false);
     const [chatSettings, setChatSettings] = useState(null);
+    const [chatSettingsDrafts, setChatSettingsDrafts] = useState({});
+    const [chatSettingsError, setChatSettingsError] = useState("");
+    const chatSettingsRequestRef = useRef(0);
     const [serverConversationHistory, setServerConversationHistory] = useState(() => Array.isArray(initialChatState.serverConversationHistory) ? initialChatState.serverConversationHistory : null);
     const [chatSessionId, setChatSessionId] = useState(() => {
       const persistedId = typeof initialChatState.chatSessionId === "string" ? initialChatState.chatSessionId.trim() : "";
@@ -2643,6 +2728,52 @@
     useEffect(() => {
       saveChatMission(chatMission);
     }, [chatMission]);
+    useEffect(() => {
+      activeChatGoalIdRef.current = activeChatGoalId;
+      saveActiveChatGoalId(activeChatGoalId);
+    }, [activeChatGoalId]);
+    useEffect(() => {
+      isTypingRef.current = isTyping;
+    }, [isTyping]);
+    useEffect(() => {
+      if (!(isChatOpen || isChatTab) || !activeChatGoalId || (activeChatGoal == null ? void 0 : activeChatGoal.id) === activeChatGoalId) {
+        return void 0;
+      }
+      let cancelled = false;
+      chatGoalRequest(chatGoalPath(activeChatGoalId)).then((data) => {
+        var _a2;
+        if (!cancelled && ((_a2 = data.goal) == null ? void 0 : _a2.id) === activeChatGoalIdRef.current) {
+          setActiveChatGoal(data.goal);
+        }
+      }).catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        if (error.status === 404) {
+          leaveChatGoal();
+        } else {
+          setChatGoalNotice({ tone: "error", text: `The goal could not be loaded. ${error.message}` });
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [isChatOpen, isChatTab, activeChatGoalId]);
+    useEffect(() => {
+      if (!isChatGoalLibraryOpen || !chatGoalLibrarySelectedId) {
+        setChatGoalLibraryDetail(null);
+        return;
+      }
+      loadChatGoalLibraryDetail(chatGoalLibrarySelectedId);
+    }, [isChatGoalLibraryOpen, chatGoalLibrarySelectedId]);
+    useEffect(() => {
+      const pending = pendingGoalChatSaveRef.current;
+      if (!pending || chatMessages.length === 0) {
+        return;
+      }
+      pendingGoalChatSaveRef.current = null;
+      saveChatToGoal(pending.goalId, pending.chatId, chatMessages, { quiet: true });
+    }, [chatMessages]);
     useEffect(() => {
       connectWebSocket();
       loadDiscoveryStatus();
@@ -8103,42 +8234,502 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       setIsChatOpen(false);
     };
     useEffect(() => {
-      if (isChatSettingsOpen && !chatSettings) {
+      if (isChatSettingsOpen) {
         loadChatSettings();
       }
     }, [isChatSettingsOpen]);
+    const applyChatSettingsResponse = (requestId, settings) => {
+      if (requestId === chatSettingsRequestRef.current && settings && typeof settings === "object") {
+        setChatSettings(settings);
+      }
+    };
     const loadChatSettings = async () => {
+      const requestId = ++chatSettingsRequestRef.current;
       try {
         const response = await fetch("/api/chat/settings");
-        const data = await response.json();
-        setChatSettings(data);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || "Could not load chat settings.");
+        }
+        setChatSettingsError("");
+        applyChatSettingsResponse(requestId, data);
       } catch (error) {
-        console.error("Error loading chat settings:", error);
+        setChatSettingsError(error.message || "Could not load chat settings.");
       }
     };
-    const updateSetting = async (key, value) => {
-      const updatedSettings = { ...chatSettings, [key]: value };
-      setChatSettings(updatedSettings);
+    const saveChatSettings = async (changes, optimistic = null) => {
+      const requestId = ++chatSettingsRequestRef.current;
+      if (optimistic) {
+        setChatSettings((prev) => prev ? { ...prev, ...optimistic } : prev);
+      }
       try {
-        await fetch("/api/chat/settings", {
+        const response = await fetch("/api/chat/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ [key]: value })
+          body: JSON.stringify(changes)
         });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || "Could not save the chat setting.");
+        }
+        setChatSettingsError("");
+        applyChatSettingsResponse(requestId, data.settings);
       } catch (error) {
-        console.error("Error updating setting:", error);
+        setChatSettingsError(error.message || "Could not save the chat setting.");
+        if (requestId === chatSettingsRequestRef.current) {
+          loadChatSettings();
+        }
       }
     };
+    const updateSetting = (key, value) => {
+      const custom = Array.isArray(chatSettings == null ? void 0 : chatSettings.custom) ? chatSettings.custom : [];
+      saveChatSettings({ [key]: value }, { [key]: value, custom: custom.includes(key) ? custom : [...custom, key] });
+    };
+    const returnChatSettingToAuto = (key) => {
+      var _a2;
+      const custom = (Array.isArray(chatSettings == null ? void 0 : chatSettings.custom) ? chatSettings.custom : []).filter((item) => item !== key);
+      setChatSettingsDrafts((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      saveChatSettings({ [key]: null }, { [key]: (_a2 = chatSettings == null ? void 0 : chatSettings.auto) == null ? void 0 : _a2[key], custom });
+    };
+    const dismissChatSettingsNotice = () => saveChatSettings({}, { notice: null });
     const resetChatSettings = async () => {
+      const requestId = ++chatSettingsRequestRef.current;
+      setChatSettingsDrafts({});
       try {
         const response = await fetch("/api/chat/settings/reset", {
           method: "POST"
         });
-        const data = await response.json();
-        setChatSettings(data.settings);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || "Could not reset chat settings.");
+        }
+        setChatSettingsError("");
+        applyChatSettingsResponse(requestId, data.settings);
       } catch (error) {
-        console.error("Error resetting settings:", error);
+        setChatSettingsError(error.message || "Could not reset chat settings.");
       }
+    };
+    const chatGoalRequest = async (path, { method = "GET", body } = {}) => {
+      const response = await fetch(path, body === void 0 ? { method } : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(typeof data.detail === "string" && data.detail ? data.detail : "The goal library could not finish that request.");
+        error.status = response.status;
+        throw error;
+      }
+      return data;
+    };
+    const chatGoalPath = (goalId, suffix = "") => `/api/chat/goals/${encodeURIComponent(goalId)}${suffix}`;
+    const applyChatGoalDetail = (goal) => {
+      if (!goal || !goal.id) {
+        return;
+      }
+      setActiveChatGoal((prev) => goal.id === activeChatGoalIdRef.current ? goal : prev);
+      setChatGoalLibraryDetail((prev) => prev && prev.id === goal.id ? goal : prev);
+      setChatGoalLibrary((prev) => prev.map((entry) => entry.id === goal.id ? { ...entry, ...goal } : entry));
+    };
+    const activateChatGoal = (goal) => {
+      activeChatGoalIdRef.current = goal.id;
+      setActiveChatGoalId(goal.id);
+      setActiveChatGoal(goal);
+      setIsChatGoalEditing(false);
+      setChatGoalNotice(null);
+    };
+    const leaveChatGoal = () => {
+      activeChatGoalIdRef.current = "";
+      setActiveChatGoalId("");
+      setActiveChatGoal(null);
+      setIsChatGoalEditing(false);
+      setIsChatGoalProgressOpen(false);
+      setChatGoalNotice(null);
+    };
+    const rememberSavedGoalChat = (marker) => {
+      savedGoalChatRef.current = marker;
+      saveSavedGoalChatMarker(marker);
+    };
+    const forgetChatGoal = (goalId) => {
+      var _a2;
+      if (((_a2 = savedGoalChatRef.current) == null ? void 0 : _a2.goalId) === goalId) {
+        rememberSavedGoalChat(null);
+      }
+      setChatGoalLibrary((prev) => prev.filter((entry) => entry.id !== goalId));
+      setChatGoalLibrarySelectedId((prev) => prev === goalId ? "" : prev);
+      if (activeChatGoalIdRef.current === goalId) {
+        leaveChatGoal();
+      }
+    };
+    const refreshChatGoal = async (goalId) => {
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId));
+        applyChatGoalDetail(data.goal);
+      } catch (error) {
+        if (error.status === 404) {
+          forgetChatGoal(goalId);
+        }
+      }
+    };
+    const reportChatGoalError = (error, goalId = "", isGoalRequest = true) => {
+      if ((error == null ? void 0 : error.status) === 404 && goalId) {
+        if (isGoalRequest) {
+          forgetChatGoal(goalId);
+          setChatGoalNotice({ tone: "error", text: "That goal is no longer in the goal library." });
+          return;
+        }
+        refreshChatGoal(goalId);
+      }
+      setChatGoalNotice({ tone: "error", text: (error == null ? void 0 : error.message) || "The goal library could not finish that request." });
+    };
+    const createChatGoal = async (goalText, { activate }) => {
+      const text = String(goalText || "").trim();
+      if (!text || chatGoalActivity) {
+        return;
+      }
+      setChatGoalActivity("creating");
+      setChatGoalNotice(null);
+      try {
+        const data = await chatGoalRequest("/api/chat/goals", { method: "POST", body: { goal: text } });
+        setChatGoalLibrary((prev) => [data.goal, ...prev.filter((entry) => entry.id !== data.goal.id)]);
+        let switchNotice = "";
+        if (activate) {
+          switchNotice = prepareChatForGoal(data.goal.id) || "";
+          activateChatGoal(data.goal);
+          setChatMission("");
+          setIsChatGoalProgressOpen(true);
+        } else {
+          setChatGoalLibraryDetail(data.goal);
+          setChatGoalLibrarySelectedId(data.goal.id);
+          setChatGoalLibraryDraft("");
+        }
+        const notices = [switchNotice, data.message].filter(Boolean);
+        if (notices.length) {
+          setChatGoalNotice({ tone: "info", text: notices.join(" ") });
+        }
+      } catch (error) {
+        reportChatGoalError(error);
+      } finally {
+        setChatGoalActivity("");
+      }
+    };
+    const updateChatGoal = async (goalId, changes) => {
+      if (chatGoalActivity) {
+        return false;
+      }
+      setChatGoalActivity("saving");
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId), { method: "PATCH", body: changes });
+        applyChatGoalDetail(data.goal);
+        setChatGoalNotice(null);
+        return true;
+      } catch (error) {
+        reportChatGoalError(error, goalId);
+        return false;
+      } finally {
+        setChatGoalActivity("");
+      }
+    };
+    const saveChatGoalText = async (goal, draft) => {
+      const goalText = String((draft == null ? void 0 : draft.goal) || "").trim();
+      if (!goalText) {
+        setChatGoalNotice({ tone: "error", text: "Describe the goal first." });
+        return false;
+      }
+      const saved = await updateChatGoal(goal.id, { title: String((draft == null ? void 0 : draft.title) || "").trim(), goal: goalText });
+      if (saved && goalText !== goal.goal) {
+        setChatGoalNotice({ tone: "info", text: "Goal saved. Select Plan again to refresh the questions it tracks." });
+      }
+      return saved;
+    };
+    const replanChatGoal = async (goalId) => {
+      if (chatGoalActivity) {
+        return;
+      }
+      setChatGoalActivity("planning");
+      setChatGoalNotice(null);
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId, "/plan"), { method: "POST" });
+        applyChatGoalDetail(data.goal);
+        if (data.message) {
+          setChatGoalNotice({ tone: "info", text: data.message });
+        }
+      } catch (error) {
+        reportChatGoalError(error, goalId);
+      } finally {
+        setChatGoalActivity("");
+      }
+    };
+    const deleteChatGoal = async (goal) => {
+      if (chatGoalActivity) {
+        return;
+      }
+      const confirmed = window.confirm(`Delete the goal "${goal.title}"?
+
+Its tracked questions and ${countLabel(goal.chat_count, "saved chat")} are deleted too. This cannot be undone.`);
+      if (!confirmed) {
+        return;
+      }
+      setChatGoalActivity("saving");
+      try {
+        await chatGoalRequest(chatGoalPath(goal.id), { method: "DELETE" });
+        forgetChatGoal(goal.id);
+        setChatGoalNotice(null);
+      } catch (error) {
+        reportChatGoalError(error, goal.id);
+      } finally {
+        setChatGoalActivity("");
+      }
+    };
+    const changeChatGoalItems = async (goalId, suffix, method, body) => {
+      if (chatGoalActivity) {
+        return false;
+      }
+      setChatGoalActivity("saving");
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId, suffix), { method, body });
+        applyChatGoalDetail(data.goal);
+        setChatGoalNotice(null);
+        return true;
+      } catch (error) {
+        reportChatGoalError(error, goalId, false);
+        return false;
+      } finally {
+        setChatGoalActivity("");
+      }
+    };
+    const addChatGoalItem = (goalId, text) => changeChatGoalItems(goalId, "/items", "POST", { text });
+    const updateChatGoalItem = (goalId, itemId, changes) => changeChatGoalItems(goalId, `/items/${encodeURIComponent(itemId)}`, "PATCH", changes);
+    const deleteChatGoalItem = (goalId, itemId) => changeChatGoalItems(goalId, `/items/${encodeURIComponent(itemId)}`, "DELETE");
+    const checkChatGoalProgress = async (goalId) => {
+      const tracker = chatGoalProgressRef.current;
+      if (!goalId) {
+        return;
+      }
+      if (tracker.running) {
+        tracker.queued = goalId;
+        return;
+      }
+      tracker.running = true;
+      setChatGoalCheckingId(goalId);
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId, "/progress"), { method: "POST" });
+        applyChatGoalDetail(data.goal);
+        if (goalId === activeChatGoalIdRef.current) {
+          setChatGoalNotice(data.message ? { tone: "info", text: `Progress was not updated. ${data.message}` } : null);
+        }
+      } catch (error) {
+        if (goalId === activeChatGoalIdRef.current) {
+          reportChatGoalError(error, goalId);
+        }
+      } finally {
+        tracker.running = false;
+        setChatGoalCheckingId("");
+        const next = tracker.queued;
+        tracker.queued = "";
+        if (next) {
+          checkChatGoalProgress(next);
+        }
+      }
+    };
+    const mergeSavedChatIntoGoal = (goalId, chat) => {
+      const merge = (goal) => {
+        if (!goal || goal.id !== goalId || !(chat == null ? void 0 : chat.id)) {
+          return goal;
+        }
+        const others = (Array.isArray(goal.chats) ? goal.chats : []).filter((entry) => entry.id !== chat.id);
+        const chats = [chat, ...others];
+        return { ...goal, chats, chat_count: chats.length };
+      };
+      setActiveChatGoal(merge);
+      setChatGoalLibraryDetail(merge);
+    };
+    const removeSavedChatFromGoal = (goalId, chatId) => {
+      const prune = (goal) => {
+        if (!goal || goal.id !== goalId || !Array.isArray(goal.chats)) {
+          return goal;
+        }
+        const chats = goal.chats.filter((entry) => entry.id !== chatId);
+        return { ...goal, chats, chat_count: chats.length };
+      };
+      setActiveChatGoal(prune);
+      setChatGoalLibraryDetail(prune);
+      setChatGoalLibrary((prev) => prev.map((entry) => entry.id === goalId ? { ...entry, chat_count: Math.max(0, Number(entry.chat_count || 0) - 1) } : entry));
+    };
+    const saveChatToGoal = async (goalId, chatId, messages2, { quiet = false } = {}) => {
+      const kept = compactPersistedChatMessages(messages2, CHAT_GOAL_SAVED_MESSAGE_LIMIT);
+      if (!goalId || !chatId || kept.length === 0) {
+        return false;
+      }
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId, `/chats/${encodeURIComponent(chatId)}`), {
+          method: "PUT",
+          body: { messages: kept }
+        });
+        mergeSavedChatIntoGoal(goalId, data.chat);
+        rememberSavedGoalChat({ goalId, chatId, lastMessageId: lastChatMessageId(messages2) });
+        return true;
+      } catch (error) {
+        if (quiet) {
+          setChatGoalNotice({ tone: "error", text: `This chat could not be saved to the goal. ${error.message}` });
+        } else {
+          reportChatGoalError(error, goalId, false);
+        }
+        return false;
+      }
+    };
+    const isCurrentChatSavedToGoal = () => {
+      const saved = savedGoalChatRef.current;
+      return chatMessages.length === 0 || Boolean(saved && saved.chatId === chatSessionId && saved.lastMessageId === lastChatMessageId(chatMessages));
+    };
+    const openSavedGoalChat = async (goal, chat) => {
+      var _a2;
+      if (isTyping) {
+        return;
+      }
+      if (!isCurrentChatSavedToGoal()) {
+        const confirmed = window.confirm(`Open "${chat.title}"?
+
+It replaces the chat on screen, which is not saved to a goal.`);
+        if (!confirmed) {
+          return;
+        }
+      }
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goal.id, `/chats/${encodeURIComponent(chat.id)}`));
+        const messages2 = compactPersistedChatMessages((_a2 = data.chat) == null ? void 0 : _a2.messages, CHAT_GOAL_SAVED_MESSAGE_LIMIT);
+        pendingGoalChatSaveRef.current = null;
+        rememberSavedGoalChat({ goalId: goal.id, chatId: chat.id, lastMessageId: lastChatMessageId(messages2) });
+        setChatMessages(messages2);
+        setServerConversationHistory(null);
+        setChatStatus("");
+        setChatInput("");
+        setChatSessionId(chat.id);
+        if (goal.id !== activeChatGoalIdRef.current) {
+          activateChatGoal(goal);
+        }
+        setIsChatGoalLibraryOpen(false);
+        setChatGoalLibraryEdit(null);
+        openChatSurface();
+      } catch (error) {
+        reportChatGoalError(error, goal.id, false);
+      }
+    };
+    const renameSavedGoalChat = async (goalId, chatId, title) => {
+      const name = String(title || "").trim();
+      if (!name) {
+        setChatGoalNotice({ tone: "error", text: "Give the chat a name first." });
+        return false;
+      }
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId, `/chats/${encodeURIComponent(chatId)}`), {
+          method: "PATCH",
+          body: { title: name }
+        });
+        mergeSavedChatIntoGoal(goalId, data.chat);
+        setChatGoalNotice(null);
+        return true;
+      } catch (error) {
+        reportChatGoalError(error, goalId, false);
+        return false;
+      }
+    };
+    const deleteSavedGoalChat = async (goalId, chat) => {
+      var _a2, _b2;
+      if (!window.confirm(`Delete the saved chat "${chat.title}"?
+
+This cannot be undone.`)) {
+        return;
+      }
+      try {
+        await chatGoalRequest(chatGoalPath(goalId, `/chats/${encodeURIComponent(chat.id)}`), { method: "DELETE" });
+        removeSavedChatFromGoal(goalId, chat.id);
+        if (((_a2 = savedGoalChatRef.current) == null ? void 0 : _a2.chatId) === chat.id && ((_b2 = savedGoalChatRef.current) == null ? void 0 : _b2.goalId) === goalId) {
+          rememberSavedGoalChat(null);
+        }
+        setChatGoalNotice(null);
+      } catch (error) {
+        reportChatGoalError(error, goalId, false);
+      }
+    };
+    const loadChatGoalLibrary = async () => {
+      setIsChatGoalLibraryLoading(true);
+      try {
+        const data = await chatGoalRequest("/api/chat/goals");
+        setChatGoalLibrary(Array.isArray(data.goals) ? data.goals : []);
+      } catch (error) {
+        reportChatGoalError(error);
+      } finally {
+        setIsChatGoalLibraryLoading(false);
+      }
+    };
+    const loadChatGoalLibraryDetail = async (goalId) => {
+      const requestId = ++chatGoalDetailRequestRef.current;
+      setChatGoalLibraryDetail((prev) => prev && prev.id === goalId ? prev : null);
+      try {
+        const data = await chatGoalRequest(chatGoalPath(goalId));
+        if (requestId === chatGoalDetailRequestRef.current) {
+          setChatGoalLibraryDetail(data.goal);
+        }
+      } catch (error) {
+        if (requestId === chatGoalDetailRequestRef.current) {
+          reportChatGoalError(error, goalId);
+        }
+      }
+    };
+    const openChatGoalLibrary = () => {
+      setChatGoalLibraryEdit(null);
+      setChatGoalNewItemText("");
+      setChatGoalLibrarySelectedId((prev) => activeChatGoalIdRef.current || prev);
+      setIsChatGoalLibraryOpen(true);
+      loadChatGoalLibrary();
+    };
+    const closeChatGoalLibrary = () => {
+      setIsChatGoalLibraryOpen(false);
+      setChatGoalLibraryEdit(null);
+    };
+    const startNewChat = () => {
+      pendingGoalChatSaveRef.current = null;
+      clearPersistedChatState();
+      setChatMessages([]);
+      setChatInput("");
+      setChatStatus("");
+      setServerConversationHistory(null);
+      setChatSessionId(generateChatSessionId());
+    };
+    const prepareChatForGoal = (goalId) => {
+      var _a2;
+      const saved = savedGoalChatRef.current;
+      if (isTypingRef.current || !saved || saved.goalId === goalId || saved.chatId !== chatSessionId || chatMessages.length === 0) {
+        return;
+      }
+      if (saved.goalId !== activeChatGoalIdRef.current && saved.lastMessageId !== lastChatMessageId(chatMessages)) {
+        return;
+      }
+      const previousTitle = ((_a2 = chatGoalLibrary.find((entry) => entry.id === saved.goalId)) == null ? void 0 : _a2.title) || ((activeChatGoal == null ? void 0 : activeChatGoal.id) === saved.goalId ? activeChatGoal.title : "");
+      startNewChat();
+      return previousTitle ? `Started a new chat for this goal. The previous chat is saved under "${previousTitle}".` : "Started a new chat for this goal. The previous chat is saved in the goal library.";
+    };
+    const switchChatToGoal = (goal) => {
+      if (isTyping) {
+        return;
+      }
+      const notice = prepareChatForGoal(goal.id);
+      activateChatGoal(goal);
+      if (notice) {
+        setChatGoalNotice({ tone: "info", text: notice });
+      }
+      closeChatGoalLibrary();
+      openChatSurface();
+    };
+    const visibleFollowOnActions = (msg) => (Array.isArray(msg == null ? void 0 : msg.follow_on_actions) ? msg.follow_on_actions : []).filter((action) => activeChatGoalId || typeof action === "string" || (action == null ? void 0 : action.kind) !== "advance_mission");
+    const startOnChatGoal = () => {
+      if (!activeChatGoal || isTyping) {
+        return;
+      }
+      sendChatMessage(`Let's start on my goal: ${activeChatGoal.goal}
+What should we check first? Run the first search that helps.`);
     };
     const sendChatMessage = async (overrideMessage = null, options = {}) => {
       if (isTyping) return;
@@ -8148,6 +8739,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       const resolvedOverride = typeof overrideMessage === "string" ? overrideMessage : "";
       const userMessage = (resolvedOverride || chatInput || "").trim();
       if (!userMessage) return;
+      const goalIdForRequest = activeChatGoalIdRef.current || "";
       setChatInput("");
       if (freshContext) {
         setServerConversationHistory(null);
@@ -8172,7 +8764,8 @@ Open Troubleshoot to find out why it can't be saved?`)) {
             history: historyToSend,
             chat_session_id: chatSessionIdOverride,
             investigation_mode: investigationMode,
-            mission: chatMission.trim()
+            mission: goalIdForRequest ? String((activeChatGoal == null ? void 0 : activeChatGoal.goal) || "") : "",
+            goal_id: goalIdForRequest || null
           })
         });
         const reader = response.body.getReader();
@@ -8237,6 +8830,13 @@ Open Troubleshoot to find out why it can't be saved?`)) {
                     setChatSessionId(result.chat_session_id);
                   } else if (chatSessionIdOverride !== chatSessionId) {
                     setChatSessionId(chatSessionIdOverride);
+                  }
+                  if (result.goal_turn_recorded && goalIdForRequest) {
+                    pendingGoalChatSaveRef.current = {
+                      goalId: goalIdForRequest,
+                      chatId: result.chat_session_id || chatSessionIdOverride
+                    };
+                    checkChatGoalProgress(goalIdForRequest);
                   }
                   setChatMessages((prev) => [...prev, ...messages2]);
                 }
@@ -10783,16 +11383,10 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         "button",
         {
           type: "button",
-          onClick: () => {
-            clearPersistedChatState();
-            setChatMessages([]);
-            setChatInput("");
-            setChatStatus("");
-            setServerConversationHistory(null);
-            setChatSessionId(generateChatSessionId());
-          },
-          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
-          title: "Clear chat",
+          onClick: startNewChat,
+          disabled: isTyping,
+          className: `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
+          title: isTyping ? "Wait for the answer to finish before clearing the chat" : "Clear chat",
           "aria-label": "Clear chat history"
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash", "aria-hidden": "true" })
@@ -10805,68 +11399,210 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-label": "Close chat"
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
-      ))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-3 border-b flex items-center gap-3 ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-mission-input", className: `text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement(
-        "input",
-        {
-          id: "chat-mission-input",
-          type: "text",
-          value: chatMission,
-          maxLength: CHAT_MISSION_MAX_CHARS,
-          onChange: (event) => setChatMission(event.target.value),
-          placeholder: "Optional. What do you want to find out? For example, why sensor data stopped arriving",
-          title: "The assistant keeps its searches, answers, and next steps focused on this goal.",
-          className: `flex-1 min-w-0 px-3 py-1.5 text-sm rounded border ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`
+      ))), (() => {
+        const goal = activeChatGoal;
+        const goalBusy = Boolean(chatGoalActivity);
+        const barClass = `px-6 py-3 border-b ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}`;
+        const iconButtonClass = `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`;
+        const inputClass = `px-3 py-1.5 text-sm rounded border ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`;
+        const primaryButtonClass = "inline-flex items-center justify-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white whitespace-nowrap transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed";
+        const outlineButtonClass = `inline-flex items-center justify-center rounded-md border px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`;
+        const labelClass = `text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}`;
+        const libraryButton = /* @__PURE__ */ React.createElement("button", { type: "button", onClick: openChatGoalLibrary, className: iconButtonClass, title: "Goal library", "aria-label": "Open the goal library" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-book", "aria-hidden": "true" }));
+        const noticeNode = chatGoalNotice && /* @__PURE__ */ React.createElement(
+          "p",
+          {
+            role: chatGoalNotice.tone === "error" ? "alert" : "status",
+            "data-testid": "chat-goal-notice",
+            className: `mt-2 text-xs ${chatGoalNotice.tone === "error" ? isDarkTheme ? "text-red-300" : "text-red-700" : mutedTextClass}`
+          },
+          chatGoalNotice.text
+        );
+        if (!activeChatGoalId) {
+          return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement(
+            "form",
+            {
+              className: "flex items-center gap-3",
+              onSubmit: (event) => {
+                event.preventDefault();
+                createChatGoal(chatMission, { activate: true });
+              }
+            },
+            /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-mission-input", className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"),
+            /* @__PURE__ */ React.createElement(
+              "input",
+              {
+                id: "chat-mission-input",
+                type: "text",
+                value: chatMission,
+                maxLength: CHAT_MISSION_MAX_CHARS,
+                onChange: (event) => setChatMission(event.target.value),
+                placeholder: "Optional. What do you want to find out? For example, why sensor data stopped arriving",
+                title: "Set a goal to list the questions that settle it and keep the assistant focused on it.",
+                className: `flex-1 min-w-0 ${inputClass}`,
+                disabled: chatGoalActivity === "creating"
+              }
+            ),
+            /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: !chatMission.trim() || goalBusy, className: primaryButtonClass }, chatGoalActivity === "creating" ? "Planning..." : "Set goal"),
+            libraryButton
+          ), noticeNode);
         }
-      ), chatMission && /* @__PURE__ */ React.createElement(
+        if (!goal) {
+          return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement("p", { className: `flex-1 min-w-0 text-sm ${mutedTextClass}` }, "Loading the goal..."), libraryButton, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: leaveChatGoal, className: iconButtonClass, title: "Leave goal", "aria-label": "Leave this goal. It stays in the goal library." }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-sign-out-alt", "aria-hidden": "true" }))), noticeNode);
+        }
+        const items = Array.isArray(goal.items) ? goal.items : [];
+        const progress2 = goal.progress || {};
+        const progressText = progress2.total ? `${progress2.answered} of ${progress2.total} answered` : "No questions tracked";
+        const isChecking = chatGoalCheckingId === goal.id;
+        const pendingTurns = Number(goal.pending_turns || 0);
+        if (isChatGoalEditing) {
+          return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement(
+            "form",
+            {
+              className: "space-y-2",
+              onSubmit: async (event) => {
+                event.preventDefault();
+                if (await saveChatGoalText(goal, chatGoalEditDraft)) {
+                  setIsChatGoalEditing(false);
+                }
+              }
+            },
+            /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-goal-edit-title", className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Name"), /* @__PURE__ */ React.createElement(
+              "input",
+              {
+                id: "chat-goal-edit-title",
+                type: "text",
+                value: chatGoalEditDraft.title,
+                maxLength: 80,
+                onChange: (event) => setChatGoalEditDraft((prev) => ({ ...prev, title: event.target.value })),
+                placeholder: "Leave empty to name it from the goal",
+                className: `flex-1 min-w-0 ${inputClass}`
+              }
+            )),
+            /* @__PURE__ */ React.createElement(
+              "textarea",
+              {
+                "aria-label": "Goal",
+                value: chatGoalEditDraft.goal,
+                maxLength: CHAT_MISSION_MAX_CHARS,
+                rows: "2",
+                onChange: (event) => setChatGoalEditDraft((prev) => ({ ...prev, goal: event.target.value })),
+                className: `w-full resize-none ${inputClass}`
+              }
+            ),
+            /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setIsChatGoalEditing(false), className: outlineButtonClass }, "Cancel"), /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: goalBusy || !chatGoalEditDraft.goal.trim(), className: primaryButtonClass }, chatGoalActivity === "saving" ? "Saving..." : "Save"))
+          ), noticeNode);
+        }
+        return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement("p", { className: `flex-1 min-w-0 truncate text-sm font-medium ${headingClass}`, title: goal.goal, "data-testid": "chat-goal-title" }, goal.title), isChecking && /* @__PURE__ */ React.createElement("span", { className: `text-xs whitespace-nowrap ${mutedTextClass}`, role: "status" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-1", "aria-hidden": "true" }), "Checking progress..."), chatMessages.length > 0 && Number(goal.turn_count || 0) === 0 && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: startOnChatGoal, disabled: isTyping, className: primaryButtonClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" }), "Start on this goal"), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => setIsChatGoalProgressOpen((prev) => !prev),
+            "aria-expanded": isChatGoalProgressOpen,
+            "aria-controls": "chat-goal-progress",
+            "data-testid": "chat-goal-progress-toggle",
+            className: `rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap ${goal.status === "done" ? isDarkTheme ? "border-green-700 bg-green-900 text-green-100" : "border-green-200 bg-green-50 text-green-800" : isDarkTheme ? "border-indigo-700 bg-indigo-950 text-indigo-100" : "border-indigo-200 bg-indigo-50 text-indigo-800"}`
+          },
+          goal.status === "done" ? `Done, ${progressText}` : progressText,
+          /* @__PURE__ */ React.createElement("i", { className: `fas ${isChatGoalProgressOpen ? "fa-chevron-up" : "fa-chevron-down"} ml-1.5`, "aria-hidden": "true" })
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => {
+              setChatGoalEditDraft({ title: goal.title || "", goal: goal.goal || "" });
+              setIsChatGoalEditing(true);
+            },
+            className: iconButtonClass,
+            title: "Edit goal",
+            "aria-label": "Edit this goal"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen", "aria-hidden": "true" })
+        ), libraryButton, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: leaveChatGoal, className: iconButtonClass, title: "Leave goal", "aria-label": "Leave this goal. It stays in the goal library." }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-sign-out-alt", "aria-hidden": "true" }))), isChatGoalProgressOpen && /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            id: "chat-goal-progress",
+            "data-testid": "chat-goal-progress",
+            className: `mt-3 rounded-lg border p-3 ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}`
+          },
+          goal.summary && /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-2 ${subtextClass}` }, goal.summary),
+          items.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: "space-y-1.5 max-h-56 overflow-y-auto" }, items.map((item) => /* @__PURE__ */ React.createElement("li", { key: item.id, className: "flex items-start gap-2 text-sm" }, /* @__PURE__ */ React.createElement(
+            "input",
+            {
+              type: "checkbox",
+              checked: item.status === "answered",
+              onChange: (event) => updateChatGoalItem(goal.id, item.id, { status: event.target.checked ? "answered" : "open" }),
+              disabled: goalBusy,
+              className: "mt-1 h-4 w-4 flex-shrink-0",
+              "aria-label": `Answered: ${item.text}`
+            }
+          ), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: item.status === "answered" ? mutedTextClass : headingClass }, item.text), item.note && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-0.5 ${mutedTextClass}` }, item.note))))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, "No questions are tracked yet. Select Plan again to suggest some, or add your own in the goal library."),
+          /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, "Progress is checked after each answer."), pendingTurns > 0 && !isChecking && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => checkChatGoalProgress(goal.id), className: "font-medium ui-link" }, "Check progress now"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => replanChatGoal(goal.id), disabled: goalBusy, className: "font-medium ui-link disabled:opacity-50" }, chatGoalActivity === "planning" ? "Planning..." : "Plan again"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: openChatGoalLibrary, className: "font-medium ui-link" }, "Manage in the goal library"))
+        ), noticeNode);
+      })(), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4", style: fullscreenChatConversationStyle }, chatMessages.length === 0 && (activeChatGoal ? /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}`, "data-testid": "chat-goal-empty-state" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-bullseye text-3xl mb-3 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, activeChatGoal.title), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2 max-w-xl mx-auto whitespace-pre-wrap break-words" }, activeChatGoal.goal), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
-          onClick: () => setChatMission(""),
-          className: `px-2 py-1 text-xs ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}`,
-          "aria-label": "Clear chat goal",
-          title: "Clear goal"
+          onClick: startOnChatGoal,
+          disabled: isTyping,
+          className: "mt-4 inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times" })
-      )), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4", style: fullscreenChatConversationStyle }, chatMessages.length === 0 && /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-3xl mb-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, "Ask about your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "For example: which indexes have the most data, what a search does, or how to write an SPL query.")), chatMessages.map((msg) => /* @__PURE__ */ React.createElement("div", { key: msg.id, className: `flex min-w-0 ${msg.type === "user" ? "justify-end" : "justify-start"}` }, /* @__PURE__ */ React.createElement("div", { className: `max-w-3xl min-w-0 p-4 rounded-lg ${msg.type === "user" ? "bg-indigo-600 text-white" : msg.type === "error" ? isDarkTheme ? "bg-red-900 text-red-100 border border-red-700" : "bg-red-50 text-red-800 border border-red-200" : msg.type === "warning" ? isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-900 border border-amber-200" : isDarkTheme ? "bg-gray-700 text-gray-100 border border-gray-600" : "bg-gray-100 text-gray-800"}`, style: getChatBubbleStyle(msg.type) }, msg.type === "user" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("i", { className: "fas fa-user ml-3 mt-1", "aria-hidden": "true" })), msg.type === "assistant" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot mr-3 mt-1 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), msg.spl_query && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Search that ran"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_query, {
-        originKind: "chat_assistant",
-        originLabel: "Chat assistant response",
-        sourceLabel: "Chat assistant response",
-        contextExcerpt: msg.content,
-        className: "sm:justify-end"
-      })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Suggested search (not run)"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_in_text, {
-        originKind: "chat_assistant_suggestion",
-        originLabel: "Chat assistant suggestion",
-        sourceLabel: "Chat assistant suggestion",
-        contextExcerpt: msg.content,
-        className: "sm:justify-end"
-      })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_in_text))), msg.visualization_spec && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-cyan-300 hover:text-cyan-100" : "text-cyan-700 hover:text-cyan-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line mr-2" }), "Visualization Preview"), renderVisualizationPreview(msg.visualization_spec, {
-        sourceQuery: msg.spl_query || msg.spl_in_text,
-        canOpenSplunk: canUseSplunkDeeplinks,
-        onOpenSplunk: openSplunkSearchFromChat
-      })), Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && /* @__PURE__ */ React.createElement(
-        "details",
-        {
-          className: "mt-3",
-          "data-testid": "chat-capability-evidence"
-        },
-        /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-2", "aria-hidden": "true" }), "Capability Evidence (", msg.capability_usage.length, ")"),
-        /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-gray-100 text-gray-700 border border-gray-200"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), renderCapabilityReusableQueryCards(usage), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, isSafeLibraryLink(chunk.url) ? /* @__PURE__ */ React.createElement("a", { href: chunk.url, target: "_blank", rel: "noopener noreferrer", className: "text-xs font-medium ui-link break-words" }, chunk.source || "Splunk documentation") : /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-200"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Match score ", chunk.score)), Array.isArray(chunk.why) && chunk.why.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-1 ${mutedTextClass}` }, chunk.why.slice(0, 3).join(" · ")), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))
-      ), msg.status_timeline && msg.status_timeline.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2", "aria-hidden": "true" }), "Steps taken (", [msg.iterations ? countLabel(msg.iterations, "round") : "", msg.execution_time].filter(Boolean).join(", "), ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between gap-3 px-3 py-2 rounded border-l-4 ${isDarkTheme ? "bg-gray-800 border-indigo-400" : "bg-white border-indigo-500"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs tabular-nums ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, Number(status.time || 0).toFixed(1), "s"))))), msg.mcp_data && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-database mr-1", "aria-hidden": "true" }), "Show raw data"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), msg.has_follow_on && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border rounded ${isDarkTheme ? "bg-indigo-900 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1" }), /* @__PURE__ */ React.createElement("span", null, "Suggested next actions")), Array.isArray(msg.follow_on_actions) && msg.follow_on_actions.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, msg.follow_on_actions.map((action, idx) => {
-        const actionLabel = typeof action === "string" ? action : action.label || action.prompt || "Follow-up action";
-        const actionPrompt = typeof action === "string" ? action : action.prompt || action.label || "";
-        return /* @__PURE__ */ React.createElement(
-          "button",
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" }),
+        "Start on this goal"
+      ), Array.isArray(activeChatGoal.suggested_questions) && activeChatGoal.suggested_questions.length > 0 && /* @__PURE__ */ React.createElement("p", { className: "text-xs mt-3" }, "Or ask one of the next questions below.")) : /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-3xl mb-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, "Ask about your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "For example: which indexes have the most data, what a search does, or how to write an SPL query."))), chatMessages.map((msg) => {
+        var _a2;
+        return /* @__PURE__ */ React.createElement("div", { key: msg.id, className: `flex min-w-0 ${msg.type === "user" ? "justify-end" : "justify-start"}` }, /* @__PURE__ */ React.createElement("div", { className: `max-w-3xl min-w-0 p-4 rounded-lg ${msg.type === "user" ? "bg-indigo-600 text-white" : msg.type === "error" ? isDarkTheme ? "bg-red-900 text-red-100 border border-red-700" : "bg-red-50 text-red-800 border border-red-200" : msg.type === "warning" ? isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-900 border border-amber-200" : isDarkTheme ? "bg-gray-700 text-gray-100 border border-gray-600" : "bg-gray-100 text-gray-800"}`, style: getChatBubbleStyle(msg.type) }, msg.type === "user" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("i", { className: "fas fa-user ml-3 mt-1", "aria-hidden": "true" })), msg.type === "assistant" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot mr-3 mt-1 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), msg.spl_query && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Search that ran"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_query, {
+          originKind: "chat_assistant",
+          originLabel: "Chat assistant response",
+          sourceLabel: "Chat assistant response",
+          contextExcerpt: msg.content,
+          className: "sm:justify-end"
+        })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Suggested search (not run)"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_in_text, {
+          originKind: "chat_assistant_suggestion",
+          originLabel: "Chat assistant suggestion",
+          sourceLabel: "Chat assistant suggestion",
+          contextExcerpt: msg.content,
+          className: "sm:justify-end"
+        })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_in_text))), msg.visualization_spec && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-cyan-300 hover:text-cyan-100" : "text-cyan-700 hover:text-cyan-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line mr-2" }), "Visualization Preview"), renderVisualizationPreview(msg.visualization_spec, {
+          sourceQuery: msg.spl_query || msg.spl_in_text,
+          canOpenSplunk: canUseSplunkDeeplinks,
+          onOpenSplunk: openSplunkSearchFromChat
+        })), Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && /* @__PURE__ */ React.createElement(
+          "details",
           {
-            key: idx,
-            type: "button",
-            onClick: () => actionPrompt && sendSuggestedQuery(actionPrompt),
-            className: `w-full text-left rounded border px-3 py-2 transition-colors ${isDarkTheme ? "bg-indigo-950 border-indigo-700 hover:bg-indigo-800 text-indigo-100" : "bg-white border-indigo-200 hover:bg-indigo-100 text-indigo-900"}`,
-            title: "Run this follow-up in chat"
+            className: "mt-3",
+            "data-testid": "chat-capability-evidence"
           },
-          /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, actionLabel),
-          typeof action !== "string" && action.prompt && action.prompt !== actionLabel && /* @__PURE__ */ React.createElement("div", { className: `text-xs mt-1 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, action.prompt)
-        );
-      })) : /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-indigo-200" : "text-indigo-800"}` }, "Follow-up action available.")))), msg.type === "error" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-3 mt-1 text-red-600" }), /* @__PURE__ */ React.createElement("p", { className: "flex-1 whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), msg.type === "warning" && /* @__PURE__ */ React.createElement("div", { className: `flex items-start min-w-0 border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? "bg-amber-900" : "bg-amber-50"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-circle mr-3 mt-1 text-amber-600" }), /* @__PURE__ */ React.createElement("p", { className: `flex-1 whitespace-pre-wrap break-words ${isDarkTheme ? "text-amber-100" : "text-amber-800"}`, style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("div", { className: "text-xs opacity-70 mt-2" }, new Date(msg.timestamp).toLocaleTimeString(void 0, { timeStyle: "short" }))))), isTyping && /* @__PURE__ */ React.createElement("div", { className: "flex justify-start" }, /* @__PURE__ */ React.createElement("div", { className: `p-4 rounded-lg border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gray-100 text-gray-800 border-gray-200"}`, role: "status", "aria-live": "polite" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center space-x-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex space-x-1", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.1s" } }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.2s" } })), /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, "The assistant is working."), chatStatus && /* @__PURE__ */ React.createElement("span", { className: `text-sm ml-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, chatStatus)))), /* @__PURE__ */ React.createElement("div", { ref: chatEndRef }))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-t ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Suggested Questions"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement(
+          /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-2", "aria-hidden": "true" }), "Capability Evidence (", msg.capability_usage.length, ")"),
+          /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-gray-100 text-gray-700 border border-gray-200"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), renderCapabilityReusableQueryCards(usage), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, isSafeLibraryLink(chunk.url) ? /* @__PURE__ */ React.createElement("a", { href: chunk.url, target: "_blank", rel: "noopener noreferrer", className: "text-xs font-medium ui-link break-words" }, chunk.source || "Splunk documentation") : /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-200"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Match score ", chunk.score)), Array.isArray(chunk.why) && chunk.why.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-1 ${mutedTextClass}` }, chunk.why.slice(0, 3).join(" · ")), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))
+        ), msg.status_timeline && msg.status_timeline.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2", "aria-hidden": "true" }), "Steps taken (", [msg.iterations ? countLabel(msg.iterations, "round") : "", msg.execution_time].filter(Boolean).join(", "), ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between gap-3 px-3 py-2 rounded border-l-4 ${isDarkTheme ? "bg-gray-800 border-indigo-400" : "bg-white border-indigo-500"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs tabular-nums ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, Number(status.time || 0).toFixed(1), "s"))))), msg.mcp_data && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-database mr-1", "aria-hidden": "true" }), "Show raw data"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), msg.has_follow_on && !(((_a2 = msg.follow_on_actions) == null ? void 0 : _a2.length) > 0 && visibleFollowOnActions(msg).length === 0) && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border rounded ${isDarkTheme ? "bg-indigo-900 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1" }), /* @__PURE__ */ React.createElement("span", null, "Suggested next actions")), visibleFollowOnActions(msg).length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, visibleFollowOnActions(msg).map((action, idx) => {
+          const actionLabel = typeof action === "string" ? action : action.label || action.prompt || "Follow-up action";
+          const actionPrompt = typeof action === "string" ? action : action.prompt || action.label || "";
+          return /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              key: idx,
+              type: "button",
+              onClick: () => actionPrompt && sendSuggestedQuery(actionPrompt),
+              className: `w-full text-left rounded border px-3 py-2 transition-colors ${isDarkTheme ? "bg-indigo-950 border-indigo-700 hover:bg-indigo-800 text-indigo-100" : "bg-white border-indigo-200 hover:bg-indigo-100 text-indigo-900"}`,
+              title: "Run this follow-up in chat"
+            },
+            /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, actionLabel),
+            typeof action !== "string" && action.prompt && action.prompt !== actionLabel && /* @__PURE__ */ React.createElement("div", { className: `text-xs mt-1 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, action.prompt)
+          );
+        })) : /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-indigo-200" : "text-indigo-800"}` }, "Follow-up action available.")))), msg.type === "error" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-3 mt-1 text-red-600" }), /* @__PURE__ */ React.createElement("p", { className: "flex-1 whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), msg.type === "warning" && /* @__PURE__ */ React.createElement("div", { className: `flex items-start min-w-0 border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? "bg-amber-900" : "bg-amber-50"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-circle mr-3 mt-1 text-amber-600" }), /* @__PURE__ */ React.createElement("p", { className: `flex-1 whitespace-pre-wrap break-words ${isDarkTheme ? "text-amber-100" : "text-amber-800"}`, style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("div", { className: "text-xs opacity-70 mt-2" }, new Date(msg.timestamp).toLocaleTimeString(void 0, { timeStyle: "short" }))));
+      }), isTyping && /* @__PURE__ */ React.createElement("div", { className: "flex justify-start" }, /* @__PURE__ */ React.createElement("div", { className: `p-4 rounded-lg border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gray-100 text-gray-800 border-gray-200"}`, role: "status", "aria-live": "polite" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center space-x-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex space-x-1", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.1s" } }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.2s" } })), /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, "The assistant is working."), chatStatus && /* @__PURE__ */ React.createElement("span", { className: `text-sm ml-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, chatStatus)))), /* @__PURE__ */ React.createElement("div", { ref: chatEndRef }))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-t ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, activeChatGoal && Array.isArray(activeChatGoal.suggested_questions) && activeChatGoal.suggested_questions.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mb-3", "data-testid": "chat-goal-questions" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold uppercase tracking-wide mb-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Next questions for your goal"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, activeChatGoal.suggested_questions.map((question, idx) => /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          key: idx,
+          type: "button",
+          onClick: () => sendSuggestedQuery(question),
+          disabled: isTyping,
+          title: "Ask this now",
+          className: `rounded-full border px-3 py-1 text-xs text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "bg-indigo-950 border-indigo-700 text-indigo-100 hover:bg-indigo-900" : "bg-indigo-50 border-indigo-200 text-indigo-900 hover:bg-indigo-100"}`
+        },
+        question
+      )))), /* @__PURE__ */ React.createElement("div", { className: "mb-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Suggested Questions"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
@@ -10929,54 +11665,138 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-paper-plane", "aria-hidden": "true" })
       )), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-2 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Press Enter to send and Shift+Enter for a new line. The conversation is kept until you clear it."))))
     ), isChatSettingsOpen && (() => {
+      var _a2, _b2, _c2, _d2;
       const closeChatSettings = () => setIsChatSettingsOpen(false);
       const sectionClass = `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}`;
       const sectionTitleClass = `text-base font-semibold mb-4 flex items-center ${headingClass}`;
       const sectionIconClass = `mr-2 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`;
-      const fieldLabelClass = `block text-sm font-medium mb-2 ${isDarkTheme ? "text-gray-200" : "text-gray-700"}`;
+      const fieldLabelClass = `text-sm font-medium ${isDarkTheme ? "text-gray-200" : "text-gray-700"}`;
       const fieldHintClass = `text-xs mt-2 ${summaryLabelClass}`;
+      const settingsModel = (chatSettings == null ? void 0 : chatSettings.model) || {};
+      const modelLabel = settingsModel.label || "the AI model";
+      const autoValues = (chatSettings == null ? void 0 : chatSettings.auto) || {};
+      const customKeys = Array.isArray(chatSettings == null ? void 0 : chatSettings.custom) ? chatSettings.custom : [];
+      const settingSources = (chatSettings == null ? void 0 : chatSettings.sources) || {};
+      const settingLimits = (chatSettings == null ? void 0 : chatSettings.limits) || {};
+      const supportsTemperature = settingsModel.supports_temperature !== false;
+      const settingsNotice = (chatSettings == null ? void 0 : chatSettings.notice) && typeof chatSettings.notice === "object" ? chatSettings.notice : null;
       const formatTokenCount = (value) => Number(value).toLocaleString("en-US");
-      const chatMaxTokens = Number(chatSettings == null ? void 0 : chatSettings.max_tokens) || 0;
-      const connectionMaxTokens = Number(activeLlmTuning == null ? void 0 : activeLlmTuning.max_tokens) || 0;
-      const tokenLimitHint = connectionMaxTokens > 0 ? chatMaxTokens > connectionMaxTokens ? `The current AI connection allows up to ${formatTokenCount(connectionMaxTokens)} tokens, so answers stop at ${formatTokenCount(connectionMaxTokens)}.` : `Answers stop at ${formatTokenCount(chatMaxTokens)} tokens. The current AI connection allows up to ${formatTokenCount(connectionMaxTokens)}.` : "Answers stop at this length or at the AI connection limit, whichever is lower.";
-      const hasConnectionTemperature = activeLlmTuning && activeLlmTuning.temperature !== null && activeLlmTuning.temperature !== void 0;
-      const renderRange = ({ id, label, settingKey, min, max, step = 1, minLabel, maxLabel, parse = (value) => parseInt(value, 10), fallback, disabled = false, hint = null }) => {
-        var _a2;
-        return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: id, className: fieldLabelClass }, label), /* @__PURE__ */ React.createElement(
+      const formatSettingValue = (key, value) => {
+        if (value === null || value === void 0) {
+          return key === "temperature" ? "set by the model" : "not set";
+        }
+        if (typeof value === "boolean") {
+          return value ? "On" : "Off";
+        }
+        switch (key) {
+          case "max_execution_time":
+            return countLabel(value, "second");
+          case "max_tokens":
+            return `${formatTokenCount(value)} tokens`;
+          case "temperature":
+            return Number(value).toFixed(1);
+          case "discovery_freshness_days":
+            return countLabel(value, "day");
+          case "max_iterations":
+          case "convergence_detection":
+            return countLabel(value, "round");
+          case "context_history":
+            return countLabel(value, "message");
+          case "rag_max_chunks":
+            return countLabel(value, "passage");
+          default:
+            return String(value);
+        }
+      };
+      const autoHint = (key) => {
+        const autoText = formatSettingValue(key, autoValues[key]);
+        if (settingSources[key] === "model") {
+          return `Auto: ${autoText}, from the tuning for ${modelLabel}.`;
+        }
+        if (settingSources[key] === "knowledge_base") {
+          return `Auto: ${autoText}. Auto is on when the Knowledge Base is installed and turned on.`;
+        }
+        return `Auto: ${autoText}, the app default.`;
+      };
+      const renderModeControls = (settingKey, name) => {
+        const isCustom = customKeys.includes(settingKey);
+        return /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 flex-shrink-0" }, /* @__PURE__ */ React.createElement(
+          "span",
+          {
+            "data-testid": `chat-setting-mode-${settingKey}`,
+            className: `rounded-full px-2 py-0.5 text-xs font-semibold ${isCustom ? isDarkTheme ? "bg-indigo-900 text-indigo-200" : "bg-indigo-100 text-indigo-800" : isDarkTheme ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700"}`
+          },
+          isCustom ? "Custom" : "Auto"
+        ), isCustom && /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => returnChatSettingToAuto(settingKey),
+            className: "text-xs font-medium ui-link",
+            "aria-label": `Use the Auto value for ${name}`
+          },
+          "Use Auto"
+        ));
+      };
+      const renderHints = (id, settingKey, extraHint) => /* @__PURE__ */ React.createElement("div", { id: `${id}-hint` }, /* @__PURE__ */ React.createElement("p", { className: fieldHintClass }, autoHint(settingKey)), extraHint && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 ${summaryLabelClass}` }, extraHint));
+      const renderRange = ({ id, name, label, settingKey, step = 1, minLabel, maxLabel, parse = (value) => parseInt(value, 10), disabled = false, extraHint = null }) => {
+        var _a3;
+        const limits = settingLimits[settingKey] || {};
+        const value = chatSettings[settingKey];
+        return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-2" }, /* @__PURE__ */ React.createElement("label", { htmlFor: id, className: fieldLabelClass }, label || `${name}: ${formatSettingValue(settingKey, value)}`), renderModeControls(settingKey, name)), /* @__PURE__ */ React.createElement(
           "input",
           {
             id,
             type: "range",
-            min,
-            max,
+            min: limits.min,
+            max: limits.max,
             step,
-            value: (_a2 = chatSettings[settingKey]) != null ? _a2 : fallback,
+            value: (_a3 = value != null ? value : limits.min) != null ? _a3 : 0,
             onChange: (e) => updateSetting(settingKey, parse(e.target.value)),
             className: "w-full",
-            disabled
+            disabled,
+            "aria-describedby": `${id}-hint`
           }
-        ), /* @__PURE__ */ React.createElement("div", { className: `flex justify-between text-xs mt-1 ${summaryLabelClass}`, "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("span", null, minLabel), /* @__PURE__ */ React.createElement("span", null, maxLabel)), hint && /* @__PURE__ */ React.createElement("p", { className: fieldHintClass }, hint));
+        ), /* @__PURE__ */ React.createElement("div", { className: `flex justify-between text-xs mt-1 ${summaryLabelClass}`, "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("span", null, minLabel != null ? minLabel : limits.min), /* @__PURE__ */ React.createElement("span", null, maxLabel != null ? maxLabel : limits.max)), renderHints(id, settingKey, extraHint));
       };
-      const renderToggle = ({ id, label, description, settingKey }) => /* @__PURE__ */ React.createElement("label", { htmlFor: id, className: `flex items-center justify-between gap-4 rounded-md border p-3 cursor-pointer ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: `block text-sm font-medium ${headingClass}` }, label), /* @__PURE__ */ React.createElement("span", { className: `block text-xs mt-0.5 ${summaryLabelClass}` }, description)), /* @__PURE__ */ React.createElement(
+      const commitChatSettingDraft = (key) => {
+        const draft = chatSettingsDrafts[key];
+        if (draft === void 0) {
+          return;
+        }
+        setChatSettingsDrafts((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        const parsed = parseInt(draft, 10);
+        if (Number.isFinite(parsed) && parsed !== chatSettings[key]) {
+          updateSetting(key, parsed);
+        }
+      };
+      const renderToggle = ({ id, name, description, settingKey }) => /* @__PURE__ */ React.createElement("div", { className: `rounded-md border p-3 ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-4" }, /* @__PURE__ */ React.createElement("label", { htmlFor: id, className: "cursor-pointer min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: `block text-sm font-medium ${headingClass}` }, name), /* @__PURE__ */ React.createElement("span", { className: `block text-xs mt-0.5 ${summaryLabelClass}` }, description)), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3 flex-shrink-0" }, renderModeControls(settingKey, name), /* @__PURE__ */ React.createElement(
         "input",
         {
           id,
           type: "checkbox",
           checked: !!chatSettings[settingKey],
           onChange: (e) => updateSetting(settingKey, e.target.checked),
-          className: "h-4 w-4 flex-shrink-0"
+          className: "h-4 w-4 flex-shrink-0",
+          "aria-describedby": `${id}-hint`
         }
-      ));
-      return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4", onClick: closeChatSettings }, /* @__PURE__ */ React.createElement("div", { className: `chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`, role: "dialog", "aria-modal": "true", "aria-labelledby": "chat-settings-title", onClick: (event) => event.stopPropagation(), onKeyDown: (event) => handleDialogKeyDown(event, closeChatSettings) }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog text-xl text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "chat-settings-title", className: `text-xl font-semibold ${headingClass}` }, "Chat Settings"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-0.5 ${mutedTextClass}` }, "How the assistant searches and answers."))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement(
+      ))), renderHints(id, settingKey, null));
+      const maxOutputTokens = Number(settingsModel.max_output_tokens) || 0;
+      return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4", onClick: closeChatSettings }, /* @__PURE__ */ React.createElement("div", { className: `chat-settings-modal-shell rounded-xl shadow-2xl w-full max-w-3xl h-5/6 flex flex-col ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`, role: "dialog", "aria-modal": "true", "aria-labelledby": "chat-settings-title", onClick: (event) => event.stopPropagation(), onKeyDown: (event) => handleDialogKeyDown(event, closeChatSettings) }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog text-xl text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "chat-settings-title", className: `text-xl font-semibold ${headingClass}` }, "Chat Settings"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-0.5 ${mutedTextClass}`, "data-testid": "chat-settings-model-line" }, chatSettings ? `Auto values follow ${modelLabel} and its AI connection settings. Change a setting to make it Custom.` : "How the assistant searches and answers."))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
           onClick: resetChatSettings,
-          className: `inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition-colors ${secondaryButtonClass}`,
-          title: "Reset to defaults"
+          disabled: !customKeys.length,
+          className: `inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`,
+          title: "Put every setting back on Auto"
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-undo", "aria-hidden": "true" }),
-        "Reset"
+        "Reset all to Auto"
       ), /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -10987,41 +11807,378 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           "aria-label": "Close chat settings"
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
-      ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 overflow-y-auto p-6 space-y-5" }, chatSettings && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-limits-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-limits-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-stopwatch ${sectionIconClass}`, "aria-hidden": "true" }), "Answer Limits"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, renderRange({ id: "chat-setting-max-execution-time", label: `Time limit per answer: ${chatSettings.max_execution_time} seconds`, settingKey: "max_execution_time", min: 30, max: 300, minLabel: "30 s", maxLabel: "300 s" }), renderRange({ id: "chat-setting-max-iterations", label: `Max search rounds per answer: ${chatSettings.max_iterations}`, settingKey: "max_iterations", min: 1, max: 10, minLabel: "1", maxLabel: "10" }), renderRange({ id: "chat-setting-discovery-freshness", label: `Use discovery results up to ${countLabel(chatSettings.discovery_freshness_days, "day")} old`, settingKey: "discovery_freshness_days", min: 1, max: 30, minLabel: "1 day", maxLabel: "30 days" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-model-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-model-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain ${sectionIconClass}`, "aria-hidden": "true" }), "AI Model"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-setting-max-tokens", className: fieldLabelClass }, "Max response length (tokens)"), /* @__PURE__ */ React.createElement(
+      ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 overflow-y-auto p-6 space-y-5" }, chatSettingsError && /* @__PURE__ */ React.createElement("div", { role: "alert", className: `rounded-md border px-4 py-3 text-sm ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, chatSettingsError), settingsNotice && /* @__PURE__ */ React.createElement("div", { role: "status", "data-testid": "chat-settings-model-notice", className: `rounded-md border px-4 py-3 text-sm flex items-start justify-between gap-3 ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-900"}` }, /* @__PURE__ */ React.createElement("p", null, "The AI model changed from ", settingsNotice.previous_model, " to ", settingsNotice.model, ", so your custom values (", countLabel(Array.isArray(settingsNotice.cleared) ? settingsNotice.cleared.length : 0, "setting"), ") were cleared. Every setting is back on Auto."), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: dismissChatSettingsNotice, className: "text-sm font-medium ui-link whitespace-nowrap" }, "Dismiss")), !chatSettings && !chatSettingsError && /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, "Loading chat settings..."), chatSettings && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-limits-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-limits-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-stopwatch ${sectionIconClass}`, "aria-hidden": "true" }), "Answer Limits"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, renderRange({
+        id: "chat-setting-max-execution-time",
+        name: "Time limit per answer",
+        settingKey: "max_execution_time",
+        step: 30,
+        minLabel: "30 s",
+        maxLabel: "30 min",
+        extraHint: "One answer can take several AI model requests. The limit is checked between them, so it is never shorter than one request."
+      }), renderRange({ id: "chat-setting-max-iterations", name: "Max search rounds per answer", settingKey: "max_iterations" }), renderRange({
+        id: "chat-setting-convergence",
+        name: "Stop early after",
+        label: `Stop early after ${countLabel(chatSettings.convergence_detection, "round")} without progress`,
+        settingKey: "convergence_detection",
+        extraHint: "Ends the answer when this many search rounds in a row find nothing new."
+      }), renderRange({
+        id: "chat-setting-discovery-freshness",
+        name: "Discovery results age limit",
+        label: `Use discovery results up to ${countLabel(chatSettings.discovery_freshness_days, "day")} old`,
+        settingKey: "discovery_freshness_days",
+        minLabel: "1 day",
+        maxLabel: "30 days"
+      }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-model-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-model-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain ${sectionIconClass}`, "aria-hidden": "true" }), "AI Model"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-2" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-setting-max-tokens", className: fieldLabelClass }, "Max response length (tokens)"), renderModeControls("max_tokens", "Max response length")), /* @__PURE__ */ React.createElement(
         "input",
         {
           id: "chat-setting-max-tokens",
           type: "number",
-          min: "1000",
-          max: "128000",
-          value: chatSettings.max_tokens,
-          onChange: (e) => updateSetting("max_tokens", parseInt(e.target.value, 10)),
+          min: (_a2 = settingLimits.max_tokens) == null ? void 0 : _a2.min,
+          max: (_b2 = settingLimits.max_tokens) == null ? void 0 : _b2.max,
+          value: (_d2 = (_c2 = chatSettingsDrafts.max_tokens) != null ? _c2 : chatSettings.max_tokens) != null ? _d2 : "",
+          onChange: (e) => setChatSettingsDrafts((prev) => ({ ...prev, max_tokens: e.target.value })),
+          onBlur: () => commitChatSettingDraft("max_tokens"),
+          onKeyDown: (e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commitChatSettingDraft("max_tokens");
+            }
+          },
           "aria-describedby": "chat-setting-max-tokens-hint",
           className: `w-full px-3 py-2 border rounded-md ${isDarkTheme ? "bg-gray-950 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`
         }
-      ), /* @__PURE__ */ React.createElement("p", { id: "chat-setting-max-tokens-hint", "data-testid": "chat-settings-token-hint", className: fieldHintClass }, tokenLimitHint)), renderRange({
+      ), /* @__PURE__ */ React.createElement("div", { "data-testid": "chat-settings-token-hint" }, renderHints("chat-setting-max-tokens", "max_tokens", maxOutputTokens > 0 ? `${modelLabel} can write up to ${formatTokenCount(maxOutputTokens)} tokens in one answer. Longer limits allow longer answers but take more time.` : "Longer limits allow longer answers but take more time."))), supportsTemperature ? renderRange({
         id: "chat-setting-temperature",
-        label: `Temperature: ${Number(chatSettings.temperature || 0).toFixed(1)}`,
+        name: "Temperature",
         settingKey: "temperature",
-        min: 0,
-        max: 2,
         step: 0.1,
         parse: (value) => parseFloat(value),
         minLabel: "0.0 (focused)",
-        maxLabel: "2.0 (creative)",
-        hint: hasConnectionTemperature ? `The AI connection default is ${activeLlmTuning.temperature}. Moving the slider overrides it until the server restarts.` : null
-      }), renderRange({ id: "chat-setting-context-history", label: `Messages remembered: ${chatSettings.context_history}`, settingKey: "context_history", min: 0, max: 20, minLabel: "0", maxLabel: "20" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-retries-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-retries-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-redo ${sectionIconClass}`, "aria-hidden": "true" }), "Retries and Sampling"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, renderRange({ id: "chat-setting-max-retry-delay", label: `Max retry delay: ${chatSettings.max_retry_delay} seconds`, settingKey: "max_retry_delay", min: 10, max: 600, minLabel: "10 s", maxLabel: "600 s" }), renderRange({ id: "chat-setting-max-retries", label: `Max retries: ${chatSettings.max_retries}`, settingKey: "max_retries", min: 1, max: 10, minLabel: "1", maxLabel: "10" }), renderRange({ id: "chat-setting-query-sample-size", label: `Sample rows per search: ${chatSettings.query_sample_size}`, settingKey: "query_sample_size", min: 1, max: 10, minLabel: "1", maxLabel: "10" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-quality-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-quality-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-check-circle ${sectionIconClass}`, "aria-hidden": "true" }), "Answer Quality"), /* @__PURE__ */ React.createElement("div", { className: "space-y-5" }, renderRange({ id: "chat-setting-quality-threshold", label: `Minimum quality score: ${chatSettings.quality_threshold}`, settingKey: "quality_threshold", min: 0, max: 100, minLabel: "0 (permissive)", maxLabel: "100 (strict)" }), renderRange({ id: "chat-setting-convergence", label: `Stop after ${chatSettings.convergence_detection} rounds without progress`, settingKey: "convergence_detection", min: 3, max: 10, minLabel: "3", maxLabel: "10" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-extras-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-extras-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-puzzle-piece ${sectionIconClass}`, "aria-hidden": "true" }), "Extras"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, renderToggle({ id: "chat-setting-splunk-augmentation", label: "Built-in Splunk Answers", description: "Answer common Splunk questions with built-in routines instead of the AI model", settingKey: "enable_splunk_augmentation" }), renderToggle({ id: "chat-setting-rag-context", label: "Search the Knowledge Base", description: "Add matching passages from your reports, imported documents, and downloaded Splunk documentation to chat answers", settingKey: "enable_rag_context" }), renderRange({
+        maxLabel: "2.0 (creative)"
+      }) : /* @__PURE__ */ React.createElement("div", { "data-testid": "chat-setting-temperature-fixed" }, /* @__PURE__ */ React.createElement("p", { className: fieldLabelClass }, "Temperature: set by the model"), /* @__PURE__ */ React.createElement("p", { className: fieldHintClass }, modelLabel, " uses a fixed temperature, so the app does not send one.")), renderRange({ id: "chat-setting-context-history", name: "Messages remembered", settingKey: "context_history" }))), /* @__PURE__ */ React.createElement("section", { className: sectionClass, "aria-labelledby": "chat-settings-extras-title" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-settings-extras-title", className: sectionTitleClass }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-puzzle-piece ${sectionIconClass}`, "aria-hidden": "true" }), "Extras"), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, renderToggle({ id: "chat-setting-splunk-augmentation", name: "Built-in Splunk Answers", description: "Answer common Splunk questions with built-in routines instead of the AI model", settingKey: "enable_splunk_augmentation" }), renderToggle({ id: "chat-setting-rag-context", name: "Search the Knowledge Base", description: "Add matching passages from your reports, imported documents, and downloaded Splunk documentation to chat answers", settingKey: "enable_rag_context" }), renderRange({
         id: "chat-setting-rag-max-chunks",
-        label: `Passages per answer: ${chatSettings.rag_max_chunks || 3}`,
+        name: "Passages per answer",
         settingKey: "rag_max_chunks",
-        min: 1,
-        max: 6,
-        fallback: 3,
-        minLabel: "1",
-        maxLabel: "6",
         disabled: !chatSettings.enable_rag_context,
-        hint: "Install the Knowledge Base on the Capabilities tab and turn it on first."
-      }))))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-3 border-t rounded-b-xl ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("p", { className: `text-sm text-center ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-info-circle mr-2", "aria-hidden": "true" }), "Changes apply right away and reset when the server restarts."))));
+        extraHint: chatSettings.enable_rag_context ? null : "Turn on Search the Knowledge Base first. Install the Knowledge Base on the Capabilities tab if it is not there yet."
+      }))))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-3 border-t rounded-b-xl ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("p", { className: `text-sm text-center ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-info-circle mr-2", "aria-hidden": "true" }), "Changes apply right away. Custom values are saved and stay until the AI model changes."))));
+    })(), isChatGoalLibraryOpen && (() => {
+      const detail = chatGoalLibraryDetail;
+      const goalBusy = Boolean(chatGoalActivity);
+      const edit = chatGoalLibraryEdit;
+      const inputClass = `w-full px-3 py-1.5 text-sm rounded border ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`;
+      const primaryButtonClass = "inline-flex items-center justify-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white whitespace-nowrap transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed";
+      const outlineButtonClass = `inline-flex items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`;
+      const iconButtonClass = `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`;
+      const fieldLabelClass = `block text-xs font-semibold uppercase tracking-wide mb-1 ${mutedTextClass}`;
+      const sectionTitleClass = `text-sm font-semibold ${headingClass}`;
+      const rowClass = `rounded-md border p-3 ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}`;
+      const badgeClass = (tone) => `rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${tone === "done" ? isDarkTheme ? "bg-green-900 text-green-100" : "bg-green-100 text-green-800" : isDarkTheme ? "bg-indigo-900 text-indigo-100" : "bg-indigo-100 text-indigo-800"}`;
+      const progressText = (goal) => {
+        const progress2 = (goal == null ? void 0 : goal.progress) || {};
+        return progress2.total ? `${progress2.answered} of ${progress2.total} answered` : "No questions tracked";
+      };
+      const detailItems = Array.isArray(detail == null ? void 0 : detail.items) ? detail.items : [];
+      const detailChats = Array.isArray(detail == null ? void 0 : detail.chats) ? detail.chats : [];
+      const isDetailInChat = Boolean(detail && detail.id === activeChatGoalId);
+      return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4", onClick: closeChatGoalLibrary }, /* @__PURE__ */ React.createElement(
+        "div",
+        {
+          className: `rounded-xl shadow-2xl w-full max-w-5xl h-5/6 flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`,
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-labelledby": "chat-goal-library-title",
+          "data-testid": "chat-goal-library",
+          onClick: (event) => event.stopPropagation(),
+          onKeyDown: (event) => handleDialogKeyDown(event, closeChatGoalLibrary)
+        },
+        /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-book text-xl text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "chat-goal-library-title", className: `text-xl font-semibold ${headingClass}` }, "Goal Library"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-0.5 ${mutedTextClass}` }, "Your goals, the questions that settle each one, and the chats saved under it."))), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: closeChatGoalLibrary,
+            autoFocus: true,
+            className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
+            "aria-label": "Close the goal library"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
+        )),
+        /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 flex flex-col md:flex-row" }, /* @__PURE__ */ React.createElement("aside", { className: `md:w-80 flex-shrink-0 flex flex-col min-h-0 max-h-72 md:max-h-none border-b md:border-b-0 md:border-r ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement(
+          "form",
+          {
+            className: `p-4 space-y-2 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}`,
+            onSubmit: (event) => {
+              event.preventDefault();
+              createChatGoal(chatGoalLibraryDraft, { activate: false });
+            }
+          },
+          /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-goal-library-new", className: fieldLabelClass }, "New goal"),
+          /* @__PURE__ */ React.createElement(
+            "textarea",
+            {
+              id: "chat-goal-library-new",
+              rows: "2",
+              value: chatGoalLibraryDraft,
+              maxLength: CHAT_MISSION_MAX_CHARS,
+              onChange: (event) => setChatGoalLibraryDraft(event.target.value),
+              placeholder: "What do you want to find out?",
+              className: `${inputClass} resize-none`
+            }
+          ),
+          /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: !chatGoalLibraryDraft.trim() || goalBusy, className: `${primaryButtonClass} w-full` }, chatGoalActivity === "creating" ? "Planning..." : "Add goal")
+        ), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto" }, chatGoalLibrary.length === 0 && /* @__PURE__ */ React.createElement("p", { className: `p-4 text-sm ${mutedTextClass}` }, isChatGoalLibraryLoading ? "Loading goals..." : "No goals yet. Add one here or set one in chat."), /* @__PURE__ */ React.createElement("ul", { "aria-label": "Goals" }, chatGoalLibrary.map((goal) => {
+          const isSelected = goal.id === chatGoalLibrarySelectedId;
+          return /* @__PURE__ */ React.createElement("li", { key: goal.id }, /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: () => {
+                setChatGoalLibraryEdit(null);
+                setChatGoalNewItemText("");
+                setChatGoalLibrarySelectedId(goal.id);
+              },
+              "aria-current": isSelected ? "true" : void 0,
+              className: `w-full text-left px-4 py-3 border-b transition-colors ${isDarkTheme ? "border-gray-700" : "border-gray-200"} ${isSelected ? isDarkTheme ? "bg-indigo-950" : "bg-indigo-50" : isDarkTheme ? "hover:bg-gray-700" : "hover:bg-gray-50"}`
+            },
+            /* @__PURE__ */ React.createElement("span", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `flex-1 min-w-0 truncate text-sm font-medium ${headingClass}` }, goal.title), goal.id === activeChatGoalId && /* @__PURE__ */ React.createElement("span", { className: badgeClass("active") }, "In chat"), goal.status === "done" && /* @__PURE__ */ React.createElement("span", { className: badgeClass("done") }, "Done")),
+            /* @__PURE__ */ React.createElement("span", { className: `block text-xs mt-1 ${mutedTextClass}` }, progressText(goal), ", ", countLabel(goal.chat_count, "saved chat")),
+            /* @__PURE__ */ React.createElement("span", { className: `block text-xs mt-0.5 ${mutedTextClass}` }, "Updated ", formatMissionDateTime(goal.updated_at))
+          ));
+        })))), /* @__PURE__ */ React.createElement("section", { className: "flex-1 min-h-0 overflow-y-auto p-6 space-y-6", "aria-label": "Goal details" }, chatGoalNotice && /* @__PURE__ */ React.createElement(
+          "div",
+          {
+            role: chatGoalNotice.tone === "error" ? "alert" : "status",
+            className: `rounded-md border px-4 py-3 text-sm ${chatGoalNotice.tone === "error" ? isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800" : isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}`
+          },
+          chatGoalNotice.text
+        ), !chatGoalLibrarySelectedId && /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, "Pick a goal to see the questions it tracks and the chats saved under it."), chatGoalLibrarySelectedId && !detail && /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, "Loading the goal..."), detail && /* @__PURE__ */ React.createElement(React.Fragment, null, (edit == null ? void 0 : edit.kind) === "goal" ? /* @__PURE__ */ React.createElement(
+          "form",
+          {
+            className: "space-y-3",
+            onSubmit: async (event) => {
+              event.preventDefault();
+              if (await saveChatGoalText(detail, edit)) {
+                setChatGoalLibraryEdit(null);
+              }
+            }
+          },
+          /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-goal-library-edit-title", className: fieldLabelClass }, "Name"), /* @__PURE__ */ React.createElement(
+            "input",
+            {
+              id: "chat-goal-library-edit-title",
+              type: "text",
+              value: edit.title,
+              maxLength: 80,
+              onChange: (event) => setChatGoalLibraryEdit({ ...edit, title: event.target.value }),
+              placeholder: "Leave empty to name it from the goal",
+              className: inputClass
+            }
+          )),
+          /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-goal-library-edit-goal", className: fieldLabelClass }, "Goal"), /* @__PURE__ */ React.createElement(
+            "textarea",
+            {
+              id: "chat-goal-library-edit-goal",
+              rows: "3",
+              value: edit.goal,
+              maxLength: CHAT_MISSION_MAX_CHARS,
+              onChange: (event) => setChatGoalLibraryEdit({ ...edit, goal: event.target.value }),
+              className: `${inputClass} resize-none`
+            }
+          )),
+          /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setChatGoalLibraryEdit(null), className: outlineButtonClass }, "Cancel"), /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: goalBusy || !edit.goal.trim(), className: primaryButtonClass }, chatGoalActivity === "saving" ? "Saving..." : "Save"))
+        ) : /* @__PURE__ */ React.createElement("div", { "data-testid": "chat-goal-detail" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 flex-1" }, /* @__PURE__ */ React.createElement("h3", { className: `text-lg font-semibold break-words ${headingClass}` }, detail.title), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-1 whitespace-pre-wrap break-words ${subtextClass}` }, detail.goal), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-2 ${mutedTextClass}` }, detail.status === "done" ? "Done" : "Active", ". Created ", formatMissionDateTime(detail.created_at), ".")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, isDetailInChat ? /* @__PURE__ */ React.createElement("span", { className: badgeClass("active") }, "In chat now") : /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => switchChatToGoal(detail),
+            disabled: isTyping,
+            className: primaryButtonClass
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye", "aria-hidden": "true" }),
+          "Use in chat"
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => updateChatGoal(detail.id, { status: detail.status === "done" ? "active" : "done" }),
+            disabled: goalBusy,
+            className: outlineButtonClass
+          },
+          detail.status === "done" ? "Mark active" : "Mark done"
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => setChatGoalLibraryEdit({ kind: "goal", title: detail.title || "", goal: detail.goal || "" }),
+            className: iconButtonClass,
+            title: "Edit goal",
+            "aria-label": "Edit this goal"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen", "aria-hidden": "true" })
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => deleteChatGoal(detail),
+            disabled: goalBusy,
+            className: iconButtonClass,
+            title: "Delete goal",
+            "aria-label": "Delete this goal"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash", "aria-hidden": "true" })
+        ))), detail.summary && /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-3 ${subtextClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Progress so far: "), detail.summary)), /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "chat-goal-items-title" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" }, /* @__PURE__ */ React.createElement("h4", { id: "chat-goal-items-title", className: sectionTitleClass }, "Questions to answer: ", progressText(detail)), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => replanChatGoal(detail.id), disabled: goalBusy, className: "text-sm font-medium ui-link disabled:opacity-50" }, chatGoalActivity === "planning" ? "Planning..." : "Plan again")), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 mb-3 ${mutedTextClass}` }, "Progress is checked after each answer in chat. Plan again keeps answered questions and replaces open ones."), detailItems.length === 0 && /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-3 ${mutedTextClass}` }, "No questions are tracked yet."), /* @__PURE__ */ React.createElement("ul", { className: "space-y-2" }, detailItems.map((item) => {
+          const isAnswered = item.status === "answered";
+          if ((edit == null ? void 0 : edit.kind) === "item" && edit.id === item.id) {
+            return /* @__PURE__ */ React.createElement("li", { key: item.id, className: rowClass }, /* @__PURE__ */ React.createElement(
+              "form",
+              {
+                className: "flex flex-wrap gap-2",
+                onSubmit: async (event) => {
+                  event.preventDefault();
+                  if (await updateChatGoalItem(detail.id, item.id, { text: edit.text })) {
+                    setChatGoalLibraryEdit(null);
+                  }
+                }
+              },
+              /* @__PURE__ */ React.createElement(
+                "input",
+                {
+                  type: "text",
+                  "aria-label": "Question to track",
+                  value: edit.text,
+                  maxLength: 200,
+                  autoFocus: true,
+                  onChange: (event) => setChatGoalLibraryEdit({ ...edit, text: event.target.value }),
+                  className: `${inputClass} flex-1 min-w-0`
+                }
+              ),
+              /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setChatGoalLibraryEdit(null), className: outlineButtonClass }, "Cancel"),
+              /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: goalBusy || !edit.text.trim(), className: primaryButtonClass }, "Save")
+            ));
+          }
+          return /* @__PURE__ */ React.createElement("li", { key: item.id, className: `${rowClass} flex items-start gap-3` }, /* @__PURE__ */ React.createElement(
+            "input",
+            {
+              type: "checkbox",
+              checked: isAnswered,
+              onChange: (event) => updateChatGoalItem(detail.id, item.id, { status: event.target.checked ? "answered" : "open" }),
+              disabled: goalBusy,
+              className: "mt-1 h-4 w-4 flex-shrink-0",
+              "aria-label": `Answered: ${item.text}`
+            }
+          ), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: `text-sm break-words ${isAnswered ? mutedTextClass : headingClass}` }, item.text), item.note && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 break-words ${mutedTextClass}` }, item.note)), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: () => setChatGoalLibraryEdit({ kind: "item", id: item.id, text: item.text || "" }),
+              className: iconButtonClass,
+              "aria-label": `Edit the question: ${item.text}`,
+              title: "Edit question"
+            },
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen text-xs", "aria-hidden": "true" })
+          ), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: () => deleteChatGoalItem(detail.id, item.id),
+              disabled: goalBusy,
+              className: iconButtonClass,
+              "aria-label": `Delete the question: ${item.text}`,
+              title: "Delete question"
+            },
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash text-xs", "aria-hidden": "true" })
+          ));
+        })), /* @__PURE__ */ React.createElement(
+          "form",
+          {
+            className: "mt-3 flex gap-2",
+            onSubmit: async (event) => {
+              event.preventDefault();
+              if (await addChatGoalItem(detail.id, chatGoalNewItemText)) {
+                setChatGoalNewItemText("");
+              }
+            }
+          },
+          /* @__PURE__ */ React.createElement(
+            "input",
+            {
+              type: "text",
+              "aria-label": "New question to track",
+              value: chatGoalNewItemText,
+              maxLength: 200,
+              onChange: (event) => setChatGoalNewItemText(event.target.value),
+              placeholder: detailItems.length >= 10 ? "A goal tracks up to 10 questions" : "Add a question to track",
+              disabled: detailItems.length >= 10,
+              className: `${inputClass} flex-1 min-w-0`
+            }
+          ),
+          /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: goalBusy || !chatGoalNewItemText.trim() || detailItems.length >= 10, className: outlineButtonClass }, "Add")
+        )), /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "chat-goal-chats-title" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-3" }, /* @__PURE__ */ React.createElement("h4", { id: "chat-goal-chats-title", className: sectionTitleClass }, "Saved chats"), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: async () => {
+              if (await saveChatToGoal(detail.id, chatSessionId, chatMessages)) {
+                loadChatGoalLibrary();
+              }
+            },
+            disabled: chatMessages.length === 0 || isTyping,
+            className: outlineButtonClass
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-save", "aria-hidden": "true" }),
+          "Save the current chat here"
+        )), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 mb-3 ${mutedTextClass}` }, "While a goal is in use, each answer saves the chat under it. Opening a saved chat lets you continue it."), detailChats.length === 0 && /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, "No saved chats yet."), /* @__PURE__ */ React.createElement("ul", { className: "space-y-2" }, detailChats.map((chat) => {
+          if ((edit == null ? void 0 : edit.kind) === "chat" && edit.id === chat.id) {
+            return /* @__PURE__ */ React.createElement("li", { key: chat.id, className: rowClass }, /* @__PURE__ */ React.createElement(
+              "form",
+              {
+                className: "flex flex-wrap gap-2",
+                onSubmit: async (event) => {
+                  event.preventDefault();
+                  if (await renameSavedGoalChat(detail.id, chat.id, edit.title)) {
+                    setChatGoalLibraryEdit(null);
+                  }
+                }
+              },
+              /* @__PURE__ */ React.createElement(
+                "input",
+                {
+                  type: "text",
+                  "aria-label": "Chat name",
+                  value: edit.title,
+                  maxLength: 80,
+                  autoFocus: true,
+                  onChange: (event) => setChatGoalLibraryEdit({ ...edit, title: event.target.value }),
+                  className: `${inputClass} flex-1 min-w-0`
+                }
+              ),
+              /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setChatGoalLibraryEdit(null), className: outlineButtonClass }, "Cancel"),
+              /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: !edit.title.trim(), className: primaryButtonClass }, "Save")
+            ));
+          }
+          return /* @__PURE__ */ React.createElement("li", { key: chat.id, className: `${rowClass} flex items-center gap-3` }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: `text-sm font-medium truncate ${headingClass}`, title: chat.title }, chat.title), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-0.5 ${mutedTextClass}` }, countLabel(chat.message_count, "message"), ". Updated ", formatMissionDateTime(chat.updated_at), ".", chat.id === chatSessionId ? " On screen now." : "")), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => openSavedGoalChat(detail, chat), disabled: isTyping, className: outlineButtonClass }, "Open"), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: () => setChatGoalLibraryEdit({ kind: "chat", id: chat.id, title: chat.title || "" }),
+              className: iconButtonClass,
+              "aria-label": `Rename the chat: ${chat.title}`,
+              title: "Rename chat"
+            },
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen text-xs", "aria-hidden": "true" })
+          ), /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: () => deleteSavedGoalChat(detail.id, chat),
+              className: iconButtonClass,
+              "aria-label": `Delete the chat: ${chat.title}`,
+              title: "Delete chat"
+            },
+            /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash text-xs", "aria-hidden": "true" })
+          ));
+        }))))))
+      ));
     })(), isReportFullViewOpen && (reportContent == null ? void 0 : reportContent.type) === "image" && /* @__PURE__ */ React.createElement(
       "div",
       {

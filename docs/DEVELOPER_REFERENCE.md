@@ -69,6 +69,13 @@ Chat strategy combines deterministic and agentic logic:
 3. Return structured timeline/tool summaries for UI feedback
 4. Add a Suggested Query in UI for demo discoverability
 
+### Chat goals and settings
+
+- `src/chat_settings.py` and `src/chat_goals.py` have no FastAPI dependency. Both store JSON under `output/chat_data/` (relative to the working directory, like the rest of `output/`), and the RAG indexer skips that folder
+- `resolve_chat_settings()` merges Auto values (`model_defaults()` from the runtime tuning) with saved Custom values. Custom values are saved with `model_identity()` (provider, endpoint, and model) and cleared when it changes. To add a setting, add it to `SETTING_LIMITS`, `SETTING_SOURCES`, and `model_defaults()`, then to the Chat Settings dialog
+- `ChatGoalStore` keeps one file per library owner (`owner_key()`: `local` when sign-in is off, `user_<id>` when it is on) and makes every change as a locked read-modify-write
+- A chat request with `goal_id` uses the stored goal text as the mission. `record_chat_goal_turn()` keeps the question and answer and sets `goal_turn_recorded`. The frontend then saves the chat under the goal and calls `POST /api/chat/goals/{goal_id}/progress`, which judges the latest unevaluated turns with `build_progress_messages()` and `parse_progress()`
+
 ## 4) MCP Integration
 
 Core contracts:

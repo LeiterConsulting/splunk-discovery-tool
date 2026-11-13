@@ -3687,7 +3687,7 @@ Environment summary.
         original_chat_logic = web_app.chat_with_splunk_logic
         original_build_deeplink = web_app.capability_manager.build_deeplink
 
-        async def stub_chat_logic(request_payload: dict, status_callback=None, runtime_config=None):
+        async def stub_chat_logic(request_payload: dict, status_callback=None, runtime_config=None, goal_owner=None):
             return {
                 "message": request_payload.get("message"),
                 "mcp_url": runtime_config.mcp.url if runtime_config else None,

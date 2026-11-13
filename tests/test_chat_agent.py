@@ -72,7 +72,8 @@ def chat_harness(llm, mcp, tools=("splunk_run_query", "splunk_get_indexes")):
             patch.object(web_app, "discover_mcp_tools", discover), \
             patch.object(web_app, "execute_mcp_tool_call", mcp), \
             patch.object(web_app, "_get_memory_store_path", lambda session_id: Path(temp_dir) / f"{session_id}.json"), \
-            patch.dict(web_app.chat_session_settings, {"enable_splunk_augmentation": True}), \
+            patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: None), \
+            patch.dict(web_app.chat_session_settings, {"enable_splunk_augmentation": True, "enable_rag_context": False}), \
             patch.dict(web_app.chat_agent_memory, {}, clear=True):
         yield lambda request: asyncio.run(web_app.chat_with_splunk_logic(request))
 
@@ -452,6 +453,36 @@ class ChatToolLoopTests(unittest.TestCase):
         self.assertIn("advance_mission", [action["kind"] for action in first["follow_on_actions"]])
         self.assertNotIn(mission, _system_text(llm.calls[2]))
         self.assertEqual(mcp.calls, [])
+
+    def test_goal_id_puts_the_goal_and_its_open_questions_in_the_prompt(self):
+        llm = ScriptedLLM([
+            "tstats reads indexed fields from tsidx files, so it is much faster than a raw search.",
+            "Use | tstats count where index=<name> by sourcetype to profile an index quickly.",
+        ])
+        mcp = RecordingMCP(lambda _call: _rows_result([]))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = web_app.ChatGoalStore(Path(temp_dir))
+            goal = store.create_goal("local", "Find out why freezer sensor data stopped arriving", items=["Which sensors stopped?", "Since when?"])
+            store.update_item("local", goal["id"], goal["items"][0]["id"], status="answered", note="s1 and s2")
+            with patch.object(web_app, "chat_goal_store", store), chat_harness(llm, mcp) as run:
+                # The stored goal text wins over a stale mission sent by the browser.
+                first = run({"message": "Explain what the tstats command does in SPL.", "history": [], "chat_session_id": "goal_test", "goal_id": goal["id"], "mission": "old text"})
+                missing_goal = run({"message": "How would I use tstats to profile an index in SPL?", "history": [], "chat_session_id": "goal_test_2", "goal_id": "goal_missing"})
+
+        prompt = _system_text(llm.calls[0])
+        self.assertIn("Find out why freezer sensor data stopped arriving", prompt)
+        self.assertNotIn("old text", prompt)
+        self.assertIn("Settled so far:\n  * Which sensors stopped? (s1 and s2)", prompt)
+        self.assertIn("Still open:\n  * Since when?", prompt)
+        next_step = next(action for action in first["follow_on_actions"] if action["kind"] == "advance_mission")
+        self.assertEqual(next_step["label"], "Next step for the goal")
+        self.assertIn("most important question still open for my goal", next_step["prompt"])
+        # The answer may settle "Since when?", so the button must not name it.
+        self.assertNotIn("Since when?", next_step["prompt"])
+        self.assertEqual(first["chat_memory"]["goal_open_items"], ["Since when?"])
+        # A goal id the library does not have (another user's, or deleted) adds no goal.
+        self.assertNotIn("freezer", _system_text(llm.calls[1]))
+        self.assertEqual(missing_goal["chat_memory"]["mission"], "")
 
 
 class FollowOnActionTests(unittest.TestCase):
