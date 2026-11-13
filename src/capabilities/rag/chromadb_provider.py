@@ -24,6 +24,9 @@ class ChromaRAGProvider(BaseRAGProvider):
     def get_index_summary(self) -> Dict[str, Any]:
         return self.indexer.get_index_summary()
 
+    def get_index_freshness(self, summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.indexer.get_index_freshness(summary)
+
     def get_knowledge_asset_summary(self) -> Dict[str, Any]:
         return self.indexer.get_knowledge_asset_summary()
 

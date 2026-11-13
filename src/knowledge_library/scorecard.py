@@ -338,7 +338,7 @@ def build_scorecard(
                 gaps.append(_gap(
                     "docs_not_downloaded", "medium", "documentation", "Splunk documentation text is not downloaded",
                     f"Chat can search {planned:,} pages from the manuals for your version and installed apps once they are downloaded.",
-                    "Turn on online library sources and select Refresh sources, or import a library pack that includes documentation.",
+                    "Turn on online library sources and select Download documentation, or import a library pack that includes documentation.",
                 ))
             else:
                 missing_manuals = int(coverage.get("missing_manuals") or 0)
@@ -348,14 +348,14 @@ def build_scorecard(
                         "docs_missing", "low", "documentation",
                         f"{missing_manuals} manual{'s are' if missing_manuals != 1 else ' is'} not downloaded yet",
                         "They match your environment, but chat cannot search them until they are downloaded.",
-                        "Select Refresh sources, or import a newer library pack.",
+                        "Select Download documentation, or import a newer library pack.",
                     ))
                 if outdated_manuals:
                     gaps.append(_gap(
                         "docs_outdated", "low", "documentation",
                         f"{outdated_manuals} downloaded manual{'s have' if outdated_manuals != 1 else ' has'} changes or missing pages",
                         "help.splunk.com updated them after the download, or some pages could not be downloaded.",
-                        "Select Refresh sources to download them again.",
+                        "Select Download documentation to download them again.",
                     ))
 
     # Knowledge Base coverage

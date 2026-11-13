@@ -13056,14 +13056,22 @@ async def update_knowledge_library_settings(request: Request, update: KnowledgeL
     return _knowledge_library_status_payload(request)
 
 
+class KnowledgeLibraryRefreshRequest(BaseModel):
+    sources: Optional[List[str]] = None
+
+
 @app.post("/api/knowledge-library/refresh")
-async def refresh_knowledge_library(request: Request):
-    """Download the library sources again in the background."""
+async def refresh_knowledge_library(request: Request, refresh_request: Optional[KnowledgeLibraryRefreshRequest] = None):
+    """Download the library sources again in the background, or only the sources the request names."""
     require_admin_user(request)
     if not config_manager.get().library.allow_online_sources:
         raise HTTPException(status_code=409, detail="Online library sources are turned off. Turn them on first, or import a library pack.")
+    try:
+        sources = knowledge_library_service.resolve_refresh_sources(refresh_request.sources if refresh_request else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     profile = build_environment_profile(_knowledge_library_blueprint(request))
-    knowledge_library_service.start_refresh(profile, reason="manual")
+    knowledge_library_service.start_refresh(profile, sources=sources, reason="manual")
     return _knowledge_library_status_payload(request, auto_refresh=False)
 
 

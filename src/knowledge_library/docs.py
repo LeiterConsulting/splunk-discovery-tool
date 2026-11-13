@@ -62,6 +62,7 @@ DOC_REQUEST_INTERVAL = 0.25
 DOC_REFUSAL_LIMIT = 3
 MAX_DOC_PAGES = 8000
 MAX_PAGES_PER_MANUAL = 1500
+MAX_STATUS_MANUALS = 400
 CHUNK_TARGET_CHARS = 1400
 CHUNK_MIN_CHARS = 160
 CHUNK_MAX_CHARS = 3000
@@ -480,6 +481,32 @@ def plan_coverage(plan: Dict[str, Any], states: Dict[str, Dict[str, Any]]) -> Di
         "current_manuals": total - missing - outdated,
         "pct": int(round(100 * downloaded / planned_pages)) if planned_pages else None,
         "groups": list(groups.values()),
+        "manuals": [manual_status(manual, states.get(manual["key"])) for manual in (plan.get("manuals") or [])[:MAX_STATUS_MANUALS]],
+    }
+
+
+def manual_status(manual: Dict[str, Any], state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """One planned manual's download state: downloaded, missing, partial (pages failed or were added), or changed on the site."""
+    pages = len(manual["pages"])
+    done = min(int((state or {}).get("page_done") or 0), pages)
+    if not state or not done:
+        status = "missing"
+    elif done < pages or not state.get("complete"):
+        status = "partial"
+    elif needs_fetch(manual, state):
+        status = "changed"
+    else:
+        status = "downloaded"
+    return {
+        "key": manual["key"],
+        "title": manual["title"],
+        "group": manual["group"],
+        "reason": manual.get("reason") or "",
+        "version": manual.get("version") or "",
+        "pages": pages,
+        "downloaded_pages": done,
+        "status": status,
+        "url": help_doc_url(manual["product"], manual["manual"], manual.get("version") or "", manual["pages"][0]) if manual["pages"] else "",
     }
 
 

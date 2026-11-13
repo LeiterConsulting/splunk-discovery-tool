@@ -2279,6 +2279,7 @@
             const [ragLibraryFilter, setRagLibraryFilter] = useState('all');
             const [knowledgeLibrary, setKnowledgeLibrary] = useState({ status: 'idle', data: null, error: '', action: '', message: null });
             const [showAllLibraryGaps, setShowAllLibraryGaps] = useState(false);
+            const [openLibraryDocGroups, setOpenLibraryDocGroups] = useState({});
             const libraryPackInputRef = useRef(null);
             const [libraryDocSearch, setLibraryDocSearch] = useState({ query: '', status: 'idle', results: [], error: '', searched: '' });
             const [headerHeight, setHeaderHeight] = useState(88);
@@ -2452,6 +2453,9 @@
                 ? ragCapability.index_summary
                 : null;
             const ragIndexedDocumentCount = Number(ragIndexSummary?.document_count || 0);
+            const ragIndexFreshness = ragCapability?.index_freshness && typeof ragCapability.index_freshness === 'object'
+                ? ragCapability.index_freshness
+                : null;
             const ragKnowledgeAssetSummary = ragCapability?.knowledge_asset_summary && typeof ragCapability?.knowledge_asset_summary === 'object'
                 ? ragCapability.knowledge_asset_summary
                 : null;
@@ -2527,6 +2531,7 @@
             const ragStatusLabel = ragCapability?.health_status || 'unknown';
             const canInstallRag = !!ragCapability?.runtime_available && !ragCapability?.installed;
             const canReindexRag = !!ragCapability?.installed && !ragCapability?.restart_required;
+            const ragNeedsReindex = canReindexRag && !!ragCapability?.enabled && ['not_indexed', 'outdated'].includes(ragIndexFreshness?.state);
             const ragInstallGuidance = ragCapability?.install_guidance && typeof ragCapability.install_guidance === 'object'
                 ? ragCapability.install_guidance
                 : null;
@@ -4861,6 +4866,12 @@
             });
 
             const refreshKnowledgeLibrarySources = () => runKnowledgeLibraryRequest('refresh', '/api/knowledge-library/refresh', { method: 'POST' });
+
+            const downloadKnowledgeLibraryDocs = () => runKnowledgeLibraryRequest('docs', '/api/knowledge-library/refresh', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sources: ['docs'] }),
+            });
 
             const searchLibraryDocs = async (event) => {
                 if (event) {
@@ -7457,6 +7468,56 @@
                 );
             };
 
+            const describeRagReindexNeed = () => {
+                if (!ragNeedsReindex) {
+                    return '';
+                }
+                if (ragIndexFreshness.state === 'not_indexed') {
+                    return 'The Knowledge Base has not been indexed yet, so chat cannot search your reports and imported documents. Select Reindex to build the index.';
+                }
+                if (ragIndexFreshness.reason === 'index_format') {
+                    return 'The index was built by an earlier version of the app. Select Reindex to rebuild it so chat finds the right passages.';
+                }
+                const changedTypes = Object.entries(ragIndexFreshness.changed_by_type || {})
+                    .map(([sourceType, count]) => `${formatCapabilitySourceTypeLabel(sourceType)}: ${count}`)
+                    .join(', ');
+                const since = ragIndexFreshness.last_indexed_at
+                    ? `since the last index on ${formatMissionDateTime(ragIndexFreshness.last_indexed_at)}`
+                    : 'since the last index';
+                return `${countLabel(ragIndexFreshness.changed_count, 'file')} changed ${since}${changedTypes ? ` (${changedTypes})` : ''}. Chat cannot find what changed until you select Reindex.`;
+            };
+
+            const renderRagReindexNotice = (testId) => {
+                const noticeText = describeRagReindexNeed();
+                if (!noticeText) {
+                    return null;
+                }
+                return (
+                    <div data-testid={testId} role="status" className={`mt-4 rounded-lg border px-4 py-3 ${isDarkTheme ? 'bg-amber-950 border-amber-800 text-amber-100' : 'bg-amber-50 border-amber-200 text-amber-900'}`}>
+                        <div className="flex items-start gap-3">
+                            <i className="fa-solid fa-triangle-exclamation mt-0.5" aria-hidden="true"></i>
+                            <div className="min-w-0">
+                                <div className="text-sm font-semibold">Reindex needed</div>
+                                <p className="mt-1 text-sm">{noticeText}</p>
+                                <p className="mt-1 text-xs">Reindexing runs only when you select it. Downloaded Splunk documentation has its own index, so it does not need a reindex.</p>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            const renderRagReindexButton = () => (
+                <button
+                    type="button"
+                    data-testid="rag-reindex-button"
+                    onClick={() => runCapabilityAction('rag_chromadb', 'reindex')}
+                    disabled={isRagBusy}
+                    className={getCapabilityActionButtonClass(ragNeedsReindex, isRagBusy)}
+                >
+                    {ragActionInProgress === 'reindex' ? 'Reindexing...' : 'Reindex'}
+                </button>
+            );
+
             const renderRagOverviewCard = () => {
                 const lastIndexedLabel = formatMissionDateTime(ragIndexSummary?.last_indexed_at, 'Not indexed yet');
                 const ragLifecycle = getCapabilityLifecycleState(ragCapability);
@@ -7498,23 +7559,16 @@
                                     <button
                                         type="button"
                                         onClick={openRagCapabilitiesWorkspace}
-                                        className={getCapabilityActionButtonClass(true, false)}
+                                        className={getCapabilityActionButtonClass(!ragNeedsReindex, false)}
                                     >
                                         Open Knowledge Base
                                     </button>
                                 )}
-                                {renderCapabilityLifecycleActions(ragCapability, canReindexRag ? (
-                                    <button
-                                        type="button"
-                                        onClick={() => runCapabilityAction('rag_chromadb', 'reindex')}
-                                        disabled={isRagBusy}
-                                        className={getCapabilityActionButtonClass(false, isRagBusy)}
-                                    >
-                                        {ragActionInProgress === 'reindex' ? 'Reindexing...' : 'Reindex'}
-                                    </button>
-                                ) : null)}
+                                {renderCapabilityLifecycleActions(ragCapability, canReindexRag ? renderRagReindexButton() : null)}
                             </div>
                         </div>
+
+                        {renderRagReindexNotice('rag-overview-reindex-notice')}
 
                         {ragIsInstalled && (
                             <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mt-5">
@@ -7533,6 +7587,9 @@
                                 <div className={ragTileClass}>
                                     <div className={`text-xs uppercase tracking-wide ${mutedTextClass}`}>Ready for Chat</div>
                                     <div className={`text-sm font-semibold mt-2 ${headingClass}`}>{isRagContextPreviewReady ? 'Yes' : 'Not yet'}</div>
+                                    {isRagContextPreviewReady && ragNeedsReindex && (
+                                        <div className={`mt-1 text-xs ${mutedTextClass}`}>Missing recent changes until you reindex.</div>
+                                    )}
                                     <div className={`mt-1 text-xs ${mutedTextClass}`}>Last indexed: {lastIndexedLabel}</div>
                                 </div>
                             </div>
@@ -8127,6 +8184,25 @@
                 unavailable: 'Unavailable',
             };
 
+            const LIBRARY_MANUAL_STATUS_LABELS = {
+                downloaded: 'Downloaded',
+                missing: 'Not downloaded',
+                partial: 'Partly downloaded',
+                changed: 'Update available',
+            };
+
+            const getLibraryManualStatusClass = (status) => {
+                switch (status) {
+                    case 'downloaded':
+                        return isDarkTheme ? 'bg-emerald-950 text-emerald-100 border border-emerald-800' : 'bg-emerald-50 text-emerald-700 border border-emerald-200';
+                    case 'partial':
+                    case 'changed':
+                        return isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-50 text-amber-800 border border-amber-200';
+                    default:
+                        return isDarkTheme ? 'bg-slate-800 text-slate-200 border border-slate-600' : 'bg-slate-100 text-slate-700 border border-slate-300';
+                }
+            };
+
             const describeLibraryRefresh = (refresh) => {
                 if (!refresh || !refresh.state || refresh.state === 'idle') {
                     return '';
@@ -8200,6 +8276,18 @@
                 const docsGroups = Array.isArray(docsCoverage.groups) ? docsCoverage.groups : [];
                 const docsPlannedPages = Number(docsCoverage.planned_pages || 0);
                 const docsDownloadedPages = Number(docsCoverage.downloaded_pages || 0);
+                const docsManuals = Array.isArray(docsCoverage.manuals) ? docsCoverage.manuals : [];
+                const docsManualPaths = new Set(docsManuals.map((manual) => String(manual.key || '').slice(0, String(manual.key || '').lastIndexOf('/'))));
+                const otherDocLinks = docsManuals.length >= Number(docsCoverage.planned_manuals || 0)
+                    ? docLinks.filter((entry) => !docsManualPaths.has(`${entry.product}/${entry.manual}`))
+                    : [];
+                const canDownloadDocs = ['ok', 'needs_source'].includes(docsStatus.plan_status);
+                const docsNeedDownload = docsStatus.plan_status === 'needs_source'
+                    || Number(docsCoverage.missing_manuals || 0) > 0
+                    || Number(docsCoverage.outdated_manuals || 0) > 0;
+                const refreshSources = Array.isArray(refresh.sources) ? refresh.sources : [];
+                const isDocsOnlyRefresh = refreshSources.length > 0 && refreshSources.every((name) => name === 'docs' || name === 'help_docs');
+                const isDownloadingDocs = busyAction === 'docs' || (isRefreshing && (isDocsOnlyRefresh || refresh.stage === 'docs'));
                 const docSearchResults = Array.isArray(libraryDocSearch.results) ? libraryDocSearch.results.filter((result) => isSafeLibraryLink(result?.url)) : [];
                 const profileFacts = profile.available ? [
                     `${deploymentLabel}${splunk.version ? ` ${splunk.version}` : ''}`,
@@ -8283,67 +8371,135 @@
                             )}
                         </div>
 
-                        {docLinks.length > 0 && (
-                            <div className="mt-5">
-                                <h4 className={`text-sm font-semibold ${headingClass}`}>Documentation for your environment</h4>
-                                <p className={`mt-1 text-xs ${mutedTextClass}`}>
-                                    {platformDocs.doc_version
-                                        ? `${platformDocs.product_title || deploymentLabel} ${platformDocs.doc_version} manuals on help.splunk.com.`
-                                        : 'Manuals on help.splunk.com.'}
-                                </p>
-                                <ul data-testid="knowledge-library-docs" className="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2">
-                                    {docLinks.map((entry) => (
-                                        <li key={entry.entry_id || entry.url} className={`rounded-lg border px-3 py-2 ${panelMutedClass}`}>
-                                            <a href={entry.url} target="_blank" rel="noopener noreferrer" className={`text-sm font-medium ${linkClass}`}>{entry.title}</a>
-                                            <div className={`mt-0.5 text-xs ${subtextClass}`}>
-                                                {[entry.reason, entry.version ? `Version ${entry.version}` : null, entry.page_count ? `${Number(entry.page_count).toLocaleString()} pages` : null].filter(Boolean).join(' · ')}
-                                            </div>
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-
                         {profile.available && docsStatus.plan_status && (
-                            <div data-testid="knowledge-library-doc-text" className="mt-5">
-                                <h4 className={`text-sm font-semibold ${headingClass}`}>Searchable documentation</h4>
-                                <p data-testid="knowledge-library-doc-coverage" className={`mt-1 text-xs ${subtextClass}`}>
-                                    {docsPlannedPages > 0
-                                        ? `${docsDownloadedPages.toLocaleString()} of ${docsPlannedPages.toLocaleString()} pages${typeof docsCoverage.pct === 'number' ? ` (${docsCoverage.pct}%)` : ''} from the ${Number(docsCoverage.planned_manuals || 0).toLocaleString()} manuals that match your environment are downloaded.`
-                                        : (docsStatus.plan_status === 'needs_source'
-                                            ? 'Load the help.splunk.com source so the library can plan which manuals to download.'
-                                            : 'No manuals on help.splunk.com match this environment.')}
-                                    {docsSummary.available
-                                        ? ` ${formatByteSize(docsSummary.size_bytes)} on disk${docsSummary.last_fetched_at ? `, updated ${formatMissionDateTime(docsSummary.last_fetched_at)}` : ''}.`
-                                        : ''}
-                                </p>
-                                <p className={`mt-1 text-xs ${mutedTextClass}`}>Chat searches these pages when Search the Knowledge Base is turned on in chat settings, and links to the page it used.</p>
+                            <div id="knowledge-library-docs" data-testid="knowledge-library-doc-text" className="mt-5" style={{ scrollMarginTop: '6rem' }}>
+                                <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <h4 className={`text-sm font-semibold ${headingClass}`}>Splunk documentation</h4>
+                                        <p data-testid="knowledge-library-doc-coverage" className={`mt-1 text-xs ${subtextClass}`}>
+                                            {docsPlannedPages > 0
+                                                ? `${docsDownloadedPages.toLocaleString()} of ${docsPlannedPages.toLocaleString()} pages${typeof docsCoverage.pct === 'number' ? ` (${docsCoverage.pct}%)` : ''} from the ${countLabel(docsCoverage.planned_manuals, 'manual')} that match your environment are downloaded.`
+                                                : (docsStatus.plan_status === 'needs_source'
+                                                    ? 'The library needs the help.splunk.com page list before it can choose the manuals for your environment.'
+                                                    : 'No manuals on help.splunk.com match this environment.')}
+                                            {docsSummary.available
+                                                ? ` ${formatByteSize(docsSummary.size_bytes)} on disk${docsSummary.last_fetched_at ? `, updated ${formatMissionDateTime(docsSummary.last_fetched_at)}` : ''}.`
+                                                : ''}
+                                        </p>
+                                    </div>
+                                    {canManage && canDownloadDocs && (
+                                        <button
+                                            type="button"
+                                            data-testid="knowledge-library-docs-download-button"
+                                            onClick={downloadKnowledgeLibraryDocs}
+                                            disabled={!allowOnline || isRefreshing || !!busyAction}
+                                            title={allowOnline ? undefined : 'Turn on internet downloads first.'}
+                                            className={`${getCapabilityActionButtonClass(docsNeedDownload, !allowOnline || isRefreshing || !!busyAction)} self-start sm:flex-shrink-0`}
+                                        >
+                                            {isDownloadingDocs ? 'Downloading...' : 'Download documentation'}
+                                        </button>
+                                    )}
+                                </div>
+                                <p className={`mt-1 text-xs ${mutedTextClass}`}>Chat searches downloaded pages when Search the Knowledge Base is turned on in chat settings, and links to the page it used. The pages have their own index, so they do not need a Knowledge Base reindex.</p>
+                                {canManage && canDownloadDocs && !allowOnline && (
+                                    <p data-testid="knowledge-library-docs-offline" className={`mt-1 text-xs ${subtextClass}`}>To download, turn on Download sources from the internet under Sources. On networks without internet access, import a library pack instead.</p>
+                                )}
+                                {isDownloadingDocs && refreshText && (
+                                    <p role="status" className={`mt-1 text-xs ${headingClass}`}>{refreshText}</p>
+                                )}
                                 {docsGroups.length > 0 && (
-                                    <ul data-testid="knowledge-library-doc-groups" className="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2">
+                                    <ul data-testid="knowledge-library-doc-groups" className="mt-3 space-y-2">
                                         {docsGroups.map((group) => {
                                             const pages = Number(group.pages || 0);
                                             const done = Number(group.downloaded_pages || 0);
                                             const pct = pages ? Math.round((100 * done) / pages) : 0;
+                                            const groupManuals = docsManuals.filter((manual) => manual.group === group.label);
+                                            const pendingManuals = groupManuals.filter((manual) => manual.status !== 'downloaded').length;
+                                            const groupReasons = Array.from(new Set(groupManuals.map((manual) => manual.reason || '')));
+                                            const sharedReason = groupReasons.length === 1 ? groupReasons[0] : '';
+                                            const isOpen = !!openLibraryDocGroups[group.label];
+                                            const unlistedManuals = Math.max(0, Number(group.manuals || 0) - groupManuals.length);
                                             return (
-                                                <li key={group.label} className={`rounded-lg border px-3 py-2 ${panelMutedClass}`}>
-                                                    <div className={`text-sm font-medium ${headingClass}`}>{group.label}</div>
-                                                    <div className={`mt-0.5 text-xs ${subtextClass}`}>
-                                                        {`${Number(group.manuals || 0).toLocaleString()} manual${group.manuals === 1 ? '' : 's'} · ${done.toLocaleString()} of ${pages.toLocaleString()} pages`}
-                                                    </div>
-                                                    <div
-                                                        role="progressbar"
-                                                        aria-label={`${group.label} pages downloaded`}
-                                                        aria-valuemin={0}
-                                                        aria-valuemax={100}
-                                                        aria-valuenow={pct}
-                                                        className={`mt-1.5 h-1.5 rounded-full overflow-hidden ${isDarkTheme ? 'bg-gray-700' : 'bg-gray-200'}`}
+                                                <li key={group.label} className={`rounded-lg border ${panelMutedClass}`}>
+                                                    <details
+                                                        open={isOpen}
+                                                        onToggle={(event) => {
+                                                            const nextOpen = event.currentTarget.open;
+                                                            setOpenLibraryDocGroups(prev => (!!prev[group.label] === nextOpen ? prev : { ...prev, [group.label]: nextOpen }));
+                                                        }}
                                                     >
-                                                        <div className={`h-full ${pct >= 100 ? 'bg-emerald-500' : 'bg-indigo-500'}`} style={{ width: `${pct}%` }}></div>
-                                                    </div>
+                                                        <summary className="flex cursor-pointer list-none items-start justify-between gap-3 px-3 py-2">
+                                                            <div className="min-w-0 flex-1">
+                                                                <div className={`text-sm font-medium ${headingClass}`}>{group.label}</div>
+                                                                <div className={`mt-0.5 text-xs ${subtextClass}`}>
+                                                                    {[
+                                                                        countLabel(group.manuals, 'manual'),
+                                                                        `${done.toLocaleString()} of ${pages.toLocaleString()} pages`,
+                                                                        pendingManuals ? `${pendingManuals.toLocaleString()} to download` : null,
+                                                                        sharedReason || null,
+                                                                    ].filter(Boolean).join(' · ')}
+                                                                </div>
+                                                                <div
+                                                                    role="progressbar"
+                                                                    aria-label={`${group.label} pages downloaded`}
+                                                                    aria-valuemin={0}
+                                                                    aria-valuemax={100}
+                                                                    aria-valuenow={pct}
+                                                                    className={`mt-1.5 h-1.5 rounded-full overflow-hidden ${isDarkTheme ? 'bg-gray-700' : 'bg-gray-200'}`}
+                                                                >
+                                                                    <div className={`h-full ${pct >= 100 ? 'bg-emerald-500' : 'bg-indigo-500'}`} style={{ width: `${pct}%` }}></div>
+                                                                </div>
+                                                            </div>
+                                                            <i aria-hidden="true" className={`fas ${isOpen ? 'fa-chevron-up' : 'fa-chevron-down'} mt-1 text-xs ${mutedTextClass}`}></i>
+                                                        </summary>
+                                                        {isOpen && (
+                                                            <ul data-testid="knowledge-library-doc-manuals" className={`border-t px-3 py-2 space-y-2 ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
+                                                                {groupManuals.map((manual) => (
+                                                                    <li key={manual.key} className="flex flex-wrap items-start justify-between gap-2">
+                                                                        <div className="min-w-0">
+                                                                            {isSafeLibraryLink(manual.url) ? (
+                                                                                <a href={manual.url} target="_blank" rel="noopener noreferrer" className={`text-xs font-medium break-words ${linkClass}`}>{manual.title}</a>
+                                                                            ) : (
+                                                                                <span className={`text-xs font-medium break-words ${headingClass}`}>{manual.title}</span>
+                                                                            )}
+                                                                            <div className={`mt-0.5 text-xs ${mutedTextClass}`}>
+                                                                                {[
+                                                                                    sharedReason ? null : manual.reason,
+                                                                                    `${Number(manual.downloaded_pages || 0).toLocaleString()} of ${countLabel(manual.pages, 'page')}`,
+                                                                                ].filter(Boolean).join(' · ')}
+                                                                            </div>
+                                                                        </div>
+                                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getLibraryManualStatusClass(manual.status)}`}>
+                                                                            {LIBRARY_MANUAL_STATUS_LABELS[manual.status] || 'Unknown'}
+                                                                        </span>
+                                                                    </li>
+                                                                ))}
+                                                                {unlistedManuals > 0 && (
+                                                                    <li className={`text-xs ${mutedTextClass}`}>{countLabel(unlistedManuals, 'more manual')} not listed here.</li>
+                                                                )}
+                                                            </ul>
+                                                        )}
+                                                    </details>
                                                 </li>
                                             );
                                         })}
                                     </ul>
+                                )}
+                                {otherDocLinks.length > 0 && (
+                                    <div className="mt-3">
+                                        <div className={`text-xs font-medium ${headingClass}`}>More manuals on help.splunk.com</div>
+                                        <p className={`mt-0.5 text-xs ${mutedTextClass}`}>These manuals also match your environment but are not downloaded, so chat does not search them.</p>
+                                        <ul data-testid="knowledge-library-docs" className="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2">
+                                            {otherDocLinks.map((entry) => (
+                                                <li key={entry.entry_id || entry.url} className={`rounded-lg border px-3 py-2 ${panelMutedClass}`}>
+                                                    <a href={entry.url} target="_blank" rel="noopener noreferrer" className={`text-sm font-medium ${linkClass}`}>{entry.title}</a>
+                                                    <div className={`mt-0.5 text-xs ${subtextClass}`}>
+                                                        {[entry.reason, entry.version ? `Version ${entry.version}` : null, entry.page_count ? `${Number(entry.page_count).toLocaleString()} pages` : null].filter(Boolean).join(' · ')}
+                                                    </div>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
                                 )}
                                 {docsStatus.addon_overviews > 0 && (
                                     <p className={`mt-2 text-xs ${mutedTextClass}`}>
@@ -8460,7 +8616,7 @@
                                             title={allowOnline ? undefined : 'Turn on internet downloads first.'}
                                             className={getCapabilityActionButtonClass(true, !allowOnline || isRefreshing || !!busyAction)}
                                         >
-                                            {isRefreshing || busyAction === 'refresh' ? 'Refreshing...' : 'Refresh sources'}
+                                            {(isRefreshing && !isDocsOnlyRefresh) || busyAction === 'refresh' ? 'Refreshing...' : 'Refresh sources'}
                                         </button>
                                         <button
                                             type="button"
@@ -8542,6 +8698,31 @@
                     );
                 }
 
+                const libraryDocs = knowledgeLibrary.data?.docs || null;
+                const libraryDocsCoverage = libraryDocs?.coverage || {};
+                const libraryDocsText = (() => {
+                    if (!libraryDocs) {
+                        return knowledgeLibrary.status === 'error' ? 'Could not check the documentation.' : 'Checking the documentation...';
+                    }
+                    if (libraryDocs.plan_status === 'needs_discovery') {
+                        return 'Run discovery so the library can choose the manuals for your environment.';
+                    }
+                    if (libraryDocs.plan_status === 'needs_source') {
+                        return 'Not downloaded yet.';
+                    }
+                    const plannedPages = Number(libraryDocsCoverage.planned_pages || 0);
+                    if (!plannedPages) {
+                        return 'No manuals on help.splunk.com match this environment.';
+                    }
+                    const missingManuals = Number(libraryDocsCoverage.missing_manuals || 0);
+                    return `${Number(libraryDocsCoverage.downloaded_pages || 0).toLocaleString()} of ${plannedPages.toLocaleString()} pages from ${countLabel(libraryDocsCoverage.planned_manuals, 'manual')} downloaded.${missingManuals ? ` ${countLabel(missingManuals, 'manual')} not downloaded yet.` : ''}`;
+                })();
+                const statusLinkClass = isDarkTheme ? 'text-indigo-300 hover:text-indigo-200 underline' : 'text-indigo-700 hover:text-indigo-900 underline';
+                const scrollToLibraryDocs = () => {
+                    const target = document.getElementById('knowledge-library-docs') || document.querySelector('[data-testid="knowledge-library-panel"]');
+                    target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                };
+
                 return (
                     <>
                         <div data-testid="rag-workspace-status" className={`rounded-lg shadow-sm p-6 border ${panelClass}`}>
@@ -8553,7 +8734,7 @@
                                             {formatCapabilityStatusLabel(ragStatusLabel)}
                                         </span>
                                     </div>
-                                    {ragCapability.installed && ragCapability.health_message && (
+                                    {ragCapability.installed && ragCapability.health_message && !ragNeedsReindex && (
                                         <p className={`mt-2 text-sm ${subtextClass}`}>{ragCapability.health_message}</p>
                                     )}
                                     {!ragCapability.installed && (
@@ -8569,18 +8750,11 @@
                                     )}
                                 </div>
                                 <div className="lg:flex-shrink-0">
-                                    {renderCapabilityLifecycleActions(ragCapability, canReindexRag ? (
-                                        <button
-                                            type="button"
-                                            onClick={() => runCapabilityAction('rag_chromadb', 'reindex')}
-                                            disabled={isRagBusy}
-                                            className={getCapabilityActionButtonClass(false, isRagBusy)}
-                                        >
-                                            {ragActionInProgress === 'reindex' ? 'Reindexing...' : 'Reindex'}
-                                        </button>
-                                    ) : null)}
+                                    {renderCapabilityLifecycleActions(ragCapability, canReindexRag ? renderRagReindexButton() : null)}
                                 </div>
                             </div>
+
+                            {renderRagReindexNotice('rag-reindex-notice')}
 
                             {ragCapability.installed && (
                                 <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mt-5">
@@ -8601,6 +8775,9 @@
                                         <div className={`text-sm font-semibold mt-2 ${headingClass}`}>{isRagContextPreviewReady
                                             ? 'Yes'
                                             : (!ragCapability.enabled ? 'Not yet. Turn it on.' : 'Not yet. Select Reindex.')}</div>
+                                        {isRagContextPreviewReady && ragNeedsReindex && (
+                                            <div className={`mt-1 text-xs ${mutedTextClass}`}>Missing recent changes until you reindex.</div>
+                                        )}
                                     </div>
                                 </div>
                             )}
@@ -8677,25 +8854,36 @@
                                 </div>
                             )}
 
-                            {ragCapability.installed && (
-                                <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4">
-                                    <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
-                                        <div className={`text-xs font-medium mb-1 ${headingClass}`}>Index Status</div>
-                                        <div className={`text-xs ${subtextClass}`}>Last indexed: {formatMissionDateTime(ragIndexSummary?.last_indexed_at, 'Not indexed yet')}</div>
-                                        {Array.isArray(ragIndexSummary?.sample_sources) && ragIndexSummary.sample_sources.length > 0 && (
-                                            <div className={`mt-2 text-xs ${mutedTextClass}`}>
-                                                Sample sources: {ragIndexSummary.sample_sources.join(', ')}
-                                            </div>
-                                        )}
-                                    </div>
-                                    <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
-                                        <div className={`text-xs font-medium mb-1 ${headingClass}`}>Imported Items</div>
-                                        <div className={`text-xs ${subtextClass}`}>Stored in: {ragDisplayedAssetDir}</div>
-                                        <div className={`mt-1 text-xs ${subtextClass}`}>Checked in: {ragCheckedInAssetCount}. Checked out: {ragCheckedOutAssetCount}.</div>
-                                        <div className={`mt-1 text-xs ${subtextClass}`}>{isRagContextPreviewReady ? 'Checked-in items are ready for chat.' : 'Chat can use imports after the Knowledge Base is turned on and reindexed.'}</div>
-                                    </div>
+                            <div className={`grid grid-cols-1 ${ragCapability.installed ? 'xl:grid-cols-3' : ''} gap-3 mt-4`}>
+                                {ragCapability.installed && (
+                                    <>
+                                        <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
+                                            <div className={`text-xs font-medium mb-1 ${headingClass}`}>Index Status</div>
+                                            <div className={`text-xs ${subtextClass}`}>Last indexed: {formatMissionDateTime(ragIndexSummary?.last_indexed_at, 'Not indexed yet')}</div>
+                                            {Array.isArray(ragIndexSummary?.sample_sources) && ragIndexSummary.sample_sources.length > 0 && (
+                                                <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                    Sample sources: {ragIndexSummary.sample_sources.join(', ')}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <div className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
+                                            <div className={`text-xs font-medium mb-1 ${headingClass}`}>Imported Items</div>
+                                            <div className={`text-xs ${subtextClass}`}>Stored in: {ragDisplayedAssetDir}</div>
+                                            <div className={`mt-1 text-xs ${subtextClass}`}>Checked in: {ragCheckedInAssetCount}. Checked out: {ragCheckedOutAssetCount}.</div>
+                                            <div className={`mt-1 text-xs ${subtextClass}`}>{isRagContextPreviewReady ? 'Checked-in items are ready for chat.' : 'Chat can use imports after the Knowledge Base is turned on and reindexed.'}</div>
+                                        </div>
+                                    </>
+                                )}
+                                <div data-testid="rag-docs-source" className={`rounded-lg border px-3 py-3 ${panelMutedClass}`}>
+                                    <div className={`text-xs font-medium mb-1 ${headingClass}`}>Splunk Documentation</div>
+                                    <div className={`text-xs ${subtextClass}`}>{libraryDocsText}</div>
+                                    <div className={`mt-1 text-xs ${subtextClass}`}>Chat also searches the downloaded pages. They have their own index, so they never need a reindex.</div>
+                                    {chatSettings && chatSettings.enable_rag_context === false && (
+                                        <div className={`mt-1 text-xs ${subtextClass}`}>Turn on Search the Knowledge Base in chat settings so chat uses them.</div>
+                                    )}
+                                    <button type="button" onClick={scrollToLibraryDocs} className={`mt-2 text-xs font-medium ${statusLinkClass}`}>Go to Splunk documentation</button>
                                 </div>
-                            )}
+                            </div>
 
                             {((Array.isArray(ragCapability.dependency_packages) && ragCapability.dependency_packages.length > 0) || ragIndexSourceTypes.length > 0 || ragKnowledgeAssetTypeCounts.length > 0) && (
                                 <div className="space-y-3 mt-4">

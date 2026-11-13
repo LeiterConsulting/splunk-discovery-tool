@@ -106,6 +106,17 @@ class KnowledgeLibraryService:
             await asyncio.shield(self._task)
         return self.job_snapshot()
 
+    def resolve_refresh_sources(self, requested: Optional[Iterable[str]]) -> Optional[List[str]]:
+        """None refreshes everything. Documentation is planned from the help.splunk.com index, so asking for it alone also loads a missing index."""
+        if requested is None:
+            return None
+        wanted = [name for name in dict.fromkeys(str(item) for item in requested) if name in REFRESH_STAGES]
+        if not wanted:
+            raise ValueError("Choose at least one library source to refresh.")
+        if DOCS_STAGE in wanted and "help_docs" not in wanted and not self.store.load_source("help_docs"):
+            wanted.insert(0, "help_docs")
+        return wanted
+
     def _progress(self, stage: str, done: int, total: int) -> None:
         self._job.update(stage=stage, done=done, total=total)
 
