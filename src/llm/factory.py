@@ -1009,7 +1009,7 @@ class CustomLLMClient:
             self.use_session = True
             logger.info(f"[CustomLLM] 🔧 Connection Strategy: PERSISTENT (detected {self.provider_type})")
         
-        # Health monitoring (v1.1.0)
+        # Health monitoring
         from llm.health_monitor import (
             get_health_monitor, 
             AdaptiveTimeoutManager, 
@@ -1160,7 +1160,7 @@ class CustomLLMClient:
         return "error parsing tool call" in response_preview or "unexpected end of json input" in response_preview
     
     def generate_response_sync(self, messages: list, max_tokens: int = 1000, temperature: float = 0.7) -> str:
-        """SYNCHRONOUS response generation with health monitoring (v1.1.0)."""
+        """SYNCHRONOUS response generation with health monitoring."""
         import requests
         import time
         

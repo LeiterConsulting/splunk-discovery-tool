@@ -14,6 +14,7 @@ from typing import Callable, Dict, Any, Optional, Tuple
 from cryptography.fernet import Fernet
 from dataclasses import dataclass, asdict, field
 
+from app_version import APP_VERSION
 from capabilities.models import CapabilityConfig
 
 
@@ -166,7 +167,7 @@ class AppConfig:
     capabilities: Dict[str, CapabilityConfig] = field(default_factory=dict)
     active_credential_name: Optional[str] = None  # Currently active credential
     active_mcp_config_name: Optional[str] = None  # Currently active MCP config
-    version: str = "1.0.0"
+    version: str = APP_VERSION
     
     def __post_init__(self):
         if self.security is None:

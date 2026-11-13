@@ -2,22 +2,26 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-1.1.0--dev-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases)
+[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0)
 
-> AI-powered Splunk environment discovery, operator workspaces, secured external access, and MCP-backed investigation.
+> Finds what a Splunk environment contains, explains what to do next, and answers questions with live Splunk searches through the Splunk MCP server.
 
-## ✨ What’s Included
+**Current release: [2.0.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0)** (November 13, 2026). See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
 
-- Discovery pipeline with intelligence artifacts and stable compatibility filenames (`v2_intelligence_blueprint_*`, `v2_insights_brief_*`, `v2_operator_runbook_*`, `v2_developer_handoff_*`)
-- Unified web workspace with Overview, Findings, Discovery, Knowledge Base, and Capabilities tabs, tabs added by enabled capabilities (such as M-26-14), and focused Chat and Summary views
-- Durable worker-backed runtime state for discovery and summarization, including persisted progress and restart-safe recovery
-- AI summarization endpoint (`/summarize-session`) generating contextual SPL queries, investigation tracks, and admin tasks
-- Managed SPL Library and local RAG context workspace for reusable queries and operator-facing knowledge assets
-- Optional local auth, OIDC sign-in, per-user MCP assignment, and admin-managed external token issuance
-- Read-only external RAG REST API and inbound MCP surface (HTTP plus stdio bridge)
-- Deterministic + agentic chat flows with MCP tool aliasing and robust tool-call parsing
-- Encrypted credential/config storage using Fernet (no plaintext secrets)
-- Universal installers for Windows (`install.ps1`) and Unix/macOS (`install.sh`)
+## ✨ What's Included
+
+- **Discovery**: a worker-backed pipeline that surveys the environment through MCP, keeps its progress across restarts, and saves an intelligence blueprint, an insights brief, an operator runbook, and a developer handoff (`v2_*` files in `output/`)
+- **Workspace**: Overview, Findings, Discovery, Knowledge Base, and Capabilities tabs, plus tabs that enabled capabilities add (such as M-26-14)
+- **AI summaries**: an on-demand summary of each discovery run with an executive summary, SPL queries, and admin tasks
+- **Chat grounded in Splunk**: the chat agent runs one search at a time against the live MCP tool catalog, shows the SPL and time range that ran, and offers follow-on searches
+- **Chat goals**: set a goal, and the AI model breaks it into questions, tracks which ones your answers settle, and suggests what to ask next. The Goal Library keeps goals, tracked questions, and saved chats
+- **Settings tuned to the model**: model profiles, ranking, and auto-tuning for hosted and local models. Chat Settings start from the model's tuning and show each value as Auto or Custom
+- **Knowledge library**: the environment profile from discovery, Splunk Security Content, Splunkbase records, and help.splunk.com documentation for your Splunk version and installed apps, downloaded for offline search, with a coverage scorecard and library packs for servers without internet access
+- **Knowledge Base** (optional capability): managed knowledge assets, the SPL Library, and context previews, with a Reindex needed notice when its sources change
+- **Troubleshooting**: Settings > Troubleshoot explains why an MCP server or AI model connection or save fails, without saving anything
+- **Security**: optional local sign-in and OIDC, per-user MCP assignment, scoped tokens for a read-only external RAG API and an inbound MCP surface (HTTP plus a stdio bridge), and Fernet-encrypted settings with no plaintext secrets
+- **Themes and accessibility**: Light, Dark, Neo, and System themes that meet WCAG AA contrast, checked by a browser test in CI
+- **Installers** for Windows (`install.ps1`) and macOS or Linux (`install.sh`)
 
 ## 📋 Prerequisites
 
@@ -30,7 +34,7 @@
 ### External Services
 
 - Splunk MCP server endpoint + bearer token
-- LLM provider key for your selected backend (OpenAI, Azure OpenAI, Anthropic, Gemini, or Custom endpoint)
+- An AI model: an API key for OpenAI, Azure OpenAI, Anthropic, or Gemini, or a local or custom OpenAI-compatible endpoint (such as Ollama, vLLM, or LM Studio)
 
 ## 🚀 Quick Start
 
@@ -49,27 +53,42 @@ chmod +x install.sh
 
 After startup, open the URL printed in the console (typically **http://localhost:8003**).
 
+### Upgrading
+
+Pull the new code in the install folder, then restart with the installer so the server runs the new code and updates its Python packages:
+
+```bash
+git pull
+./install.sh --restart
+```
+
+```powershell
+git pull
+.\install.ps1 -Restart
+```
+
+Settings, keys, and `output/` stay in the install folder. Read the upgrade notes in [CHANGELOG.md](CHANGELOG.md) when moving between major versions.
+
 ## ⚙️ First-Time Configuration
 
-1. Open the app at the startup URL shown in console (default `http://localhost:8003`)
-2. Click Settings (gear icon)
-3. Configure:
-   - MCP URL / token / SSL settings
-   - LLM provider / API key / endpoint URL (if required) / model / token limits
-   - Web server options (port, debug mode)
-  - Optional security/auth settings, external API exposure, and OIDC provider details
-4. Save settings and restart service
+1. Open the app at the startup URL shown in the console (default `http://localhost:8003`) and select **Set Up Connections** on the welcome screen, or open Settings (gear icon)
+2. On **Settings > Connections**:
+   - **Add MCP Server**: the MCP URL (for example `https://<splunk-host>:8089/services/mcp`), token, SSL verification, and an optional CA bundle file. Select **Test Connection**, then save
+   - **Add AI Model**: provider, API key, endpoint URL (when required), and model. Select **Fetch Models** for a ranked list with a recommendation, then **Test Connection & Auto-Configure**, then save
+3. Saved connections apply right away. You can keep several saved MCP configurations and AI model connections and switch between them
+4. Optional: turn on sign-in, OIDC, and external access on **Settings > Users** and **Settings > Security**, and pick a theme on **Settings > Appearance**
+5. Run discovery from the **Discovery** tab
 
-### LLM Setup Notes
+If a test or save fails, open **Settings > Troubleshoot** (see [Troubleshooting](#-troubleshooting)).
 
-- Providers supported: `openai`, `azure`, `anthropic`, `gemini`, `custom`
+### AI Model Notes
+
+- Providers: `openai`, `azure`, `anthropic`, `gemini`, `ollama`, `custom` (any OpenAI-compatible endpoint, such as vLLM or LM Studio)
 - Endpoint URL required for: `azure`, `custom`
-- Endpoint URL optional override for: `anthropic`, `gemini`
-- For `custom`, you can use a base URL (for example `http://host:port/v1`); the app auto-resolves common completion paths.
-- Use **Test Connection & Auto-Configure** in Settings to run:
-  - connectivity probe,
-  - model generation test,
-  - provider-safe token recommendation.
+- Endpoint URL optional override for: `anthropic`, `gemini`, `ollama` (defaults to the local Ollama port)
+- For `custom`, you can use a base URL (for example `http://host:port/v1`); the app tries the common completion paths
+- **Auto-tune** (on by default) sets the output length, temperature, context window, request timeout, and reasoning effort from the model's profile. You can override each value
+- **Test Connection & Auto-Configure** runs a connectivity probe and a generation test with the tuned settings, and recommends settings for the model
 
 ## 🧠 Workspace Overview
 
@@ -79,9 +98,37 @@ The header holds the connection status, Chat, sign-in, and Settings. Each tab ke
 - **Findings**: The full next-step lists for admins, analysts, and executives, the environment profile, key evidence, and patterns
 - **Discovery**: Run discovery, follow each stage, and open saved reports and summaries
 - **Knowledge Base**: Library health (how well public Splunk references, Splunkbase, and versioned docs cover your environment, with gaps to fix), searchable Splunk documentation for your versions and installed apps, managed knowledge assets, the SPL Library, reusable query evidence, and context previews
-- **Capabilities**: Optional add-ons for the knowledge base, exports, charts, and Splunk search links
+- **Capabilities**: Optional add-ons for the knowledge base, exports, charts, and Splunk search links. Each can be installed, turned on or off, tested, and removed
 - **Capability tabs**: An enabled capability can add its own tab after the core tabs. The M-26-14 Readiness Advisor adds an M-26-14 tab
-- **Chat and Summary**: Full-screen investigation chat plus the runbook and summary views when you need more detail
+- **Chat and Summary**: Investigation chat (in a window or full screen) plus the runbook and summary views when you need more detail
+
+## 💬 Chat, Goals, and Chat Settings
+
+Chat answers questions about your Splunk environment with live searches through the MCP server, using what discovery found to pick indexes, sourcetypes, and hosts.
+
+- **Goals**: type what you want to find out and select **Set goal**. The AI model breaks the goal into 3 to 6 questions that settle it and suggests the first questions to ask. **Start on this goal** sends a first message that runs the first search
+- **Progress**: after each answer, the app checks which tracked questions the answer settled (only answers backed by search evidence count), may add up to 2 new open questions, and refreshes the suggestions. The goal bar shows progress such as "1 of 4 answered" and opens a checklist you can tick by hand, with **Plan again** and **Check progress now**
+- **Goal Library**: add, rename, rewrite, finish, and delete goals; edit the tracked questions; and open, rename, and delete the chats saved under each goal. Each recorded answer saves the chat under its goal
+- **Chat Settings** (gear icon in the chat header): each setting starts as Auto, from the AI model's tuning, and becomes Custom when you change it. Custom values stay across restarts and are cleared when the AI model changes. **Reset all to Auto** clears them
+- **Search the Knowledge Base**: when it is on, chat adds matching Knowledge Base passages and downloaded Splunk documentation, with links, to its answers
+
+Goals and saved chats are kept per user when sign-in is on and in one shared library when it is off, under `output/chat_data/`.
+
+![Chat with a goal, its progress checklist, and suggested next questions](docs/screenshots/chat-goal-current.png)
+
+![Goal Library with a goal, its tracked questions, and a saved chat](docs/screenshots/chat-goal-library-current.png)
+
+![Chat Settings showing Auto values that come from the AI model's tuning](docs/screenshots/chat-settings-current.png)
+
+## 📚 Knowledge Library and Splunk Documentation
+
+Library health on the Knowledge Base tab scores how well reference sources cover the environment from your latest discovery and lists gaps with a next action (missing or turned-off add-ons, outdated or archived apps, apps not marked Cloud compatible, and busy sourcetypes no public reference describes).
+
+- **Sources**: Splunk Security Content data sources, Splunkbase records for your installed apps, and the help.splunk.com documentation index
+- **Documentation**: **Download documentation** saves the help.splunk.com manuals for your platform version and installed apps (up to 8,000 pages) into a local search index. Downloads are slow on purpose and stop when the site refuses requests. Chat uses the pages only when Search the Knowledge Base is on
+- **Online sources are off by default**. An admin turns on **Download sources from the internet** under Sources. Requests go only to `api.github.com`, `raw.githubusercontent.com`, `splunkbase.splunk.com`, and `help.splunk.com` over HTTPS
+- **Servers without internet access**: **Export library pack** on a connected server and **Import library pack** on the offline one (up to 100 MB, checked before anything is saved)
+- The documentation has its own index, so it never needs a Knowledge Base reindex. The Knowledge Base shows **Reindex needed** when it was never indexed, when reports or other source files changed after the last index, or when the index uses an older format. Report changes are never indexed on their own; documents you import into the Knowledge Base are indexed when you import them
 
 ## 📸 Current Workspace Snapshots
 
@@ -123,52 +170,62 @@ The SPL Library keeps reusable SPL in the managed context workspace so operators
 
 ## 🔐 Security
 
-- Optional local username/password auth with first-login password reset flow
+- Sign-in is off after install, and anyone who can reach the app can use it until an admin turns it on
+- Optional local username/password sign-in with a password reset on first login
 - OIDC sign-in with provider metadata, claim mapping, and local-user linking support
 - Per-user MCP assignment plus admin-managed connection, user, and token controls
 - Read-only external RAG REST API and inbound MCP access with scoped tokens and rate limiting
-- Credentials encrypted at rest (`config.encrypted`, `.config.key`)
-- No plaintext secret persistence
+- Chat goals and saved chats are kept per user when sign-in is on
+- Credentials encrypted at rest (`config.encrypted`, `.config.key`); no plaintext secrets are stored, and troubleshooting reports hide tokens and keys
 - Configurable SSL verification and CA bundle support
 - Host/CORS protections available via server settings
+- Knowledge library downloads are off until an admin turns them on, and reach only four allowed HTTPS hosts
 
 ## 📁 Key Paths
 
 ```text
-install.ps1 / install.sh       Installer + service control
-src/main.py                    Runtime entrypoint
-src/web_app.py                 FastAPI API + frontend delivery/runtime orchestration
+install.ps1 / install.sh        Installer + service control
+src/main.py                     Runtime entrypoint
+src/app_version.py              Release version
+src/web_app.py                  FastAPI API + frontend delivery/runtime orchestration
 src/frontend_legacy_template.html Source-of-truth frontend template
-src/frontend_legacy.py         Frontend template loader for runtime and build tooling
-src/static/                    Shipped local frontend bundle
-src/discovery/v2_pipeline.py   Discovery pipeline + artifact packaging
-src/config_manager.py          Encrypted config manager
-src/security_manager.py        Local auth, OIDC, sessions, roles, and token management
-src/runtime_job_worker.py      Detached worker entrypoint for durable discovery/summary jobs
-tools/build_frontend.mjs       Rebuild shipped frontend assets from src/frontend_legacy_template.html
-tools/check_frontend_sync.py   Validate frontend bundle sync before release
-tools/test_auth_browser.mjs    Browser auth/OIDC regression harness
+src/frontend_legacy.py          Frontend template loader for runtime and build tooling
+src/static/                     Shipped local frontend bundle (built, checked in)
+src/discovery/                  Discovery engine, v2 pipeline, and environment profile
+src/chat_agent.py               Grounded chat prompts, tool outcomes, and evidence
+src/chat_settings.py            Chat settings with Auto values from the model's tuning
+src/chat_goals.py               Chat goals, tracked questions, and saved chats
+src/llm/                        AI provider clients, model profiles, and auto-tuning
+src/knowledge_library/          Library sources, documentation index, ranking, and scorecard
+src/capabilities/               Optional capabilities (Knowledge Base, exports, charts, links, M-26-14)
+src/troubleshooting.py          Settings > Troubleshoot checks
+src/config_manager.py           Encrypted config manager
+src/security_manager.py         Local auth, OIDC, sessions, roles, and token management
+src/runtime_job_worker.py       Detached worker entrypoint for durable discovery/summary jobs
+tools/build_frontend.mjs        Rebuild shipped frontend assets from src/frontend_legacy_template.html
+tools/check_frontend_sync.py    Validate frontend bundle sync before release
+tools/test_*_browser.mjs        Browser regression suites (Playwright)
 tools/run_account_function_tests.mjs Account/auth regression entrypoint
 .github/workflows/repo-validation.yml  GitHub Actions validation workflow for repo quality gates
-output/                        Discovery and summary artifacts
+output/                         Discovery reports, summaries, chat data, and the knowledge library
 ```
 
 ## 📚 Documentation
 
-Public-facing docs in this repository:
-- `README.md` — install, configure, run
-- `CHANGELOG.md` — release history and notable changes
-- `CONFIGURATION_VARIABLES.md` — configuration reference
-- `docs/DEVELOPER_REFERENCE.md` — developer extension/reference guide
-- `docs/AUTH_TESTING.md` — local-password, OIDC, and account-function test guidance
-- `docs/EXTERNAL_RAG_API_QUICKSTART.md` — read-only external RAG API setup and examples
-- `docs/EXTERNAL_MCP_QUICKSTART.md` — inbound MCP setup, helper client, and stdio bridge usage
-- `docs/SECURITY_ACCESS_ROADMAP.md` — shipped-state security model plus extension notes
-- `docs/DISCOVERY_ARCHITECTURE_GUIDE.md` — discovery architecture and migration guidance
+- [CHANGELOG.md](CHANGELOG.md): release history, highlights, and upgrade notes
+- [CONFIGURATION_VARIABLES.md](CONFIGURATION_VARIABLES.md): settings, limits, defaults, and routes
+- [docs/DEVELOPER_REFERENCE.md](docs/DEVELOPER_REFERENCE.md): code layout, extension points, and the endpoint map
+- [docs/DISCOVERY_ARCHITECTURE_GUIDE.md](docs/DISCOVERY_ARCHITECTURE_GUIDE.md): discovery artifacts, the workspace model, and chat architecture
+- [docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md](docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md): the optional capability model (Knowledge Base, exports, charts, links, capability tabs)
+- [docs/SECURITY_ACCESS_ROADMAP.md](docs/SECURITY_ACCESS_ROADMAP.md): the shipped security model plus extension notes
+- [docs/AUTH_TESTING.md](docs/AUTH_TESTING.md): local-password, OIDC, and account-function test guidance
+- [docs/EXTERNAL_RAG_API_QUICKSTART.md](docs/EXTERNAL_RAG_API_QUICKSTART.md): read-only external RAG API setup and examples
+- [docs/EXTERNAL_MCP_QUICKSTART.md](docs/EXTERNAL_MCP_QUICKSTART.md): inbound MCP setup, helper client, and stdio bridge usage
+- [docs/M-26-14/](docs/M-26-14/): the M-26-14 Readiness Advisor plan and development ledger
 
 ## ✅ Validation
 
-From an activated virtual environment, the main local release checks are:
+From an activated virtual environment with the dev requirements (`pip install -r requirements-dev.txt`) and the Node packages (`npm ci`, then `npx playwright install chromium` once), the release checks are:
 
 ```bash
 npm run build:frontend
@@ -176,6 +233,7 @@ python tools/check_frontend_sync.py
 npm run test:browser
 npm run test:settings-profiles-browser
 npm run test:settings-troubleshoot-browser
+npm run test:ui-contrast-browser
 npm run test:auth-browser
 npm run test:account-functions
 python -m ruff check src tests
@@ -183,6 +241,7 @@ python -W error::SyntaxWarning -m compileall -q src tests
 python -m unittest discover -v
 ```
 
+GitHub Actions runs the same checks on Ubuntu and Windows for every push and pull request (`.github/workflows/repo-validation.yml`).
 ## 🛠️ Installer Commands
 
 | Command | Description |

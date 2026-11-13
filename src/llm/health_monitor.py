@@ -3,8 +3,6 @@ LLM Endpoint Health Monitoring System
 
 Provides continuous health tracking, adaptive timeout calculation,
 and intelligent retry strategies for LLM endpoints.
-
-Version: 1.1.0
 """
 
 import asyncio

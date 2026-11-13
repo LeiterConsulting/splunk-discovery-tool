@@ -1,7 +1,6 @@
 """
 Splunk Discovery Tool
 Main application entry point
-Version: 1.0.0
 """
 
 import uvicorn
@@ -16,6 +15,7 @@ from typing import Optional
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from app_version import APP_VERSION
 from web_app import app, config_manager
 
 
@@ -165,7 +165,7 @@ def main():
     
     print("=" * 60)
     print(" Splunk Discovery Tool")
-    print(f" Version: {config.version}")
+    print(f" Version: {APP_VERSION}")
     print("=" * 60)
     print(f" Web Interface: http://localhost:{startup_port}")
     print(f" Settings: Click gear icon in web interface")

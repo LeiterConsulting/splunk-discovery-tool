@@ -42,6 +42,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, paddin
 from pydantic import BaseModel, Field, ValidationError
 
 # DT4SMS: Use encrypted config manager instead of YAML
+from app_version import APP_VERSION
 from config_manager import MASKED_SECRET, ConfigManager, is_unset_secret
 from troubleshooting import capture_startup_state, run_llm_diagnostics, run_mcp_diagnostics, server_code_status
 from capabilities import CapabilityManager, CapabilityRegistry
@@ -2215,12 +2216,11 @@ def _build_external_mcp_info_payload() -> Dict[str, Any]:
 
 
 def _build_external_mcp_initialize_result() -> Dict[str, Any]:
-    version = str(getattr(config_manager.get(), "version", "1.0.0") or "1.0.0")
     return {
         "protocolVersion": EXTERNAL_MCP_PROTOCOL_VERSION,
         "serverInfo": {
             "name": EXTERNAL_MCP_SERVER_NAME,
-            "version": version,
+            "version": APP_VERSION,
         },
         "capabilities": {
             "tools": {
@@ -2795,7 +2795,7 @@ def get_or_create_llm_client(config):
 app = FastAPI(
     title="Splunk Discovery Tool",
     description="Finds what a Splunk environment contains and suggests next steps. Includes encrypted settings, AI summaries, and SPL generation.",
-    version="1.0.0"
+    version=APP_VERSION
 )
 
 FRONTEND_STATIC_DIR = Path(__file__).with_name("static")
@@ -20268,7 +20268,7 @@ async def get_status(request: Request):
 
 @app.get("/api/llm/health")
 async def get_llm_health():
-    """Get LLM endpoint health metrics (v1.1.0)"""
+    """Get LLM endpoint health metrics"""
     try:
         from llm.health_monitor import get_all_health_metrics
         

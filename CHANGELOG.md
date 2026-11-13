@@ -5,7 +5,35 @@ All notable changes to the Splunk Discovery Tool will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - TBD (In Development)
+## [Unreleased]
+
+### Planned
+- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
+- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
+- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.0.0] - 2026-11-13
+
+Version 2.0.0 is the first release since 1.0.0. It turns the single discovery report into a workspace with tabs, grounds chat in live Splunk searches, and adds goals, a knowledge library with documentation for your Splunk versions, and optional sign-in. Version 1.1.0 was never released. The `v1.1.0` tag marks a development checkpoint from May 2026, and everything in it is part of this release.
+
+### ⭐ Highlights
+- **Workspace**: Overview, Findings, Discovery, Knowledge Base, and Capabilities tabs, plus tabs that enabled capabilities add (the M-26-14 Readiness Advisor adds an M-26-14 tab). Chat and the discovery summary open from the header and the Discovery tab
+- **Chat grounded in Splunk**: the chat agent plans one search at a time against the live MCP tool catalog, shows the SPL and time range that ran, and does not treat empty results as proof
+- **Chat goals**: set a goal, and the AI model breaks it into questions, tracks which ones your answers settle, and suggests what to ask next. The Goal Library keeps goals, tracked questions, and saved chats
+- **Settings tuned to the model**: model profiles, ranking, and auto-tuning for hosted and local models; chat settings start from the model's tuning and show Auto or Custom
+- **Knowledge library**: an environment profile from discovery, Splunk Security Content, Splunkbase records, and help.splunk.com documentation for your versions and installed apps, downloaded and searchable offline, with a coverage scorecard and library packs for servers without internet access
+- **Knowledge Base** (optional capability): managed knowledge assets, the SPL Library, hybrid ranking, and a Reindex needed notice
+- **Settings**: a Troubleshoot tab that explains why a connection or save fails, reliable saved MCP configurations and AI model credentials, and Light, Dark, Neo, and System themes under Appearance
+- **Security**: optional local sign-in and OIDC, per-user MCP assignment, and scoped tokens for the read-only external RAG API and inbound MCP
+- **Reliability and accessibility**: worker-backed discovery and summaries that survive restarts, WCAG AA contrast in every theme, and plain-language text, each checked in CI
+
+### ⬆️ Upgrading from 1.0.0
+- Python 3.11 or newer is required
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). The new version makes it update the Python packages; settings, keys, and `output/` in the install folder are kept
+- Saved settings load as they are. Settings that no longer exist (such as the removed chat retry and quality settings) are ignored
+- Online knowledge library sources are off by default. An admin turns them on in Knowledge Base > Library health
+- If the Knowledge Base shows Reindex needed after the upgrade, select Reindex. Report changes are never indexed on their own
+- The Chat tab is gone (Chat opens from the header), and the theme picker moved to Settings > Appearance
 
 ### 🤖 Grounded Chat Agent, Reliable Discovery & LLM Auto-Tuning
 
@@ -171,7 +199,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Library packs carry the downloaded documentation text (`docs/library_docs.json`), checked page by page on import, so servers without internet access get searchable documentation too
 - `POST /api/knowledge-library/search` searches the downloaded documentation the way chat does. `GET /api/knowledge-library/status` adds a `docs` section, and `POST /api/capabilities/rag/context/build` adds `details.library_matches`
 - `POST /api/knowledge-library/refresh` accepts an optional `{"sources": [...]}` body. Download documentation sends `["docs"]`, and the server adds the help.splunk.com page list when it is not loaded yet (400 when no named source is valid). The status `docs.coverage.manuals` lists each planned manual with its status (up to 400)
-- **Reindex needed notice**: the Knowledge Base Status card and the Capabilities overview show a Reindex needed notice, with Reindex as the main button, when the Knowledge Base was never indexed, when reports or other source files changed after the last index, or when the index uses an older format. The app never reindexes on its own. The app's runtime state and job files, chat memory, and imports (searches reindex imports first) do not count as changes. `GET /api/capabilities` adds `index_freshness` for `rag_chromadb`
+- **Reindex needed notice**: the Knowledge Base Status card and the Capabilities overview show a Reindex needed notice, with Reindex as the main button, when the Knowledge Base was never indexed, when reports or other source files changed after the last index, or when the index uses an older format. The app never reindexes for report changes on its own. The app's runtime state and job files, chat memory, and imports (searches reindex imports first) do not count as changes. `GET /api/capabilities` adds `index_freshness` for `rag_chromadb`
 - The Knowledge Base Status card lists Splunk documentation as a source chat searches, with the pages downloaded, and says it has its own index, so it never needs a reindex
 - **Online sources are off by default.** An admin turns them on in Knowledge Base > Library health. The server then refreshes in the background when a source is missing or more than a week old, or when discovery finds an app that has not been looked up. Requests go only to `api.github.com`, `raw.githubusercontent.com`, `splunkbase.splunk.com`, and `help.splunk.com` over HTTPS
 - **Library packs** for servers without internet access: Export pack downloads the loaded sources as a zip, and Import pack loads one (up to 100 MB; every file is checked before anything is saved)
@@ -266,6 +294,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Removed
 - Chat settings that had no effect or are now covered by the model's tuning: max retry delay, max retries, answer quality threshold, and query sample size. The Retries and Sampling and Answer Quality groups are gone
+
+### 🏷️ Versioning & Release Checks
+
+#### Added
+- `src/app_version.py` holds the release version. The startup banner, the API description, and the inbound MCP server's `serverInfo` report it, instead of the version saved in the settings file, which kept saying 1.0.0 after upgrades
+- `tests/test_version_consistency.py` fails when the installers, the README badge, or the latest release in this changelog name a different version
+
+#### Fixed
+- The contrast browser check clicked through before the summary dialog opened on slow runners, so the dialog appeared later on top of the chat and blocked Chat Settings. It now waits for the dialog and its tabs, and for the dialog to close
+
 ### 🧩 Workspace & Summarization UX Hardening
 
 #### Added
@@ -280,7 +318,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Unittest coverage that fails when `src/web_app.py` and `src/static/` fall out of sync
   - Installer start warnings when stale frontend assets are detected
 
-#### Added
 - **Workspace Surfaces (UI + API integration)**
   - Unified static top bar with Mission / Intelligence / Artifacts workflow tabs
   - Intelligence workspace bindings to `/api/discovery/dashboard`, `/api/discovery/compare`, `/api/discovery/runbook`, and `/api/v2/intelligence`
@@ -401,22 +438,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Adaptivity: 19 → 20 (+1) - Endpoint-aware behavior
   - Token Efficiency: 14 → 15 (+1) - Payload adaptation
 
-### 🎯 Phase 2: Adaptive Discovery (Planned)
-- AI-driven discovery planning
-- Context-aware MCP call selection
-- Early termination logic
-- Anomaly detection & deep-dive
-
-### 🔁 Phase 3: Iterative Summarization (Planned)
-- Multi-pass analysis with quality gates
-- Gap detection and filling
-- Self-assessment integration
-
-### 🏗️ Phase 4: Unified Agentic Framework (Planned)
-- Shared agentic loop infrastructure
-- Common quality assessment
-- Unified error handling
-
 ---
 
 ## [1.0.0] - 2025-10-31
@@ -524,4 +545,6 @@ Required configuration:
 
 ---
 
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0
 [1.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v1.0.0

@@ -1,20 +1,28 @@
 # Splunk Discovery Tool Developer Reference
 
-This reference is for developers repurposing the demo into production or custom projects.
+This reference is for developers who extend Splunk Discovery Tool or reuse it in their own projects. It describes release 2.0.0.
 
 ## 1) Runtime Topology
 
-- Entry point: src/main.py
-- Web app + API + embedded frontend: src/web_app.py
+- Entry point: src/main.py (finds a free port, prints the release version from src/app_version.py, and starts uvicorn)
+- Web app + API + frontend delivery: src/web_app.py (the browser app is built from src/frontend_legacy_template.html into src/static/)
 - Discovery orchestration:
-  - Legacy: src/discovery/engine.py
-   - Current primary pipeline: src/discovery/v2_pipeline.py
+  - Engine (MCP calls and step-level findings): src/discovery/engine.py
+  - Current primary pipeline: src/discovery/v2_pipeline.py
+  - Environment profile (Splunk version, deployment type, installed apps): src/discovery/environment_profile.py
+  - Durable discovery and summary jobs: src/runtime_job_worker.py
 - LLM abstraction: src/llm/factory.py
   - Model profiles, ranking, and auto-tuning: src/llm/model_profiles.py, src/llm/runtime_tuning.py
+  - Endpoint health tracking: src/llm/health_monitor.py
 - Chat agent helpers (prompts, tool outcomes, evidence, loop guards): src/chat_agent.py
+- Chat settings and chat goals: src/chat_settings.py, src/chat_goals.py
 - MCP argument adaptation to advertised tool schemas: src/mcp_tool_args.py
 - SPL safety, validation, and scoping helpers: src/spl/spl_utils.py
+- Optional capabilities (registry, install manager, Knowledge Base indexer): src/capabilities/
+- Knowledge library (reference sources, documentation index, ranking, scorecard): src/knowledge_library/
+- Settings troubleshooting: src/troubleshooting.py
 - Config and encrypted credentials: src/config_manager.py
+- Local auth, OIDC, sessions, roles, and tokens: src/security_manager.py
 
 ## 2) Discovery Flow (Current)
 
@@ -131,6 +139,12 @@ Every button should communicate purpose:
 
 ## 8) Workspace Endpoint Map (Current)
 
+- `POST /start-discovery` → Start a discovery run (progress streams over `/ws`)
+- `GET /api/discovery/status` and `GET /api/discovery/sessions` → Discovery run state and saved runs
+- `POST /chat` and `POST /chat/stream` → Chat answers (`goal_id` ties a request to a chat goal)
+- `GET` and `POST /api/chat/settings`, `POST /api/chat/settings/reset` → Chat settings with Auto, Custom, and effective values
+- `GET` and `POST /api/chat/goals`; `GET`, `PATCH`, and `DELETE /api/chat/goals/{goal_id}`; `POST /api/chat/goals/{goal_id}/plan` and `/progress`; `POST`, `PATCH`, and `DELETE` on `/items`; `GET`, `PUT`, `PATCH`, and `DELETE` on `/chats/{chat_id}` → Chat goals, tracked questions, and saved chats
+- `POST /api/llm/list-models`, `POST /api/llm/test-connection`, `POST /api/llm/assess-max-tokens`, `GET /api/llm/health` → AI model listing, ranking, tuning, and health
 - `GET /api/discovery/dashboard` → Overview and Findings data
 - `GET /api/discovery/compare` → Session delta metrics
 - `GET /api/discovery/runbook` → Persona runbook payload
@@ -188,6 +202,9 @@ Every button should communicate purpose:
 
 ## 9) Quality Gates
 
+- `tests/test_ui_copy.py` fails when the template contains the old product name, "(s)" plurals, doubled words, listed jargon (such as "deterministic"), or dates not formatted with `formatMissionDateTime()`; the contrast browser check applies the same rules to the text each view shows
+- `tests/test_version_consistency.py` fails when `src/app_version.py`, the installers, the README badge, and the latest CHANGELOG release name different versions
+
 - lightweight repo linting now lives in `ruff.toml` with developer install support in `requirements-dev.txt`
 - current lint baseline is intentionally narrow and correctness-focused: unused imports, undefined names, invalid local scope references, and syntax-level failures
 - the public frontend now ships from checked-in local static assets under `src/static/`; rebuild them with `npm run build:frontend` whenever the source template in `src/frontend_legacy_template.html` changes
@@ -220,8 +237,19 @@ Every button should communicate purpose:
 
 ## 11) Optional Capabilities
 
-For the proposed optional RAG and installable enhancement-pack model, see:
+For the optional capability model (the Knowledge Base, exports, charts, Splunk search links, and capability tabs), see:
 
 - `docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md`
 
 A capability can add its own workspace tab by setting `workspace` on its `CapabilityDefinition` to a `CapabilityWorkspace(id, label, description)`. `GET /api/capabilities` returns it as `workspace` (or `null`) on each capability, and the UI shows the tab after the core tabs while the capability is installed and enabled. The tab label comes from `label`; the frontend maps `id` to the view it opens in `MODULE_WORKSPACE_OPENERS`.
+
+## 12) Releases and Versioning
+
+The release version lives in `src/app_version.py` (`APP_VERSION`). The startup banner, the FastAPI app, and the inbound MCP server's `serverInfo` report it. The `version` field in the settings file records the version that created the file and is not the running version.
+
+To cut a release:
+
+1. Set `APP_VERSION`, `VERSION` in `install.sh`, `$VERSION` in `install.ps1`, and the README version badge to the new version. A new installer version makes existing installs update their Python packages on the next start
+2. Move the changes into a `## [X.Y.Z] - <date>` section at the top of `CHANGELOG.md` (under `## [Unreleased]`) and add its link at the bottom
+3. Run the quality gates above; `tests/test_version_consistency.py` checks that the numbers match
+4. Tag the release commit `vX.Y.Z` and publish a GitHub release from the tag with the CHANGELOG section as its notes
