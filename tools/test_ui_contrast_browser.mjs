@@ -436,8 +436,13 @@ async function auditTheme(browser, baseUrl, themeName) {
         }
 
         if (await clickIfPresent(page.locator('button', { hasText: 'View Summary' }))) {
-            await settle(page, 1500);
+            // The summary opens only after a progress request returns, so on a slow runner a fixed delay can miss it
+            // and the dialog then appears later on top of the chat.
+            const summaryDialog = page.locator('[role="dialog"][aria-labelledby="summary-modal-title"]');
             const summaryTabs = page.locator('[role="tablist"][aria-label="Summary views"] [role="tab"]');
+            await summaryDialog.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+            await summaryTabs.first().waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+            await settle(page, 800);
             const count = await summaryTabs.count();
             for (let index = 0; index < count; index += 1) {
                 const label = ((await summaryTabs.nth(index).innerText()) || `tab-${index}`).trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '');
@@ -446,6 +451,7 @@ async function auditTheme(browser, baseUrl, themeName) {
                 await capture(`summary-${label}`, '[role="dialog"]');
             }
             await closeDialogs(page);
+            await summaryDialog.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
         }
 
         await clickIfPresent(page.locator('#workspace-tab-overview'));
