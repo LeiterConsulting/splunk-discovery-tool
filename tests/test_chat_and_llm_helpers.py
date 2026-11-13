@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -1134,90 +1135,187 @@ class LLMSettingsTests(unittest.TestCase):
 
 
 class ChatSettingsTests(unittest.TestCase):
-    def test_get_chat_settings_defaults_rag_context_when_optional_rag_is_enabled(self):
-        original_chat_settings = dict(web_app.chat_session_settings)
-        original_overrides = dict(web_app.chat_settings_explicit_overrides)
+    """Chat settings start from the model's tuning; custom values are saved until the model changes."""
 
-        web_app.chat_session_settings.clear()
-        web_app.chat_session_settings.update(web_app.build_default_chat_settings())
-        web_app.chat_session_settings["enable_rag_context"] = False
-        web_app.chat_settings_explicit_overrides["enable_rag_context"] = False
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.data_dir = Path(temp_dir.name)
+        original_settings = dict(web_app.chat_session_settings)
+        original_view = web_app.chat_settings_view
 
-        enabled_rag_capabilities = {
-            "rag_chromadb": CapabilityConfig(name="rag_chromadb", installed=True, enabled=True),
-        }
-        actual_runtime_value = None
-
-        try:
-            with patch.object(web_app.config_manager, "list_capabilities", return_value=enabled_rag_capabilities):
-                result = asyncio.run(web_app.get_chat_settings())
-                actual_runtime_value = web_app.chat_session_settings["enable_rag_context"]
-        finally:
+        def restore():
             web_app.chat_session_settings.clear()
-            web_app.chat_session_settings.update(original_chat_settings)
-            web_app.chat_settings_explicit_overrides.clear()
-            web_app.chat_settings_explicit_overrides.update(original_overrides)
+            web_app.chat_session_settings.update(original_settings)
+            web_app.chat_settings_view = original_view
 
-        self.assertTrue(result["enable_rag_context"])
-        self.assertTrue(actual_runtime_value)
+        self.addCleanup(restore)
+        self.config = self._config("gpt-4o")
+        self.capabilities = {}
+        for patcher in (
+            patch.object(web_app, "chat_settings_store", web_app.ChatSettingsStore(self.data_dir)),
+            patch.object(web_app.config_manager, "get", side_effect=lambda: self.config),
+            patch.object(web_app.config_manager, "list_capabilities", side_effect=lambda: self.capabilities),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-    def test_get_chat_settings_preserves_manual_disable_for_current_session(self):
-        original_chat_settings = dict(web_app.chat_session_settings)
-        original_overrides = dict(web_app.chat_settings_explicit_overrides)
+    @staticmethod
+    def _config(model, provider="openai", **llm_fields):
+        llm = SimpleNamespace(provider=provider, endpoint_url="", model=model, **llm_fields)
+        return SimpleNamespace(llm=llm)
 
+    def _tuning(self):
+        return web_app.resolve_active_llm_tuning(self.config)
+
+    def _get(self):
+        return asyncio.run(web_app.get_chat_settings())
+
+    def _post(self, values):
+        return asyncio.run(web_app.update_chat_settings(values))["settings"]
+
+    def _restart(self):
+        web_app.chat_settings_view = None
         web_app.chat_session_settings.clear()
-        web_app.chat_session_settings.update(web_app.build_default_chat_settings())
-        web_app.chat_session_settings["enable_rag_context"] = True
-        web_app.chat_settings_explicit_overrides["enable_rag_context"] = False
+        web_app.chat_session_settings.update(web_app.model_defaults(None, False))
+        web_app.chat_settings_store = web_app.ChatSettingsStore(self.data_dir)
 
-        enabled_rag_capabilities = {
-            "rag_chromadb": CapabilityConfig(name="rag_chromadb", installed=True, enabled=True),
-        }
-        override_after_update = None
+    def test_auto_values_come_from_the_model_tuning(self):
+        tuning = self._tuning()
+        result = self._get()
 
-        try:
-            with patch.object(web_app.config_manager, "list_capabilities", return_value=enabled_rag_capabilities):
-                asyncio.run(web_app.update_chat_settings({"enable_rag_context": False}))
-                result = asyncio.run(web_app.get_chat_settings())
-                override_after_update = web_app.chat_settings_explicit_overrides["enable_rag_context"]
-        finally:
-            web_app.chat_session_settings.clear()
-            web_app.chat_session_settings.update(original_chat_settings)
-            web_app.chat_settings_explicit_overrides.clear()
-            web_app.chat_settings_explicit_overrides.update(original_overrides)
+        self.assertEqual(result["max_tokens"], tuning["max_tokens"])
+        self.assertEqual(result["temperature"], tuning["temperature"])
+        self.assertEqual(result["context_history"], tuning["chat"]["history_turns"])
+        self.assertEqual(result["max_execution_time"], max(120, min(900, tuning["request_timeout"])))
+        self.assertEqual(result["custom"], [])
+        self.assertEqual(result["auto"]["max_tokens"], tuning["max_tokens"])
+        self.assertEqual(result["model"]["label"], "gpt-4o")
+        self.assertTrue(result["model"]["supports_temperature"])
+        self.assertEqual(result["sources"]["max_tokens"], "model")
+        self.assertEqual(result["limits"]["max_iterations"], {"min": 1, "max": 10})
+        self.assertEqual(web_app.chat_session_settings["max_tokens"], tuning["max_tokens"])
+        for removed in ("max_retry_delay", "max_retries", "quality_threshold", "query_sample_size"):
+            self.assertNotIn(removed, result)
 
-        self.assertFalse(result["enable_rag_context"])
-        self.assertTrue(override_after_update)
+    def test_knowledge_base_search_is_auto_on_when_the_knowledge_base_is_enabled(self):
+        self.assertFalse(self._get()["enable_rag_context"])
 
-    def test_reset_chat_settings_reapplies_optional_rag_default(self):
-        original_chat_settings = dict(web_app.chat_session_settings)
-        original_overrides = dict(web_app.chat_settings_explicit_overrides)
+        self.capabilities = {"rag_chromadb": CapabilityConfig(name="rag_chromadb", installed=True, enabled=True)}
+        self.assertTrue(self._get()["enable_rag_context"])
 
-        web_app.chat_session_settings.clear()
-        web_app.chat_session_settings.update(web_app.build_default_chat_settings())
-        web_app.chat_session_settings["enable_rag_context"] = False
-        web_app.chat_settings_explicit_overrides["enable_rag_context"] = True
+        settings = self._post({"enable_rag_context": False})
+        self.assertFalse(settings["enable_rag_context"])
+        self.assertIn("enable_rag_context", settings["custom"])
+        self.assertFalse(self._get()["enable_rag_context"])
 
-        enabled_rag_capabilities = {
-            "rag_chromadb": CapabilityConfig(name="rag_chromadb", installed=True, enabled=True),
-        }
-        override_after_reset = None
+    def test_custom_values_are_saved_across_restarts(self):
+        self._post({"max_tokens": 3000, "temperature": 0.6, "max_iterations": 7})
+        self._restart()
 
-        try:
-            with patch.object(web_app.config_manager, "list_capabilities", return_value=enabled_rag_capabilities):
-                result = asyncio.run(web_app.reset_chat_settings())
-                override_after_reset = web_app.chat_settings_explicit_overrides["enable_rag_context"]
-        finally:
-            web_app.chat_session_settings.clear()
-            web_app.chat_session_settings.update(original_chat_settings)
-            web_app.chat_settings_explicit_overrides.clear()
-            web_app.chat_settings_explicit_overrides.update(original_overrides)
+        result = self._get()
+        self.assertEqual(result["max_tokens"], 3000)
+        self.assertEqual(result["temperature"], 0.6)
+        self.assertEqual(result["max_iterations"], 7)
+        self.assertEqual(result["custom"], ["max_iterations", "max_tokens", "temperature"])
+        self.assertEqual(web_app.chat_session_settings["max_iterations"], 7)
+        self.assertTrue((self.data_dir / "chat_settings.json").exists())
 
-        self.assertTrue(result["settings"]["enable_rag_context"])
-        self.assertFalse(override_after_reset)
+    def test_null_puts_one_setting_back_on_auto(self):
+        tuning = self._tuning()
+        self._post({"max_tokens": 3000, "max_iterations": 7})
 
+        settings = self._post({"max_tokens": None})
+
+        self.assertEqual(settings["max_tokens"], tuning["max_tokens"])
+        self.assertEqual(settings["max_iterations"], 7)
+        self.assertEqual(settings["custom"], ["max_iterations"])
+
+    def test_reset_puts_every_setting_back_on_auto(self):
+        self._post({"max_tokens": 3000, "max_iterations": 7})
+
+        settings = asyncio.run(web_app.reset_chat_settings())["settings"]
+
+        self.assertEqual(settings["custom"], [])
+        self.assertEqual(settings["max_tokens"], self._tuning()["max_tokens"])
+
+    def test_changing_the_ai_model_clears_custom_values_with_a_notice(self):
+        self._post({"max_tokens": 3000, "max_iterations": 7})
+
+        self.config = self._config("gpt-4.1")
+        self._restart()
+        result = self._get()
+
+        self.assertEqual(result["custom"], [])
+        self.assertEqual(result["max_tokens"], self._tuning()["max_tokens"])
+        self.assertEqual(result["notice"]["previous_model"], "gpt-4o")
+        self.assertEqual(result["notice"]["model"], "gpt-4.1")
+        self.assertEqual(result["notice"]["cleared"], ["max_iterations", "max_tokens"])
+
+        # Saving anything, even nothing, dismisses the notice.
+        self.assertIsNone(self._post({})["notice"])
+        self.assertIsNone(self._get()["notice"])
+
+    def test_tuning_changes_for_the_same_model_keep_custom_values(self):
+        self._post({"max_iterations": 7})
+
+        self.config = self._config("gpt-4o", request_timeout=600)
+        result = self._get()
+
+        self.assertEqual(result["max_iterations"], 7)
+        self.assertEqual(result["max_execution_time"], 600)
+        self.assertIsNone(result["notice"])
+
+    def test_values_are_validated_and_kept_in_range(self):
+        settings = self._post({"max_iterations": 99, "temperature": -1, "query_sample_size": 5, "unknown": 1})
+        self.assertEqual(settings["max_iterations"], 10)
+        self.assertEqual(settings["temperature"], 0.0)
+        self.assertNotIn("query_sample_size", settings)
+        self.assertNotIn("unknown", settings)
+
+        for bad in ({"max_iterations": "many"}, {"enable_rag_context": "yes"}, {"max_tokens": True}):
+            with self.assertRaises(web_app.HTTPException) as raised:
+                asyncio.run(web_app.update_chat_settings(bad))
+            self.assertEqual(raised.exception.status_code, 400)
+
+    def test_fixed_temperature_models_show_no_temperature_and_reject_one(self):
+        self.config = self._config("gpt-5")
+        result = self._get()
+
+        self.assertIsNone(result["temperature"])
+        self.assertFalse(result["model"]["supports_temperature"])
+        with self.assertRaises(web_app.HTTPException) as raised:
+            asyncio.run(web_app.update_chat_settings({"temperature": 0.5}))
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("fixed temperature", raised.exception.detail)
+
+    def test_runtime_profile_uses_custom_output_length_history_and_temperature(self):
+        tuning = self._tuning()
+        self._get()
+        auto_profile = web_app.build_chat_runtime_profile(self.config)
+        self.assertEqual(auto_profile["final_max_tokens"], tuning["max_tokens"])
+        self.assertEqual(auto_profile["context_history_limit"], tuning["chat"]["history_turns"])
+
+        self._post({"max_tokens": 1000, "context_history": 12, "temperature": 0.9})
+        lowered = web_app.build_chat_runtime_profile(self.config)
+        self.assertEqual(lowered["final_max_tokens"], 1000)
+        self.assertLessEqual(lowered["initial_max_tokens"], 1000)
+        self.assertEqual(lowered["context_history_limit"], 12)
+        self.assertAlmostEqual(lowered["temperature"], 0.9)
+
+        model_limit = tuning["profile"].max_output_tokens
+        self._post({"max_tokens": 128000})
+        raised = web_app.build_chat_runtime_profile(self.config)
+        self.assertEqual(raised["final_max_tokens"], min(128000, model_limit))
+        self.assertGreater(raised["final_max_tokens"], tuning["max_tokens"])
 
 class ChatHelperTests(unittest.TestCase):
+    def setUp(self):
+        # These tests set chat_session_settings directly; keep chat requests from recomputing them.
+        patcher = patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_generate_recommendations_filters_text_placeholders(self):
         class StubAnalyzer:
             def summarize_discovery(self, _results):
@@ -1340,7 +1438,7 @@ class ChatHelperTests(unittest.TestCase):
         original_process_chat = web_app.process_chat_with_streaming
         original_wait_for = web_app.asyncio.wait_for
 
-        async def immediate_chat(_request, status_queue, runtime_config=None):
+        async def immediate_chat(_request, status_queue, runtime_config=None, goal_owner=None):
             await status_queue.put({"type": "status", "message": "Finishing"})
             await status_queue.put({"type": "done", "data": {"response": "Completed"}})
 
@@ -1406,21 +1504,13 @@ class ChatHelperTests(unittest.TestCase):
             },
         )()
         stub_client = type("LLMClientStub", (), {"provider_type": "ollama"})()
-        original_chat_settings = dict(web_app.chat_session_settings)
-
-        try:
-            web_app.chat_session_settings["max_tokens"] = 16000
-            web_app.chat_session_settings["context_history"] = 6
-
+        with patch.object(web_app, "chat_custom_settings", return_value={}):
             profile = web_app.build_chat_runtime_profile(stub_config, stub_client)
-        finally:
-            web_app.chat_session_settings.clear()
-            web_app.chat_session_settings.update(original_chat_settings)
 
         expected = recommend_settings(build_model_profile("ollama", "gpt-oss:20b"))
         self.assertEqual(profile["provider"], "ollama")
         self.assertTrue(profile["auto_tune"])
-        self.assertEqual(profile["context_history_limit"], min(6, expected["chat"]["history_turns"]))
+        self.assertEqual(profile["context_history_limit"], expected["chat"]["history_turns"])
         self.assertEqual(profile["final_max_tokens"], expected["max_tokens"])
         self.assertEqual(profile["initial_max_tokens"], expected["chat"]["initial_max_tokens"])
         self.assertLessEqual(profile["initial_max_tokens"], profile["final_max_tokens"])
@@ -1445,16 +1535,10 @@ class ChatHelperTests(unittest.TestCase):
             },
         )()
         stub_config = type("Config", (), {"llm": manual_llm})()
-        original_chat_settings = dict(web_app.chat_session_settings)
-        try:
-            web_app.chat_session_settings["max_tokens"] = 16000
-            web_app.chat_session_settings["context_history"] = 6
+        with patch.object(web_app, "chat_custom_settings", return_value={}):
             profile = web_app.build_chat_runtime_profile(stub_config, None)
-            web_app.chat_session_settings["max_tokens"] = 1000
+        with patch.object(web_app, "chat_custom_settings", return_value={"max_tokens": 1000}):
             capped = web_app.build_chat_runtime_profile(stub_config, None)
-        finally:
-            web_app.chat_session_settings.clear()
-            web_app.chat_session_settings.update(original_chat_settings)
 
         self.assertFalse(profile["auto_tune"])
         self.assertEqual(profile["final_max_tokens"], 1500)
@@ -2047,7 +2131,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         original_get_memory_store_path = web_app._get_memory_store_path
         original_cache = dict(web_app.chat_agent_memory)
         original_chat_settings = dict(web_app.chat_session_settings)
-        original_overrides = dict(web_app.chat_settings_explicit_overrides)
 
         class StubLLMClient:
             async def generate_response(self, messages, max_tokens, temperature):
@@ -2073,7 +2156,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             }
             web_app.chat_session_settings["enable_rag_context"] = True
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
-            web_app.chat_settings_explicit_overrides["enable_rag_context"] = True
 
             try:
                 result = asyncio.run(
@@ -2092,8 +2174,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                 web_app._get_memory_store_path = original_get_memory_store_path
                 web_app.chat_session_settings.clear()
                 web_app.chat_session_settings.update(original_chat_settings)
-                web_app.chat_settings_explicit_overrides.clear()
-                web_app.chat_settings_explicit_overrides.update(original_overrides)
                 web_app.chat_agent_memory.clear()
                 web_app.chat_agent_memory.update(original_cache)
 
@@ -2113,7 +2193,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         original_extract_recoverable_tool_call = web_app.extract_recoverable_tool_call
         original_cache = dict(web_app.chat_agent_memory)
         original_chat_settings = dict(web_app.chat_session_settings)
-        original_overrides = dict(web_app.chat_settings_explicit_overrides)
 
         class StubLLMClient:
             async def generate_response(self, messages, max_tokens, temperature):
@@ -2181,7 +2260,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             }
             web_app.chat_session_settings["enable_rag_context"] = True
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
-            web_app.chat_settings_explicit_overrides["enable_rag_context"] = True
 
             try:
                 result = asyncio.run(
@@ -2202,8 +2280,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                 web_app.extract_recoverable_tool_call = original_extract_recoverable_tool_call
                 web_app.chat_session_settings.clear()
                 web_app.chat_session_settings.update(original_chat_settings)
-                web_app.chat_settings_explicit_overrides.clear()
-                web_app.chat_settings_explicit_overrides.update(original_overrides)
                 web_app.chat_agent_memory.clear()
                 web_app.chat_agent_memory.update(original_cache)
 
@@ -2710,9 +2786,9 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             web_app.discover_mcp_tools = stub_discover_mcp_tools
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
             web_app.chat_session_settings["enable_rag_context"] = False
-            # The session history cap applies even when the model's context allows more turns.
-            web_app.chat_session_settings["context_history"] = 4
-            web_app.chat_session_settings["max_tokens"] = 16000
+            # A custom history length applies even when the model's context allows more turns.
+            custom_history = patch.object(web_app, "chat_custom_settings", return_value={"context_history": 4})
+            custom_history.start()
 
             try:
                 result = asyncio.run(
@@ -2733,6 +2809,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                     )
                 )
             finally:
+                custom_history.stop()
                 web_app.get_or_create_llm_client = original_get_or_create_llm_client
                 web_app.config_manager.get = original_config_get
                 web_app.load_latest_report_knowledge = original_load_latest_report_knowledge
@@ -2760,7 +2837,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         original_get_memory_store_path = web_app._get_memory_store_path
         original_cache = dict(web_app.chat_agent_memory)
         original_chat_settings = dict(web_app.chat_session_settings)
-        original_overrides = dict(web_app.chat_settings_explicit_overrides)
 
         report_knowledge = {
             "viability": {"status": "usable", "score": 84, "age_days": 1, "usable": True},
@@ -2815,7 +2891,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
             }
             web_app.chat_session_settings["enable_rag_context"] = True
             web_app.chat_session_settings["enable_splunk_augmentation"] = True
-            web_app.chat_settings_explicit_overrides["enable_rag_context"] = True
 
             try:
                 result = asyncio.run(
@@ -2837,8 +2912,6 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                 web_app._get_memory_store_path = original_get_memory_store_path
                 web_app.chat_session_settings.clear()
                 web_app.chat_session_settings.update(original_chat_settings)
-                web_app.chat_settings_explicit_overrides.clear()
-                web_app.chat_settings_explicit_overrides.update(original_overrides)
                 web_app.chat_agent_memory.clear()
                 web_app.chat_agent_memory.update(original_cache)
 
