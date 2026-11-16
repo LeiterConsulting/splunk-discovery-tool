@@ -7,20 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- Built-in profiles for OpenAI's GPT-6 models (Astra, Sol, Terra, and Luna) and GPT-5.6 models (Sol, Terra, and Luna), with their 1.05M-token context window, 128K output limit, and list prices. Fetch Models ranks them by capability, speed, and cost, and auto-tune uses their limits instead of GPT-5 limits. GPT generations newer than the built-in profiles (for example `gpt-7.1-luna`) use the closest GPT-6 tier, then the closest GPT-5 tier
-
-### Fixed
-- GPT-6 models were sent to OpenAI as older chat models, with `temperature` and `max_tokens`. Every GPT-5 or newer model (including later point releases such as `gpt-6.1-terra`) now tries the Responses API first, runs as a reasoning model (except `-chat` models), leaves out `temperature`, and sends `max_completion_tokens` to Chat Completions
-- GPT-5.6 and GPT-6 models don't accept the `minimal` reasoning effort, so the app sends `low` for them instead
-- Fetch Models returned "API key required" when the API key field was blank for a saved model. Like Test Connection, it now uses the active model's saved key, but only for the same provider and endpoint
-- Fetch Models no longer lists OpenAI's GPT Live models (`gpt-live-*`), and model ranking for every provider marks GPT Live and realtime models as not suitable for chat, since they aren't chat models
-- AI model listing, connection tests, hosted-provider generation, OpenAI image requests, and AI TLS diagnostics now share system and bundled public certificate trust. This fixes certificate verification failures when the required CA is trusted by Python's system store but absent from the bundled list. Explicit `SSL_CERT_FILE` and `SSL_CERT_DIR` settings remain authoritative; TLS verification stays enabled.
-
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
 - **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.0.1] - 2026-11-16
+
+Version 2.0.1 fixes certificate verification errors when the app calls AI providers from networks whose CA is trusted only by the system certificate store, and adds support for OpenAI's GPT-6 models.
+
+### ⬆️ Upgrading from 2.0.0
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). The new version makes it update the Python packages; settings, keys, and `output/` in the install folder are kept
+- Saved AI models keep their settings. GPT-6 models with auto-tune on use their own profiles right away; with auto-tune off, they keep the values you set
+
+### Added
+- Built-in profiles for OpenAI's GPT-6 models (Astra, Sol, Terra, and Luna) and GPT-5.6 models (Sol, Terra, and Luna), with their 1.05M-token context window, 128K output limit, and list prices. Fetch Models ranks them by capability, speed, and cost, and auto-tune uses their limits instead of GPT-5 limits. GPT generations newer than the built-in profiles (for example `gpt-7.1-luna`) use the closest GPT-6 tier, then the closest GPT-5 tier
+
+### Fixed
+- AI model listing, connection tests, hosted-provider generation, OpenAI image requests, and AI TLS diagnostics now share system and bundled public certificate trust. This fixes certificate verification failures when the required CA is trusted by Python's system store but absent from the bundled list. Explicit `SSL_CERT_FILE` and `SSL_CERT_DIR` settings remain authoritative; TLS verification stays enabled.
+- GPT-6 models were sent to OpenAI as older chat models, with `temperature` and `max_tokens`. Every GPT-5 or newer model (including later point releases such as `gpt-6.1-terra`) now tries the Responses API first, runs as a reasoning model (except `-chat` models), leaves out `temperature`, and sends `max_completion_tokens` to Chat Completions
+- GPT-5.6 and GPT-6 models don't accept the `minimal` reasoning effort, so the app sends `low` for them instead
+- Fetch Models returned "API key required" when the API key field was blank for a saved model. Like Test Connection, it now uses the active model's saved key, but only for the same provider and endpoint
+- Fetch Models no longer lists OpenAI's GPT Live models (`gpt-live-*`), and model ranking for every provider marks GPT Live and realtime models as not suitable for chat, since they aren't chat models
 
 ## [2.0.0] - 2026-11-13
 
@@ -555,6 +563,7 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1
 [2.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0
 [1.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v1.0.0

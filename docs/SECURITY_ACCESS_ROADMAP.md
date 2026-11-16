@@ -1,6 +1,6 @@
 # Security, Access, and External API Roadmap
 
-> Historical note: this document started as the implementation roadmap for Splunk Discovery Tool security and external access. As of release 2.0.0, local sign-in, OIDC sign-in, per-user MCP assignment, token issuance, the read-only external RAG API, the inbound MCP surface, and browser coverage of account functions all ship. An in-app audit view has not shipped yet; audit events are recorded in the security database only. The phase sections below remain useful as implementation history and extension notes.
+> Historical note: this document started as the implementation roadmap for Splunk Discovery Tool security and external access. As of release 2.0.1, local sign-in, OIDC sign-in, per-user MCP assignment, token issuance, the read-only external RAG API, the inbound MCP surface, and browser coverage of account functions all ship. An in-app audit view has not shipped yet; audit events are recorded in the security database only. The phase sections below remain useful as implementation history and extension notes.
 
 ## Goal
 

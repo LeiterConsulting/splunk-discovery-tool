@@ -1,6 +1,6 @@
 # Splunk Discovery Tool: Discovery Architecture Guide
 
-This document describes how discovery, reports, the workspace, and chat fit together in release 2.0.0.
+This document describes how discovery, reports, the workspace, and chat fit together in release 2.0.1.
 
 ## Design Goals
 

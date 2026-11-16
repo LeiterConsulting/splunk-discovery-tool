@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0)
+[![Version](https://img.shields.io/badge/version-2.0.1-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1)
 
 > Finds what a Splunk environment contains, explains what to do next, and answers questions with live Splunk searches through the Splunk MCP server.
 
-**Current release: [2.0.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0)** (November 13, 2026). See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
+**Current release: [2.0.1](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1)** (November 16, 2026). It fixes certificate errors with AI providers and adds support for OpenAI's GPT-6 models. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
 
 ## ✨ What's Included
 
@@ -313,7 +313,7 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 **Fetch Models** or **Test Connection** fails with `CERTIFICATE_VERIFY_FAILED` (for example `unable to get local issuer certificate`):
 
-- AI requests trust both Python's system certificate store and the bundled public CAs. In version 2.0.0 and earlier, **Fetch Models** and the **Test Connection** probe used only the bundled list, so update to the current version and restart (`./install.sh --restart` or `.\install.ps1 -Restart`)
+- AI requests trust both Python's system certificate store and the bundled public CAs. In version 2.0.0 and earlier, **Fetch Models** and the **Test Connection** probe used only the bundled list, so update to version 2.0.1 or later and restart (`./install.sh --restart` or `.\install.ps1 -Restart`)
 - Run **Settings > Troubleshoot** with **AI Provider**. Its TLS check uses the same certificate trust as the AI requests
 - If the error remains, your network probably inspects HTTPS with a company CA. Ask IT for the CA bundle as a PEM file and start the app with it:
 
