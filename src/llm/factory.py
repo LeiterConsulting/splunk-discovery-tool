@@ -12,6 +12,8 @@ import time
 import re
 import random
 import logging
+import ssl
+import certifi
 from typing import Optional, Protocol, Dict, Any, Callable
 from datetime import datetime
 from urllib.parse import quote
@@ -19,6 +21,17 @@ from urllib.parse import quote
 from spl.spl_utils import extract_json_payload
 
 logger = logging.getLogger(__name__)
+
+
+def create_llm_ssl_context() -> ssl.SSLContext:
+    """Trust system and bundled public CAs unless an explicit CA store is configured."""
+    cafile = os.environ.get("SSL_CERT_FILE") or None
+    capath = os.environ.get("SSL_CERT_DIR") or None
+    if cafile or capath:
+        return ssl.create_default_context(cafile=cafile, capath=capath)
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=certifi.where())
+    return context
 
 
 OPENAI_GENERATION_PREFIXES = (
@@ -821,7 +834,7 @@ class OpenAIClient:
                 retry_loop = False
                 last_error = None
 
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=create_llm_ssl_context())) as session:
                     for strategy in request_strategies:
                         async with session.post(
                             strategy["endpoint"],
@@ -1525,7 +1538,7 @@ class CustomLLMClient:
         headers = {"Content-Type": "application/json"}
         
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=create_llm_ssl_context())) as session:
                 async with session.post(
                     f"{self.endpoint_url}/api/generate",
                     headers=headers,
@@ -1708,7 +1721,7 @@ class LLMClientFactory:
 
         chat_messages = LLMClientFactory._normalize_chat_messages(messages)
         last_error = ""
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=create_llm_ssl_context())) as session:
             for options in unique_attempts:
                 payload = {"messages": chat_messages, **options}
                 async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
@@ -1751,7 +1764,7 @@ class LLMClientFactory:
             "anthropic-version": "2023-06-01",
         }
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=create_llm_ssl_context())) as session:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 if response.status != 200:
                     body = await response.text()
@@ -1808,7 +1821,7 @@ class LLMClientFactory:
         if system_text:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=create_llm_ssl_context())) as session:
             for _ in range(2):
                 async with session.post(url, headers={"Content-Type": "application/json"}, json=payload,
                                         timeout=aiohttp.ClientTimeout(total=timeout)) as response:

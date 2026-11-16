@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from config_manager import AppConfig, LLMCredential, MCPCredential, clean_secret, is_unset_secret
+from llm.factory import create_llm_ssl_context
 
 PASS = "pass"
 WARN = "warn"
@@ -1467,7 +1468,11 @@ async def network_stage(
         return stage, True
 
     try:
-        verify_context = _certifi_context(ca_bundle if (verify and ca_bundle) else None)
+        verify_context = (
+            create_llm_ssl_context()
+            if kind == "llm"
+            else _certifi_context(ca_bundle if (verify and ca_bundle) else None)
+        )
     except (OSError, ssl.SSLError) as exc:
         stage.add("tls", "The CA bundle can't be loaded", FAIL, f"{type(exc).__name__}: {exc}",
                   "Use a readable PEM file with the CA certificate.")
@@ -1479,7 +1484,7 @@ async def network_stage(
         detail = f"{_certificate_summary(info)} {version}".strip()
         if verify:
             stage.add("tls", "The server's certificate is trusted", PASS, detail)
-            if not ca_bundle:
+            if kind == "mcp" and not ca_bundle:
                 await _check_system_trust_store(stage, connected, endpoint, kind)
         else:
             stage.add("tls", "The server's certificate is trusted", PASS,

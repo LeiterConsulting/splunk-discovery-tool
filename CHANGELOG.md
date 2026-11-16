@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- AI model listing, connection tests, hosted-provider generation, OpenAI image requests, and AI TLS diagnostics now share system and bundled public certificate trust. This fixes certificate verification failures when the required CA is trusted by Python's system store but absent from the bundled list. Explicit `SSL_CERT_FILE` and `SSL_CERT_DIR` settings remain authoritative; TLS verification stays enabled.
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

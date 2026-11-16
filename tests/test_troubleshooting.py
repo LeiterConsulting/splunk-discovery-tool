@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+import certifi
 from fastapi.testclient import TestClient
 
 
@@ -129,6 +130,10 @@ class _FakeServer:
                 bodies.append(self.rfile.read(length))
                 auth = self.headers.get("Authorization", "")
                 received.append(auth)
+                if self.path in extra_routes:
+                    status, payload = extra_routes[self.path]
+                    self._send(status, payload)
+                    return
                 if auth != f"Bearer {GOOD_TOKEN}":
                     self._send(401, {"messages": [{"type": "ERROR", "text": "Unauthorized"}]})
                     return
@@ -290,6 +295,80 @@ class TroubleshootApiTests(unittest.TestCase):
         self.assertEqual(missing["status"], "error")
         self.assertIn("missing.pem", missing["message"])
         self.assertEqual(bodies, [{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}])
+
+    def test_openai_models_generation_and_diagnostics_use_system_ca(self):
+        cert_files = _self_signed_cert(self.temp_path)
+
+        def load_system_ca(context, purpose=ssl.Purpose.SERVER_AUTH):
+            context.load_verify_locations(cafile=str(cert_files[0]))
+
+        routes = {
+            "/v1/models": (200, {"data": [{"id": "gpt-4o-mini"}]}),
+            "/v1/chat/completions": (200, {"choices": [{"message": {"content": "test successful"}}]}),
+        }
+        with (
+            _FakeServer(tls_files=cert_files, routes=routes) as server,
+            patch.dict(os.environ, {"SSL_CERT_FILE": "", "SSL_CERT_DIR": ""}),
+            patch.object(ssl.SSLContext, "load_default_certs", load_system_ca),
+        ):
+            payload = {
+                "provider": "openai",
+                "api_key": GOOD_TOKEN,
+                "model": "gpt-4o-mini",
+                "endpoint_url": f"https://localhost:{server.port}/v1",
+            }
+            models = self.client.post("/api/llm/list-models", json=payload)
+            self.assertEqual(models.status_code, 200, models.text)
+            self.assertEqual(models.json()["models"], ["gpt-4o-mini"])
+
+            connection = self.client.post("/api/llm/test-connection", json=payload).json()
+            self.assertEqual(connection["status"], "success", connection)
+            self.assertEqual(connection["tests"]["model"]["response_preview"], "test successful")
+
+            report = self.client.post("/api/troubleshoot/llm", json={**payload, "check_save": False}).json()
+            self.assertEqual(_checks(report, "network")["tls"]["status"], "pass", report)
+            self.assertEqual(_checks(report, "response")["model"]["status"], "pass", report)
+
+    def test_openai_models_use_bundled_cas_when_system_store_is_empty(self):
+        cert_files = _self_signed_cert(self.temp_path)
+        with (
+            _FakeServer(tls_files=cert_files, routes={"/v1/models": (200, {"data": [{"id": "gpt-4o-mini"}]})}) as server,
+            patch.dict(os.environ, {"SSL_CERT_FILE": "", "SSL_CERT_DIR": ""}),
+            patch.object(ssl.SSLContext, "load_default_certs"),
+            patch.object(certifi, "where", return_value=str(cert_files[0])),
+        ):
+            response = self.client.post("/api/llm/list-models", json={
+                "provider": "openai", "api_key": GOOD_TOKEN,
+                "endpoint_url": f"https://localhost:{server.port}/v1",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["models"], ["gpt-4o-mini"])
+
+    def test_openai_explicit_ca_bundle_is_respected_without_system_fallback(self):
+        cert_files = _self_signed_cert(self.temp_path)
+
+        def load_system_ca(context, purpose=ssl.Purpose.SERVER_AUTH):
+            context.load_verify_locations(cafile=str(cert_files[0]))
+
+        with (
+            _FakeServer(tls_files=cert_files, routes={"/v1/models": (200, {"data": [{"id": "gpt-4o-mini"}]})}) as server,
+            patch.object(ssl.SSLContext, "load_default_certs", load_system_ca),
+        ):
+            payload = {
+                "provider": "openai", "api_key": GOOD_TOKEN,
+                "endpoint_url": f"https://localhost:{server.port}/v1",
+            }
+            for bundle, expected_status in ((str(cert_files[0]), 200), (certifi.where(), 500)):
+                with self.subTest(bundle=bundle), patch.dict(os.environ, {"SSL_CERT_FILE": bundle, "SSL_CERT_DIR": ""}):
+                    response = self.client.post("/api/llm/list-models", json=payload)
+                    self.assertEqual(response.status_code, expected_status, response.text)
+                    if expected_status == 500:
+                        self.assertIn("CERTIFICATE_VERIFY_FAILED", response.json()["detail"])
+
+            with patch.dict(os.environ, {"SSL_CERT_FILE": str(self.temp_path / "missing.pem"), "SSL_CERT_DIR": ""}):
+                response = self.client.post("/api/llm/list-models", json=payload)
+                self.assertEqual(response.status_code, 500, response.text)
+                self.assertIn("No such file", response.json()["detail"])
 
     def test_https_url_on_a_plain_http_port(self):
         with _FakeServer() as server:

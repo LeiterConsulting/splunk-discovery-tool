@@ -19,6 +19,7 @@ Splunk Discovery Tool finds what a Splunk environment contains through the Splun
 - UI text uses plain language: no "(s)" plurals, doubled words, listed jargon, or raw dates (`tests/test_ui_copy.py`), and every theme must meet WCAG AA contrast (`npm run test:ui-contrast-browser`)
 - Never log, print, or commit tokens, keys, `config.encrypted`, `.config.key`, `security.db`, or `output/`
 - Keep the settings API and saved-config format backward compatible; unknown config keys are ignored on load
+- AI provider requests get their TLS context from `create_llm_ssl_context()` in `src/llm/factory.py` (system CAs plus certifi, verification always on); new AI request paths must use it
 - Record user-facing changes in `CHANGELOG.md` and keep the docs in `docs/` current
 
 ## Validation

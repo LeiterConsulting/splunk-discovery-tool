@@ -62,6 +62,7 @@ from knowledge_library.sources import MAX_PACK_BYTES, LibraryPackError
 from llm.factory import (
     DEFAULT_OLLAMA_ENDPOINT_URL,
     LLMClientFactory,
+    create_llm_ssl_context,
     filter_openai_generation_models,
     get_openai_model_capabilities,
     is_openai_image_generation_model,
@@ -13979,7 +13980,7 @@ async def list_models(request: Request):
         api_key = data.get('api_key')
         endpoint_url = (data.get('endpoint_url') or '').strip() or None
 
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(verify=create_llm_ssl_context(), timeout=12.0) as client:
             if provider == 'openai':
                 if not api_key:
                     raise HTTPException(status_code=400, detail="API key required for OpenAI")
@@ -14222,7 +14223,7 @@ async def get_summary_infographic_capability(request: Request, timestamp: Option
         }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(verify=create_llm_ssl_context(), timeout=10.0) as client:
             response = await client.get(
                 build_openai_api_url(config.llm.endpoint_url, "/models"),
                 headers={"Authorization": f"Bearer {config.llm.api_key}"},
@@ -14299,7 +14300,7 @@ async def generate_summary_infographic(request: SummaryInfographicRequest, http_
     }
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(420.0, connect=30.0)) as client:
+        async with httpx.AsyncClient(verify=create_llm_ssl_context(), timeout=httpx.Timeout(420.0, connect=30.0)) as client:
             response = await client.post(
                 build_openai_api_url(config.llm.endpoint_url, "/images/generations"),
                 headers={
@@ -14343,7 +14344,7 @@ async def generate_summary_infographic(request: SummaryInfographicRequest, http_
 
     if image_url:
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+            async with httpx.AsyncClient(verify=create_llm_ssl_context(), timeout=httpx.Timeout(60.0, connect=15.0)) as client:
                 image_response = await client.get(image_url)
                 image_response.raise_for_status()
             content_type = str(image_response.headers.get("content-type") or "image/png").split(";", 1)[0].strip().lower() or "image/png"
@@ -14608,7 +14609,7 @@ async def _run_llm_connection_test(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         # Test 1: Connectivity probe
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
+            async with httpx.AsyncClient(verify=create_llm_ssl_context(), timeout=12.0) as client:
                 if provider == "openai":
                     base = (endpoint_url or "https://api.openai.com").rstrip('/')
                     if base.endswith('/v1'):

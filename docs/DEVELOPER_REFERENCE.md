@@ -114,6 +114,7 @@ LLM flow:
 - Keep deterministic paths for high-value queries
 - Reserve free-form agentic behavior for exploratory questions
 - Track and expose reasoning timeline to users for transparency
+- HTTPX AI requests, aiohttp provider generation, and the AI troubleshooter use `llm.factory.create_llm_ssl_context()`: Python's system CA store plus certifi's public CAs, with hostname and certificate verification enabled. `SSL_CERT_FILE` and `SSL_CERT_DIR`, when set before startup, replace that combined trust store. Keep new AI request paths on the same helper; MCP retains its separate Verify SSL and CA bundle settings.
 
 ## 6) Settings Surface (Preserved)
 

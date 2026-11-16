@@ -427,6 +427,27 @@ llm_health_endpoint = "/api/llm/health"
 
 `/api/llm/list-models` also returns `ranked` (per-model profile and balanced score), `recommended`, `recommended_model`, and `ranking_basis`. `/api/llm/test-connection` returns the tuned settings it used and the recommended settings for the model.
 
+### 9.7 Certificate Trust for AI Requests (src/llm/factory.py)
+```python
+# create_llm_ssl_context()
+# SSL_CERT_FILE or SSL_CERT_DIR set (nonempty): trust only that CA file or folder
+# Otherwise: Python's system CA store plus certifi's public CA bundle
+# Certificate chain and host name verification stay on; there is no unverified retry
+# A missing or unreadable SSL_CERT_FILE is an error, not a fallback
+```
+
+Used by:
+- `/api/llm/list-models` and `/api/llm/test-connection` (HTTPX)
+- Generation for OpenAI, Azure OpenAI, Anthropic, and Gemini, and the custom-provider fallback request (aiohttp)
+- OpenAI infographic capability checks, image generation, and image download
+- The TLS check in **Settings > Troubleshoot > AI Provider**
+
+Not used by:
+- MCP connections, which use **Verify SSL Certificate** and **CA Bundle File**
+- Custom-provider requests sent through the Requests client, and the Ollama and custom model metadata lookups
+
+`SSL_CERT_FILE` and `SSL_CERT_DIR` are read when each request starts, so set them in the environment that starts the app (the installers pass the environment through). HTTPX also honors them for other outbound HTTPS that uses its default trust, such as knowledge library downloads.
+
 ---
 
 ## 10. Error Handling
@@ -579,5 +600,5 @@ FRESHNESS_EXEMPT_DIRS = {"runtime_jobs"}
 
 ---
 
-*Last Updated: 2026-11-13*
+*Last Updated: 2026-11-16*
 *Version: 2.0.0*

@@ -89,6 +89,7 @@ If a test or save fails, open **Settings > Troubleshoot** (see [Troubleshooting]
 - For `custom`, you can use a base URL (for example `http://host:port/v1`); the app tries the common completion paths
 - **Auto-tune** (on by default) sets the output length, temperature, context window, request timeout, and reasoning effort from the model's profile. You can override each value
 - **Test Connection & Auto-Configure** runs a connectivity probe and a generation test with the tuned settings, and recommends settings for the model
+- AI model requests trust Python's system certificate store plus the bundled public CAs (certifi), and certificate verification is always on. If your network inspects HTTPS with a CA that neither list has, set `SSL_CERT_FILE` to an IT-provided PEM bundle before starting the app (see [AI provider certificate errors](#ai-provider-certificate-errors))
 
 ## 🧠 Workspace Overview
 
@@ -305,6 +306,24 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 - Run **Settings > Troubleshoot** with the URL and token
 - For private certificate chains, turn on **Verify SSL Certificate** and enter the path of a `.pem` file on the app server in **CA Bundle File**, or turn verification off for a self-signed lab server
+
+### AI provider certificate errors
+
+**Fetch Models** or **Test Connection** fails with `CERTIFICATE_VERIFY_FAILED` (for example `unable to get local issuer certificate`):
+
+- AI requests trust both Python's system certificate store and the bundled public CAs. In version 2.0.0 and earlier, **Fetch Models** and the **Test Connection** probe used only the bundled list, so update to the current version and restart (`./install.sh --restart` or `.\install.ps1 -Restart`)
+- Run **Settings > Troubleshoot** with **AI Provider**. Its TLS check uses the same certificate trust as the AI requests
+- If the error remains, your network probably inspects HTTPS with a company CA. Ask IT for the CA bundle as a PEM file and start the app with it:
+
+```bash
+SSL_CERT_FILE=/path/to/company-ca.pem ./install.sh --restart
+```
+
+```powershell
+$env:SSL_CERT_FILE = "C:\path\to\company-ca.pem"; .\install.ps1 -Restart
+```
+
+`SSL_CERT_FILE` (or `SSL_CERT_DIR` for a folder of certificates) replaces the default trust, so the file must include every CA the app needs. It also applies to other outbound HTTPS that uses the default trust, such as knowledge library downloads and MCP servers without a CA bundle. Don't turn off certificate verification for AI providers; there is no setting for it.
 
 ### pip install timeout / `repo.splunkdev.net` unreachable
 
