@@ -42,6 +42,12 @@ max_tokens: hosted 8192 (16000 for reasoning models), local 4096 (8192 for reaso
 temperature: 0.2                   # Omitted for models with a fixed temperature
 request_timeout: hosted 120s (300s reasoning), local 600s (900s reasoning)
 reasoning_effort: "low"            # OpenAI/Azure reasoning models and gpt-oss
+
+# Built-in catalog (HOSTED_CATALOG, first matching pattern wins)
+# gpt-6-astra, gpt-6-sol, gpt-6-terra, gpt-6-luna, gpt-6 (any other gpt-6 id)
+# gpt-5-sol, gpt-5-terra, gpt-5-luna (the GPT-5.6 tiers)
+#   1,050,000-token context window, 128,000 output tokens, reasoning, no temperature
+NEWEST_CATALOG_GPT_GENERATION = 6  # gpt-7 and later use the closest gpt-6 tier, then the closest gpt-5 tier
 ```
 
 Chat budgets come from `chat_budgets()`: the first step gets about 50% and follow-up steps about 60% of `max_tokens` (at least 2048 tokens for reasoning models and 512 otherwise). History turns (`_history_turns()`: 2 up to 8192 tokens of context, 4 up to 16384, 6 up to 32768, otherwise 8) and evidence rows scale with the context window.
@@ -379,10 +385,15 @@ security.db
 
 ## 9. LLM Provider-Specific Settings
 
-### 9.1 OpenAI
+### 9.1 OpenAI (src/llm/factory.py)
 ```python
 default_model = "gpt-4o-mini"
 max_context_window = 128000            # gpt-4o-mini profile (varies by model)
+
+# get_openai_model_capabilities(): o1, o3, o4, and every gpt-5 or newer model (gpt-5.6, gpt-6.1, gpt-7)
+#   try the Responses API first, run as reasoning models (except -chat models), omit temperature,
+#   and send max_completion_tokens to Chat Completions
+# openai_reasoning_effort_for_model(): "minimal" is sent as "low" for gpt-5.6 and newer
 ```
 
 ### 9.2 Azure OpenAI (src/llm/factory.py)
@@ -425,7 +436,7 @@ llm_assess_max_tokens_endpoint = "/api/llm/assess-max-tokens"
 llm_health_endpoint = "/api/llm/health"
 ```
 
-`/api/llm/list-models` also returns `ranked` (per-model profile and balanced score), `recommended`, `recommended_model`, and `ranking_basis`. `/api/llm/test-connection` returns the tuned settings it used and the recommended settings for the model.
+`/api/llm/list-models` also returns `ranked` (per-model profile and balanced score), `recommended`, `recommended_model`, and `ranking_basis`. With a blank or masked `api_key`, it uses the active model's saved key when the provider matches and the endpoint is the same; when the request gives no endpoint, it uses the active model's endpoint for the same provider. `/api/llm/test-connection` returns the tuned settings it used and the recommended settings for the model.
 
 ### 9.7 Certificate Trust for AI Requests (src/llm/factory.py)
 ```python

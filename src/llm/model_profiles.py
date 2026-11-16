@@ -43,6 +43,8 @@ NON_GENERATION_NAME_TOKENS = (
     "tts",
     "transcribe",
     "moderation",
+    "realtime",
+    "gpt-live",
     "dall-e",
     "gpt-image",
     "imagen",
@@ -64,6 +66,8 @@ class CatalogEntry:
     supports_tools: bool = True
     supports_temperature: bool = True
     vision: bool = False
+    # Off for entries priced and scored for one exact minor version (gpt-5.6-sol).
+    version_bonus: bool = True
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,14 @@ _F = OpenWeightFamily
 
 # Order matters: the first matching pattern wins, so specific tiers come first.
 HOSTED_CATALOG: Tuple[CatalogEntry, ...] = (
+    _C(r"^gpt-6(\.\d+)?-astra", "gpt-6-astra", 1050000, 128000, 0.99, 0.28, 10.0, 50.0, reasoning=True, supports_temperature=False, vision=True),
+    _C(r"^gpt-6(\.\d+)?-sol", "gpt-6-sol", 1050000, 128000, 0.97, 0.45, 2.0, 10.0, reasoning=True, supports_temperature=False, vision=True),
+    _C(r"^gpt-6(\.\d+)?-terra", "gpt-6-terra", 1050000, 128000, 0.92, 0.70, 1.0, 5.0, reasoning=True, supports_temperature=False, vision=True),
+    _C(r"^gpt-6(\.\d+)?-luna", "gpt-6-luna", 1050000, 128000, 0.82, 0.86, 0.10, 0.50, reasoning=True, supports_temperature=False, vision=True),
+    _C(r"^gpt-6(?=$|[.\-])", "gpt-6", 1050000, 128000, 0.97, 0.28, 10.0, 50.0, reasoning=True, supports_temperature=False, vision=True),
+    _C(r"^gpt-5(\.\d+)?-sol", "gpt-5-sol", 1050000, 128000, 0.95, 0.45, 4.0, 20.0, reasoning=True, supports_temperature=False, vision=True, version_bonus=False),
+    _C(r"^gpt-5(\.\d+)?-terra", "gpt-5-terra", 1050000, 128000, 0.89, 0.68, 2.0, 12.0, reasoning=True, supports_temperature=False, vision=True, version_bonus=False),
+    _C(r"^gpt-5(\.\d+)?-luna", "gpt-5-luna", 1050000, 128000, 0.78, 0.84, 0.20, 1.20, reasoning=True, supports_temperature=False, vision=True, version_bonus=False),
     _C(r"^gpt-5(\.\d+)?-pro", "gpt-5-pro", 400000, 128000, 0.97, 0.15, 15.0, 120.0, reasoning=True, supports_temperature=False, vision=True),
     _C(r"^gpt-5(\.\d+)?-nano", "gpt-5-nano", 400000, 128000, 0.70, 0.80, 0.05, 0.40, reasoning=True, supports_temperature=False, vision=True),
     _C(r"^gpt-5(\.\d+)?-mini", "gpt-5-mini", 400000, 128000, 0.85, 0.66, 0.25, 2.00, reasoning=True, supports_temperature=False, vision=True),
@@ -122,6 +134,9 @@ HOSTED_CATALOG: Tuple[CatalogEntry, ...] = (
     _C(r"^gemini-[\d.]+-flash", "gemini-flash", 1048576, 65536, 0.82, 0.85, 0.30, 2.50, reasoning=True, vision=True),
     _C(r"^gemini", "gemini", 1048576, 8192, 0.75, 0.80, 0.30, 2.50, vision=True),
 )
+
+NEWEST_CATALOG_GPT_GENERATION = 6
+_GPT_GENERATION_CATCH_ALL_FAMILIES = {f"gpt-{generation}" for generation in range(5, NEWEST_CATALOG_GPT_GENERATION + 1)}
 
 OPEN_WEIGHT_FAMILIES: Tuple[OpenWeightFamily, ...] = (
     _F(r"qwen3[-_.]?coder", "qwen3-coder", 0.03, True, 262144),
@@ -266,12 +281,31 @@ def match_catalog_entry(normalized_model: str) -> Optional[CatalogEntry]:
     return None
 
 
-def newer_gpt_generation_alias(normalized_model: str) -> Optional[str]:
-    """Map ids from GPT generations newer than the catalog (gpt-6, gpt-7.1-mini) onto gpt-5 ids."""
+def newer_gpt_generation_aliases(normalized_model: str) -> List[str]:
+    """Catalog ids to try for GPT generations newer than the catalog, newest generation first.
+
+    ``gpt-7.1-luna`` becomes ``gpt-6.1-luna`` and then ``gpt-5.1-luna``, so a new
+    generation inherits the closest tier the catalog knows.
+    """
     match = re.match(r"^gpt-(\d+)(?=$|[.\-])", normalized_model)
-    if not match or int(match.group(1)) <= 5:
-        return None
-    return "gpt-5" + normalized_model[match.end():]
+    if not match or int(match.group(1)) <= NEWEST_CATALOG_GPT_GENERATION:
+        return []
+    rest = normalized_model[match.end():]
+    return [f"gpt-{generation}{rest}" for generation in range(NEWEST_CATALOG_GPT_GENERATION, 4, -1)]
+
+
+def match_newer_gpt_generation(normalized_model: str) -> Tuple[Optional[CatalogEntry], Optional[str]]:
+    """Prefer a tier match (``-luna``, ``-mini``) from any generation over a generation's catch-all entry."""
+    catch_all: Tuple[Optional[CatalogEntry], Optional[str]] = (None, None)
+    for alias in newer_gpt_generation_aliases(normalized_model):
+        entry = match_catalog_entry(alias)
+        if entry is None:
+            continue
+        if entry.family not in _GPT_GENERATION_CATCH_ALL_FAMILIES:
+            return entry, alias
+        if catch_all[0] is None:
+            catch_all = (entry, alias)
+    return catch_all
 
 
 def match_open_weight_family(normalized_model: str) -> Optional[OpenWeightFamily]:
@@ -334,10 +368,10 @@ def _price_score(input_cost: Optional[float], output_cost: Optional[float]) -> O
 
 
 def _version_bonus(normalized_model: str) -> float:
-    match = re.match(r"^gpt-5\.(\d+)", normalized_model)
-    if not match:
+    match = re.match(r"^gpt-(\d+)\.(\d+)", normalized_model)
+    if not match or int(match.group(1)) < 5:
         return 0.0
-    return min(0.04, 0.01 * int(match.group(1)))
+    return min(0.04, 0.01 * int(match.group(2)))
 
 
 def _first_int(*values: Any) -> Optional[int]:
@@ -517,10 +551,7 @@ def build_model_profile(
     entry = match_catalog_entry(normalized)
     successor_alias = None
     if entry is None:
-        successor_alias = newer_gpt_generation_alias(normalized)
-        entry = match_catalog_entry(successor_alias) if successor_alias else None
-        if entry is None:
-            successor_alias = None
+        entry, successor_alias = match_newer_gpt_generation(normalized)
     family_rule = None if entry else match_open_weight_family(normalized)
 
     if provider_key in HOSTED_PROVIDERS:
@@ -541,7 +572,7 @@ def build_model_profile(
         family = entry.family
         context_window = entry.context_window
         max_output = entry.max_output_tokens
-        quality = entry.quality + _version_bonus(successor_alias or normalized)
+        quality = entry.quality + (_version_bonus(successor_alias or normalized) if entry.version_bonus else 0.0)
         speed = entry.speed
         supports_tools = entry.supports_tools
         supports_temperature = entry.supports_temperature

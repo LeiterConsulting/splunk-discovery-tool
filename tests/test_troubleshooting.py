@@ -106,6 +106,7 @@ class _FakeServer:
 
     def __init__(self, tls_files=None, routes=None, port=0):
         received = self.received = []
+        get_auth = self.get_auth = []
         bodies = self.bodies = []
         extra_routes = routes or {}
 
@@ -119,6 +120,7 @@ class _FakeServer:
                 self.wfile.write(body)
 
             def do_GET(self):
+                get_auth.append(self.headers.get("Authorization", ""))
                 if self.path in extra_routes:
                     status, payload = extra_routes[self.path]
                     self._send(status, payload)
@@ -370,6 +372,28 @@ class TroubleshootApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 500, response.text)
                 self.assertIn("No such file", response.json()["detail"])
 
+    def test_openai_model_list_uses_the_saved_key_when_the_field_is_blank(self):
+        models = {"/v1/models": (200, {"data": [{"id": "gpt-6.1-terra"}, {"id": "gpt-6-luna"}, {"id": "gpt-live-1"}]})}
+        with _FakeServer(routes=models) as server, _FakeServer(routes=models) as other:
+            endpoint = f"http://127.0.0.1:{server.port}/v1"
+            self.config_manager.update_llm(provider="openai", api_key=GOOD_TOKEN, model="gpt-6.1-terra", endpoint_url=endpoint)
+
+            for api_key in ("", "***"):
+                with self.subTest(api_key=api_key):
+                    response = self.client.post("/api/llm/list-models", json={"provider": "openai", "api_key": api_key})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()["models"], ["gpt-6-luna", "gpt-6.1-terra"])
+
+            elsewhere = self.client.post("/api/llm/list-models", json={
+                "provider": "openai", "api_key": "", "endpoint_url": f"http://127.0.0.1:{other.port}/v1",
+            })
+            wrong_provider = self.client.post("/api/llm/list-models", json={"provider": "anthropic", "api_key": ""})
+            server_auth, other_auth = list(server.get_auth), list(other.get_auth)
+
+        self.assertEqual(server_auth, [f"Bearer {GOOD_TOKEN}"] * 2)
+        self.assertEqual(elsewhere.status_code, 400, elsewhere.text)
+        self.assertEqual(other_auth, [])
+        self.assertEqual(wrong_provider.status_code, 400, wrong_provider.text)
     def test_https_url_on_a_plain_http_port(self):
         with _FakeServer() as server:
             report = self._mcp(url=f"https://127.0.0.1:{server.port}/services/mcp", token=GOOD_TOKEN)

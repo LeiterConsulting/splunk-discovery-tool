@@ -89,6 +89,8 @@ If a test or save fails, open **Settings > Troubleshoot** (see [Troubleshooting]
 - For `custom`, you can use a base URL (for example `http://host:port/v1`); the app tries the common completion paths
 - **Auto-tune** (on by default) sets the output length, temperature, context window, request timeout, and reasoning effort from the model's profile. You can override each value
 - **Test Connection & Auto-Configure** runs a connectivity probe and a generation test with the tuned settings, and recommends settings for the model
+- **Fetch Models** and **Test Connection** use the active model's saved API key when the key field is blank, so you don't need to paste the key again to refresh the list
+- OpenAI GPT-6 (Astra, Sol, Terra, Luna) and GPT-5.6 models have built-in profiles with their real context and output limits. GPT-5 and newer models run as reasoning models through the Responses API, without a temperature setting. A newer GPT generation than the app knows about uses the closest GPT-6 profile, and the model profile says so
 - AI model requests trust Python's system certificate store plus the bundled public CAs (certifi), and certificate verification is always on. If your network inspects HTTPS with a CA that neither list has, set `SSL_CERT_FILE` to an IT-provided PEM bundle before starting the app (see [AI provider certificate errors](#ai-provider-certificate-errors))
 
 ## 🧠 Workspace Overview

@@ -57,6 +57,7 @@ OPENAI_NON_GENERATION_TOKENS = (
     "realtime",
     "search-preview",
     "computer-use-preview",
+    "gpt-live",
 )
 
 OPENAI_IMAGE_GENERATION_PREFIXES = (
@@ -280,6 +281,30 @@ def _normalize_openai_model_name(model: Optional[str]) -> str:
     return (model or "").strip().lower()
 
 
+_GPT_VERSION_PATTERN = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?=$|[.\-])")
+
+
+def openai_gpt_version(model: Optional[str]) -> Optional[tuple[int, int]]:
+    """Return (major, minor) for GPT ids such as ``gpt-5.6-luna`` or ``gpt-6-astra``."""
+    match = _GPT_VERSION_PATTERN.match(_normalize_openai_model_name(model))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def openai_reasoning_effort_for_model(model: Optional[str], effort: Optional[str]) -> Optional[str]:
+    """Return the effort to send, or None when the value isn't one the app supports."""
+    value = str(effort or "").strip().lower()
+    if value not in {"minimal", "low", "medium", "high"}:
+        return None
+    version = openai_gpt_version(model)
+    # GPT-5.6 and GPT-6 models accept none, low, medium, high, xhigh, and max, but not
+    # minimal. Every tier accepts low, while some (GPT-6 Astra, GPT-6.1 Sol) reject none.
+    if value == "minimal" and version is not None and version >= (5, 6):
+        return "low"
+    return value
+
+
 def is_openai_generation_model(model_id: str) -> bool:
     """Return True when a model ID is a likely text-generation/chat model."""
     model_lower = _normalize_openai_model_name(model_id)
@@ -326,13 +351,15 @@ def filter_openai_generation_models(model_ids: list[str]) -> list[str]:
 def get_openai_model_capabilities(model: str) -> Dict[str, Any]:
     """Infer compatibility hints for OpenAI model families used by the app."""
     model_lower = _normalize_openai_model_name(model)
-    prefers_responses_api = model_lower.startswith(OPENAI_RESPONSES_MODEL_PREFIXES)
-    is_gpt5_chat = bool(re.match(r"^gpt-5(\.\d+)?-chat", model_lower))
-    reasoning = model_lower.startswith(("o1", "o3", "o4")) or (model_lower.startswith("gpt-5") and not is_gpt5_chat)
+    version = openai_gpt_version(model_lower)
+    gpt5_or_newer = version is not None and version[0] >= 5
+    prefers_responses_api = gpt5_or_newer or model_lower.startswith(OPENAI_RESPONSES_MODEL_PREFIXES)
+    is_chat_variant = gpt5_or_newer and bool(re.match(r"^gpt-\d+(\.\d+)?-chat", model_lower))
+    reasoning = model_lower.startswith(("o1", "o3", "o4")) or (gpt5_or_newer and not is_chat_variant)
     supports_temperature = not reasoning
 
     chat_token_keys = ["max_tokens"]
-    if any(hint in model_lower for hint in OPENAI_CHAT_COMPLETION_NEW_TOKEN_HINTS):
+    if gpt5_or_newer or any(hint in model_lower for hint in OPENAI_CHAT_COMPLETION_NEW_TOKEN_HINTS):
         chat_token_keys = ["max_completion_tokens", "max_tokens"]
 
     return {
@@ -628,10 +655,9 @@ class OpenAIClient:
         tuning = tuning if isinstance(tuning, dict) else {}
         default_timeout = 300 if self.model_capabilities.get("reasoning") else 120
         self.request_timeout = _positive_int(tuning.get("request_timeout"), default_timeout)
-        effort = str(tuning.get("reasoning_effort") or "").strip().lower()
         self.reasoning_effort = (
-            effort
-            if effort in {"minimal", "low", "medium", "high"} and self.model_capabilities.get("reasoning")
+            openai_reasoning_effort_for_model(model, tuning.get("reasoning_effort"))
+            if self.model_capabilities.get("reasoning")
             else None
         )
 

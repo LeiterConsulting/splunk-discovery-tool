@@ -23,6 +23,7 @@ from llm.factory import (
     filter_openai_generation_models,
     get_openai_model_capabilities,
     is_openai_image_generation_model,
+    openai_reasoning_effort_for_model,
     parse_json_from_llm_text,
 )
 from llm import runtime_tuning
@@ -69,6 +70,63 @@ class OpenAIModelHelperTests(unittest.TestCase):
                 capabilities = get_openai_model_capabilities(model)
                 self.assertTrue(capabilities["supports_generation"])
                 self.assertTrue(capabilities["prefers_responses_api"])
+
+    def test_gpt5_and_newer_models_use_reasoning_request_rules(self):
+        for model in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6-cyber", "gpt-7.1-luna", "gpt-5.6-terra", "gpt-5"):
+            with self.subTest(model=model):
+                capabilities = get_openai_model_capabilities(model)
+                self.assertTrue(capabilities["supports_generation"])
+                self.assertTrue(capabilities["prefers_responses_api"])
+                self.assertTrue(capabilities["reasoning"])
+                self.assertFalse(capabilities["supports_temperature"])
+                self.assertEqual(capabilities["chat_token_keys"], ["max_completion_tokens", "max_tokens"])
+
+        for model in ("gpt-5-chat-latest", "gpt-6-chat-latest"):
+            with self.subTest(model=model):
+                capabilities = get_openai_model_capabilities(model)
+                self.assertFalse(capabilities["reasoning"])
+                self.assertTrue(capabilities["supports_temperature"])
+
+        legacy = get_openai_model_capabilities("gpt-4o")
+        self.assertFalse(legacy["prefers_responses_api"])
+        self.assertFalse(legacy["reasoning"])
+
+    def test_gpt6_request_strategy_starts_with_responses_api_and_no_temperature(self):
+        client = OpenAIClient(api_key="test-key", model="gpt-6.1-terra", tuning={"reasoning_effort": "low"})
+        strategies = client._build_openai_request_strategies([{"role": "user", "content": "hi"}], 2000, 0.7)
+
+        first = strategies[0]
+        self.assertEqual(first["mode"], "responses")
+        self.assertEqual(first["payload"]["reasoning"], {"effort": "low"})
+        self.assertEqual(first["payload"]["max_output_tokens"], 2000)
+        self.assertTrue(all("temperature" not in strategy["payload"] for strategy in strategies))
+        chat = [strategy for strategy in strategies if strategy["mode"] == "chat"]
+        self.assertEqual(chat[0]["token_key"], "max_completion_tokens")
+        self.assertEqual(chat[0]["payload"]["reasoning_effort"], "low")
+
+    def test_minimal_reasoning_effort_is_sent_as_low_for_gpt_5_6_and_newer(self):
+        self.assertEqual(openai_reasoning_effort_for_model("gpt-6-astra", "minimal"), "low")
+        self.assertEqual(openai_reasoning_effort_for_model("gpt-6.1-sol", "Minimal"), "low")
+        self.assertEqual(openai_reasoning_effort_for_model("gpt-5.6-luna", "minimal"), "low")
+        self.assertEqual(openai_reasoning_effort_for_model("gpt-5-mini", "minimal"), "minimal")
+        self.assertEqual(openai_reasoning_effort_for_model("o4-mini", "minimal"), "minimal")
+        self.assertEqual(openai_reasoning_effort_for_model("gpt-6-luna", "high"), "high")
+        self.assertIsNone(openai_reasoning_effort_for_model("gpt-6-luna", "max"))
+        self.assertIsNone(openai_reasoning_effort_for_model("gpt-6-luna", ""))
+
+        self.assertEqual(OpenAIClient(api_key="test-key", model="gpt-6-astra", tuning={"reasoning_effort": "minimal"}).reasoning_effort, "low")
+        self.assertIsNone(OpenAIClient(api_key="test-key", model="gpt-4o", tuning={"reasoning_effort": "low"}).reasoning_effort)
+
+    def test_gpt6_era_listing_keeps_only_chat_models(self):
+        models = [
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-terra",
+            "gpt-image-2.6-sunburst", "gpt-image-2.5-flare", "gpt-live-1", "gpt-live-transcribe",
+            "gpt-realtime-2.1", "gpt-realtime-translate", "gpt-transcribe",
+        ]
+        self.assertEqual(
+            filter_openai_generation_models(models),
+            ["gpt-5.6-terra", "gpt-6-astra", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"],
+        )
 
     def test_image_model_capabilities_report_image_generation(self):
         capabilities = get_openai_model_capabilities("gpt-image-2")

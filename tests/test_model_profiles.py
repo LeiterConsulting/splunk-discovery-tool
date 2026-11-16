@@ -134,15 +134,68 @@ class ProfileAndRankingTests(unittest.TestCase):
         self.assertEqual([item["rank"] for item in ranked], list(range(1, len(models) + 1)))
         self.assertEqual(sum(1 for item in ranked if item["recommended"]), 1)
 
-    def test_newer_gpt_generation_inherits_gpt5_limits(self):
-        profile = build_model_profile("openai", "gpt-6.1-terra")
-        self.assertEqual(profile.family, "gpt-5")
-        self.assertEqual(profile.context_window, 400000)
-        self.assertIn("catalog", profile.sources)
-        self.assertTrue(any("Newer GPT generation" in note for note in profile.notes))
-        self.assertEqual(recommend_settings(profile)["context_window"], HOSTED_CONTEXT_CAP)
+    def test_gpt6_and_gpt56_tiers_use_their_catalog_profiles(self):
+        # Limits and list prices from OpenAI's model and pricing pages.
+        expected = {
+            "gpt-6-astra": ("gpt-6-astra", 10.0, 50.0),
+            "gpt-6.1-sol": ("gpt-6-sol", 2.0, 10.0),
+            "gpt-6-sol": ("gpt-6-sol", 2.0, 10.0),
+            "gpt-6.1-terra": ("gpt-6-terra", 1.0, 5.0),
+            "gpt-6-luna": ("gpt-6-luna", 0.10, 0.50),
+            "gpt-5.6-sol": ("gpt-5-sol", 4.0, 20.0),
+            "gpt-5.6-terra": ("gpt-5-terra", 2.0, 12.0),
+            "gpt-5.6-luna": ("gpt-5-luna", 0.20, 1.20),
+        }
+        for model, (family, input_cost, output_cost) in expected.items():
+            with self.subTest(model=model):
+                profile = build_model_profile("openai", model)
+                self.assertEqual(profile.family, family)
+                self.assertEqual(profile.context_window, 1050000)
+                self.assertEqual(profile.max_output_tokens, 128000)
+                self.assertEqual((profile.input_cost_per_mtok, profile.output_cost_per_mtok), (input_cost, output_cost))
+                self.assertTrue(profile.reasoning)
+                self.assertFalse(profile.supports_temperature)
+                self.assertEqual(profile.sources, ["catalog"])
+                self.assertEqual(profile.notes, [])
+                settings = recommend_settings(profile)
+                self.assertEqual(settings["context_window"], HOSTED_CONTEXT_CAP)
+                self.assertEqual(settings["model_context_window"], 1050000)
+                self.assertIsNone(settings["temperature"])
+                self.assertEqual(settings["reasoning_effort"], "low")
 
-        self.assertEqual(build_model_profile("openai", "gpt-7-mini").family, "gpt-5-mini")
+    def test_gpt6_tiers_order_by_capability_speed_and_generation(self):
+        profiles = {model: build_model_profile("openai", model) for model in (
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        )}
+        quality = [profiles[m].quality for m in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna")]
+        speed = [profiles[m].speed for m in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna")]
+        self.assertEqual(quality, sorted(quality, reverse=True))
+        self.assertEqual(speed, sorted(speed))
+        for older, newer in (("gpt-5.6-sol", "gpt-6.1-sol"), ("gpt-5.6-terra", "gpt-6.1-terra"), ("gpt-5.6-luna", "gpt-6-luna")):
+            with self.subTest(older=older):
+                self.assertLess(profiles[older].quality, profiles[newer].quality)
+                self.assertLess(profiles[older].cost, profiles[newer].cost)
+        self.assertGreater(build_model_profile("openai", "gpt-6.1-sol").quality, build_model_profile("openai", "gpt-6-sol").quality)
+
+    def test_gpt6_era_listing_ranks_only_chat_models_as_eligible(self):
+        models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-image-2.6-sunburst", "gpt-live-1", "gpt-realtime-2.1"]
+        ranked = rank_models("openai", models)
+        eligible = {item["model"] for item in ranked if item["eligible"]}
+        self.assertEqual(eligible, {"gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"})
+        self.assertEqual({item["model"] for item in ranked[-3:]}, {"gpt-image-2.6-sunburst", "gpt-live-1", "gpt-realtime-2.1"})
+        self.assertIn(recommend_model("openai", models)["model"], eligible)
+
+    def test_newer_gpt_generation_maps_to_the_closest_catalog_tier(self):
+        luna = build_model_profile("openai", "gpt-7.1-luna")
+        self.assertEqual(luna.family, "gpt-6-luna")
+        self.assertEqual(luna.context_window, 1050000)
+        self.assertIn("catalog", luna.sources)
+        self.assertTrue(any("Newer GPT generation" in note and "gpt-6-luna" in note for note in luna.notes))
+        self.assertEqual(recommend_settings(luna)["context_window"], HOSTED_CONTEXT_CAP)
+
+        self.assertEqual(build_model_profile("openai", "gpt-7").family, "gpt-6")
+        self.assertEqual(build_model_profile("openai", "gpt-8-mini").family, "gpt-5-mini")
+        self.assertEqual(build_model_profile("openai", "gpt-6-cyber").family, "gpt-6")
         self.assertFalse(any("Newer GPT generation" in note for note in build_model_profile("openai", "gpt-5.1").notes))
         self.assertIn("heuristic", build_model_profile("openai", "gpt-60x").sources)
 

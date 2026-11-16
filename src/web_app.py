@@ -13979,6 +13979,14 @@ async def list_models(request: Request):
         provider = normalize_provider_name(data.get('provider', 'openai'))
         api_key = data.get('api_key')
         endpoint_url = (data.get('endpoint_url') or '').strip() or None
+        if is_unset_secret(api_key):
+            # The form shows a saved key as blank and has no endpoint field for OpenAI.
+            # Like the connection test, fall back to the active model's endpoint and key,
+            # but never send that key to a different provider or endpoint.
+            active_llm = config_manager.get().llm
+            if not endpoint_url and normalize_provider_name(active_llm.provider) == provider:
+                endpoint_url = str(active_llm.endpoint_url or '').strip() or None
+            api_key = config_manager.resolve_llm_api_key(None, provider, endpoint_url)
 
         async with httpx.AsyncClient(verify=create_llm_ssl_context(), timeout=12.0) as client:
             if provider == 'openai':
