@@ -374,6 +374,10 @@ def get_openai_model_capabilities(model: str) -> Dict[str, Any]:
     }
 
 
+# Responses API labels for assistant messages: a note before a tool call, or the answer.
+ASSISTANT_PHASES = frozenset({"commentary", "final_answer"})
+
+
 def extract_text_from_openai_response(response_data: Dict[str, Any]) -> str:
     """Extract assistant text from either chat-completions or responses payloads."""
     if not isinstance(response_data, dict):
@@ -410,27 +414,61 @@ def extract_text_from_openai_response(response_data: Dict[str, Any]) -> str:
         for item in output_items:
             if not isinstance(item, dict):
                 continue
+            text_value = ""
             if item.get("type") in {"output_text", "text"}:
-                text_value = item.get("text") or item.get("content") or item.get("value")
-                if isinstance(text_value, str) and text_value.strip():
-                    parts.append(text_value.strip())
-                continue
-            if item.get("type") == "message":
-                for content_item in item.get("content", []) if isinstance(item.get("content", []), list) else []:
-                    if not isinstance(content_item, dict):
-                        continue
-                    text_value = (
-                        content_item.get("text")
-                        or content_item.get("content")
-                        or content_item.get("value")
-                        or content_item.get("refusal")
-                    )
-                    if isinstance(text_value, str) and text_value.strip():
-                        parts.append(text_value.strip())
+                candidate = item.get("text") or item.get("content") or item.get("value")
+                text_value = candidate.strip() if isinstance(candidate, str) else ""
+            elif item.get("type") == "message":
+                text_value = _responses_message_text(item)
+            # Some models repeat the same message item; show it once.
+            if text_value and (not parts or parts[-1] != text_value):
+                parts.append(text_value)
         if parts:
             return "\n".join(parts).strip()
 
     return ""
+
+
+def _responses_message_text(item: Dict[str, Any]) -> str:
+    parts = []
+    for content_item in item.get("content", []) if isinstance(item.get("content", []), list) else []:
+        if not isinstance(content_item, dict):
+            continue
+        text_value = (
+            content_item.get("text")
+            or content_item.get("content")
+            or content_item.get("value")
+            or content_item.get("refusal")
+        )
+        if isinstance(text_value, str) and text_value.strip():
+            parts.append(text_value.strip())
+    return "\n".join(parts).strip()
+
+
+def openai_response_ends_on_preamble(response_data: Dict[str, Any]) -> bool:
+    """True when a Responses API reply has commentary text but no final-answer text.
+
+    Newer GPT models label the note they write before a tool call with
+    ``phase: "commentary"``. A reply that stops there meant to act next and
+    holds no answer.
+    """
+    output_items = response_data.get("output") if isinstance(response_data, dict) else None
+    if not isinstance(output_items, list):
+        return False
+    has_commentary = False
+    for item in output_items:
+        if not isinstance(item, dict) or item.get("type") != "message" or not _responses_message_text(item):
+            continue
+        if item.get("phase") != "commentary":
+            return False
+        has_commentary = True
+    return has_commentary
+
+
+class PreambleReply(str):
+    """Reply text from a model that stopped after a commentary preamble."""
+
+    ends_on_preamble = True
 
 
 class RateLimitManager:
@@ -685,7 +723,10 @@ class OpenAIClient:
             content = str(content).strip()
             if not content:
                 continue
-            normalized.append({"role": role, "content": content})
+            entry = {"role": role, "content": content}
+            if role == "assistant" and message.get("phase") in ASSISTANT_PHASES:
+                entry["phase"] = message["phase"]
+            normalized.append(entry)
 
         if not normalized:
             normalized = [{"role": "user", "content": "Hello"}]
@@ -696,7 +737,7 @@ class OpenAIClient:
                             include_reasoning: bool = False) -> Dict[str, Any]:
         payload = {
             "model": self.model,
-            "messages": messages,
+            "messages": [{"role": message["role"], "content": message["content"]} for message in messages],
             token_key: max_tokens,
         }
         if include_temperature:
@@ -717,8 +758,13 @@ class OpenAIClient:
                 continue
             if role == "system":
                 instructions.append(content)
+            elif role == "assistant":
+                entry = {"role": "assistant", "content": content}
+                if message.get("phase") in ASSISTANT_PHASES:
+                    entry["phase"] = message["phase"]
+                dialogue.append(entry)
             else:
-                dialogue.append({"role": "assistant" if role == "assistant" else "user", "content": content})
+                dialogue.append({"role": "user", "content": content})
 
         if not dialogue:
             dialogue = [{"role": "user", "content": "Hello"}]
@@ -874,6 +920,8 @@ class OpenAIClient:
                                 self._preferred_strategies[(self.base_url, self.model)] = strategy["signature"]
                                 if response_text:
                                     self.rate_limit_manager.reset_retry_count()
+                                    if openai_response_ends_on_preamble(result):
+                                        return PreambleReply(response_text)
                                     return response_text
                                 if self._output_budget_exhausted(result) and not budget_retry_used and adjusted_max_tokens < 32000:
                                     # Reasoning tokens consumed the whole budget before any visible text.

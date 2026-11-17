@@ -5369,7 +5369,12 @@ def build_llm_continuity_context(
 ) -> str:
     """Build a provider-agnostic continuity gate so the LLM sees the live session state on every turn."""
     memory = memory if isinstance(memory, dict) else {}
-    recent_turns = _build_llm_recent_context_turns(history, memory, limit=limit)
+    # Replies that only promised a search hold no facts and invite another promise.
+    recent_turns = [
+        turn
+        for turn in _build_llm_recent_context_turns(history, memory, limit=limit)
+        if not (turn.get("role") == "assistant" and announces_unexecuted_search(turn.get("content")))
+    ]
     user_text = _compact_memory_text(user_message, limit=320)
     last_result_context = _format_last_result_context_for_prompt(memory)
     entities = memory.get("entities", {}) if isinstance(memory.get("entities", {}), dict) else {}
@@ -5399,7 +5404,7 @@ def build_llm_continuity_context(
         state_lines.append(f"- Last result context: {last_result_context}")
 
     last_assistant_response = _compact_memory_text(memory.get("last_assistant_response", ""), limit=200)
-    if last_assistant_response:
+    if last_assistant_response and not announces_unexecuted_search(last_assistant_response):
         state_lines.append(f"- Last assistant response: {last_assistant_response}")
 
     if not state_lines and not recent_turns and not user_text:
@@ -6432,10 +6437,17 @@ def scope_unscoped_chat_search(tool_args: Dict[str, Any]) -> bool:
 
 DEFAULT_DIRECT_CHAT_RESPONSE = "I couldn't generate a complete answer for that request. Please try again."
 UNEXECUTED_SEARCH_NUDGE = (
-    "You said you would run a search but did not include a TOOL_CALL. If live Splunk data is needed, "
-    "reply with only the TOOL_CALL now. Otherwise reply with your final answer."
+    "Your last reply described a Splunk search, or said you could not run one, but included no TOOL_CALL. "
+    "You can run searches: put a TOOL_CALL in your reply and the app runs it and sends you the results. "
+    "If live Splunk data is needed, reply with only the TOOL_CALL now. Otherwise reply with your final answer."
 )
+UNRUN_SEARCH_NOTE = "The search described above did not run. Send your question again to retry it."
 DEFAULT_TOOL_INVESTIGATION_RESPONSE = "Investigation complete. See findings above."
+
+
+def reply_needs_search_nudge(response: Any, clean_text: str) -> bool:
+    """True when a reply without a TOOL_CALL promised a search or stopped after a preamble."""
+    return bool(getattr(response, "ends_on_preamble", False)) or announces_unexecuted_search(clean_text)
 
 
 def finalize_user_facing_response_text(text: Any, fallback: str) -> str:
@@ -7300,7 +7312,7 @@ Rules:
 1) Your primary expertise is Splunk Discovery Tool, Splunk, discovery outputs, optional capabilities, and RAG context.
 2) You may answer broader questions directly, but do not claim tool-backed or environment-specific evidence unless it comes from the provided context or executed tools.
 3) When a session continuity gate is present, treat the current request as a follow-up unless the user clearly changes topic.
-4) For live data requests, make a tool call instead of guessing. Use one tool call per reply and wait for the result.
+4) For live data requests, make a tool call instead of guessing; the app runs it and sends you the results. Use one tool call per reply and wait for the result. Never reply with only a promise to search.
 5) Only use index, sourcetype, and host names from the context or earlier results. Searches must be read-only.
 6) If a query returns no data, broaden once (wider time range, fewer filters, or index=* instead of one index at a time). If there is still no data, say so and show what was tried. Zero matches only means nothing matched that search; it does not show that a system is healthy or broken.
 7) Answer with the actual numbers from the results, name the SPL and time range you used, and keep it concise.
@@ -19649,12 +19661,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             for msg in normalized_history:
                 if not isinstance(msg, dict):
                     continue
-                if has_role_history:
-                    messages.append({"role": msg["role"], "content": msg["content"]})
-                elif msg.get('type') == 'user':
-                    messages.append({"role": "user", "content": msg['content']})
-                elif msg.get('type') == 'assistant':
-                    messages.append({"role": "assistant", "content": msg['content']})
+                speaker = msg.get("role") if has_role_history else msg.get("type")
+                # Earlier replies that only promised a search hold no facts and lead the model to answer with promises again.
+                if speaker == "assistant" and announces_unexecuted_search(msg.get("content")):
+                    continue
+                if speaker in {"user", "assistant"}:
+                    messages.append({"role": speaker, "content": msg["content"]})
 
             if query_plan_context:
                 messages.append({"role": "system", "content": query_plan_context})
@@ -19691,6 +19703,38 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 return parsed
             return None
 
+        async def _nudge_for_search(
+            base_messages: List[Dict[str, Any]],
+            announced_text: str,
+            earliest: str,
+            latest: str,
+        ) -> Tuple[List[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
+            """Ask for the TOOL_CALL a reply described. Returns the messages sent, the reply, and the parsed call."""
+            nudge_messages = list(base_messages) + [
+                {"role": "assistant", "content": announced_text, "phase": "commentary"},
+                {"role": "user", "content": UNEXECUTED_SEARCH_NUDGE},
+            ]
+            reply = ""
+            # A second try covers replies that come back empty or as another promise.
+            for _attempt in range(2):
+                try:
+                    reply = await llm_client.generate_response(
+                        messages=nudge_messages,
+                        max_tokens=chat_runtime_profile["retry_max_tokens"],
+                        temperature=runtime_temperature,
+                    )
+                except Exception as nudge_error:
+                    debug_log(f"Search nudge reply failed: {nudge_error}", "warning")
+                    reply = ""
+                reply = reply if isinstance(reply, str) else str(reply or "")
+                nudge_call = _parse_tool_call(reply, earliest, latest)
+                if nudge_call:
+                    return nudge_messages, reply, nudge_call
+                cleaned_reply = sanitize_llm_response_text(reply)
+                if cleaned_reply and not reply_needs_search_nudge(reply, cleaned_reply):
+                    break
+            return nudge_messages, reply, None
+
         tool_call = _parse_tool_call(response, default_earliest, default_latest)
         clean_response = sanitize_llm_response_text(response)
 
@@ -19726,26 +19770,21 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 tool_call = _parse_tool_call(response, default_earliest, default_latest)
                 clean_response = sanitize_llm_response_text(response)
 
-        if not tool_call and not small_talk and announces_unexecuted_search(clean_response):
-            # Models sometimes promise a search without emitting the TOOL_CALL; ask once for the call itself.
+        if not tool_call and not small_talk and reply_needs_search_nudge(response, clean_response):
+            # Models sometimes promise a search without emitting the TOOL_CALL; ask for the call itself.
             await push_status(status_timeline, "🔁 Asking the model for the search it described", 0)
-            nudge_messages = messages + [
-                {"role": "assistant", "content": clean_response},
-                {"role": "user", "content": UNEXECUTED_SEARCH_NUDGE},
-            ]
-            nudge_response = await llm_client.generate_response(
-                messages=nudge_messages,
-                max_tokens=chat_runtime_profile["retry_max_tokens"],
-                temperature=runtime_temperature,
+            nudge_messages, nudge_response, nudge_tool_call = await _nudge_for_search(
+                messages, clean_response, default_earliest, default_latest
             )
-            nudge_response = nudge_response if isinstance(nudge_response, str) else str(nudge_response or "")
-            nudge_tool_call = _parse_tool_call(nudge_response, default_earliest, default_latest)
+            nudge_text = sanitize_llm_response_text(nudge_response)
             if nudge_tool_call:
                 tool_call = nudge_tool_call
                 messages = nudge_messages
-                clean_response = sanitize_llm_response_text(nudge_response)
-            elif sanitize_llm_response_text(nudge_response):
-                clean_response = sanitize_llm_response_text(nudge_response)
+                clean_response = nudge_text
+            else:
+                clean_response = nudge_text or clean_response
+                if not nudge_text or reply_needs_search_nudge(nudge_response, nudge_text):
+                    clean_response = f"{clean_response}\n\n_{UNRUN_SEARCH_NOTE}_"
 
         if tool_call:
             await push_status(status_timeline, "🛠 Tool plan created", 0)
@@ -19889,19 +19928,12 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                     continue
 
                 final_answer = sanitize_llm_response_text(next_response)
-                if next_tool_call is None and remaining_steps > 0 and not loop_nudged and announces_unexecuted_search(final_answer):
+                if next_tool_call is None and remaining_steps > 0 and not loop_nudged and reply_needs_search_nudge(next_response, final_answer):
                     loop_nudged = True
                     await push_status(status_timeline, "🔁 Asking the model for the search it described", iteration)
-                    conversation_history.append({"role": "assistant", "content": final_answer})
-                    conversation_history.append({"role": "user", "content": UNEXECUTED_SEARCH_NUDGE})
-                    nudge_response = await llm_client.generate_response(
-                        messages=conversation_history,
-                        max_tokens=chat_runtime_profile["retry_max_tokens"],
-                        temperature=runtime_temperature,
-                    )
-                    nudge_response = nudge_response if isinstance(nudge_response, str) else str(nudge_response or "")
-                    nudge_tool_call = _parse_tool_call(
-                        nudge_response,
+                    conversation_history, nudge_response, nudge_tool_call = await _nudge_for_search(
+                        conversation_history,
+                        final_answer,
                         str(tool_args.get("earliest_time") or default_earliest),
                         str(tool_args.get("latest_time") or default_latest),
                     )

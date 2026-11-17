@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Chat often answered with only a plan, such as "I’ll check recent events in `index=ping`...", and never ran the search, most often with GPT-6 models. The app now notices these replies even when they use a typographic apostrophe or verbs such as "inspect" or "look in", and when a reply wrongly says it can't run a live search. It then asks the model for the search, once more if the first reply comes back empty. If the search still doesn't run, the answer says so instead of ending on the plan
+- GPT-5.4 and newer models label the note they write before a tool call as `commentary`. A reply that stops after that note now counts as a search that didn't run, and the app sends the note back with its `commentary` label when it asks for the search, as OpenAI recommends
+- Earlier chat replies that only promised a search are no longer sent back to the AI model, because they taught it to answer the next question the same way
+- Some GPT-6 replies repeated the same message twice, and chat showed both copies. Repeated messages now appear once
+- The chat instructions now say that writing a TOOL_CALL runs the search, and that the model should not end on a plan, ask permission for a read-only search, or tell the user to run SPL it can run itself
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

@@ -20,10 +20,12 @@ from llm.factory import (
     CustomLLMClient,
     OpenAIClient,
     build_analysis_prompt,
+    extract_text_from_openai_response,
     filter_openai_generation_models,
     get_openai_model_capabilities,
     is_openai_image_generation_model,
     openai_reasoning_effort_for_model,
+    openai_response_ends_on_preamble,
     parse_json_from_llm_text,
 )
 from llm import runtime_tuning
@@ -90,6 +92,92 @@ class OpenAIModelHelperTests(unittest.TestCase):
         legacy = get_openai_model_capabilities("gpt-4o")
         self.assertFalse(legacy["prefers_responses_api"])
         self.assertFalse(legacy["reasoning"])
+
+    def test_responses_payload_keeps_assistant_phase_and_chat_payload_drops_it(self):
+        client = OpenAIClient(api_key="test-key", model="gpt-6-luna")
+        messages = client._normalize_messages([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Which host sends data to index=ping?", "phase": "final_answer"},
+            {"role": "assistant", "content": "I'll check index=ping.", "phase": "commentary"},
+            {"role": "assistant", "content": "Earlier answer.", "phase": "not-a-phase"},
+            {"role": "user", "content": "Run it now."},
+        ])
+        strategies = client._build_openai_request_strategies(messages, 500, None)
+
+        responses_input = next(s for s in strategies if s["mode"] == "responses")["payload"]["input"]
+        self.assertEqual(responses_input[0], {"role": "user", "content": "Which host sends data to index=ping?"})
+        self.assertEqual(responses_input[1], {"role": "assistant", "content": "I'll check index=ping.", "phase": "commentary"})
+        self.assertEqual(responses_input[2], {"role": "assistant", "content": "Earlier answer."})
+        chat_messages = next(s for s in strategies if s["mode"] == "chat")["payload"]["messages"]
+        self.assertTrue(all(set(message) == {"role", "content"} for message in chat_messages))
+
+    def test_openai_reply_text_skips_repeated_messages_and_flags_preamble_only_replies(self):
+        def message(phase, text):
+            return {"type": "message", "role": "assistant", "phase": phase, "content": [{"type": "output_text", "text": text}]}
+
+        preamble_only = {"output": [
+            {"type": "reasoning", "content": []},
+            message("commentary", "I\u2019ll check recent events in index=ping."),
+            message("final_answer", ""),
+        ]}
+        repeated = {"output": [message("final_answer", "Host A sent 12 events."), message("final_answer", "Host A sent 12 events.")]}
+        answered = {"output": [message("commentary", "I\u2019ll check index=ping."), message("final_answer", "Host A sent 12 events.")]}
+
+        self.assertEqual(extract_text_from_openai_response(preamble_only), "I\u2019ll check recent events in index=ping.")
+        self.assertTrue(openai_response_ends_on_preamble(preamble_only))
+        self.assertEqual(extract_text_from_openai_response(repeated), "Host A sent 12 events.")
+        self.assertFalse(openai_response_ends_on_preamble(repeated))
+        self.assertEqual(extract_text_from_openai_response(answered), "I\u2019ll check index=ping.\nHost A sent 12 events.")
+        self.assertFalse(openai_response_ends_on_preamble(answered))
+        self.assertFalse(openai_response_ends_on_preamble({"choices": [{"message": {"content": "Hi"}}]}))
+
+    def test_generate_response_marks_a_reply_that_stopped_after_a_preamble(self):
+        payloads = {
+            "preamble": {"status": "completed", "output": [
+                {"type": "message", "phase": "commentary", "content": [{"type": "output_text", "text": "I\u2019ll check index=ping."}]},
+                {"type": "message", "phase": "final_answer", "content": [{"type": "output_text", "text": ""}]},
+            ]},
+            "answer": {"status": "completed", "output": [
+                {"type": "message", "phase": "final_answer", "content": [{"type": "output_text", "text": "Host A sent 12 events."}]},
+            ]},
+        }
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            async def json(self):
+                return self.payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        class FakeSession:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def post(self, *_args, **_kwargs):
+                return FakeResponse(self.payload)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        for name, payload in payloads.items():
+            with self.subTest(name), \
+                    patch("llm.factory.aiohttp.TCPConnector", lambda **_kwargs: None), \
+                    patch("llm.factory.aiohttp.ClientSession", lambda **_kwargs: FakeSession(payload)):
+                client = OpenAIClient(api_key="test-key", model="gpt-6-luna")
+                reply = asyncio.run(client.generate_response(messages=[{"role": "user", "content": "Which host sends data to index=ping?"}]))
+            self.assertEqual(getattr(reply, "ends_on_preamble", False), name == "preamble")
+            self.assertIsInstance(reply, str)
 
     def test_gpt6_request_strategy_starts_with_responses_api_and_no_temperature(self):
         client = OpenAIClient(api_key="test-key", model="gpt-6.1-terra", tuning={"reasoning_effort": "low"})

@@ -89,24 +89,43 @@ def is_small_talk(message: Any) -> bool:
     return False
 
 
+# Models often write typographic apostrophes ("I’ll"), which plain-quote patterns miss.
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'", "\uff07": "'"})
+
 _ANNOUNCED_SEARCH_RE = re.compile(
-    r"\b(?:let me|i(?:'ll| will| am going to|'m going to)|now i(?:'ll| will))\s+"
-    r"(?:now\s+|quickly\s+|first\s+|go ahead and\s+)?"
-    r"(?:run|execute|query|search|check|look up|pull|fetch|retrieve)\b",
+    r"\b(?:let me|i(?:'ll| will| am going to|'m going to| am about to|'m about to))\s+"
+    r"(?:(?:now|quickly|first|then|also|next|just|briefly|go ahead and)\s+){0,2}"
+    r"(?:run|execute|query|search|check|look\s+(?:up|in|at|into|through|for|over)|(?:take|have)\s+a\s+(?:quick\s+)?look"
+    r"|pull|fetch|retrieve|inspect|examine|review|scan|list|find|count|gather|sample|analy[sz]e|investigate"
+    r"|dig\s+(?:into|through)|grab|identify|verify|trace|correlate|(?:start|begin)\s+by)\b",
     re.IGNORECASE,
 )
+_DISCLAIMED_SEARCH_RE = re.compile(
+    r"\bi(?:\s+can(?:not|'t)|(?:\s+am|'m)\s+(?:unable|not able) to|\s+don't have (?:the ability|access) to)\s+"
+    r"(?:directly\s+)?(?:run|execute|perform|query|search|access)\b[^.\n]{0,80}?"
+    r"\b(?:live|splunk|search|lookup|query|in this (?:reply|response|chat))\b",
+    re.IGNORECASE,
+)
+_OFFER_PREFIX_RE = re.compile(r"\b(?:if you|if needed|would you|want me|should i|do you want)\b", re.IGNORECASE)
 
 
 def announces_unexecuted_search(text: Any, max_chars: int = 600) -> bool:
-    """True when a short reply promises to run a search instead of answering.
+    """True when a short reply promises a search, or claims it cannot run one, instead of answering.
 
-    Long replies are treated as answers even when they mention a next search.
+    Long replies are treated as answers even when they mention a next search,
+    and offers such as "if you want, I'll check..." are not promises.
     """
 
-    cleaned = str(text or "").strip()
+    cleaned = str(text or "").strip().translate(_APOSTROPHES)
     if not cleaned or len(cleaned) > max_chars:
         return False
-    return bool(_ANNOUNCED_SEARCH_RE.search(cleaned))
+    if _DISCLAIMED_SEARCH_RE.search(cleaned):
+        return True
+    for match in _ANNOUNCED_SEARCH_RE.finditer(cleaned):
+        sentence_start = max(cleaned.rfind(mark, 0, match.start()) for mark in (".", "!", "?", "\n")) + 1
+        if not _OFFER_PREFIX_RE.search(cleaned[sentence_start:match.start()]):
+            return True
+    return False
 
 
 def normalize_mission(value: Any) -> str:
@@ -226,8 +245,8 @@ def build_grounded_chat_prompt(
 {chr(10) + mission_block + chr(10) if mission_block else ''}
 HOW TO WORK
 1. Decide whether the request needs live Splunk data. Concept questions, SPL help, and general questions can be answered directly without tools.
-2. When live data is needed, make one tool call at a time and wait for its result. Never say you are about to run a search without including the TOOL_CALL in the same reply.
-3. Ground every environment-specific statement (index names, counts, hosts, sourcetypes, timestamps, health) in tool results or the ENVIRONMENT CONTEXT below. If you have no evidence, say so and offer to check. Do not claim that all or every host, target, or source is covered unless the evidence includes the expected list; otherwise report what was observed and what would confirm completeness.
+2. When live data is needed, run the search yourself: write a TOOL_CALL and the app runs it and sends the results back to you in the next message. Make one tool call at a time and wait for its result. Never end a reply with only a plan or a promise to search, never ask permission for a read-only search, and never tell the user to run SPL you can run yourself. If you say you are about to search, include the TOOL_CALL in that same reply.
+3. Ground every environment-specific statement (index names, counts, hosts, sourcetypes, timestamps, health) in tool results or the ENVIRONMENT CONTEXT below. If you have no evidence, say so, and run a search when live data would settle it. Do not claim that all or every host, target, or source is covered unless the evidence includes the expected list; otherwise report what was observed and what would confirm completeness.
 4. Use only index, sourcetype, and host names that appear in the context or in earlier results. If you need a name you do not know, look it up first.
 5. Keep searches efficient and read-only:
    - Always set earliest_time and latest_time in the tool args. Start with the user's window, or -24h if none was given, and widen only when needed.

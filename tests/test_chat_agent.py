@@ -18,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
 
 import chat_agent  # noqa: E402
 import web_app  # noqa: E402
+from llm.factory import PreambleReply  # noqa: E402
 from mcp_tool_args import adapt_tool_arguments, parse_jsonrpc_error  # noqa: E402
 
 
@@ -48,7 +49,10 @@ class ScriptedLLM:
         self.calls.append(list(messages) if messages is not None else prompt)
         if not self.responses:
             raise AssertionError("Unexpected extra LLM call")
-        return self.responses.pop(0)
+        reply = self.responses.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
 
 
 class RecordingMCP:
@@ -94,6 +98,32 @@ class ChatAgentHelperTests(unittest.TestCase):
         self.assertTrue(chat_agent.announces_unexecuted_search("I'll query Splunk for the latest events."))
         self.assertFalse(chat_agent.announces_unexecuted_search("Here are the results: 42 events."))
         self.assertFalse(chat_agent.announces_unexecuted_search("Answer. " * 120 + "Let me run a search next."))
+
+    def test_announces_unexecuted_search_reads_typographic_apostrophes_and_more_verbs(self):
+        promises = [
+            "I\u2019ll check recent events in `index=ping` for the sender\u2019s host and any IP fields.",
+            "I\u2019ll inspect a small sample of recent events in `index=ping` for the sender\u2019s IP address.",
+            "I\u2019ll look in recent ESP32 events for an IP-address field associated with the freezer monitor.",
+            "First, I\u2019m going to review the hosts that sent data to index=ping today.",
+            "I\u2019ll take a quick look at the newest events in index=ping.",
+        ]
+        for text in promises:
+            self.assertTrue(chat_agent.announces_unexecuted_search(text), text)
+
+    def test_announces_unexecuted_search_flags_claims_that_searches_cannot_run(self):
+        self.assertTrue(chat_agent.announces_unexecuted_search(
+            "I can\u2019t run a live Splunk search in this reply. To check the last 24 hours, try:\n\n```spl\nindex=ping | head 100\n```"
+        ))
+        self.assertTrue(chat_agent.announces_unexecuted_search("I'm unable to run the lookup in this response."))
+
+    def test_offers_and_answers_are_not_promises(self):
+        for text in [
+            "index=ping has events from 3 hosts. If you want, I\u2019ll check the raw events next.",
+            "Would you like me to look up the hosts recorded in index=ping over the last 24 hours?",
+            "The ping data is sent by host DESKTOP-BFF2PPI; its events list target_ip values such as 192.168.1.252.",
+            "I can\u2019t find a sender IP in these results; the host field holds a hostname.",
+        ]:
+            self.assertFalse(chat_agent.announces_unexecuted_search(text), text)
 
     def test_normalize_mission_cleans_and_bounds_text(self):
         self.assertEqual(chat_agent.normalize_mission("  Find\tsensor\n gaps \x00 "), "Find sensor gaps")
@@ -395,8 +425,83 @@ class ChatToolLoopTests(unittest.TestCase):
             result = run({"message": "Did index=main receive data in the last day, and roughly how much?", "history": [], "chat_session_id": "loop_nudge"})
 
         self.assertEqual(len(mcp.calls), 1)
-        self.assertIn("did not include a TOOL_CALL", llm.calls[1][-1]["content"])
+        self.assertIn("included no TOOL_CALL", llm.calls[1][-1]["content"])
+        self.assertEqual(llm.calls[1][-2], {"role": "assistant", "content": "Let me run a search for that.", "phase": "commentary"})
         self.assertIn("42 events", result["response"])
+
+    def test_typographic_apostrophe_preamble_gets_the_search_run(self):
+        llm = ScriptedLLM([
+            "I\u2019ll check recent events in `index=ping` for the sender\u2019s host and any IP fields.",
+            _tool_call("index=ping | head 10"),
+            "The ping events come from host DESKTOP-BFF2PPI.",
+        ])
+        mcp = RecordingMCP(lambda _call: _rows_result([{"host": "DESKTOP-BFF2PPI"}]))
+        with chat_harness(llm, mcp) as run:
+            result = run({"message": "what's the device ip sending data to index 'ping'", "history": [], "chat_session_id": "loop_curly_nudge"})
+
+        self.assertEqual(len(mcp.calls), 1)
+        self.assertIn("included no TOOL_CALL", llm.calls[1][-1]["content"])
+        self.assertIn("DESKTOP-BFF2PPI", result["response"])
+
+    def test_reply_that_stopped_after_a_preamble_is_nudged_without_promise_words(self):
+        llm = ScriptedLLM([
+            PreambleReply("Checking the newest events in index=ping for an address field."),
+            _tool_call("index=ping | head 10"),
+            "The ping events come from host DESKTOP-BFF2PPI.",
+        ])
+        mcp = RecordingMCP(lambda _call: _rows_result([{"host": "DESKTOP-BFF2PPI"}]))
+        with chat_harness(llm, mcp) as run:
+            result = run({"message": "Which host sends data to index=ping?", "history": [], "chat_session_id": "loop_preamble_nudge"})
+
+        self.assertEqual(len(mcp.calls), 1)
+        self.assertIn("DESKTOP-BFF2PPI", result["response"])
+
+    def test_empty_or_failed_nudge_reply_is_tried_again(self):
+        for first_reply in ("", RuntimeError("OpenAI API returned an empty response payload")):
+            with self.subTest(first_reply=repr(first_reply)):
+                llm = ScriptedLLM([
+                    "I\u2019ll check recent events in index=ping.",
+                    first_reply,
+                    _tool_call("index=ping | head 10"),
+                    "The ping events come from host DESKTOP-BFF2PPI.",
+                ])
+                mcp = RecordingMCP(lambda _call: _rows_result([{"host": "DESKTOP-BFF2PPI"}]))
+                with chat_harness(llm, mcp) as run:
+                    result = run({"message": "Which host sends data to index=ping?", "history": [], "chat_session_id": "loop_nudge_retry"})
+
+                self.assertEqual(len(mcp.calls), 1)
+                self.assertIn("DESKTOP-BFF2PPI", result["response"])
+
+    def test_search_that_never_runs_is_called_out(self):
+        llm = ScriptedLLM([
+            "I\u2019ll check recent events in index=ping.",
+            "I\u2019ll check recent events in index=ping.",
+            "",
+        ])
+        mcp = RecordingMCP(lambda _call: _rows_result([]))
+        with chat_harness(llm, mcp) as run:
+            result = run({"message": "Which host sends data to index=ping?", "history": [], "chat_session_id": "loop_nudge_gives_up"})
+
+        self.assertEqual(mcp.calls, [])
+        self.assertEqual(len(llm.calls), 3)
+        self.assertIn(web_app.UNRUN_SEARCH_NOTE, result["response"])
+
+    def test_earlier_promise_only_replies_are_left_out_of_the_prompt(self):
+        llm = ScriptedLLM(["tstats reads indexed fields, so it is faster than a raw search."])
+        mcp = RecordingMCP(lambda _call: _rows_result([]))
+        history = [
+            {"role": "user", "content": "what is the ip for the device in the esp32 index"},
+            {"role": "assistant", "content": "I\u2019ll look in recent ESP32 events for an IP-address field."},
+            {"role": "user", "content": "How many esp32 events arrived today?"},
+            {"role": "assistant", "content": "index=esp32 received 1,204 events in the last 24 hours."},
+        ]
+        with chat_harness(llm, mcp) as run:
+            run({"message": "Explain what the tstats command does in SPL.", "history": history, "chat_session_id": "history_promises"})
+
+        replayed = [m["content"] for m in llm.calls[0] if m.get("role") == "assistant"]
+        self.assertEqual(replayed, ["index=esp32 received 1,204 events in the last 24 hours."])
+        self.assertIn("what is the ip for the device in the esp32 index", [m["content"] for m in llm.calls[0]])
+        self.assertNotIn("look in recent ESP32 events", "\n".join(m["content"] for m in llm.calls[0]))
 
     def test_promise_after_a_tool_result_gets_one_nudge_inside_the_loop(self):
         llm = ScriptedLLM([
@@ -410,7 +515,7 @@ class ChatToolLoopTests(unittest.TestCase):
             result = run({"message": "Is index=ping receiving data from its hosts today?", "history": [], "chat_session_id": "loop_inner_nudge"})
 
         self.assertEqual(len(mcp.calls), 2)
-        self.assertIn("did not include a TOOL_CALL", llm.calls[2][-1]["content"])
+        self.assertIn("included no TOOL_CALL", llm.calls[2][-1]["content"])
         self.assertIn("3 hosts", result["response"])
 
     def test_repeated_promise_falls_back_to_a_final_answer_pass(self):
@@ -418,6 +523,7 @@ class ChatToolLoopTests(unittest.TestCase):
             _tool_call("| tstats count where index=main"),
             "Let me check that again.",
             "I will check the hosts too.",
+            "I\u2019ll check the sourcetypes as well.",
             "index=main received 42 events in the last 24 hours.",
         ])
         mcp = RecordingMCP(lambda _call: _rows_result([{"count": "42"}]))
@@ -425,7 +531,7 @@ class ChatToolLoopTests(unittest.TestCase):
             result = run({"message": "How many events reached index=main in the last day?", "history": [], "chat_session_id": "loop_final_pass"})
 
         self.assertEqual(len(mcp.calls), 1)
-        self.assertEqual(len(llm.calls), 4)
+        self.assertEqual(len(llm.calls), 5)
         self.assertIn("42 events", result["response"])
         self.assertNotIn("Let me check", result["response"])
 

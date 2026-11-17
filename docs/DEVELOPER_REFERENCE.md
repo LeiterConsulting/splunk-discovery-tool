@@ -108,6 +108,8 @@ LLM flow:
 - runtime_tuning.resolve_llm_tuning() resolves the model profile and tuned settings (auto_tune); build_chat_runtime_profile() turns them into per-step chat budgets
 - Chat pipeline uses the compact reliability-first prompt for local and small-context models
 - Tool-call extraction (extract_recoverable_tool_call) accepts tagged JSON, misspelled or missing closing tags, python-like dicts, and a tool-call JSON object that ends the reply (bare, backticked, or fenced)
+- A reply with no tool call that promises a search, says it cannot run one (chat_agent.announces_unexecuted_search), or stops after a Responses API `commentary` preamble (OpenAIClient returns a `PreambleReply` with `ends_on_preamble`) gets a nudge asking for the TOOL_CALL, tried twice at most. The nudge sends the preamble back with `phase: "commentary"`; OpenAIClient keeps `phase` on assistant messages for the Responses API and drops it for Chat Completions, and other providers ignore it
+- Promise-only assistant replies are left out of the history and continuity context sent to the model
 
 ### Guidance
 
