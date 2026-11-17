@@ -117,9 +117,13 @@
             to { transform: translateX(0); }
         }
 
-        .scroll-container {
-            scrollbar-width: thin;
-            scrollbar-color: rgb(var(--ui-scrollbar-thumb)) rgb(var(--ui-scrollbar-track));
+        /* Chromium ignores the ::-webkit-scrollbar rules below once scrollbar-width or scrollbar-color is set,
+           and macOS then hides the bar until scrolling, so only browsers without those rules get the standard ones. */
+        @supports not selector(::-webkit-scrollbar) {
+            .scroll-container {
+                scrollbar-width: thin;
+                scrollbar-color: rgb(var(--ui-scrollbar-thumb)) rgb(var(--ui-scrollbar-track));
+            }
         }
 
         .scroll-container::-webkit-scrollbar {
@@ -590,6 +594,9 @@
         const CHAT_GOAL_STORAGE_KEY = 'dt4sms_chat_goal_v1';
         const CHAT_GOAL_SAVED_CHAT_STORAGE_KEY = 'dt4sms_chat_goal_saved_chat_v1';
         const CHAT_GOAL_SAVED_MESSAGE_LIMIT = 200;
+        const CHAT_LAYOUT_STORAGE_KEY = 'dt4sms_chat_layout_v1';
+        const CHAT_SIDE_COLUMN_MEDIA_QUERY = '(min-width: 1024px)';
+        const CHAT_INPUT_MAX_HEIGHT_PX = 200;
         const WELCOME_SPLASH_PREFERENCE_KEY = 'dt4sms_welcome_splash_dismissed_v1';
         const THEME_PREFERENCE_OPTIONS = [
             { value: 'light', label: 'Light' },
@@ -1102,6 +1109,120 @@
             } catch (error) {
                 console.warn('Failed to save the chat goal', error);
             }
+        };
+
+        // Chat opens as a full page unless the user last chose to show it in a window.
+        const loadChatLayoutPreference = () => {
+            try {
+                if (typeof window === 'undefined' || !window.localStorage) {
+                    return 'page';
+                }
+                return window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY) === 'window' ? 'window' : 'page';
+            } catch (error) {
+                return 'page';
+            }
+        };
+
+        const saveChatLayoutPreference = (value) => {
+            try {
+                if (typeof window === 'undefined' || !window.localStorage) {
+                    return;
+                }
+                window.localStorage.setItem(CHAT_LAYOUT_STORAGE_KEY, value === 'window' ? 'window' : 'page');
+            } catch (error) {
+                console.warn('Failed to save the chat layout', error);
+            }
+        };
+
+        const matchesChatSideColumnViewport = () => (
+            typeof window !== 'undefined'
+            && typeof window.matchMedia === 'function'
+            && window.matchMedia(CHAT_SIDE_COLUMN_MEDIA_QUERY).matches
+        );
+
+        // Pairs each question with the answer or error that came back for it.
+        const buildChatTurns = (messages) => {
+            const turns = [];
+            let current = null;
+            for (const message of Array.isArray(messages) ? messages : []) {
+                if (!message || typeof message !== 'object') {
+                    continue;
+                }
+                if (message.type === 'user') {
+                    current = { question: message, reply: null, error: null };
+                    turns.push(current);
+                    continue;
+                }
+                if (!current) {
+                    continue;
+                }
+                if (message.type === 'assistant' && !current.reply) {
+                    current.reply = message;
+                } else if (message.type === 'error' && !current.error) {
+                    current.error = message;
+                }
+            }
+            return turns;
+        };
+
+        const CHAT_DATA_FOCUS_PATTERN = /\b(index|sourcetype|host|source)\s*=\s*("[^"]+"|[^\s|()\[\],]+)/gi;
+        const CHAT_DATA_FOCUS_LIMIT = 10;
+
+        // The indexes, sourcetypes, hosts, and sources named in searches that ran, newest first.
+        const collectChatDataFocus = (turns) => {
+            const terms = [];
+            const seen = new Set();
+            for (let turnIndex = (Array.isArray(turns) ? turns.length : 0) - 1; turnIndex >= 0; turnIndex -= 1) {
+                const query = String(turns[turnIndex]?.reply?.spl_query || '');
+                for (const match of query.matchAll(CHAT_DATA_FOCUS_PATTERN)) {
+                    const field = match[1].toLowerCase();
+                    const value = match[2];
+                    if (!value.replace(/["*]/g, '').trim()) {
+                        continue;
+                    }
+                    const term = `${field}=${value}`;
+                    if (seen.has(term.toLowerCase())) {
+                        continue;
+                    }
+                    seen.add(term.toLowerCase());
+                    terms.push({ field, value, term });
+                    if (terms.length >= CHAT_DATA_FOCUS_LIMIT) {
+                        return terms;
+                    }
+                }
+            }
+            return terms;
+        };
+
+        const formatChatExportTimestamp = (value) => {
+            const parsed = value instanceof Date ? value : new Date(value);
+            if (Number.isNaN(parsed.getTime())) {
+                return '';
+            }
+            const pad = (part) => String(part).padStart(2, '0');
+            return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+        };
+
+        const CHAT_EXPORT_HEADINGS = { user: 'You', assistant: 'Assistant', warning: 'Notice', error: 'Error' };
+
+        const buildChatMarkdownExport = (messages, { goal = null, exportedAt = new Date() } = {}) => {
+            const lines = ['# Chat export', '', `Exported ${formatChatExportTimestamp(exportedAt)}`];
+            if (goal && goal.goal) {
+                lines.push('', `**Goal:** ${goal.title ? `${goal.title}. ` : ''}${goal.goal}`);
+            }
+            for (const message of Array.isArray(messages) ? messages : []) {
+                if (!message || typeof message !== 'object') {
+                    continue;
+                }
+                const when = formatChatExportTimestamp(message.timestamp);
+                const heading = CHAT_EXPORT_HEADINGS[message.type] || 'Message';
+                lines.push('', `## ${heading}${when ? ` (${when})` : ''}`, '', String(message.content || '').trim());
+                const query = message.type === 'assistant' ? String(message.spl_query || message.spl_in_text || '').trim() : '';
+                if (query) {
+                    lines.push('', message.spl_query ? 'Search that ran:' : 'Suggested search (not run):', '', '```spl', query, '```');
+                }
+            }
+            return `${lines.join('\n')}\n`;
         };
 
         const lastChatMessageId = (messages) => {
@@ -2293,7 +2414,11 @@
             const [mcpSaveDraft, setMCPSaveDraft] = useState(null); // MCP form values captured when the save dialog opens
             const [showMCPConfigForm, setShowMCPConfigForm] = useState(false); // Show/hide MCP configuration form
             const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState('Enter token'); // Track token placeholder state
-            const [showSuggestedQueries, setShowSuggestedQueries] = useState(false);
+            const [showChatGoalQuestions, setShowChatGoalQuestions] = useState(false);
+            const [chatReplyPanels, setChatReplyPanels] = useState({});
+            const [highlightedChatMessageId, setHighlightedChatMessageId] = useState(null);
+            const [chatCopyStatus, setChatCopyStatus] = useState(null);
+            const [isChatSideColumnViewport, setIsChatSideColumnViewport] = useState(matchesChatSideColumnViewport);
             const [isWelcomeSplashOpen, setIsWelcomeSplashOpen] = useState(() => !initialWelcomeSplashDismissed);
             const [hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash] = useState(() => initialWelcomeSplashDismissed);
             const [welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain] = useState(() => initialWelcomeSplashDismissed);
@@ -2351,6 +2476,7 @@
             const isArtifactsTab = workspaceTab === 'artifacts';
             const isCapabilitiesTab = workspaceTab === 'capabilities';
             const isChatTab = isChatFullscreen && workspaceTab === 'chat';
+            const showChatSideColumn = isChatTab && isChatSideColumnViewport;
             const isSummaryTab = isSummaryFullscreen && workspaceTab === 'summary-workspace';
             const operatorVoiceDefinition = OPERATOR_VOICE_OPTIONS.find((option) => option.value === operatorVoice) || OPERATOR_VOICE_OPTIONS[0];
             const isCapabilitiesOverview = isCapabilitiesTab && capabilitiesView === 'overview';
@@ -2394,7 +2520,7 @@
                 : '';
             const discoveryWorkspaceSplitClass = 'grid grid-cols-1 gap-6 lg:grid-cols-3';
             const windowedChatDialogStyle = {
-                height: 'min(860px, calc(100dvh - 3rem))',
+                height: 'min(1040px, calc(100dvh - 3rem))',
                 maxHeight: 'calc(100dvh - 3rem)',
             };
             const windowedSummaryDialogStyle = {
@@ -2407,24 +2533,6 @@
             };
             const windowedCapabilityDetailDialogStyle = {
                 maxHeight: `calc(100dvh - ${capabilityOverlayTopOffset}px - 1.5rem)`,
-            };
-            const fullscreenChatConversationStyle = isChatTab
-                ? {
-                    maxWidth: 'min(96%, 112rem)',
-                    marginLeft: 'auto',
-                    marginRight: 'auto',
-                }
-                : undefined;
-            const getChatBubbleStyle = (messageType) => {
-                if (!isChatTab) {
-                    return undefined;
-                }
-
-                if (messageType === 'user') {
-                    return { maxWidth: 'min(72%, 60rem)' };
-                }
-
-                return { maxWidth: '100%' };
             };
             const capabilityList = Object.values(capabilitiesData?.capabilities || {});
             const genericCapabilityList = capabilityList.filter((capability) => capability.name !== 'rag_chromadb');
@@ -3360,17 +3468,6 @@
                 };
             };
 
-            const suggestedChatQueries = [
-                'Give me a narrative overview of what our Splunk environment appears to prioritize operationally.',
-                'What story do the current data sources tell about platform usage, reliability, and potential blind spots?',
-                'If you were onboarding a new security lead, what should they review first and why?',
-                'Describe likely risk trends we should monitor weekly, and how to validate whether they are improving.',
-                'Identify where data quality issues could silently undermine detections or reporting confidence.',
-                'Propose a practical 30-day hardening plan with quick wins, medium-term tasks, and measurable outcomes.',
-                'Suggest a weekly check we can run to catch drift, anomalies, and hidden failures.',
-                'Translate the discovery output into executive-ready priorities with business impact and verification steps.'
-            ];
-
             // Function to track when settings have been modified
             const handleSettingsChange = () => {
                 // Don't clear the loaded credential name - we need it to show "Update Active Connection" button
@@ -3861,7 +3958,12 @@
             const discoveryViewerScrollPendingRef = useRef(false);
             const messagesEndRef = useRef(null);
             const chatEndRef = useRef(null);
+            const chatScrollRef = useRef(null);
+            const chatScrollMessageCountRef = useRef(0);
             const chatInputRef = useRef(null);
+            const chatAbortControllerRef = useRef(null);
+            const chatHighlightTimerRef = useRef(null);
+            const chatCopyTimerRef = useRef(null);
             const ragAssetFileInputRef = useRef(null);
             const summaryRequestAbortRef = useRef(null);
 
@@ -3935,11 +4037,38 @@
             useEffect(() => {
                 if (isChatOpen || isChatTab) {
                     setTimeout(() => {
-                        chatEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
                         chatInputRef.current?.focus();
                     }, 100);
                 }
             }, [isChatOpen, isChatTab]);
+
+            useEffect(() => {
+                if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+                    return undefined;
+                }
+                const query = window.matchMedia(CHAT_SIDE_COLUMN_MEDIA_QUERY);
+                const update = () => setIsChatSideColumnViewport(query.matches);
+                update();
+                if (typeof query.addEventListener === 'function') {
+                    query.addEventListener('change', update);
+                    return () => query.removeEventListener('change', update);
+                }
+                query.addListener(update);
+                return () => query.removeListener(update);
+            }, []);
+
+            // The message box grows with its text up to a limit, then scrolls.
+            useEffect(() => {
+                const input = chatInputRef.current;
+                if (!input) {
+                    return;
+                }
+                input.style.height = 'auto';
+                const borderHeight = input.offsetHeight - input.clientHeight;
+                const fullHeight = input.scrollHeight + borderHeight;
+                input.style.height = `${Math.min(fullHeight, CHAT_INPUT_MAX_HEIGHT_PX)}px`;
+                input.style.overflowY = fullHeight > CHAT_INPUT_MAX_HEIGHT_PX ? 'auto' : 'hidden';
+            }, [chatInput, isChatOpen, isChatTab, showChatSideColumn]);
 
             useEffect(() => {
                 savePersistedChatState({
@@ -10763,32 +10892,36 @@
                 openSettingsTroubleshooter(kind, draft, { autoRun: true });
             };
 
-            const copyTroubleshootReport = async (reportText) => {
-                let copied = false;
+            // Plain-http pages on another host have no clipboard API, so copying falls back to a hidden text box.
+            const writeTextToClipboard = async (value) => {
+                const textValue = String(value ?? '');
                 try {
                     if (navigator.clipboard && window.isSecureContext) {
-                        await navigator.clipboard.writeText(reportText);
-                        copied = true;
+                        await navigator.clipboard.writeText(textValue);
+                        return true;
                     }
                 } catch (clipboardError) {
+                    // Fall through to the text box copy.
+                }
+                const area = document.createElement('textarea');
+                area.value = textValue;
+                area.setAttribute('readonly', '');
+                area.style.position = 'fixed';
+                area.style.opacity = '0';
+                document.body.appendChild(area);
+                area.select();
+                let copied = false;
+                try {
+                    copied = document.execCommand('copy');
+                } catch (copyError) {
                     copied = false;
                 }
-                if (!copied) {
-                    // Plain-http pages on another host have no clipboard API.
-                    const area = document.createElement('textarea');
-                    area.value = reportText;
-                    area.setAttribute('readonly', '');
-                    area.style.position = 'fixed';
-                    area.style.opacity = '0';
-                    document.body.appendChild(area);
-                    area.select();
-                    try {
-                        copied = document.execCommand('copy');
-                    } catch (copyError) {
-                        copied = false;
-                    }
-                    area.remove();
-                }
+                area.remove();
+                return copied;
+            };
+
+            const copyTroubleshootReport = async (reportText) => {
+                const copied = await writeTextToClipboard(reportText);
                 setTroubleshootCopied(copied ? 'copied' : 'failed');
             };
 
@@ -12478,17 +12611,49 @@
                 }));
             };
 
-            // Auto-scroll chat messages to bottom
+            // A new answer is shown from its question down, so long answers are read from the top instead of
+            // landing at their end. A just-sent question scrolls to the bottom to show the working indicator.
             useEffect(() => {
-                if ((isChatOpen || isChatTab) && chatMessages.length > 0) {
-                    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+                if (!(isChatOpen || isChatTab) || chatMessages.length === 0) {
+                    chatScrollMessageCountRef.current = chatMessages.length;
+                    return;
                 }
+                const isNewMessage = chatMessages.length > chatScrollMessageCountRef.current;
+                chatScrollMessageCountRef.current = chatMessages.length;
+                const behavior = isNewMessage ? 'smooth' : 'auto';
+                const lastMessage = chatMessages[chatMessages.length - 1];
+                let anchorId = null;
+                if (lastMessage && lastMessage.type !== 'user') {
+                    for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
+                        if (chatMessages[index].type === 'user') {
+                            anchorId = chatMessages[index].id;
+                            break;
+                        }
+                    }
+                    if (anchorId === null) {
+                        anchorId = lastMessage.id;
+                    }
+                }
+                const container = chatScrollRef.current;
+                const anchor = anchorId !== null && container
+                    ? Array.from(container.querySelectorAll('[data-chat-message-id]')).find((node) => node.getAttribute('data-chat-message-id') === String(anchorId))
+                    : null;
+                if (anchor) {
+                    anchor.scrollIntoView({ behavior, block: 'start' });
+                    return;
+                }
+                chatEndRef.current?.scrollIntoView({ behavior, block: 'end' });
             }, [chatMessages, isChatOpen, isChatTab]);
 
+            const showChatPage = () => {
+                setIsChatOpen(false);
+                setIsChatFullscreen(true);
+                setWorkspaceTab('chat');
+            };
+
             const openChatSurface = () => {
-                if (isChatFullscreen) {
-                    setIsChatOpen(false);
-                    setWorkspaceTab('chat');
+                if (isChatFullscreen || loadChatLayoutPreference() === 'page') {
+                    showChatPage();
                     return;
                 }
 
@@ -12496,13 +12661,15 @@
             };
 
             const enterChatFullscreen = () => {
-                setIsChatOpen(false);
-                setIsChatFullscreen(true);
-                setWorkspaceTab('chat');
+                saveChatLayoutPreference('page');
+                showChatPage();
             };
 
             const exitChatFullscreen = ({ reopenModal = false } = {}) => {
                 const nextTab = lastPrimaryWorkspaceTab && lastPrimaryWorkspaceTab !== 'chat' ? lastPrimaryWorkspaceTab : 'mission';
+                if (reopenModal) {
+                    saveChatLayoutPreference('window');
+                }
                 setIsChatFullscreen(false);
                 if (workspaceTab === 'chat') {
                     setWorkspaceTab(nextTab);
@@ -13082,6 +13249,8 @@
                     setServerConversationHistory(null);
                 }
                 setIsTyping(true);
+                const requestController = new AbortController();
+                chatAbortControllerRef.current = requestController;
 
                 // Add user message
                 setChatMessages(prev => [...prev, {
@@ -13112,7 +13281,8 @@
                             investigation_mode: investigationMode,
                             mission: goalIdForRequest ? String(activeChatGoal?.goal || '') : '',
                             goal_id: goalIdForRequest || null
-                        })
+                        }),
+                        signal: requestController.signal
                     });
 
                     // Handle Server-Sent Events
@@ -13218,15 +13388,27 @@
                     }
 
                 } catch (error) {
-                    console.error('Chat error:', error);
                     setChatStatus('');
-                    setChatMessages(prev => [...prev, {
-                        id: Date.now() + 1,
-                        type: 'error',
-                        content: `Failed to send message: ${error.message}`,
-                        timestamp: new Date().toISOString()
-                    }]);
+                    if (error?.name === 'AbortError') {
+                        setChatMessages(prev => [...prev, {
+                            id: Date.now() + 1,
+                            type: 'warning',
+                            content: 'You stopped this answer before it finished.',
+                            timestamp: new Date().toISOString()
+                        }]);
+                    } else {
+                        console.error('Chat error:', error);
+                        setChatMessages(prev => [...prev, {
+                            id: Date.now() + 1,
+                            type: 'error',
+                            content: `Failed to send message: ${error.message}`,
+                            timestamp: new Date().toISOString()
+                        }]);
+                    }
                 } finally {
+                    if (chatAbortControllerRef.current === requestController) {
+                        chatAbortControllerRef.current = null;
+                    }
                     setIsTyping(false);
                     setChatStatus('');
                     // Re-focus input after sending
@@ -13262,15 +13444,71 @@
                 });
             };
 
-            const useSuggestedQuery = (query) => {
-                setChatInput(query);
-                if (chatInputRef.current) {
-                    setTimeout(() => chatInputRef.current.focus(), 0);
+            const addTermToChatInput = (term) => {
+                const value = String(term || '').trim();
+                if (!value) {
+                    return;
                 }
+                setChatInput((previous) => {
+                    const current = String(previous || '');
+                    if (current.includes(value)) {
+                        return current;
+                    }
+                    return current.trim() ? `${current.replace(/\s+$/, '')} ${value}` : value;
+                });
+                setTimeout(() => chatInputRef.current?.focus(), 0);
+            };
+
+            const findChatMessageNode = (messageId) => {
+                const container = chatScrollRef.current;
+                return container
+                    ? Array.from(container.querySelectorAll('[data-chat-message-id]')).find((node) => node.getAttribute('data-chat-message-id') === String(messageId))
+                    : null;
+            };
+
+            const jumpToChatMessage = (messageId, options = {}) => {
+                if (options.replyId !== undefined && options.panel) {
+                    setChatReplyPanels(prev => ({ ...prev, [options.replyId]: options.panel }));
+                }
+                const target = findChatMessageNode(messageId);
+                if (!target) {
+                    return;
+                }
+                const reduceMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                target.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+                setHighlightedChatMessageId(messageId);
+                clearTimeout(chatHighlightTimerRef.current);
+                chatHighlightTimerRef.current = setTimeout(() => setHighlightedChatMessageId(null), 1800);
+            };
+
+            const copyChatText = async (key, value) => {
+                const copied = await writeTextToClipboard(value);
+                setChatCopyStatus({ key, status: copied ? 'copied' : 'failed' });
+                clearTimeout(chatCopyTimerRef.current);
+                chatCopyTimerRef.current = setTimeout(() => setChatCopyStatus(null), 2000);
+            };
+
+            const chatCopyState = (key) => (chatCopyStatus && chatCopyStatus.key === key ? chatCopyStatus.status : null);
+
+            const exportChatAsMarkdown = () => {
+                if (chatMessages.length === 0) {
+                    return;
+                }
+                const exportedAt = new Date();
+                const content = buildChatMarkdownExport(chatMessages, { goal: activeChatGoal, exportedAt });
+                exportReport(`chat-${formatChatExportTimestamp(exportedAt).replace(/[: ]/g, '-')}.md`, content);
+            };
+
+            const stopChatAnswer = () => {
+                chatAbortControllerRef.current?.abort();
             };
 
             const sendSuggestedQuery = async (query) => {
                 await sendChatMessage(query);
+            };
+
+            const toggleChatReplyPanel = (messageId, panelKey) => {
+                setChatReplyPanels(prev => ({ ...prev, [messageId]: prev[messageId] === panelKey ? null : panelKey }));
             };
 
             const loadReport = async (filename) => {
@@ -14659,13 +14897,12 @@
                 return true;
             });
 
-            const copyToClipboard = (text) => {
-                navigator.clipboard.writeText(text).then(() => {
+            const copyToClipboard = async (text) => {
+                if (await writeTextToClipboard(text)) {
                     addMessage('success', { message: 'Copied to clipboard!' });
-                }).catch(err => {
-                    console.error('Failed to copy:', err);
+                } else {
                     addMessage('error', { message: 'Failed to copy to clipboard' });
-                });
+                }
             };
 
             const exportReport = (filename, content) => {
@@ -15284,9 +15521,9 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                     const key = `${keyPrefix}-${tokenIndex}`;
                     tokenIndex += 1;
                     if (token.startsWith('`')) {
-                        parts.push(<code key={key} className={`rounded px-1 py-0.5 font-mono text-xs ${isDarkTheme ? 'bg-gray-900 text-gray-100' : 'bg-gray-100 text-gray-900'}`}>{token.slice(1, -1)}</code>);
+                        parts.push(<code key={key} className={`rounded border px-1 py-0.5 font-mono ${isDarkTheme ? 'bg-gray-800 border-gray-700 text-gray-100' : 'bg-gray-100 border-gray-200 text-gray-900'}`} style={{ fontSize: '0.875em' }}>{token.slice(1, -1)}</code>);
                     } else if (token.startsWith('**')) {
-                        parts.push(<strong key={key} className="font-semibold">{token.slice(2, -2)}</strong>);
+                        parts.push(<strong key={key} className="font-semibold">{renderMarkdownInline(token.slice(2, -2), key)}</strong>);
                     } else if (token.startsWith('[')) {
                         const linkMatch = token.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
                         if (linkMatch && /^https?:\/\//i.test(linkMatch[2])) {
@@ -15303,7 +15540,9 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                 return parts;
             };
 
-            const renderMarkdownDocument = (source) => {
+            // Compact output sizes headings for chat answers instead of full reports.
+            const renderMarkdownDocument = (source, options = {}) => {
+                const compact = Boolean(options.compact);
                 const lines = String(source || '').replace(/\r\n?/g, '\n').split('\n');
                 const fencePattern = /^\s*```/;
                 const headingPattern = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
@@ -15323,7 +15562,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                 );
                 const bodyClass = isDarkTheme ? 'text-gray-200' : 'text-gray-800';
                 const ruleClass = isDarkTheme ? 'border-gray-700' : 'border-gray-200';
-                const headingSizes = ['text-xl', 'text-lg', 'text-base'];
+                const headingSizes = compact ? ['text-lg', 'text-base', 'text-base'] : ['text-xl', 'text-lg', 'text-base'];
                 const blocks = [];
                 let index = 0;
                 while (index < lines.length) {
@@ -15351,7 +15590,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                         const level = Math.min(heading[1].length, 3);
                         const HeadingTag = `h${level + 2}`;
                         blocks.push(
-                            <HeadingTag key={key} className={`${level === 1 ? 'pt-2' : 'pt-3'} font-semibold ${headingSizes[level - 1]} ${headingClass}`}>
+                            <HeadingTag key={key} className={`${compact ? 'pt-1' : (level === 1 ? 'pt-2' : 'pt-3')} font-semibold ${headingSizes[level - 1]} ${headingClass}`}>
                                 {renderMarkdownInline(heading[2], key)}
                             </HeadingTag>
                         );
@@ -15413,10 +15652,22 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                     const listMatch = line.match(listPattern);
                     if (listMatch) {
                         const ordered = /\d/.test(listMatch[2]);
+                        const startNumber = ordered ? parseInt(listMatch[2], 10) : 1;
                         const items = [];
                         while (index < lines.length) {
                             const itemMatch = lines[index].match(listPattern);
-                            if (!itemMatch) break;
+                            if (!itemMatch) {
+                                // An indented line under an item continues that item's text.
+                                const continuation = lines[index];
+                                if (items.length > 0 && /^\s{2,}\S/.test(continuation) && !fencePattern.test(continuation)) {
+                                    const lastItem = items[items.length - 1];
+                                    const target = lastItem.children.length > 0 ? lastItem.children[lastItem.children.length - 1] : lastItem;
+                                    target.text = `${target.text} ${continuation.trim()}`;
+                                    index += 1;
+                                    continue;
+                                }
+                                break;
+                            }
                             const isNested = itemMatch[1].length >= 2 && items.length > 0;
                             if (!isNested && /\d/.test(itemMatch[2]) !== ordered) break;
                             const item = { text: itemMatch[3], ordered: /\d/.test(itemMatch[2]), children: [] };
@@ -15429,7 +15680,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                         }
                         const ListTag = ordered ? 'ol' : 'ul';
                         blocks.push(
-                            <ListTag key={key} className={`space-y-1 pl-5 ${ordered ? 'list-decimal' : 'list-disc'} ${bodyClass}`}>
+                            <ListTag key={key} start={ordered && startNumber > 1 ? startNumber : undefined} className={`space-y-1 pl-5 ${ordered ? 'list-decimal' : 'list-disc'} ${bodyClass}`}>
                                 {items.map((item, itemIndex) => (
                                     <li key={`${key}-${itemIndex}`}>
                                         {renderMarkdownInline(item.text, `${key}-${itemIndex}`)}
@@ -15465,6 +15716,292 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                 return blocks;
             };
 
+            // The goal shows as a bar above the conversation, or at the top of the chat side column on wide screens.
+            const renderChatGoalSection = (layout = 'bar') => {
+                const isColumn = layout === 'column';
+                const goal = activeChatGoal;
+                const goalBusy = Boolean(chatGoalActivity);
+                const barClass = isColumn
+                    ? `p-4 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`
+                    : `px-5 py-2.5 border-b ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`;
+                const iconButtonClass = `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`;
+                const inputClass = `px-3 py-1.5 text-sm rounded border ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`;
+                const primaryButtonClass = 'inline-flex items-center justify-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white whitespace-nowrap transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed';
+                const outlineButtonClass = `inline-flex items-center justify-center rounded-md border px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`;
+                const labelClass = `text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}`;
+                const libraryButton = (
+                    <button type="button" onClick={openChatGoalLibrary} className={iconButtonClass} title="Goal library" aria-label="Open the goal library">
+                        <i className="fas fa-book" aria-hidden="true"></i>
+                    </button>
+                );
+                const leaveButton = (
+                    <button type="button" onClick={leaveChatGoal} className={iconButtonClass} title="Leave goal" aria-label="Leave this goal. It stays in the goal library.">
+                        <i className="fas fa-sign-out-alt" aria-hidden="true"></i>
+                    </button>
+                );
+                const noticeNode = chatGoalNotice && (
+                    <p
+                        role={chatGoalNotice.tone === 'error' ? 'alert' : 'status'}
+                        data-testid="chat-goal-notice"
+                        className={`mt-2 text-xs ${chatGoalNotice.tone === 'error' ? (isDarkTheme ? 'text-red-300' : 'text-red-700') : mutedTextClass}`}
+                    >
+                        {chatGoalNotice.text}
+                    </p>
+                );
+
+                if (!activeChatGoalId) {
+                    const missionLabel = (
+                        <label htmlFor="chat-mission-input" className={labelClass}>
+                            <i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Goal
+                        </label>
+                    );
+                    const missionInput = (
+                        <input
+                            id="chat-mission-input"
+                            type="text"
+                            value={chatMission}
+                            maxLength={CHAT_MISSION_MAX_CHARS}
+                            onChange={(event) => setChatMission(event.target.value)}
+                            placeholder={isColumn ? 'Optional. What do you want to find out?' : 'Optional. What do you want to find out? For example, why sensor data stopped arriving'}
+                            title="Set a goal to list the questions that settle it and keep the assistant focused on it."
+                            className={`${isColumn ? 'w-full' : 'flex-1 min-w-0'} ${inputClass}`}
+                            disabled={chatGoalActivity === 'creating'}
+                        />
+                    );
+                    const submitButton = (
+                        <button type="submit" disabled={!chatMission.trim() || goalBusy} className={primaryButtonClass}>
+                            {chatGoalActivity === 'creating' ? 'Planning...' : 'Set goal'}
+                        </button>
+                    );
+                    return (
+                        <div className={barClass} data-testid="chat-goal-bar">
+                            <form
+                                className={isColumn ? 'space-y-2' : 'flex items-center gap-3'}
+                                onSubmit={(event) => {
+                                    event.preventDefault();
+                                    createChatGoal(chatMission, { activate: true });
+                                }}
+                            >
+                                {isColumn ? (
+                                    <>
+                                        <div className="flex items-center justify-between gap-2">
+                                            {missionLabel}
+                                            {libraryButton}
+                                        </div>
+                                        {missionInput}
+                                        <div>{submitButton}</div>
+                                    </>
+                                ) : (
+                                    <>
+                                        {missionLabel}
+                                        {missionInput}
+                                        {submitButton}
+                                        {libraryButton}
+                                    </>
+                                )}
+                            </form>
+                            {noticeNode}
+                        </div>
+                    );
+                }
+
+                if (!goal) {
+                    return (
+                        <div className={barClass} data-testid="chat-goal-bar">
+                            <div className="flex items-center gap-3">
+                                <span className={labelClass}><i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Goal</span>
+                                <p className={`flex-1 min-w-0 text-sm ${mutedTextClass}`}>Loading the goal...</p>
+                                {libraryButton}
+                                {leaveButton}
+                            </div>
+                            {noticeNode}
+                        </div>
+                    );
+                }
+
+                const items = Array.isArray(goal.items) ? goal.items : [];
+                const progress = goal.progress || {};
+                const progressText = progress.total
+                    ? `${progress.answered} of ${progress.total} answered`
+                    : 'No questions tracked';
+                const isChecking = chatGoalCheckingId === goal.id;
+                const pendingTurns = Number(goal.pending_turns || 0);
+
+                if (isChatGoalEditing) {
+                    return (
+                        <div className={barClass} data-testid="chat-goal-bar">
+                            <form
+                                className="space-y-2"
+                                onSubmit={async (event) => {
+                                    event.preventDefault();
+                                    if (await saveChatGoalText(goal, chatGoalEditDraft)) {
+                                        setIsChatGoalEditing(false);
+                                    }
+                                }}
+                            >
+                                <div className="flex items-center gap-3">
+                                    <label htmlFor="chat-goal-edit-title" className={labelClass}>
+                                        <i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Name
+                                    </label>
+                                    <input
+                                        id="chat-goal-edit-title"
+                                        type="text"
+                                        value={chatGoalEditDraft.title}
+                                        maxLength={80}
+                                        onChange={(event) => setChatGoalEditDraft(prev => ({ ...prev, title: event.target.value }))}
+                                        placeholder="Leave empty to name it from the goal"
+                                        className={`flex-1 min-w-0 ${inputClass}`}
+                                    />
+                                </div>
+                                <textarea
+                                    aria-label="Goal"
+                                    value={chatGoalEditDraft.goal}
+                                    maxLength={CHAT_MISSION_MAX_CHARS}
+                                    rows={isColumn ? 4 : 2}
+                                    onChange={(event) => setChatGoalEditDraft(prev => ({ ...prev, goal: event.target.value }))}
+                                    className={`w-full resize-none ${inputClass}`}
+                                />
+                                <div className="flex justify-end gap-2">
+                                    <button type="button" onClick={() => setIsChatGoalEditing(false)} className={outlineButtonClass}>Cancel</button>
+                                    <button type="submit" disabled={goalBusy || !chatGoalEditDraft.goal.trim()} className={primaryButtonClass}>
+                                        {chatGoalActivity === 'saving' ? 'Saving...' : 'Save'}
+                                    </button>
+                                </div>
+                            </form>
+                            {noticeNode}
+                        </div>
+                    );
+                }
+
+                const progressLabel = goal.status === 'done' ? `Done, ${progressText}` : progressText;
+                const progressBadgeClass = `rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap ${goal.status === 'done'
+                    ? (isDarkTheme ? 'border-green-700 bg-green-900 text-green-100' : 'border-green-200 bg-green-50 text-green-800')
+                    : (isDarkTheme ? 'border-indigo-700 bg-indigo-950 text-indigo-100' : 'border-indigo-200 bg-indigo-50 text-indigo-800')}`;
+                const checkingNode = isChecking && (
+                    <span className={`text-xs whitespace-nowrap ${mutedTextClass}`} role="status">
+                        <i className="fas fa-spinner fa-spin mr-1" aria-hidden="true"></i>Checking progress...
+                    </span>
+                );
+                const startButton = chatMessages.length > 0 && Number(goal.turn_count || 0) === 0 && (
+                    <button type="button" onClick={startOnChatGoal} disabled={isTyping} className={primaryButtonClass}>
+                        <i className="fas fa-play" aria-hidden="true"></i>
+                        Start on this goal
+                    </button>
+                );
+                const editButton = (
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setChatGoalEditDraft({ title: goal.title || '', goal: goal.goal || '' });
+                            setIsChatGoalEditing(true);
+                        }}
+                        className={iconButtonClass}
+                        title="Edit goal"
+                        aria-label="Edit this goal"
+                    >
+                        <i className="fas fa-pen" aria-hidden="true"></i>
+                    </button>
+                );
+                const progressPanel = (
+                    <div
+                        id="chat-goal-progress"
+                        data-testid="chat-goal-progress"
+                        className={`mt-3 rounded-lg border p-3 ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-white'}`}
+                    >
+                        {goal.summary && <p className={`text-sm mb-2 ${subtextClass}`}>{renderMarkdownInline(goal.summary, 'goal-summary')}</p>}
+                        {items.length > 0 ? (
+                            <ul className={`space-y-1.5 ${isColumn ? '' : 'max-h-56 overflow-y-auto'}`}>
+                                {items.map((item) => (
+                                    <li key={item.id} className="flex items-start gap-2 text-sm">
+                                        <input
+                                            type="checkbox"
+                                            checked={item.status === 'answered'}
+                                            onChange={(event) => updateChatGoalItem(goal.id, item.id, { status: event.target.checked ? 'answered' : 'open' })}
+                                            disabled={goalBusy}
+                                            className="mt-1 h-4 w-4 flex-shrink-0"
+                                            aria-label={`Answered: ${item.text}`}
+                                        />
+                                        <div className="min-w-0">
+                                            <p className={item.status === 'answered' ? mutedTextClass : headingClass}>{renderMarkdownInline(item.text, `goal-item-${item.id}`)}</p>
+                                            {item.note && <p className={`text-xs mt-0.5 ${mutedTextClass}`}>{renderMarkdownInline(item.note, `goal-note-${item.id}`)}</p>}
+                                        </div>
+                                    </li>
+                                ))}
+                            </ul>
+                        ) : (
+                            <p className={`text-sm ${mutedTextClass}`}>No questions are tracked yet. Select Plan again to suggest some, or add your own in the goal library.</p>
+                        )}
+                        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                            <span className={mutedTextClass}>Progress is checked after each answer.</span>
+                            {pendingTurns > 0 && !isChecking && (
+                                <button type="button" onClick={() => checkChatGoalProgress(goal.id)} className="font-medium ui-link">
+                                    Check progress now
+                                </button>
+                            )}
+                            <button type="button" onClick={() => replanChatGoal(goal.id)} disabled={goalBusy} className="font-medium ui-link disabled:opacity-50">
+                                {chatGoalActivity === 'planning' ? 'Planning...' : 'Plan again'}
+                            </button>
+                            <button type="button" onClick={openChatGoalLibrary} className="font-medium ui-link">
+                                Manage in the goal library
+                            </button>
+                        </div>
+                    </div>
+                );
+
+                if (isColumn) {
+                    return (
+                        <div className={barClass} data-testid="chat-goal-bar">
+                            <div className="flex items-center justify-between gap-2">
+                                <span className={labelClass}><i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Goal</span>
+                                <div className="flex items-center gap-1">
+                                    {editButton}
+                                    {libraryButton}
+                                    {leaveButton}
+                                </div>
+                            </div>
+                            <p className={`mt-1 text-sm font-semibold break-words ${headingClass}`} title={goal.goal} data-testid="chat-goal-title">
+                                {goal.title}
+                            </p>
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                                <span className={progressBadgeClass} data-testid="chat-goal-progress-status">{progressLabel}</span>
+                                {checkingNode}
+                            </div>
+                            {startButton && <div className="mt-3">{startButton}</div>}
+                            {progressPanel}
+                            {noticeNode}
+                        </div>
+                    );
+                }
+
+                return (
+                    <div className={barClass} data-testid="chat-goal-bar">
+                        <div className="flex items-center gap-3">
+                            <span className={labelClass}><i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Goal</span>
+                            <p className={`flex-1 min-w-0 truncate text-sm font-medium ${headingClass}`} title={goal.goal} data-testid="chat-goal-title">
+                                {goal.title}
+                            </p>
+                            {checkingNode}
+                            {startButton}
+                            <button
+                                type="button"
+                                onClick={() => setIsChatGoalProgressOpen(prev => !prev)}
+                                aria-expanded={isChatGoalProgressOpen}
+                                aria-controls="chat-goal-progress"
+                                data-testid="chat-goal-progress-toggle"
+                                className={progressBadgeClass}
+                            >
+                                {progressLabel}
+                                <i className={`fas ${isChatGoalProgressOpen ? 'fa-chevron-up' : 'fa-chevron-down'} ml-1.5`} aria-hidden="true"></i>
+                            </button>
+                            {editButton}
+                            {libraryButton}
+                            {leaveButton}
+                        </div>
+                        {isChatGoalProgressOpen && progressPanel}
+                        {noticeNode}
+                    </div>
+                );
+            };
             const isMarkdownReportName = (reportName) => /\.(md|markdown)$/i.test(String(reportName || ''));
             const openDiscoveryLibraryReport = (reportName) => {
                 discoveryViewerScrollPendingRef.current = true;
@@ -17304,29 +17841,59 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                     })()}
 
                     {/* Chat Surface */}
-                    {(isChatOpen || isChatTab) && (
+                    {(isChatOpen || isChatTab) && (() => {
+                        const chatGoalQuestions = activeChatGoal && Array.isArray(activeChatGoal.suggested_questions) ? activeChatGoal.suggested_questions : [];
+                        const chatColumnClass = 'mx-auto w-full max-w-4xl';
+                        const chatDividerClass = isDarkTheme ? 'border-gray-700' : 'border-gray-200';
+                        const chatSectionLabelClass = `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`;
+                        const headerIconButtonClass = `rounded-md p-1.5 ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`;
+                        const goalQuestionButtonClass = isDarkTheme ? 'bg-indigo-950 border-indigo-700 text-indigo-100 hover:bg-indigo-900' : 'bg-indigo-50 border-indigo-200 text-indigo-900 hover:bg-indigo-100';
+                        const chatTurns = buildChatTurns(chatMessages);
+                        const chatDataFocus = collectChatDataFocus(chatTurns);
+                        const chatSearchCount = chatTurns.filter((turn) => turn.reply?.spl_query).length;
+                        const turnCardClass = isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-white';
+                        const turnJumpClass = isDarkTheme ? 'text-gray-100 hover:bg-gray-800' : 'text-gray-800 hover:bg-gray-50';
+                        const turnChipClass = isDarkTheme ? 'border-gray-600 text-gray-200 hover:bg-gray-800' : 'border-gray-200 text-gray-700 hover:bg-gray-100';
+                        const turnIconButtonClass = `rounded p-1 ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-800 hover:bg-gray-100'}`;
+                        const dataFocusChipClass = isDarkTheme ? 'border-gray-600 bg-gray-900 text-gray-100 hover:border-indigo-400' : 'border-gray-200 bg-white text-gray-800 hover:border-indigo-400';
+                        const quietActionClass = isDarkTheme ? 'text-gray-400 hover:text-gray-100' : 'text-gray-500 hover:text-gray-800';
+                        const twoLineClampStyle = { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', overflowWrap: 'anywhere' };
+                        const replyToggleIdleClass = isDarkTheme ? 'border-gray-700 text-gray-200 hover:bg-gray-800' : 'border-gray-200 text-gray-700 hover:bg-gray-50';
+                        const replyToggleOpenClass = isDarkTheme ? 'border-indigo-500 bg-indigo-950 text-indigo-100' : 'border-indigo-300 bg-indigo-50 text-indigo-800';
+                        const nextActionButtonClass = isDarkTheme ? 'bg-indigo-950 border-indigo-700 text-indigo-100 hover:bg-indigo-900' : 'bg-white border-indigo-200 text-indigo-900 hover:bg-indigo-50';
+                        const assistantAvatarClass = isDarkTheme ? 'bg-indigo-950 text-indigo-300' : 'bg-indigo-50 text-indigo-600';
+                        return (
                         <div
                             className={isChatTab ? 'fixed inset-x-0 bottom-0 z-40' : 'fixed inset-0 bg-black bg-opacity-50 z-50 overflow-y-auto p-3 sm:p-6'}
                             style={isChatTab ? { top: `${headerHeight}px` } : undefined}
                         >
-                            <div className={isChatTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-6` : 'min-h-full w-full flex items-center justify-center'}>
+                            <div className={isChatTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-4` : 'min-h-full w-full flex items-center justify-center'}>
                             <div className={`${isChatTab
                                 ? `h-full min-h-0 rounded-2xl shadow-2xl flex flex-col overflow-hidden ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white border border-gray-200'}`
-                                : `rounded-xl shadow-2xl w-full max-w-4xl min-h-0 flex flex-col overflow-hidden ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`
+                                : `rounded-xl shadow-2xl w-full max-w-5xl min-h-0 flex flex-col overflow-hidden ${isDarkTheme ? 'bg-gray-800 border border-gray-700' : 'bg-white'}`
                             }`} style={isChatTab ? undefined : windowedChatDialogStyle} role="dialog" aria-modal={isChatTab ? 'false' : 'true'} aria-labelledby="chat-modal-title" onKeyDown={(event) => handleDialogKeyDown(event, closeChatSurface)}>
                                 {/* Chat Header */}
-                                <div className={`px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
+                                <div className={`px-5 py-2.5 border-b flex justify-between items-center gap-4 ${chatDividerClass}`}>
                                     <div className="flex items-center">
-                                        <i className="fas fa-comments text-xl text-indigo-600 mr-3" aria-hidden="true"></i>
-                                        <div>
-                                            <h2 id="chat-modal-title" className={`text-xl font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Chat</h2>
-                                        </div>
+                                        <i className="fas fa-comments text-lg text-indigo-600 mr-3" aria-hidden="true"></i>
+                                        <h2 id="chat-modal-title" className={`text-lg font-semibold ${isDarkTheme ? 'text-gray-100' : 'text-gray-900'}`}>Chat</h2>
                                     </div>
                                     <div className="flex items-center gap-1">
                                         <button
                                             type="button"
+                                            onClick={exportChatAsMarkdown}
+                                            disabled={chatMessages.length === 0}
+                                            className={`${headerIconButtonClass} disabled:opacity-50 disabled:cursor-not-allowed`}
+                                            title={chatMessages.length === 0 ? 'Nothing to download yet' : 'Download this chat as a Markdown file'}
+                                            aria-label="Download this chat as Markdown"
+                                            data-testid="chat-export"
+                                        >
+                                            <i className="fas fa-download" aria-hidden="true"></i>
+                                        </button>
+                                        <button
+                                            type="button"
                                             onClick={() => setIsChatSettingsOpen(true)}
-                                            className={`rounded-md p-1.5 ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
+                                            className={headerIconButtonClass}
                                             title="Chat settings"
                                             aria-label="Open chat settings"
                                         >
@@ -17336,7 +17903,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             <button
                                                 type="button"
                                                 onClick={() => exitChatFullscreen({ reopenModal: true })}
-                                                className={`rounded-md p-1.5 ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
+                                                className={headerIconButtonClass}
                                                 title="Show chat in a window"
                                                 aria-label="Show chat in a window"
                                             >
@@ -17346,7 +17913,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             <button
                                                 type="button"
                                                 onClick={enterChatFullscreen}
-                                                className={`rounded-md p-1.5 ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
+                                                className={headerIconButtonClass}
                                                 title="Open chat full screen"
                                                 aria-label="Open chat full screen"
                                             >
@@ -17357,7 +17924,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             type="button"
                                             onClick={startNewChat}
                                             disabled={isTyping}
-                                            className={`rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
+                                            className={`${headerIconButtonClass} disabled:opacity-50 disabled:cursor-not-allowed`}
                                             title={isTyping ? 'Wait for the answer to finish before clearing the chat' : 'Clear chat'}
                                             aria-label="Clear chat history"
                                         >
@@ -17366,7 +17933,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         <button
                                             type="button"
                                             onClick={closeChatSurface}
-                                            className={`rounded-md p-1.5 ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
+                                            className={headerIconButtonClass}
                                             aria-label="Close chat"
                                         >
                                             <i className="fas fa-times text-xl" aria-hidden="true"></i>
@@ -17374,236 +17941,13 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                     </div>
                                 </div>
 
-                                {/* Chat Goal */}
-                                {(() => {
-                                    const goal = activeChatGoal;
-                                    const goalBusy = Boolean(chatGoalActivity);
-                                    const barClass = `px-6 py-3 border-b ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`;
-                                    const iconButtonClass = `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? 'text-gray-300 hover:text-gray-100 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`;
-                                    const inputClass = `px-3 py-1.5 text-sm rounded border ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`;
-                                    const primaryButtonClass = 'inline-flex items-center justify-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white whitespace-nowrap transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed';
-                                    const outlineButtonClass = `inline-flex items-center justify-center rounded-md border px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`;
-                                    const labelClass = `text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}`;
-                                    const libraryButton = (
-                                        <button type="button" onClick={openChatGoalLibrary} className={iconButtonClass} title="Goal library" aria-label="Open the goal library">
-                                            <i className="fas fa-book" aria-hidden="true"></i>
-                                        </button>
-                                    );
-                                    const noticeNode = chatGoalNotice && (
-                                        <p
-                                            role={chatGoalNotice.tone === 'error' ? 'alert' : 'status'}
-                                            data-testid="chat-goal-notice"
-                                            className={`mt-2 text-xs ${chatGoalNotice.tone === 'error' ? (isDarkTheme ? 'text-red-300' : 'text-red-700') : mutedTextClass}`}
-                                        >
-                                            {chatGoalNotice.text}
-                                        </p>
-                                    );
+                                {!showChatSideColumn && renderChatGoalSection('bar')}
 
-                                    if (!activeChatGoalId) {
-                                        return (
-                                            <div className={barClass} data-testid="chat-goal-bar">
-                                                <form
-                                                    className="flex items-center gap-3"
-                                                    onSubmit={(event) => {
-                                                        event.preventDefault();
-                                                        createChatGoal(chatMission, { activate: true });
-                                                    }}
-                                                >
-                                                    <label htmlFor="chat-mission-input" className={labelClass}>
-                                                        <i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Goal
-                                                    </label>
-                                                    <input
-                                                        id="chat-mission-input"
-                                                        type="text"
-                                                        value={chatMission}
-                                                        maxLength={CHAT_MISSION_MAX_CHARS}
-                                                        onChange={(event) => setChatMission(event.target.value)}
-                                                        placeholder="Optional. What do you want to find out? For example, why sensor data stopped arriving"
-                                                        title="Set a goal to list the questions that settle it and keep the assistant focused on it."
-                                                        className={`flex-1 min-w-0 ${inputClass}`}
-                                                        disabled={chatGoalActivity === 'creating'}
-                                                    />
-                                                    <button type="submit" disabled={!chatMission.trim() || goalBusy} className={primaryButtonClass}>
-                                                        {chatGoalActivity === 'creating' ? 'Planning...' : 'Set goal'}
-                                                    </button>
-                                                    {libraryButton}
-                                                </form>
-                                                {noticeNode}
-                                            </div>
-                                        );
-                                    }
-
-                                    if (!goal) {
-                                        return (
-                                            <div className={barClass} data-testid="chat-goal-bar">
-                                                <div className="flex items-center gap-3">
-                                                    <span className={labelClass}><i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Goal</span>
-                                                    <p className={`flex-1 min-w-0 text-sm ${mutedTextClass}`}>Loading the goal...</p>
-                                                    {libraryButton}
-                                                    <button type="button" onClick={leaveChatGoal} className={iconButtonClass} title="Leave goal" aria-label="Leave this goal. It stays in the goal library.">
-                                                        <i className="fas fa-sign-out-alt" aria-hidden="true"></i>
-                                                    </button>
-                                                </div>
-                                                {noticeNode}
-                                            </div>
-                                        );
-                                    }
-
-                                    const items = Array.isArray(goal.items) ? goal.items : [];
-                                    const progress = goal.progress || {};
-                                    const progressText = progress.total
-                                        ? `${progress.answered} of ${progress.total} answered`
-                                        : 'No questions tracked';
-                                    const isChecking = chatGoalCheckingId === goal.id;
-                                    const pendingTurns = Number(goal.pending_turns || 0);
-
-                                    if (isChatGoalEditing) {
-                                        return (
-                                            <div className={barClass} data-testid="chat-goal-bar">
-                                                <form
-                                                    className="space-y-2"
-                                                    onSubmit={async (event) => {
-                                                        event.preventDefault();
-                                                        if (await saveChatGoalText(goal, chatGoalEditDraft)) {
-                                                            setIsChatGoalEditing(false);
-                                                        }
-                                                    }}
-                                                >
-                                                    <div className="flex items-center gap-3">
-                                                        <label htmlFor="chat-goal-edit-title" className={labelClass}>
-                                                            <i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Name
-                                                        </label>
-                                                        <input
-                                                            id="chat-goal-edit-title"
-                                                            type="text"
-                                                            value={chatGoalEditDraft.title}
-                                                            maxLength={80}
-                                                            onChange={(event) => setChatGoalEditDraft(prev => ({ ...prev, title: event.target.value }))}
-                                                            placeholder="Leave empty to name it from the goal"
-                                                            className={`flex-1 min-w-0 ${inputClass}`}
-                                                        />
-                                                    </div>
-                                                    <textarea
-                                                        aria-label="Goal"
-                                                        value={chatGoalEditDraft.goal}
-                                                        maxLength={CHAT_MISSION_MAX_CHARS}
-                                                        rows="2"
-                                                        onChange={(event) => setChatGoalEditDraft(prev => ({ ...prev, goal: event.target.value }))}
-                                                        className={`w-full resize-none ${inputClass}`}
-                                                    />
-                                                    <div className="flex justify-end gap-2">
-                                                        <button type="button" onClick={() => setIsChatGoalEditing(false)} className={outlineButtonClass}>Cancel</button>
-                                                        <button type="submit" disabled={goalBusy || !chatGoalEditDraft.goal.trim()} className={primaryButtonClass}>
-                                                            {chatGoalActivity === 'saving' ? 'Saving...' : 'Save'}
-                                                        </button>
-                                                    </div>
-                                                </form>
-                                                {noticeNode}
-                                            </div>
-                                        );
-                                    }
-
-                                    return (
-                                        <div className={barClass} data-testid="chat-goal-bar">
-                                            <div className="flex items-center gap-3">
-                                                <span className={labelClass}><i className="fas fa-bullseye mr-1" aria-hidden="true"></i>Goal</span>
-                                                <p className={`flex-1 min-w-0 truncate text-sm font-medium ${headingClass}`} title={goal.goal} data-testid="chat-goal-title">
-                                                    {goal.title}
-                                                </p>
-                                                {isChecking && (
-                                                    <span className={`text-xs whitespace-nowrap ${mutedTextClass}`} role="status">
-                                                        <i className="fas fa-spinner fa-spin mr-1" aria-hidden="true"></i>Checking progress...
-                                                    </span>
-                                                )}
-                                                {chatMessages.length > 0 && Number(goal.turn_count || 0) === 0 && (
-                                                    <button type="button" onClick={startOnChatGoal} disabled={isTyping} className={primaryButtonClass}>
-                                                        <i className="fas fa-play" aria-hidden="true"></i>
-                                                        Start on this goal
-                                                    </button>
-                                                )}
-                                                <button
-                                                    type="button"
-                                                    onClick={() => setIsChatGoalProgressOpen(prev => !prev)}
-                                                    aria-expanded={isChatGoalProgressOpen}
-                                                    aria-controls="chat-goal-progress"
-                                                    data-testid="chat-goal-progress-toggle"
-                                                    className={`rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap ${goal.status === 'done'
-                                                        ? (isDarkTheme ? 'border-green-700 bg-green-900 text-green-100' : 'border-green-200 bg-green-50 text-green-800')
-                                                        : (isDarkTheme ? 'border-indigo-700 bg-indigo-950 text-indigo-100' : 'border-indigo-200 bg-indigo-50 text-indigo-800')}`}
-                                                >
-                                                    {goal.status === 'done' ? `Done, ${progressText}` : progressText}
-                                                    <i className={`fas ${isChatGoalProgressOpen ? 'fa-chevron-up' : 'fa-chevron-down'} ml-1.5`} aria-hidden="true"></i>
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        setChatGoalEditDraft({ title: goal.title || '', goal: goal.goal || '' });
-                                                        setIsChatGoalEditing(true);
-                                                    }}
-                                                    className={iconButtonClass}
-                                                    title="Edit goal"
-                                                    aria-label="Edit this goal"
-                                                >
-                                                    <i className="fas fa-pen" aria-hidden="true"></i>
-                                                </button>
-                                                {libraryButton}
-                                                <button type="button" onClick={leaveChatGoal} className={iconButtonClass} title="Leave goal" aria-label="Leave this goal. It stays in the goal library.">
-                                                    <i className="fas fa-sign-out-alt" aria-hidden="true"></i>
-                                                </button>
-                                            </div>
-                                            {isChatGoalProgressOpen && (
-                                                <div
-                                                    id="chat-goal-progress"
-                                                    data-testid="chat-goal-progress"
-                                                    className={`mt-3 rounded-lg border p-3 ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-white'}`}
-                                                >
-                                                    {goal.summary && <p className={`text-sm mb-2 ${subtextClass}`}>{goal.summary}</p>}
-                                                    {items.length > 0 ? (
-                                                        <ul className="space-y-1.5 max-h-56 overflow-y-auto">
-                                                            {items.map((item) => (
-                                                                <li key={item.id} className="flex items-start gap-2 text-sm">
-                                                                    <input
-                                                                        type="checkbox"
-                                                                        checked={item.status === 'answered'}
-                                                                        onChange={(event) => updateChatGoalItem(goal.id, item.id, { status: event.target.checked ? 'answered' : 'open' })}
-                                                                        disabled={goalBusy}
-                                                                        className="mt-1 h-4 w-4 flex-shrink-0"
-                                                                        aria-label={`Answered: ${item.text}`}
-                                                                    />
-                                                                    <div className="min-w-0">
-                                                                        <p className={item.status === 'answered' ? mutedTextClass : headingClass}>{item.text}</p>
-                                                                        {item.note && <p className={`text-xs mt-0.5 ${mutedTextClass}`}>{item.note}</p>}
-                                                                    </div>
-                                                                </li>
-                                                            ))}
-                                                        </ul>
-                                                    ) : (
-                                                        <p className={`text-sm ${mutedTextClass}`}>No questions are tracked yet. Select Plan again to suggest some, or add your own in the goal library.</p>
-                                                    )}
-                                                    <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-                                                        <span className={mutedTextClass}>Progress is checked after each answer.</span>
-                                                        {pendingTurns > 0 && !isChecking && (
-                                                            <button type="button" onClick={() => checkChatGoalProgress(goal.id)} className="font-medium ui-link">
-                                                                Check progress now
-                                                            </button>
-                                                        )}
-                                                        <button type="button" onClick={() => replanChatGoal(goal.id)} disabled={goalBusy} className="font-medium ui-link disabled:opacity-50">
-                                                            {chatGoalActivity === 'planning' ? 'Planning...' : 'Plan again'}
-                                                        </button>
-                                                        <button type="button" onClick={openChatGoalLibrary} className="font-medium ui-link">
-                                                            Manage in the goal library
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            )}
-                                            {noticeNode}
-                                        </div>
-                                    );
-                                })()}
-
+                                <div className="flex-1 min-h-0 flex">
+                                <div className="flex-1 min-w-0 flex flex-col">
                                 {/* Chat Messages */}
-                                <div className={`flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? 'bg-gray-900' : 'bg-white'}`}>
-                                    <div className="space-y-4" style={fullscreenChatConversationStyle}>
+                                <div ref={chatScrollRef} className={`flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-6 ${isDarkTheme ? 'bg-gray-900' : 'bg-white'}`}>
+                                    <div className={`${chatColumnClass} space-y-6`}>
                                     {chatMessages.length === 0 && (activeChatGoal ? (
                                         <div className={`text-center mt-12 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`} data-testid="chat-goal-empty-state">
                                             <i className={`fas fa-bullseye text-3xl mb-3 ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`} aria-hidden="true"></i>
@@ -17618,8 +17962,23 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 <i className="fas fa-play" aria-hidden="true"></i>
                                                 Start on this goal
                                             </button>
-                                            {Array.isArray(activeChatGoal.suggested_questions) && activeChatGoal.suggested_questions.length > 0 && (
-                                                <p className="text-xs mt-3">Or ask one of the next questions below.</p>
+                                            {chatGoalQuestions.length > 0 && !showChatSideColumn && (
+                                                <div className="mt-6 max-w-xl mx-auto">
+                                                    <p className={`text-xs ${mutedTextClass}`}>Or ask one of these questions:</p>
+                                                    <div className="mt-2 flex flex-col gap-2">
+                                                        {chatGoalQuestions.map((question, idx) => (
+                                                            <button
+                                                                key={idx}
+                                                                type="button"
+                                                                onClick={() => sendSuggestedQuery(question)}
+                                                                disabled={isTyping}
+                                                                className={`rounded-lg border px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${goalQuestionButtonClass}`}
+                                                            >
+                                                                {question}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
                                             )}
                                         </div>
                                     ) : (
@@ -17630,269 +17989,271 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         </div>
                                     ))}
 
-                                    {chatMessages.map((msg) => (
-                                        <div key={msg.id} className={`flex min-w-0 ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                            <div className={`max-w-3xl min-w-0 p-4 rounded-lg ${
-                                                msg.type === 'user'
-                                                    ? 'bg-indigo-600 text-white'
-                                                    : msg.type === 'error'
-                                                    ? (isDarkTheme ? 'bg-red-900 text-red-100 border border-red-700' : 'bg-red-50 text-red-800 border border-red-200')
-                                                    : msg.type === 'warning'
-                                                    ? (isDarkTheme ? 'bg-amber-900 text-amber-100 border border-amber-700' : 'bg-amber-50 text-amber-900 border border-amber-200')
-                                                    : (isDarkTheme ? 'bg-gray-700 text-gray-100 border border-gray-600' : 'bg-gray-100 text-gray-800')
-                                            }`} style={getChatBubbleStyle(msg.type)}>
-                                                {msg.type === 'user' && (
-                                                    <div className="flex items-start min-w-0">
-                                                        <div className="flex-1 min-w-0">
-                                                            <p className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'anywhere' }}>{msg.content}</p>
-                                                        </div>
-                                                        <i className="fas fa-user ml-3 mt-1" aria-hidden="true"></i>
+                                    {chatMessages.map((msg) => {
+                                        const messageTime = new Date(msg.timestamp).toLocaleTimeString(undefined, { timeStyle: 'short' });
+
+                                        if (msg.type === 'user') {
+                                            return (
+                                                <div key={msg.id} data-chat-message-id={msg.id} className="flex min-w-0 justify-end">
+                                                    <div className={`max-w-[85%] min-w-0 rounded-2xl bg-indigo-600 px-4 py-2.5 text-white transition-shadow ${highlightedChatMessageId === msg.id ? 'ring-4 ring-amber-300' : ''}`}>
+                                                        <p className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'anywhere' }}>{msg.content}</p>
+                                                        <div className="mt-1 text-right text-xs">{messageTime}</div>
                                                     </div>
-                                                )}
+                                                </div>
+                                            );
+                                        }
 
-                                                {msg.type === 'assistant' && (
+                                        if (msg.type === 'error' || msg.type === 'warning') {
+                                            const isError = msg.type === 'error';
+                                            return (
+                                                <div key={msg.id} data-chat-message-id={msg.id} className={`min-w-0 rounded-lg border p-4 ${isError
+                                                    ? (isDarkTheme ? 'bg-red-900 text-red-100 border-red-700' : 'bg-red-50 text-red-800 border-red-200')
+                                                    : (isDarkTheme ? 'bg-amber-900 text-amber-100 border-amber-700' : 'bg-amber-50 text-amber-900 border-amber-200')}`}>
                                                     <div className="flex items-start min-w-0">
-                                                        <i className={`fas fa-robot mr-3 mt-1 ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`} aria-hidden="true"></i>
-                                                        <div className="flex-1 min-w-0">
-                                                            <p className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'anywhere' }}>{msg.content}</p>
-
-                                                            {/* Show SPL Query from tool execution */}
-                                                            {msg.spl_query && (
-                                                                <details className="mt-3" open>
-                                                                    <summary className="cursor-pointer text-sm font-medium ui-link flex items-center">
-                                                                        <i className="fas fa-code mr-2" aria-hidden="true"></i>
-                                                                        Search that ran
-                                                                    </summary>
-                                                                    <div className={`mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}`}>
-                                                                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2">
-                                                                            <span className={`text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}`}>SPL</span>
-                                                                            {renderSplQueryActionButtons(msg.spl_query, {
-                                                                                originKind: 'chat_assistant',
-                                                                                originLabel: 'Chat assistant response',
-                                                                                sourceLabel: 'Chat assistant response',
-                                                                                contextExcerpt: msg.content,
-                                                                                className: 'sm:justify-end',
-                                                                            })}
-                                                                        </div>
-                                                                        <pre className="whitespace-pre-wrap break-all">{msg.spl_query}</pre>
-                                                                    </div>
-                                                                </details>
-                                                            )}
-
-                                                            {/* Show SPL mentioned in text (even if not executed) */}
-                                                            {!msg.spl_query && msg.spl_in_text && (
-                                                                <details className="mt-3">
-                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}>
-                                                                        <i className="fas fa-code mr-2" aria-hidden="true"></i>
-                                                                        Suggested search (not run)
-                                                                    </summary>
-                                                                    <div className={`mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}`}>
-                                                                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2">
-                                                                            <span className={`text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}`}>SPL</span>
-                                                                            {renderSplQueryActionButtons(msg.spl_in_text, {
-                                                                                originKind: 'chat_assistant_suggestion',
-                                                                                originLabel: 'Chat assistant suggestion',
-                                                                                sourceLabel: 'Chat assistant suggestion',
-                                                                                contextExcerpt: msg.content,
-                                                                                className: 'sm:justify-end',
-                                                                            })}
-                                                                        </div>
-                                                                        <pre className="whitespace-pre-wrap break-all">{msg.spl_in_text}</pre>
-                                                                    </div>
-                                                                </details>
-                                                            )}
-
-                                                            {msg.visualization_spec && (
-                                                                <details className="mt-3" open>
-                                                                    <summary className={`cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? 'text-cyan-300 hover:text-cyan-100' : 'text-cyan-700 hover:text-cyan-900'}`}>
-                                                                        <i className="fas fa-chart-line mr-2"></i>
-                                                                        Visualization Preview
-                                                                    </summary>
-                                                                    {renderVisualizationPreview(msg.visualization_spec, {
-                                                                        sourceQuery: msg.spl_query || msg.spl_in_text,
-                                                                        canOpenSplunk: canUseSplunkDeeplinks,
-                                                                        onOpenSplunk: openSplunkSearchFromChat,
-                                                                    })}
-                                                                </details>
-                                                            )}
-
-                                                            {Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && (
-                                                                <details
-                                                                    className="mt-3"
-                                                                    data-testid="chat-capability-evidence"
-                                                                >
-                                                                    <summary className="cursor-pointer text-sm font-medium ui-link flex items-center">
-                                                                        <i className="fas fa-puzzle-piece mr-2" aria-hidden="true"></i>
-                                                                        Capability Evidence ({msg.capability_usage.length})
-                                                                    </summary>
-                                                                    <div className="mt-2 space-y-3">
-                                                                        {msg.capability_usage.map((usage, usageIdx) => (
-                                                                            <div key={usageIdx} className={`rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
-                                                                                <div className="flex flex-wrap items-center gap-2 mb-2">
-                                                                                    <span className={`text-sm font-semibold ${headingClass}`}>{usage.title || usage.name || 'Capability'}</span>
-                                                                                    {usage.category && (
-                                                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? 'bg-gray-900 text-gray-200 border border-gray-600' : 'bg-white text-gray-700 border border-gray-300'}`}>
-                                                                                            {formatCapabilityCategoryLabel(usage.category)}
-                                                                                        </span>
-                                                                                    )}
-                                                                                    {usage.used_in && (
-                                                                                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? 'bg-gray-900 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-700 border border-gray-200'}`}>
-                                                                                            {formatCapabilityUsageContextLabel(usage.used_in)}
-                                                                                        </span>
-                                                                                    )}
-                                                                                </div>
-                                                                                {usage.contribution && (
-                                                                                    <div className={`text-sm mb-2 ${subtextClass}`}>{usage.contribution}</div>
-                                                                                )}
-                                                                                {renderCapabilityReusableQueryCards(usage)}
-                                                                                {Array.isArray(usage.chunks) && usage.chunks.length > 0 && (
-                                                                                    <div className="space-y-2">
-                                                                                        {usage.chunks.map((chunk, chunkIdx) => (
-                                                                                            <div key={chunkIdx} className={`rounded border p-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                                                                                <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
-                                                                                                    <div className="flex flex-wrap items-center gap-2">
-                                                                                                        {isSafeLibraryLink(chunk.url) ? (
-                                                                                                            <a href={chunk.url} target="_blank" rel="noopener noreferrer" className="text-xs font-medium ui-link break-words">{chunk.source || 'Splunk documentation'}</a>
-                                                                                                        ) : (
-                                                                                                            <span className={`text-xs font-medium ${headingClass}`}>{chunk.source || `artifact_${chunkIdx + 1}`}</span>
-                                                                                                        )}
-                                                                                                        {chunk.source_type && (
-                                                                                                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-white text-gray-700 border border-gray-200'}`}>
-                                                                                                                {formatCapabilitySourceTypeLabel(chunk.source_type)}
-                                                                                                            </span>
-                                                                                                        )}
-                                                                                                    </div>
-                                                                                                    {typeof chunk.score === 'number' && (
-                                                                                                        <span className={`text-xs ${mutedTextClass}`}>Match score {chunk.score}</span>
-                                                                                                    )}
-                                                                                                </div>
-                                                                                                {Array.isArray(chunk.why) && chunk.why.length > 0 && (
-                                                                                                    <div className={`text-xs mb-1 ${mutedTextClass}`}>{chunk.why.slice(0, 3).join(' · ')}</div>
-                                                                                                )}
-                                                                                                <div className={`text-xs whitespace-pre-wrap break-words ${subtextClass}`} style={{ overflowWrap: 'anywhere' }}>{chunk.snippet}</div>
-                                                                                            </div>
-                                                                                        ))}
-                                                                                    </div>
-                                                                                )}
-                                                                            </div>
-                                                                        ))}
-                                                                    </div>
-                                                                </details>
-                                                            )}
-
-                                                            {/* Show investigation timeline if multi-turn */}
-                                                            {msg.status_timeline && msg.status_timeline.length > 0 && (
-                                                                <details className="mt-3">
-                                                                    <summary className="cursor-pointer text-sm font-medium ui-link flex items-center">
-                                                                        <i className="fas fa-tasks mr-2" aria-hidden="true"></i>
-                                                                        Steps taken ({[msg.iterations ? countLabel(msg.iterations, 'round') : '', msg.execution_time].filter(Boolean).join(', ')})
-                                                                    </summary>
-                                                                    <div className="mt-2 space-y-2">
-                                                                        {msg.status_timeline.map((status, idx) => (
-                                                                            <div key={idx} className={`flex items-center justify-between gap-3 px-3 py-2 rounded border-l-4 ${isDarkTheme ? 'bg-gray-800 border-indigo-400' : 'bg-white border-indigo-500'}`}>
-                                                                                <span className={`text-sm ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{status.action}</span>
-                                                                                <span className={`text-xs tabular-nums ${isDarkTheme ? 'text-gray-400' : 'text-gray-600'}`}>{Number(status.time || 0).toFixed(1)}s</span>
-                                                                            </div>
-                                                                        ))}
-                                                                    </div>
-                                                                </details>
-                                                            )}
-
-                                                            {/* Show raw MCP data if available */}
-                                                            {msg.mcp_data && (
-                                                                <details className="mt-3">
-                                                                    <summary className={`cursor-pointer text-sm ${isDarkTheme ? 'text-gray-300 hover:text-gray-100' : 'text-gray-600 hover:text-gray-800'}`}>
-                                                                        <i className="fas fa-database mr-1" aria-hidden="true"></i>
-                                                                        Show raw data
-                                                                    </summary>
-                                                                    <pre className={`mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-200 text-gray-800'}`}>
-                                                                        {JSON.stringify(msg.mcp_data, null, 2)}
-                                                                    </pre>
-                                                                </details>
-                                                            )}
-
-                                                            {/* Indicate if follow-on is expected */}
-                                                            {msg.has_follow_on && !(msg.follow_on_actions?.length > 0 && visibleFollowOnActions(msg).length === 0) && (
-                                                                <div className={`mt-3 p-3 border rounded ${isDarkTheme ? 'bg-indigo-900 border-indigo-700' : 'bg-indigo-50 border-indigo-200'}`}>
-                                                                    <div className={`text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'}`}>
-                                                                        <i className="fas fa-arrow-right mr-1"></i>
-                                                                        <span>Suggested next actions</span>
-                                                                    </div>
-                                                                    {visibleFollowOnActions(msg).length > 0 ? (
-                                                                        <div className="space-y-2">
-                                                                            {visibleFollowOnActions(msg).map((action, idx) => {
-                                                                                const actionLabel = typeof action === 'string'
-                                                                                    ? action
-                                                                                    : (action.label || action.prompt || 'Follow-up action');
-                                                                                const actionPrompt = typeof action === 'string'
-                                                                                    ? action
-                                                                                    : (action.prompt || action.label || '');
-
-                                                                                return (
-                                                                                    <button
-                                                                                        key={idx}
-                                                                                        type="button"
-                                                                                        onClick={() => actionPrompt && sendSuggestedQuery(actionPrompt)}
-                                                                                        className={`w-full text-left rounded border px-3 py-2 transition-colors ${isDarkTheme ? 'bg-indigo-950 border-indigo-700 hover:bg-indigo-800 text-indigo-100' : 'bg-white border-indigo-200 hover:bg-indigo-100 text-indigo-900'}`}
-                                                                                        title="Run this follow-up in chat"
-                                                                                    >
-                                                                                        <div className="text-xs font-semibold">{actionLabel}</div>
-                                                                                        {typeof action !== 'string' && action.prompt && action.prompt !== actionLabel && (
-                                                                                            <div className={`text-xs mt-1 ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-700'}`}>
-                                                                                                {action.prompt}
-                                                                                            </div>
-                                                                                        )}
-                                                                                    </button>
-                                                                                );
-                                                                            })}
-                                                                        </div>
-                                                                    ) : (
-                                                                        <div className={`text-xs ${isDarkTheme ? 'text-indigo-200' : 'text-indigo-800'}`}>Follow-up action available.</div>
-                                                                    )}
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    </div>
-                                                )}
-
-                                                {msg.type === 'error' && (
-                                                    <div className="flex items-start min-w-0">
-                                                        <i className="fas fa-exclamation-triangle mr-3 mt-1 text-red-600"></i>
+                                                        <i className={`fas ${isError ? 'fa-exclamation-triangle text-red-600' : 'fa-exclamation-circle text-amber-600'} mr-3 mt-1`} aria-hidden="true"></i>
                                                         <p className="flex-1 whitespace-pre-wrap break-words" style={{ overflowWrap: 'anywhere' }}>{msg.content}</p>
                                                     </div>
-                                                )}
+                                                    <div className="mt-2 text-xs opacity-80">{messageTime}</div>
+                                                </div>
+                                            );
+                                        }
 
-                                                {msg.type === 'warning' && (
-                                                    <div className={`flex items-start min-w-0 border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? 'bg-amber-900' : 'bg-amber-50'}`}>
-                                                        <i className="fas fa-exclamation-circle mr-3 mt-1 text-amber-600"></i>
-                                                        <p className={`flex-1 whitespace-pre-wrap break-words ${isDarkTheme ? 'text-amber-100' : 'text-amber-800'}`} style={{ overflowWrap: 'anywhere' }}>{msg.content}</p>
+                                        const capabilityUsage = Array.isArray(msg.capability_usage) ? msg.capability_usage : [];
+                                        const statusTimeline = Array.isArray(msg.status_timeline) ? msg.status_timeline : [];
+                                        const replyPanels = [
+                                            msg.spl_query
+                                                ? { key: 'search', label: 'Search that ran', icon: 'fa-code' }
+                                                : (msg.spl_in_text ? { key: 'search', label: 'Suggested search (not run)', icon: 'fa-code' } : null),
+                                            msg.visualization_spec ? { key: 'chart', label: 'Chart', icon: 'fa-chart-line' } : null,
+                                            capabilityUsage.length > 0 ? { key: 'evidence', label: `Capability evidence (${capabilityUsage.length})`, icon: 'fa-puzzle-piece' } : null,
+                                            statusTimeline.length > 0
+                                                ? { key: 'steps', label: `Steps taken (${[msg.iterations ? countLabel(msg.iterations, 'round') : '', msg.execution_time].filter(Boolean).join(', ')})`, icon: 'fa-tasks' }
+                                                : null,
+                                            msg.mcp_data ? { key: 'raw', label: 'Raw data', icon: 'fa-database' } : null,
+                                        ].filter(Boolean);
+                                        const openReplyPanel = replyPanels.some((panel) => panel.key === chatReplyPanels[msg.id]) ? chatReplyPanels[msg.id] : null;
+                                        const replyPanelId = (key) => `chat-reply-${msg.id}-${key}`;
+                                        const nextActions = msg.has_follow_on ? visibleFollowOnActions(msg) : [];
+
+                                        return (
+                                            <div key={msg.id} data-chat-message-id={msg.id} className="flex min-w-0 items-start gap-3">
+                                                <span className={`mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${assistantAvatarClass}`} aria-hidden="true">
+                                                    <i className="fas fa-robot text-xs"></i>
+                                                </span>
+                                                <div className="flex-1 min-w-0">
+                                                    <div data-testid="chat-reply-markdown" className="space-y-3 text-[15px] leading-7 break-words">
+                                                        {renderMarkdownDocument(msg.content, { compact: true })}
                                                     </div>
-                                                )}
 
-                                                <div className="text-xs opacity-70 mt-2">
-                                                    {new Date(msg.timestamp).toLocaleTimeString(undefined, { timeStyle: 'short' })}
+                                                    {replyPanels.length > 0 && (
+                                                        <div className="mt-3 flex flex-wrap gap-2" data-testid="chat-reply-toggles">
+                                                            {replyPanels.map((panel) => {
+                                                                const isOpen = openReplyPanel === panel.key;
+                                                                return (
+                                                                    <button
+                                                                        key={panel.key}
+                                                                        type="button"
+                                                                        onClick={() => toggleChatReplyPanel(msg.id, panel.key)}
+                                                                        aria-expanded={isOpen}
+                                                                        aria-controls={isOpen ? replyPanelId(panel.key) : undefined}
+                                                                        data-testid={`chat-reply-toggle-${panel.key}`}
+                                                                        className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${isOpen ? replyToggleOpenClass : replyToggleIdleClass}`}
+                                                                    >
+                                                                        <i className={`fas ${panel.icon}`} aria-hidden="true"></i>
+                                                                        {panel.label}
+                                                                        <i className={`fas ${isOpen ? 'fa-chevron-up' : 'fa-chevron-down'} opacity-70`} style={{ fontSize: '0.65rem' }} aria-hidden="true"></i>
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+
+                                                    {openReplyPanel === 'search' && msg.spl_query && (
+                                                        <div id={replyPanelId('search')}>
+                                                            <div className={`mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}`}>
+                                                                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2">
+                                                                    <span className={`text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}`}>SPL</span>
+                                                                    {renderSplQueryActionButtons(msg.spl_query, {
+                                                                        originKind: 'chat_assistant',
+                                                                        originLabel: 'Chat assistant response',
+                                                                        sourceLabel: 'Chat assistant response',
+                                                                        contextExcerpt: msg.content,
+                                                                        className: 'sm:justify-end',
+                                                                    })}
+                                                                </div>
+                                                                <pre className="whitespace-pre-wrap break-all">{msg.spl_query}</pre>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    {openReplyPanel === 'search' && !msg.spl_query && msg.spl_in_text && (
+                                                        <div id={replyPanelId('search')}>
+                                                            <div className={`mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}`}>
+                                                                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2">
+                                                                    <span className={`text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}`}>SPL</span>
+                                                                    {renderSplQueryActionButtons(msg.spl_in_text, {
+                                                                        originKind: 'chat_assistant_suggestion',
+                                                                        originLabel: 'Chat assistant suggestion',
+                                                                        sourceLabel: 'Chat assistant suggestion',
+                                                                        contextExcerpt: msg.content,
+                                                                        className: 'sm:justify-end',
+                                                                    })}
+                                                                </div>
+                                                                <pre className="whitespace-pre-wrap break-all">{msg.spl_in_text}</pre>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    {openReplyPanel === 'chart' && (
+                                                        <div id={replyPanelId('chart')} className="mt-2">
+                                                            {renderVisualizationPreview(msg.visualization_spec, {
+                                                                sourceQuery: msg.spl_query || msg.spl_in_text,
+                                                                canOpenSplunk: canUseSplunkDeeplinks,
+                                                                onOpenSplunk: openSplunkSearchFromChat,
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                    {openReplyPanel === 'evidence' && (
+                                                        <div id={replyPanelId('evidence')} data-testid="chat-capability-evidence">
+                                                            <div className="mt-2 space-y-3">
+                                                                {msg.capability_usage.map((usage, usageIdx) => (
+                                                                    <div key={usageIdx} className={`rounded-lg border p-3 ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                                                        <div className="flex flex-wrap items-center gap-2 mb-2">
+                                                                            <span className={`text-sm font-semibold ${headingClass}`}>{usage.title || usage.name || 'Capability'}</span>
+                                                                            {usage.category && (
+                                                                                <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? 'bg-gray-900 text-gray-200 border border-gray-600' : 'bg-white text-gray-700 border border-gray-300'}`}>
+                                                                                    {formatCapabilityCategoryLabel(usage.category)}
+                                                                                </span>
+                                                                            )}
+                                                                            {usage.used_in && (
+                                                                                <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? 'bg-gray-900 text-gray-200 border border-gray-600' : 'bg-gray-100 text-gray-700 border border-gray-200'}`}>
+                                                                                    {formatCapabilityUsageContextLabel(usage.used_in)}
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                        {usage.contribution && (
+                                                                            <div className={`text-sm mb-2 ${subtextClass}`}>{usage.contribution}</div>
+                                                                        )}
+                                                                        {renderCapabilityReusableQueryCards(usage)}
+                                                                        {Array.isArray(usage.chunks) && usage.chunks.length > 0 && (
+                                                                            <div className="space-y-2">
+                                                                                {usage.chunks.map((chunk, chunkIdx) => (
+                                                                                    <div key={chunkIdx} className={`rounded border p-2 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                                                                                        <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+                                                                                            <div className="flex flex-wrap items-center gap-2">
+                                                                                                {isSafeLibraryLink(chunk.url) ? (
+                                                                                                    <a href={chunk.url} target="_blank" rel="noopener noreferrer" className="text-xs font-medium ui-link break-words">{chunk.source || 'Splunk documentation'}</a>
+                                                                                                ) : (
+                                                                                                    <span className={`text-xs font-medium ${headingClass}`}>{chunk.source || `artifact_${chunkIdx + 1}`}</span>
+                                                                                                )}
+                                                                                                {chunk.source_type && (
+                                                                                                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? 'bg-gray-800 text-gray-200 border border-gray-600' : 'bg-white text-gray-700 border border-gray-200'}`}>
+                                                                                                        {formatCapabilitySourceTypeLabel(chunk.source_type)}
+                                                                                                    </span>
+                                                                                                )}
+                                                                                            </div>
+                                                                                            {typeof chunk.score === 'number' && (
+                                                                                                <span className={`text-xs ${mutedTextClass}`}>Match score {chunk.score}</span>
+                                                                                            )}
+                                                                                        </div>
+                                                                                        {Array.isArray(chunk.why) && chunk.why.length > 0 && (
+                                                                                            <div className={`text-xs mb-1 ${mutedTextClass}`}>{chunk.why.slice(0, 3).join(' · ')}</div>
+                                                                                        )}
+                                                                                        <div className={`text-xs whitespace-pre-wrap break-words ${subtextClass}`} style={{ overflowWrap: 'anywhere' }}>{chunk.snippet}</div>
+                                                                                    </div>
+                                                                                ))}
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    {openReplyPanel === 'steps' && (
+                                                        <div id={replyPanelId('steps')}>
+                                                            <div className="mt-2 space-y-2">
+                                                                {msg.status_timeline.map((status, idx) => (
+                                                                    <div key={idx} className={`flex items-center justify-between gap-3 px-3 py-2 rounded border-l-4 ${isDarkTheme ? 'bg-gray-800 border-indigo-400' : 'bg-white border-indigo-500'}`}>
+                                                                        <span className={`text-sm ${isDarkTheme ? 'text-gray-200' : 'text-gray-700'}`}>{status.action}</span>
+                                                                        <span className={`text-xs tabular-nums ${isDarkTheme ? 'text-gray-400' : 'text-gray-600'}`}>{Number(status.time || 0).toFixed(1)}s</span>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    {openReplyPanel === 'raw' && (
+                                                        <div id={replyPanelId('raw')}>
+                                                            <pre className={`mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? 'bg-gray-800 text-gray-200' : 'bg-gray-200 text-gray-800'}`}>
+                                                                {JSON.stringify(msg.mcp_data, null, 2)}
+                                                            </pre>
+                                                        </div>
+                                                    )}
+
+                                                    {nextActions.length > 0 && (
+                                                        <div className="mt-3" data-testid="chat-next-actions">
+                                                            <p className={`text-xs font-semibold mb-1.5 ${mutedTextClass}`}>Suggested next actions</p>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {visibleFollowOnActions(msg).map((action, idx) => {
+                                                                    const actionLabel = typeof action === 'string'
+                                                                        ? action
+                                                                        : (action.label || action.prompt || 'Follow-up action');
+                                                                    const actionPrompt = typeof action === 'string'
+                                                                        ? action
+                                                                        : (action.prompt || action.label || '');
+
+                                                                    return (
+                                                                        <button
+                                                                            key={idx}
+                                                                            type="button"
+                                                                            onClick={() => actionPrompt && sendSuggestedQuery(actionPrompt)}
+                                                                            disabled={isTyping}
+                                                                            className={`max-w-full rounded-full border px-3 py-1 text-left text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${nextActionButtonClass}`}
+                                                                            title={String(actionPrompt).replace(/\*\*|`/g, '')}
+                                                                        >
+                                                                            <i className="fas fa-arrow-right mr-1.5" aria-hidden="true"></i>
+                                                                            {renderMarkdownInline(actionLabel, `${msg.id}-action-${idx}`)}
+                                                                        </button>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        </div>
+                                                    )}
+
+                                                    <div className={`mt-2 flex items-center gap-3 text-xs ${mutedTextClass}`}>
+                                                        <span>{messageTime}</span>
+                                                        {String(msg.content || '').trim() && (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => copyChatText(`reply-${msg.id}`, msg.content)}
+                                                                className={`inline-flex items-center gap-1 font-medium ${quietActionClass}`}
+                                                                aria-label="Copy this answer"
+                                                                data-testid="chat-reply-copy"
+                                                            >
+                                                                <i className={`fas ${chatCopyState(`reply-${msg.id}`) === 'copied' ? 'fa-check' : 'fa-copy'}`} aria-hidden="true"></i>
+                                                                {chatCopyState(`reply-${msg.id}`) === 'copied' ? 'Copied' : (chatCopyState(`reply-${msg.id}`) === 'failed' ? 'Copy failed' : 'Copy')}
+                                                            </button>
+                                                        )}
+                                                    </div>
                                                 </div>
                                             </div>
-                                        </div>
-                                    ))}
+                                        );
+                                    })}
 
                                     {isTyping && (
-                                        <div className="flex justify-start">
-                                            <div className={`p-4 rounded-lg border ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-700' : 'bg-gray-100 text-gray-800 border-gray-200'}`} role="status" aria-live="polite">
-                                                <div className="flex items-center space-x-3">
-                                                    <i className={`fas fa-robot ${isDarkTheme ? 'text-indigo-300' : 'text-indigo-600'}`} aria-hidden="true"></i>
-                                                    <div className="flex space-x-1" aria-hidden="true">
-                                                        <div className="w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce"></div>
-                                                        <div className="w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" style={{animationDelay: '0.1s'}}></div>
-                                                        <div className="w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" style={{animationDelay: '0.2s'}}></div>
-                                                    </div>
-                                                    <span className="sr-only">The assistant is working.</span>
-                                                    {chatStatus && (
-                                                        <span className={`text-sm ml-2 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
-                                                            {chatStatus}
-                                                        </span>
-                                                    )}
+                                        <div className="flex min-w-0 items-start gap-3" role="status" aria-live="polite">
+                                            <span className={`mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${assistantAvatarClass}`} aria-hidden="true">
+                                                <i className="fas fa-robot text-xs"></i>
+                                            </span>
+                                            <div className={`flex items-center gap-3 rounded-lg border px-4 py-3 ${isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-700' : 'bg-gray-50 text-gray-800 border-gray-200'}`}>
+                                                <div className="flex space-x-1" aria-hidden="true">
+                                                    <div className="w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce"></div>
+                                                    <div className="w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" style={{animationDelay: '0.1s'}}></div>
+                                                    <div className="w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" style={{animationDelay: '0.2s'}}></div>
                                                 </div>
+                                                <span className="sr-only">The assistant is working.</span>
+                                                {chatStatus && (
+                                                    <span className={`text-sm ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>
+                                                        {chatStatus}
+                                                    </span>
+                                                )}
                                             </div>
                                         </div>
                                     )}
@@ -17902,19 +18263,20 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                 </div>
 
                                 {/* Chat Input */}
-                                <div className={`px-6 py-4 border-t ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
-                                    {activeChatGoal && Array.isArray(activeChatGoal.suggested_questions) && activeChatGoal.suggested_questions.length > 0 && (
-                                        <div className="mb-3" data-testid="chat-goal-questions">
-                                            <p className={`text-xs font-semibold uppercase tracking-wide mb-2 ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>Next questions for your goal</p>
-                                            <div className="flex flex-wrap gap-2">
-                                                {activeChatGoal.suggested_questions.map((question, idx) => (
+                                <div className={`px-4 sm:px-6 py-3 border-t ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'}`}>
+                                    <div className={chatColumnClass}>
+                                    {!showChatSideColumn && showChatGoalQuestions && chatGoalQuestions.length > 0 && (
+                                        <div id="chat-goal-questions-panel" data-testid="chat-goal-questions" className="mb-3 max-h-48 overflow-y-auto scroll-container">
+                                            <p className={chatSectionLabelClass}>Next questions for your goal</p>
+                                            <div className="mt-1.5 flex flex-wrap gap-2">
+                                                {chatGoalQuestions.map((question, idx) => (
                                                     <button
                                                         key={idx}
                                                         type="button"
                                                         onClick={() => sendSuggestedQuery(question)}
                                                         disabled={isTyping}
                                                         title="Ask this now"
-                                                        className={`rounded-full border px-3 py-1 text-xs text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? 'bg-indigo-950 border-indigo-700 text-indigo-100 hover:bg-indigo-900' : 'bg-indigo-50 border-indigo-200 text-indigo-900 hover:bg-indigo-100'}`}
+                                                        className={`rounded-full border px-3 py-1 text-xs text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${goalQuestionButtonClass}`}
                                                     >
                                                         {question}
                                                     </button>
@@ -17922,52 +18284,8 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             </div>
                                         </div>
                                     )}
-                                    <div className="mb-3">
-                                        <div className="flex items-center justify-between mb-2">
-                                            <p className={`text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? 'text-gray-300' : 'text-gray-600'}`}>Suggested Questions</p>
-                                            <div className="flex items-center gap-3">
-                                                <button
-                                                    type="button"
-                                                    onClick={() => setShowSuggestedQueries(prev => !prev)}
-                                                    className="text-xs ui-link flex items-center"
-                                                    title={showSuggestedQueries ? 'Hide suggested questions' : 'Show suggested questions'}
-                                                    aria-label={showSuggestedQueries ? 'Hide suggested questions' : 'Show suggested questions'}
-                                                    aria-expanded={showSuggestedQueries}
-                                                    aria-controls="suggested-queries-panel"
-                                                >
-                                                    <i className={`fas ${showSuggestedQueries ? 'fa-chevron-up' : 'fa-chevron-down'}`} aria-hidden="true"></i>
-                                                </button>
-                                            </div>
-                                        </div>
-                                        {showSuggestedQueries && (
-                                            <div id="suggested-queries-panel" className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                                                {suggestedChatQueries.map((query, idx) => (
-                                                    <div key={idx} className={`flex items-center border rounded-lg px-2 py-1.5 ${isDarkTheme ? 'bg-gray-900 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => useSuggestedQuery(query)}
-                                                            className={`flex-1 text-left text-xs truncate ${isDarkTheme ? 'text-gray-200 hover:text-indigo-300' : 'text-gray-700 hover:text-indigo-700'}`}
-                                                            title={query}
-                                                        >
-                                                            {query}
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => sendSuggestedQuery(query)}
-                                                            disabled={isTyping}
-                                                            className={`ml-2 px-2 py-1 text-xs rounded ${isTyping ? (isDarkTheme ? 'bg-gray-700 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-500 cursor-not-allowed') : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
-                                                            title="Ask this now"
-                                                            aria-label={`Ask now: ${query}`}
-                                                        >
-                                                            <i className="fas fa-play" aria-hidden="true"></i>
-                                                        </button>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
 
-                                    <div className="flex gap-3">
+                                    <div className="flex items-end gap-2">
                                         <textarea
                                             ref={chatInputRef}
                                             value={chatInput}
@@ -17980,34 +18298,218 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             }}
                                             placeholder="Ask me about your Splunk environment..."
                                             aria-label="Chat message input"
-                                            className={`flex-1 p-3 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
-                                            rows="3"
+                                            className={`flex-1 px-3 py-2.5 leading-6 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none ${isDarkTheme ? 'bg-gray-900 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                            style={{ maxHeight: `${CHAT_INPUT_MAX_HEIGHT_PX}px` }}
+                                            rows="1"
                                             disabled={isTyping}
                                         />
-                                        <button
-                                            type="button"
-                                            onClick={sendChatMessage}
-                                            disabled={!chatInput.trim() || isTyping}
-                                            aria-label={isTyping ? 'Sending chat message' : 'Send chat message'}
-                                            title={isTyping ? 'Sending chat message' : 'Send chat message'}
-                                            className={`px-5 py-3 rounded-lg font-medium ${
-                                                chatInput.trim() && !isTyping
-                                                    ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
-                                                    : (isDarkTheme ? 'bg-gray-700 text-gray-400 cursor-not-allowed' : 'bg-gray-300 text-gray-500 cursor-not-allowed')
-                                            }`}
-                                        >
-                                            <i className="fas fa-paper-plane" aria-hidden="true"></i>
-                                        </button>
+                                        {isTyping ? (
+                                            <button
+                                                type="button"
+                                                onClick={stopChatAnswer}
+                                                aria-label="Stop the answer"
+                                                title="Stop the answer"
+                                                data-testid="chat-stop"
+                                                className={`h-[46px] px-4 rounded-lg border font-medium ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700' : 'border-gray-300 bg-white text-gray-800 hover:bg-gray-100'}`}
+                                            >
+                                                <i className="fas fa-stop" aria-hidden="true"></i>
+                                            </button>
+                                        ) : (
+                                            <button
+                                                type="button"
+                                                onClick={() => sendChatMessage()}
+                                                disabled={!chatInput.trim()}
+                                                aria-label="Send chat message"
+                                                title="Send chat message"
+                                                className={`h-[46px] px-4 rounded-lg font-medium ${
+                                                    chatInput.trim()
+                                                        ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                                                        : (isDarkTheme ? 'bg-gray-700 text-gray-400 cursor-not-allowed' : 'bg-gray-300 text-gray-500 cursor-not-allowed')
+                                                }`}
+                                            >
+                                                <i className="fas fa-paper-plane" aria-hidden="true"></i>
+                                            </button>
+                                        )}
                                     </div>
-                                    <p className={`text-xs mt-2 ${isDarkTheme ? 'text-gray-400' : 'text-gray-500'}`}>
-                                        Press Enter to send and Shift+Enter for a new line. The conversation is kept until you clear it.
-                                    </p>
+                                    <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs">
+                                        {!showChatSideColumn && chatGoalQuestions.length > 0 ? (
+                                            <button
+                                                type="button"
+                                                onClick={() => setShowChatGoalQuestions(prev => !prev)}
+                                                className="inline-flex items-center gap-1.5 font-medium ui-link"
+                                                aria-expanded={showChatGoalQuestions}
+                                                aria-controls="chat-goal-questions-panel"
+                                                data-testid="chat-goal-questions-toggle"
+                                            >
+                                                <i className="fas fa-bullseye" aria-hidden="true"></i>
+                                                Next questions for your goal ({chatGoalQuestions.length})
+                                                <i className={`fas ${showChatGoalQuestions ? 'fa-chevron-down' : 'fa-chevron-up'}`} aria-hidden="true"></i>
+                                            </button>
+                                        ) : <span></span>}
+                                        <span className={isDarkTheme ? 'text-gray-400' : 'text-gray-500'}>
+                                            {isTyping ? 'Stop ends this answer early.' : 'Enter sends and Shift+Enter adds a line. The chat is kept until you clear it.'}
+                                        </span>
+                                    </div>
+                                    </div>
+                                </div>
+                                </div>
+
+                                {showChatSideColumn && (
+                                    <aside
+                                        className={`w-80 xl:w-96 flex-shrink-0 min-h-0 overflow-y-auto scroll-container border-l ${isDarkTheme ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}
+                                        aria-label="Goal and conversation"
+                                        data-testid="chat-side-column"
+                                    >
+                                        {renderChatGoalSection('column')}
+                                        {chatGoalQuestions.length > 0 && (
+                                            <div className={`p-4 border-b ${chatDividerClass}`} data-testid="chat-goal-questions">
+                                                <p className={chatSectionLabelClass}>Next questions for your goal</p>
+                                                <ul className="mt-2 space-y-2">
+                                                    {chatGoalQuestions.map((question, idx) => (
+                                                        <li key={idx}>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => sendSuggestedQuery(question)}
+                                                                disabled={isTyping}
+                                                                title="Ask this now"
+                                                                className={`w-full rounded-lg border px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${goalQuestionButtonClass}`}
+                                                            >
+                                                                {question}
+                                                            </button>
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+                                        )}
+                                        <section className="p-4" aria-labelledby="chat-conversation-title" data-testid="chat-conversation-panel">
+                                            <div className="flex items-baseline justify-between gap-2">
+                                                <h3 id="chat-conversation-title" className={chatSectionLabelClass}>In this chat</h3>
+                                                {chatTurns.length > 0 && (
+                                                    <span className={`text-xs ${mutedTextClass}`}>
+                                                        {countLabel(chatTurns.length, 'question')}, {countLabel(chatSearchCount, 'search', 'searches')}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {chatTurns.length === 0 ? (
+                                                <p className={`mt-2 text-sm ${mutedTextClass}`}>
+                                                    Your questions show up here with the searches they ran, so you can jump back to an answer, copy a search, or open it in Splunk.
+                                                </p>
+                                            ) : (
+                                                <>
+                                                    {chatDataFocus.length > 0 && (
+                                                        <div className="mt-3" data-testid="chat-data-focus">
+                                                            <p className={`text-xs font-medium ${mutedTextClass}`}>Data searched</p>
+                                                            <div className="mt-1.5 flex flex-wrap gap-1.5">
+                                                                {chatDataFocus.map((item) => (
+                                                                    <button
+                                                                        key={item.term}
+                                                                        type="button"
+                                                                        onClick={() => addTermToChatInput(item.term)}
+                                                                        title="Add to the message box"
+                                                                        className={`max-w-full truncate rounded-md border px-2 py-0.5 font-mono text-xs transition-colors ${dataFocusChipClass}`}
+                                                                    >
+                                                                        {item.term}
+                                                                    </button>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    <ol className="mt-3 space-y-2" aria-label="Questions in this chat" data-testid="chat-turn-list">
+                                                        {chatTurns.map((turn, idx) => {
+                                                            const reply = turn.reply;
+                                                            const ranQuery = String(reply?.spl_query || '').trim();
+                                                            const suggestedQuery = !ranQuery ? String(reply?.spl_in_text || '').trim() : '';
+                                                            const shownQuery = ranQuery || suggestedQuery;
+                                                            const isAnswering = !reply && !turn.error && isTyping && idx === chatTurns.length - 1;
+                                                            const copyKey = `turn-${turn.question.id}`;
+                                                            return (
+                                                                <li key={turn.question.id} className={`overflow-hidden rounded-lg border ${turnCardClass}`} data-testid="chat-turn">
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => jumpToChatMessage(turn.question.id)}
+                                                                        className={`block w-full px-3 pt-2 pb-1.5 text-left transition-colors ${turnJumpClass}`}
+                                                                        title="Jump to this question"
+                                                                    >
+                                                                        <span className="flex items-start gap-2">
+                                                                            <span className={`mt-0.5 text-xs tabular-nums ${mutedTextClass}`}>{idx + 1}</span>
+                                                                            <span className="flex-1 min-w-0 text-sm" style={twoLineClampStyle}>{turn.question.content}</span>
+                                                                        </span>
+                                                                        {shownQuery && (
+                                                                            <code className={`mt-1 block truncate font-mono text-xs ${mutedTextClass}`}>{shownQuery}</code>
+                                                                        )}
+                                                                    </button>
+                                                                    <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
+                                                                        {isAnswering && (
+                                                                            <span className={`text-xs ${mutedTextClass}`}>Answering...</span>
+                                                                        )}
+                                                                        {turn.error && !reply && (
+                                                                            <span className={`text-xs font-medium ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>
+                                                                                <i className="fas fa-exclamation-triangle mr-1" aria-hidden="true"></i>
+                                                                                No answer
+                                                                            </span>
+                                                                        )}
+                                                                        {reply && shownQuery && (
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => jumpToChatMessage(turn.question.id, { replyId: reply.id, panel: 'search' })}
+                                                                                className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs transition-colors ${turnChipClass}`}
+                                                                                title={ranQuery ? 'Show the search that ran' : 'Show the suggested search'}
+                                                                            >
+                                                                                <i className="fas fa-code" aria-hidden="true"></i>
+                                                                                {ranQuery ? 'Search' : 'Not run'}
+                                                                            </button>
+                                                                        )}
+                                                                        {reply && reply.visualization_spec && (
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => jumpToChatMessage(turn.question.id, { replyId: reply.id, panel: 'chart' })}
+                                                                                className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs transition-colors ${turnChipClass}`}
+                                                                                title="Show the chart"
+                                                                            >
+                                                                                <i className="fas fa-chart-line" aria-hidden="true"></i>
+                                                                                Chart
+                                                                            </button>
+                                                                        )}
+                                                                        {shownQuery && (
+                                                                            <span className="ml-auto flex items-center gap-0.5">
+                                                                                <button
+                                                                                    type="button"
+                                                                                    onClick={() => copyChatText(copyKey, shownQuery)}
+                                                                                    className={turnIconButtonClass}
+                                                                                    title={chatCopyState(copyKey) === 'copied' ? 'Copied' : (chatCopyState(copyKey) === 'failed' ? 'Copy failed' : 'Copy the search')}
+                                                                                    aria-label="Copy the search"
+                                                                                >
+                                                                                    <i className={`fas ${chatCopyState(copyKey) === 'copied' ? 'fa-check' : 'fa-copy'} text-xs`} aria-hidden="true"></i>
+                                                                                </button>
+                                                                                {canUseSplunkDeeplinks && (
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => openSplunkSearchFromChat(shownQuery)}
+                                                                                        className={turnIconButtonClass}
+                                                                                        title="Open the search in Splunk"
+                                                                                        aria-label="Open the search in Splunk"
+                                                                                    >
+                                                                                        <i className="fas fa-external-link-alt text-xs" aria-hidden="true"></i>
+                                                                                    </button>
+                                                                                )}
+                                                                            </span>
+                                                                        )}
+                                                                    </div>
+                                                                </li>
+                                                            );
+                                                        })}
+                                                    </ol>
+                                                </>
+                                            )}
+                                        </section>
+                                    </aside>
+                                )}
                                 </div>
                             </div>
                             </div>
                         </div>
-                    )}
-
+                        );
+                    })()}
                     {/* Chat Settings Modal */}
                     {isChatSettingsOpen && (() => {
                         const closeChatSettings = () => setIsChatSettingsOpen(false);
@@ -18384,7 +18886,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                 </div>
 
                                 <div className="flex-1 min-h-0 flex flex-col md:flex-row">
-                                    <aside className={`md:w-80 flex-shrink-0 flex flex-col min-h-0 max-h-72 md:max-h-none border-b md:border-b-0 md:border-r ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
+                                    <aside className={`md:w-80 flex-shrink-0 flex flex-col min-h-0 max-h-[50%] md:max-h-[none] border-b md:border-b-0 md:border-r ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`} data-testid="chat-goal-library-list">
                                         <form
                                             className={`p-4 space-y-2 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}
                                             onSubmit={(event) => {
@@ -18406,7 +18908,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 {chatGoalActivity === 'creating' ? 'Planning...' : 'Add goal'}
                                             </button>
                                         </form>
-                                        <div className="flex-1 min-h-0 overflow-y-auto">
+                                        <div className="flex-1 min-h-0 overflow-y-auto scroll-container">
                                             {chatGoalLibrary.length === 0 && (
                                                 <p className={`p-4 text-sm ${mutedTextClass}`}>
                                                     {isChatGoalLibraryLoading ? 'Loading goals...' : 'No goals yet. Add one here or set one in chat.'}
@@ -18446,7 +18948,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         </div>
                                     </aside>
 
-                                    <section className="flex-1 min-h-0 overflow-y-auto p-6 space-y-6" aria-label="Goal details">
+                                    <section className="flex-1 min-h-0 overflow-y-auto scroll-container p-6 space-y-6" aria-label="Goal details">
                                         {chatGoalNotice && (
                                             <div
                                                 role={chatGoalNotice.tone === 'error' ? 'alert' : 'status'}

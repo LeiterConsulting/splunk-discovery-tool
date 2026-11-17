@@ -20,6 +20,15 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+# Splunk adds these to events to describe indexing and parsing; charting them says nothing about the data.
+_SPLUNK_METADATA_FIELDS = frozenset({"linecount", "punct", "splunk_server", "splunk_server_group", "timestartpos", "timeendpos"})
+
+
+def _is_splunk_metadata_field(field: Any) -> bool:
+    lowered = str(field or "").strip().lower()
+    return lowered.startswith("_") or lowered.startswith("date_") or lowered in _SPLUNK_METADATA_FIELDS
+
+
 def _short_label(value: Any, limit: int = 22) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -186,6 +195,8 @@ class VisualizationPreviewProvider:
     def _numeric_fields(self, rows: List[Dict[str, Any]], fields: List[str]) -> List[str]:
         numeric_fields = []
         for field in fields:
+            if _is_splunk_metadata_field(field):
+                continue
             samples = [row.get(field) for row in rows[:8] if row.get(field) not in (None, "")]
             if samples and all(_safe_float(sample) is not None for sample in samples):
                 numeric_fields.append(field)

@@ -42,6 +42,17 @@ const themeNames = (process.env.UI_CONTRAST_THEMES || Object.keys(THEMES).join('
     .filter(Boolean);
 // A navigation change that silently skips a surface would otherwise let the gate pass.
 const SEEDED_GOAL_TITLE = 'Sensor data gap';
+const SEEDED_CHAT_REPLY = {
+    type: 'response',
+    data: {
+        response: '**Two sourcetypes** report into `sensors`:\n\n- `sensor:temp` sends most events.\n- `sensor:health` reports every 5 minutes.\n\n### Next step\nCheck when `sensor:temp` last reported.',
+        spl_query: 'index=sensors | stats count by sourcetype',
+        follow_on_actions: [{ label: 'Check the last sensor:temp event', prompt: 'When did sensor:temp last report?', kind: 'assistant_response_follow_up' }],
+        status_timeline: [{ action: 'Ran the search', time: 0.4 }],
+        iterations: 1,
+        execution_time: '0.4s',
+    },
+};
 const REQUIRED_SURFACES = [
     'welcome',
     'tab-overview',
@@ -52,6 +63,7 @@ const REQUIRED_SURFACES = [
     'tab-capabilities',
     'discovery-report-open',
     'chat',
+    'chat-conversation',
     'chat-settings',
     'chat-goal-library',
     'chat-goal',
@@ -459,6 +471,24 @@ async function auditTheme(browser, baseUrl, themeName) {
         if (await clickIfPresent(page.getByRole('button', { name: 'Open chat', exact: true }))) {
             await settle(page, 1000);
             await capture('chat', '[role="dialog"]');
+            // An answered question, so the reply, its toggles, and the side column's question list are audited too.
+            await page.route('**/chat/stream', (route) => route.fulfill({
+                status: 200,
+                contentType: 'text/event-stream',
+                body: `data: ${JSON.stringify(SEEDED_CHAT_REPLY)}\n\n`,
+            }));
+            const chatInput = page.getByLabel('Chat message input');
+            if (await chatInput.isVisible().catch(() => false)) {
+                await chatInput.fill('Which sourcetypes are in the sensors index?');
+                await chatInput.press('Enter');
+                await page.getByTestId('chat-reply-markdown').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                await settle(page, 600);
+                await capture('chat-conversation', '[role="dialog"]');
+                // The goal surfaces below expect an empty chat.
+                await clickIfPresent(page.getByRole('button', { name: 'Clear chat history' }));
+                await settle(page, 300);
+            }
+            await page.unroute('**/chat/stream');
             if (await clickIfPresent(page.getByRole('button', { name: 'Open chat settings' }))) {
                 await settle(page, 600);
                 await capture('chat-settings', '[role="dialog"]');

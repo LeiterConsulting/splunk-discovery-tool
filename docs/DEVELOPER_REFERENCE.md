@@ -75,7 +75,6 @@ Chat strategy combines deterministic and agentic logic:
 1. Update detect_basic_inventory_intent()
 2. Add handler branch in chat_with_splunk_logic()
 3. Return structured timeline/tool summaries for UI feedback
-4. Add a Suggested Query in UI for demo discoverability
 
 ### Chat goals and settings
 

@@ -12,6 +12,9 @@
   const CHAT_GOAL_STORAGE_KEY = "dt4sms_chat_goal_v1";
   const CHAT_GOAL_SAVED_CHAT_STORAGE_KEY = "dt4sms_chat_goal_saved_chat_v1";
   const CHAT_GOAL_SAVED_MESSAGE_LIMIT = 200;
+  const CHAT_LAYOUT_STORAGE_KEY = "dt4sms_chat_layout_v1";
+  const CHAT_SIDE_COLUMN_MEDIA_QUERY = "(min-width: 1024px)";
+  const CHAT_INPUT_MAX_HEIGHT_PX = 200;
   const WELCOME_SPLASH_PREFERENCE_KEY = "dt4sms_welcome_splash_dismissed_v1";
   const THEME_PREFERENCE_OPTIONS = [
     { value: "light", label: "Light" },
@@ -425,6 +428,106 @@
     } catch (error) {
       console.warn("Failed to save the chat goal", error);
     }
+  };
+  const loadChatLayoutPreference = () => {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) {
+        return "page";
+      }
+      return window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY) === "window" ? "window" : "page";
+    } catch (error) {
+      return "page";
+    }
+  };
+  const saveChatLayoutPreference = (value) => {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) {
+        return;
+      }
+      window.localStorage.setItem(CHAT_LAYOUT_STORAGE_KEY, value === "window" ? "window" : "page");
+    } catch (error) {
+      console.warn("Failed to save the chat layout", error);
+    }
+  };
+  const matchesChatSideColumnViewport = () => typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(CHAT_SIDE_COLUMN_MEDIA_QUERY).matches;
+  const buildChatTurns = (messages) => {
+    const turns = [];
+    let current = null;
+    for (const message of Array.isArray(messages) ? messages : []) {
+      if (!message || typeof message !== "object") {
+        continue;
+      }
+      if (message.type === "user") {
+        current = { question: message, reply: null, error: null };
+        turns.push(current);
+        continue;
+      }
+      if (!current) {
+        continue;
+      }
+      if (message.type === "assistant" && !current.reply) {
+        current.reply = message;
+      } else if (message.type === "error" && !current.error) {
+        current.error = message;
+      }
+    }
+    return turns;
+  };
+  const CHAT_DATA_FOCUS_PATTERN = /\b(index|sourcetype|host|source)\s*=\s*("[^"]+"|[^\s|()\[\],]+)/gi;
+  const CHAT_DATA_FOCUS_LIMIT = 10;
+  const collectChatDataFocus = (turns) => {
+    var _a, _b;
+    const terms = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (let turnIndex = (Array.isArray(turns) ? turns.length : 0) - 1; turnIndex >= 0; turnIndex -= 1) {
+      const query = String(((_b = (_a = turns[turnIndex]) == null ? void 0 : _a.reply) == null ? void 0 : _b.spl_query) || "");
+      for (const match of query.matchAll(CHAT_DATA_FOCUS_PATTERN)) {
+        const field = match[1].toLowerCase();
+        const value = match[2];
+        if (!value.replace(/["*]/g, "").trim()) {
+          continue;
+        }
+        const term = `${field}=${value}`;
+        if (seen.has(term.toLowerCase())) {
+          continue;
+        }
+        seen.add(term.toLowerCase());
+        terms.push({ field, value, term });
+        if (terms.length >= CHAT_DATA_FOCUS_LIMIT) {
+          return terms;
+        }
+      }
+    }
+    return terms;
+  };
+  const formatChatExportTimestamp = (value) => {
+    const parsed = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      return "";
+    }
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+  };
+  const CHAT_EXPORT_HEADINGS = { user: "You", assistant: "Assistant", warning: "Notice", error: "Error" };
+  const buildChatMarkdownExport = (messages, { goal = null, exportedAt = /* @__PURE__ */ new Date() } = {}) => {
+    const lines = ["# Chat export", "", `Exported ${formatChatExportTimestamp(exportedAt)}`];
+    if (goal && goal.goal) {
+      lines.push("", `**Goal:** ${goal.title ? `${goal.title}. ` : ""}${goal.goal}`);
+    }
+    for (const message of Array.isArray(messages) ? messages : []) {
+      if (!message || typeof message !== "object") {
+        continue;
+      }
+      const when = formatChatExportTimestamp(message.timestamp);
+      const heading = CHAT_EXPORT_HEADINGS[message.type] || "Message";
+      lines.push("", `## ${heading}${when ? ` (${when})` : ""}`, "", String(message.content || "").trim());
+      const query = message.type === "assistant" ? String(message.spl_query || message.spl_in_text || "").trim() : "";
+      if (query) {
+        lines.push("", message.spl_query ? "Search that ran:" : "Suggested search (not run):", "", "```spl", query, "```");
+      }
+    }
+    return `${lines.join("\n")}
+`;
   };
   const lastChatMessageId = (messages) => {
     const last = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : null;
@@ -1383,7 +1486,11 @@
     const [mcpSaveDraft, setMCPSaveDraft] = useState(null);
     const [showMCPConfigForm, setShowMCPConfigForm] = useState(false);
     const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState("Enter token");
-    const [showSuggestedQueries, setShowSuggestedQueries] = useState(false);
+    const [showChatGoalQuestions, setShowChatGoalQuestions] = useState(false);
+    const [chatReplyPanels, setChatReplyPanels] = useState({});
+    const [highlightedChatMessageId, setHighlightedChatMessageId] = useState(null);
+    const [chatCopyStatus, setChatCopyStatus] = useState(null);
+    const [isChatSideColumnViewport, setIsChatSideColumnViewport] = useState(matchesChatSideColumnViewport);
     const [isWelcomeSplashOpen, setIsWelcomeSplashOpen] = useState(() => !initialWelcomeSplashDismissed);
     const [hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash] = useState(() => initialWelcomeSplashDismissed);
     const [welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain] = useState(() => initialWelcomeSplashDismissed);
@@ -1438,6 +1545,7 @@
     const isArtifactsTab = workspaceTab === "artifacts";
     const isCapabilitiesTab = workspaceTab === "capabilities";
     const isChatTab = isChatFullscreen && workspaceTab === "chat";
+    const showChatSideColumn = isChatTab && isChatSideColumnViewport;
     const isSummaryTab = isSummaryFullscreen && workspaceTab === "summary-workspace";
     const operatorVoiceDefinition = OPERATOR_VOICE_OPTIONS.find((option) => option.value === operatorVoice) || OPERATOR_VOICE_OPTIONS[0];
     const isCapabilitiesOverview = isCapabilitiesTab && capabilitiesView === "overview";
@@ -1476,7 +1584,7 @@
     const workspaceRailListClass = showWorkspaceRail ? "lg:flex-1 lg:overflow-y-auto" : "";
     const discoveryWorkspaceSplitClass = "grid grid-cols-1 gap-6 lg:grid-cols-3";
     const windowedChatDialogStyle = {
-      height: "min(860px, calc(100dvh - 3rem))",
+      height: "min(1040px, calc(100dvh - 3rem))",
       maxHeight: "calc(100dvh - 3rem)"
     };
     const windowedSummaryDialogStyle = {
@@ -1489,20 +1597,6 @@
     };
     const windowedCapabilityDetailDialogStyle = {
       maxHeight: `calc(100dvh - ${capabilityOverlayTopOffset}px - 1.5rem)`
-    };
-    const fullscreenChatConversationStyle = isChatTab ? {
-      maxWidth: "min(96%, 112rem)",
-      marginLeft: "auto",
-      marginRight: "auto"
-    } : void 0;
-    const getChatBubbleStyle = (messageType) => {
-      if (!isChatTab) {
-        return void 0;
-      }
-      if (messageType === "user") {
-        return { maxWidth: "min(72%, 60rem)" };
-      }
-      return { maxWidth: "100%" };
     };
     const capabilityList = Object.values((capabilitiesData == null ? void 0 : capabilitiesData.capabilities) || {});
     const genericCapabilityList = capabilityList.filter((capability) => capability.name !== "rag_chromadb");
@@ -2244,16 +2338,6 @@
         execution_mode: String((source == null ? void 0 : source.execution_mode) || "").trim().toLowerCase() || null
       };
     };
-    const suggestedChatQueries = [
-      "Give me a narrative overview of what our Splunk environment appears to prioritize operationally.",
-      "What story do the current data sources tell about platform usage, reliability, and potential blind spots?",
-      "If you were onboarding a new security lead, what should they review first and why?",
-      "Describe likely risk trends we should monitor weekly, and how to validate whether they are improving.",
-      "Identify where data quality issues could silently undermine detections or reporting confidence.",
-      "Propose a practical 30-day hardening plan with quick wins, medium-term tasks, and measurable outcomes.",
-      "Suggest a weekly check we can run to catch drift, anomalies, and hidden failures.",
-      "Translate the discovery output into executive-ready priorities with business impact and verification steps."
-    ];
     const handleSettingsChange = () => {
     };
     const getApiKeyPlaceholderForProvider = (provider, hasStoredKey = false) => {
@@ -2653,7 +2737,12 @@
     const discoveryViewerScrollPendingRef = useRef(false);
     const messagesEndRef = useRef(null);
     const chatEndRef = useRef(null);
+    const chatScrollRef = useRef(null);
+    const chatScrollMessageCountRef = useRef(0);
     const chatInputRef = useRef(null);
+    const chatAbortControllerRef = useRef(null);
+    const chatHighlightTimerRef = useRef(null);
+    const chatCopyTimerRef = useRef(null);
     const ragAssetFileInputRef = useRef(null);
     const summaryRequestAbortRef = useRef(null);
     const scrollDiscoveryLogToBottom = (behavior = "smooth") => {
@@ -2712,12 +2801,36 @@
     useEffect(() => {
       if (isChatOpen || isChatTab) {
         setTimeout(() => {
-          var _a2, _b2;
-          (_a2 = chatEndRef.current) == null ? void 0 : _a2.scrollIntoView({ behavior: "auto", block: "end" });
-          (_b2 = chatInputRef.current) == null ? void 0 : _b2.focus();
+          var _a2;
+          (_a2 = chatInputRef.current) == null ? void 0 : _a2.focus();
         }, 100);
       }
     }, [isChatOpen, isChatTab]);
+    useEffect(() => {
+      if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+        return void 0;
+      }
+      const query = window.matchMedia(CHAT_SIDE_COLUMN_MEDIA_QUERY);
+      const update = () => setIsChatSideColumnViewport(query.matches);
+      update();
+      if (typeof query.addEventListener === "function") {
+        query.addEventListener("change", update);
+        return () => query.removeEventListener("change", update);
+      }
+      query.addListener(update);
+      return () => query.removeListener(update);
+    }, []);
+    useEffect(() => {
+      const input = chatInputRef.current;
+      if (!input) {
+        return;
+      }
+      input.style.height = "auto";
+      const borderHeight = input.offsetHeight - input.clientHeight;
+      const fullHeight = input.scrollHeight + borderHeight;
+      input.style.height = `${Math.min(fullHeight, CHAT_INPUT_MAX_HEIGHT_PX)}px`;
+      input.style.overflowY = fullHeight > CHAT_INPUT_MAX_HEIGHT_PX ? "auto" : "hidden";
+    }, [chatInput, isChatOpen, isChatTab, showChatSideColumn]);
     useEffect(() => {
       savePersistedChatState({
         chatSessionId,
@@ -7074,31 +7187,33 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       if (closeSaveDialog) closeSaveDialog();
       openSettingsTroubleshooter(kind, draft, { autoRun: true });
     };
-    const copyTroubleshootReport = async (reportText) => {
-      let copied = false;
+    const writeTextToClipboard = async (value) => {
+      const textValue = String(value != null ? value : "");
       try {
         if (navigator.clipboard && window.isSecureContext) {
-          await navigator.clipboard.writeText(reportText);
-          copied = true;
+          await navigator.clipboard.writeText(textValue);
+          return true;
         }
       } catch (clipboardError) {
+      }
+      const area = document.createElement("textarea");
+      area.value = textValue;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      let copied = false;
+      try {
+        copied = document.execCommand("copy");
+      } catch (copyError) {
         copied = false;
       }
-      if (!copied) {
-        const area = document.createElement("textarea");
-        area.value = reportText;
-        area.setAttribute("readonly", "");
-        area.style.position = "fixed";
-        area.style.opacity = "0";
-        document.body.appendChild(area);
-        area.select();
-        try {
-          copied = document.execCommand("copy");
-        } catch (copyError) {
-          copied = false;
-        }
-        area.remove();
-      }
+      area.remove();
+      return copied;
+    };
+    const copyTroubleshootReport = async (reportText) => {
+      const copied = await writeTextToClipboard(reportText);
       setTroubleshootCopied(copied ? "copied" : "failed");
     };
     const pagePort = () => Number(window.location.port) || (window.location.protocol === "https:" ? 443 : 80);
@@ -8201,25 +8316,55 @@ Open Troubleshoot to find out why it can't be saved?`)) {
     };
     useEffect(() => {
       var _a2;
-      if ((isChatOpen || isChatTab) && chatMessages.length > 0) {
-        (_a2 = chatEndRef.current) == null ? void 0 : _a2.scrollIntoView({ behavior: "smooth", block: "end" });
+      if (!(isChatOpen || isChatTab) || chatMessages.length === 0) {
+        chatScrollMessageCountRef.current = chatMessages.length;
+        return;
       }
+      const isNewMessage = chatMessages.length > chatScrollMessageCountRef.current;
+      chatScrollMessageCountRef.current = chatMessages.length;
+      const behavior = isNewMessage ? "smooth" : "auto";
+      const lastMessage = chatMessages[chatMessages.length - 1];
+      let anchorId = null;
+      if (lastMessage && lastMessage.type !== "user") {
+        for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
+          if (chatMessages[index].type === "user") {
+            anchorId = chatMessages[index].id;
+            break;
+          }
+        }
+        if (anchorId === null) {
+          anchorId = lastMessage.id;
+        }
+      }
+      const container = chatScrollRef.current;
+      const anchor = anchorId !== null && container ? Array.from(container.querySelectorAll("[data-chat-message-id]")).find((node) => node.getAttribute("data-chat-message-id") === String(anchorId)) : null;
+      if (anchor) {
+        anchor.scrollIntoView({ behavior, block: "start" });
+        return;
+      }
+      (_a2 = chatEndRef.current) == null ? void 0 : _a2.scrollIntoView({ behavior, block: "end" });
     }, [chatMessages, isChatOpen, isChatTab]);
+    const showChatPage = () => {
+      setIsChatOpen(false);
+      setIsChatFullscreen(true);
+      setWorkspaceTab("chat");
+    };
     const openChatSurface = () => {
-      if (isChatFullscreen) {
-        setIsChatOpen(false);
-        setWorkspaceTab("chat");
+      if (isChatFullscreen || loadChatLayoutPreference() === "page") {
+        showChatPage();
         return;
       }
       setIsChatOpen(true);
     };
     const enterChatFullscreen = () => {
-      setIsChatOpen(false);
-      setIsChatFullscreen(true);
-      setWorkspaceTab("chat");
+      saveChatLayoutPreference("page");
+      showChatPage();
     };
     const exitChatFullscreen = ({ reopenModal = false } = {}) => {
       const nextTab = lastPrimaryWorkspaceTab && lastPrimaryWorkspaceTab !== "chat" ? lastPrimaryWorkspaceTab : "mission";
+      if (reopenModal) {
+        saveChatLayoutPreference("window");
+      }
       setIsChatFullscreen(false);
       if (workspaceTab === "chat") {
         setWorkspaceTab(nextTab);
@@ -8745,6 +8890,8 @@ What should we check first? Run the first search that helps.`);
         setServerConversationHistory(null);
       }
       setIsTyping(true);
+      const requestController = new AbortController();
+      chatAbortControllerRef.current = requestController;
       setChatMessages((prev) => [...prev, {
         id: Date.now(),
         type: "user",
@@ -8766,7 +8913,8 @@ What should we check first? Run the first search that helps.`);
             investigation_mode: investigationMode,
             mission: goalIdForRequest ? String((activeChatGoal == null ? void 0 : activeChatGoal.goal) || "") : "",
             goal_id: goalIdForRequest || null
-          })
+          }),
+          signal: requestController.signal
         });
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -8853,15 +9001,27 @@ What should we check first? Run the first search that helps.`);
           }
         }
       } catch (error) {
-        console.error("Chat error:", error);
         setChatStatus("");
-        setChatMessages((prev) => [...prev, {
-          id: Date.now() + 1,
-          type: "error",
-          content: `Failed to send message: ${error.message}`,
-          timestamp: (/* @__PURE__ */ new Date()).toISOString()
-        }]);
+        if ((error == null ? void 0 : error.name) === "AbortError") {
+          setChatMessages((prev) => [...prev, {
+            id: Date.now() + 1,
+            type: "warning",
+            content: "You stopped this answer before it finished.",
+            timestamp: (/* @__PURE__ */ new Date()).toISOString()
+          }]);
+        } else {
+          console.error("Chat error:", error);
+          setChatMessages((prev) => [...prev, {
+            id: Date.now() + 1,
+            type: "error",
+            content: `Failed to send message: ${error.message}`,
+            timestamp: (/* @__PURE__ */ new Date()).toISOString()
+          }]);
+        }
       } finally {
+        if (chatAbortControllerRef.current === requestController) {
+          chatAbortControllerRef.current = null;
+        }
         setIsTyping(false);
         setChatStatus("");
         setTimeout(() => {
@@ -8893,14 +9053,65 @@ What should we check first? Run the first search that helps.`);
         investigationMode: (options == null ? void 0 : options.investigationMode) || null
       });
     };
-    const useSuggestedQuery = (query) => {
-      setChatInput(query);
-      if (chatInputRef.current) {
-        setTimeout(() => chatInputRef.current.focus(), 0);
+    const addTermToChatInput = (term) => {
+      const value = String(term || "").trim();
+      if (!value) {
+        return;
       }
+      setChatInput((previous) => {
+        const current = String(previous || "");
+        if (current.includes(value)) {
+          return current;
+        }
+        return current.trim() ? `${current.replace(/\s+$/, "")} ${value}` : value;
+      });
+      setTimeout(() => {
+        var _a2;
+        return (_a2 = chatInputRef.current) == null ? void 0 : _a2.focus();
+      }, 0);
+    };
+    const findChatMessageNode = (messageId) => {
+      const container = chatScrollRef.current;
+      return container ? Array.from(container.querySelectorAll("[data-chat-message-id]")).find((node) => node.getAttribute("data-chat-message-id") === String(messageId)) : null;
+    };
+    const jumpToChatMessage = (messageId, options = {}) => {
+      if (options.replyId !== void 0 && options.panel) {
+        setChatReplyPanels((prev) => ({ ...prev, [options.replyId]: options.panel }));
+      }
+      const target = findChatMessageNode(messageId);
+      if (!target) {
+        return;
+      }
+      const reduceMotion = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      target.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+      setHighlightedChatMessageId(messageId);
+      clearTimeout(chatHighlightTimerRef.current);
+      chatHighlightTimerRef.current = setTimeout(() => setHighlightedChatMessageId(null), 1800);
+    };
+    const copyChatText = async (key, value) => {
+      const copied = await writeTextToClipboard(value);
+      setChatCopyStatus({ key, status: copied ? "copied" : "failed" });
+      clearTimeout(chatCopyTimerRef.current);
+      chatCopyTimerRef.current = setTimeout(() => setChatCopyStatus(null), 2e3);
+    };
+    const chatCopyState = (key) => chatCopyStatus && chatCopyStatus.key === key ? chatCopyStatus.status : null;
+    const exportChatAsMarkdown = () => {
+      if (chatMessages.length === 0) {
+        return;
+      }
+      const exportedAt = /* @__PURE__ */ new Date();
+      const content = buildChatMarkdownExport(chatMessages, { goal: activeChatGoal, exportedAt });
+      exportReport(`chat-${formatChatExportTimestamp(exportedAt).replace(/[: ]/g, "-")}.md`, content);
+    };
+    const stopChatAnswer = () => {
+      var _a2;
+      (_a2 = chatAbortControllerRef.current) == null ? void 0 : _a2.abort();
     };
     const sendSuggestedQuery = async (query) => {
       await sendChatMessage(query);
+    };
+    const toggleChatReplyPanel = (messageId, panelKey) => {
+      setChatReplyPanels((prev) => ({ ...prev, [messageId]: prev[messageId] === panelKey ? null : panelKey }));
     };
     const loadReport = async (filename) => {
       try {
@@ -10044,13 +10255,12 @@ What should we check first? Run the first search that helps.`);
       }
       return true;
     });
-    const copyToClipboard = (text) => {
-      navigator.clipboard.writeText(text).then(() => {
+    const copyToClipboard = async (text) => {
+      if (await writeTextToClipboard(text)) {
         addMessage("success", { message: "Copied to clipboard!" });
-      }).catch((err) => {
-        console.error("Failed to copy:", err);
+      } else {
         addMessage("error", { message: "Failed to copy to clipboard" });
-      });
+      }
     };
     const exportReport = (filename, content) => {
       const blob = new Blob([content], { type: "text/plain" });
@@ -10294,9 +10504,9 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         const key = `${keyPrefix}-${tokenIndex}`;
         tokenIndex += 1;
         if (token.startsWith("`")) {
-          parts.push(/* @__PURE__ */ React.createElement("code", { key, className: `rounded px-1 py-0.5 font-mono text-xs ${isDarkTheme ? "bg-gray-900 text-gray-100" : "bg-gray-100 text-gray-900"}` }, token.slice(1, -1)));
+          parts.push(/* @__PURE__ */ React.createElement("code", { key, className: `rounded border px-1 py-0.5 font-mono ${isDarkTheme ? "bg-gray-800 border-gray-700 text-gray-100" : "bg-gray-100 border-gray-200 text-gray-900"}`, style: { fontSize: "0.875em" } }, token.slice(1, -1)));
         } else if (token.startsWith("**")) {
-          parts.push(/* @__PURE__ */ React.createElement("strong", { key, className: "font-semibold" }, token.slice(2, -2)));
+          parts.push(/* @__PURE__ */ React.createElement("strong", { key, className: "font-semibold" }, renderMarkdownInline(token.slice(2, -2), key)));
         } else if (token.startsWith("[")) {
           const linkMatch = token.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
           if (linkMatch && /^https?:\/\//i.test(linkMatch[2])) {
@@ -10312,7 +10522,8 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       if (lastIndex < source.length) parts.push(source.slice(lastIndex));
       return parts;
     };
-    const renderMarkdownDocument = (source) => {
+    const renderMarkdownDocument = (source, options = {}) => {
+      const compact = Boolean(options.compact);
       const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
       const fencePattern = /^\s*```/;
       const headingPattern = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
@@ -10325,7 +10536,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       const startsBlock = (line, nextLine) => fencePattern.test(line) || headingPattern.test(line) || rulePattern.test(line) || quotePattern.test(line) || listPattern.test(line) || tableRowPattern.test(line) && tableDividerPattern.test(nextLine || "");
       const bodyClass = isDarkTheme ? "text-gray-200" : "text-gray-800";
       const ruleClass = isDarkTheme ? "border-gray-700" : "border-gray-200";
-      const headingSizes = ["text-xl", "text-lg", "text-base"];
+      const headingSizes = compact ? ["text-lg", "text-base", "text-base"] : ["text-xl", "text-lg", "text-base"];
       const blocks = [];
       let index = 0;
       while (index < lines.length) {
@@ -10353,7 +10564,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           const level = Math.min(heading[1].length, 3);
           const HeadingTag = `h${level + 2}`;
           blocks.push(
-            /* @__PURE__ */ React.createElement(HeadingTag, { key, className: `${level === 1 ? "pt-2" : "pt-3"} font-semibold ${headingSizes[level - 1]} ${headingClass}` }, renderMarkdownInline(heading[2], key))
+            /* @__PURE__ */ React.createElement(HeadingTag, { key, className: `${compact ? "pt-1" : level === 1 ? "pt-2" : "pt-3"} font-semibold ${headingSizes[level - 1]} ${headingClass}` }, renderMarkdownInline(heading[2], key))
           );
           index += 1;
           continue;
@@ -10390,10 +10601,21 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         const listMatch = line.match(listPattern);
         if (listMatch) {
           const ordered = /\d/.test(listMatch[2]);
+          const startNumber = ordered ? parseInt(listMatch[2], 10) : 1;
           const items = [];
           while (index < lines.length) {
             const itemMatch = lines[index].match(listPattern);
-            if (!itemMatch) break;
+            if (!itemMatch) {
+              const continuation = lines[index];
+              if (items.length > 0 && /^\s{2,}\S/.test(continuation) && !fencePattern.test(continuation)) {
+                const lastItem = items[items.length - 1];
+                const target = lastItem.children.length > 0 ? lastItem.children[lastItem.children.length - 1] : lastItem;
+                target.text = `${target.text} ${continuation.trim()}`;
+                index += 1;
+                continue;
+              }
+              break;
+            }
             const isNested = itemMatch[1].length >= 2 && items.length > 0;
             if (!isNested && /\d/.test(itemMatch[2]) !== ordered) break;
             const item = { text: itemMatch[3], ordered: /\d/.test(itemMatch[2]), children: [] };
@@ -10406,7 +10628,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           }
           const ListTag = ordered ? "ol" : "ul";
           blocks.push(
-            /* @__PURE__ */ React.createElement(ListTag, { key, className: `space-y-1 pl-5 ${ordered ? "list-decimal" : "list-disc"} ${bodyClass}` }, items.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${key}-${itemIndex}` }, renderMarkdownInline(item.text, `${key}-${itemIndex}`), item.children.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: "mt-1 space-y-1 pl-5", style: { listStyleType: "circle" } }, item.children.map((child, childIndex) => /* @__PURE__ */ React.createElement("li", { key: `${key}-${itemIndex}-${childIndex}` }, renderMarkdownInline(child.text, `${key}-${itemIndex}-${childIndex}`)))))))
+            /* @__PURE__ */ React.createElement(ListTag, { key, start: ordered && startNumber > 1 ? startNumber : void 0, className: `space-y-1 pl-5 ${ordered ? "list-decimal" : "list-disc"} ${bodyClass}` }, items.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${key}-${itemIndex}` }, renderMarkdownInline(item.text, `${key}-${itemIndex}`), item.children.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: "mt-1 space-y-1 pl-5", style: { listStyleType: "circle" } }, item.children.map((child, childIndex) => /* @__PURE__ */ React.createElement("li", { key: `${key}-${itemIndex}-${childIndex}` }, renderMarkdownInline(child.text, `${key}-${itemIndex}-${childIndex}`)))))))
           );
           continue;
         }
@@ -10420,6 +10642,158 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         );
       }
       return blocks;
+    };
+    const renderChatGoalSection = (layout = "bar") => {
+      const isColumn = layout === "column";
+      const goal = activeChatGoal;
+      const goalBusy = Boolean(chatGoalActivity);
+      const barClass = isColumn ? `p-4 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` : `px-5 py-2.5 border-b ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}`;
+      const iconButtonClass = `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`;
+      const inputClass = `px-3 py-1.5 text-sm rounded border ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`;
+      const primaryButtonClass = "inline-flex items-center justify-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white whitespace-nowrap transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed";
+      const outlineButtonClass = `inline-flex items-center justify-center rounded-md border px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`;
+      const labelClass = `text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}`;
+      const libraryButton = /* @__PURE__ */ React.createElement("button", { type: "button", onClick: openChatGoalLibrary, className: iconButtonClass, title: "Goal library", "aria-label": "Open the goal library" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-book", "aria-hidden": "true" }));
+      const leaveButton = /* @__PURE__ */ React.createElement("button", { type: "button", onClick: leaveChatGoal, className: iconButtonClass, title: "Leave goal", "aria-label": "Leave this goal. It stays in the goal library." }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-sign-out-alt", "aria-hidden": "true" }));
+      const noticeNode = chatGoalNotice && /* @__PURE__ */ React.createElement(
+        "p",
+        {
+          role: chatGoalNotice.tone === "error" ? "alert" : "status",
+          "data-testid": "chat-goal-notice",
+          className: `mt-2 text-xs ${chatGoalNotice.tone === "error" ? isDarkTheme ? "text-red-300" : "text-red-700" : mutedTextClass}`
+        },
+        chatGoalNotice.text
+      );
+      if (!activeChatGoalId) {
+        const missionLabel = /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-mission-input", className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal");
+        const missionInput = /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            id: "chat-mission-input",
+            type: "text",
+            value: chatMission,
+            maxLength: CHAT_MISSION_MAX_CHARS,
+            onChange: (event) => setChatMission(event.target.value),
+            placeholder: isColumn ? "Optional. What do you want to find out?" : "Optional. What do you want to find out? For example, why sensor data stopped arriving",
+            title: "Set a goal to list the questions that settle it and keep the assistant focused on it.",
+            className: `${isColumn ? "w-full" : "flex-1 min-w-0"} ${inputClass}`,
+            disabled: chatGoalActivity === "creating"
+          }
+        );
+        const submitButton = /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: !chatMission.trim() || goalBusy, className: primaryButtonClass }, chatGoalActivity === "creating" ? "Planning..." : "Set goal");
+        return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement(
+          "form",
+          {
+            className: isColumn ? "space-y-2" : "flex items-center gap-3",
+            onSubmit: (event) => {
+              event.preventDefault();
+              createChatGoal(chatMission, { activate: true });
+            }
+          },
+          isColumn ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, missionLabel, libraryButton), missionInput, /* @__PURE__ */ React.createElement("div", null, submitButton)) : /* @__PURE__ */ React.createElement(React.Fragment, null, missionLabel, missionInput, submitButton, libraryButton)
+        ), noticeNode);
+      }
+      if (!goal) {
+        return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement("p", { className: `flex-1 min-w-0 text-sm ${mutedTextClass}` }, "Loading the goal..."), libraryButton, leaveButton), noticeNode);
+      }
+      const items = Array.isArray(goal.items) ? goal.items : [];
+      const progress2 = goal.progress || {};
+      const progressText = progress2.total ? `${progress2.answered} of ${progress2.total} answered` : "No questions tracked";
+      const isChecking = chatGoalCheckingId === goal.id;
+      const pendingTurns = Number(goal.pending_turns || 0);
+      if (isChatGoalEditing) {
+        return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement(
+          "form",
+          {
+            className: "space-y-2",
+            onSubmit: async (event) => {
+              event.preventDefault();
+              if (await saveChatGoalText(goal, chatGoalEditDraft)) {
+                setIsChatGoalEditing(false);
+              }
+            }
+          },
+          /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-goal-edit-title", className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Name"), /* @__PURE__ */ React.createElement(
+            "input",
+            {
+              id: "chat-goal-edit-title",
+              type: "text",
+              value: chatGoalEditDraft.title,
+              maxLength: 80,
+              onChange: (event) => setChatGoalEditDraft((prev) => ({ ...prev, title: event.target.value })),
+              placeholder: "Leave empty to name it from the goal",
+              className: `flex-1 min-w-0 ${inputClass}`
+            }
+          )),
+          /* @__PURE__ */ React.createElement(
+            "textarea",
+            {
+              "aria-label": "Goal",
+              value: chatGoalEditDraft.goal,
+              maxLength: CHAT_MISSION_MAX_CHARS,
+              rows: isColumn ? 4 : 2,
+              onChange: (event) => setChatGoalEditDraft((prev) => ({ ...prev, goal: event.target.value })),
+              className: `w-full resize-none ${inputClass}`
+            }
+          ),
+          /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setIsChatGoalEditing(false), className: outlineButtonClass }, "Cancel"), /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: goalBusy || !chatGoalEditDraft.goal.trim(), className: primaryButtonClass }, chatGoalActivity === "saving" ? "Saving..." : "Save"))
+        ), noticeNode);
+      }
+      const progressLabel = goal.status === "done" ? `Done, ${progressText}` : progressText;
+      const progressBadgeClass = `rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap ${goal.status === "done" ? isDarkTheme ? "border-green-700 bg-green-900 text-green-100" : "border-green-200 bg-green-50 text-green-800" : isDarkTheme ? "border-indigo-700 bg-indigo-950 text-indigo-100" : "border-indigo-200 bg-indigo-50 text-indigo-800"}`;
+      const checkingNode = isChecking && /* @__PURE__ */ React.createElement("span", { className: `text-xs whitespace-nowrap ${mutedTextClass}`, role: "status" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-1", "aria-hidden": "true" }), "Checking progress...");
+      const startButton = chatMessages.length > 0 && Number(goal.turn_count || 0) === 0 && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: startOnChatGoal, disabled: isTyping, className: primaryButtonClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" }), "Start on this goal");
+      const editButton = /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => {
+            setChatGoalEditDraft({ title: goal.title || "", goal: goal.goal || "" });
+            setIsChatGoalEditing(true);
+          },
+          className: iconButtonClass,
+          title: "Edit goal",
+          "aria-label": "Edit this goal"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen", "aria-hidden": "true" })
+      );
+      const progressPanel = /* @__PURE__ */ React.createElement(
+        "div",
+        {
+          id: "chat-goal-progress",
+          "data-testid": "chat-goal-progress",
+          className: `mt-3 rounded-lg border p-3 ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}`
+        },
+        goal.summary && /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-2 ${subtextClass}` }, renderMarkdownInline(goal.summary, "goal-summary")),
+        items.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: `space-y-1.5 ${isColumn ? "" : "max-h-56 overflow-y-auto"}` }, items.map((item) => /* @__PURE__ */ React.createElement("li", { key: item.id, className: "flex items-start gap-2 text-sm" }, /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "checkbox",
+            checked: item.status === "answered",
+            onChange: (event) => updateChatGoalItem(goal.id, item.id, { status: event.target.checked ? "answered" : "open" }),
+            disabled: goalBusy,
+            className: "mt-1 h-4 w-4 flex-shrink-0",
+            "aria-label": `Answered: ${item.text}`
+          }
+        ), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: item.status === "answered" ? mutedTextClass : headingClass }, renderMarkdownInline(item.text, `goal-item-${item.id}`)), item.note && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-0.5 ${mutedTextClass}` }, renderMarkdownInline(item.note, `goal-note-${item.id}`)))))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, "No questions are tracked yet. Select Plan again to suggest some, or add your own in the goal library."),
+        /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, "Progress is checked after each answer."), pendingTurns > 0 && !isChecking && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => checkChatGoalProgress(goal.id), className: "font-medium ui-link" }, "Check progress now"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => replanChatGoal(goal.id), disabled: goalBusy, className: "font-medium ui-link disabled:opacity-50" }, chatGoalActivity === "planning" ? "Planning..." : "Plan again"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: openChatGoalLibrary, className: "font-medium ui-link" }, "Manage in the goal library"))
+      );
+      if (isColumn) {
+        return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, editButton, libraryButton, leaveButton)), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-sm font-semibold break-words ${headingClass}`, title: goal.goal, "data-testid": "chat-goal-title" }, goal.title), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: progressBadgeClass, "data-testid": "chat-goal-progress-status" }, progressLabel), checkingNode), startButton && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, startButton), progressPanel, noticeNode);
+      }
+      return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement("p", { className: `flex-1 min-w-0 truncate text-sm font-medium ${headingClass}`, title: goal.goal, "data-testid": "chat-goal-title" }, goal.title), checkingNode, startButton, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => setIsChatGoalProgressOpen((prev) => !prev),
+          "aria-expanded": isChatGoalProgressOpen,
+          "aria-controls": "chat-goal-progress",
+          "data-testid": "chat-goal-progress-toggle",
+          className: progressBadgeClass
+        },
+        progressLabel,
+        /* @__PURE__ */ React.createElement("i", { className: `fas ${isChatGoalProgressOpen ? "fa-chevron-up" : "fa-chevron-down"} ml-1.5`, "aria-hidden": "true" })
+      ), editButton, libraryButton, leaveButton), isChatGoalProgressOpen && progressPanel, noticeNode);
     };
     const isMarkdownReportName = (reportName) => /\.(md|markdown)$/i.test(String(reportName || ""));
     const openDiscoveryLibraryReport = (reportName) => {
@@ -11343,328 +11717,358 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           ))
         )
       );
-    })(), (isChatOpen || isChatTab) && /* @__PURE__ */ React.createElement(
-      "div",
-      {
-        className: isChatTab ? "fixed inset-x-0 bottom-0 z-40" : "fixed inset-0 bg-black bg-opacity-50 z-50 overflow-y-auto p-3 sm:p-6",
-        style: isChatTab ? { top: `${headerHeight}px` } : void 0
-      },
-      /* @__PURE__ */ React.createElement("div", { className: isChatTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-6` : "min-h-full w-full flex items-center justify-center" }, /* @__PURE__ */ React.createElement("div", { className: `${isChatTab ? `h-full min-h-0 rounded-2xl shadow-2xl flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white border border-gray-200"}` : `rounded-xl shadow-2xl w-full max-w-4xl min-h-0 flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`}`, style: isChatTab ? void 0 : windowedChatDialogStyle, role: "dialog", "aria-modal": isChatTab ? "false" : "true", "aria-labelledby": "chat-modal-title", onKeyDown: (event) => handleDialogKeyDown(event, closeChatSurface) }, /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-b flex justify-between items-center gap-4 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-comments text-xl text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { id: "chat-modal-title", className: `text-xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Chat"))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, /* @__PURE__ */ React.createElement(
-        "button",
+    })(), (isChatOpen || isChatTab) && (() => {
+      const chatGoalQuestions = activeChatGoal && Array.isArray(activeChatGoal.suggested_questions) ? activeChatGoal.suggested_questions : [];
+      const chatColumnClass = "mx-auto w-full max-w-4xl";
+      const chatDividerClass = isDarkTheme ? "border-gray-700" : "border-gray-200";
+      const chatSectionLabelClass = `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}`;
+      const headerIconButtonClass = `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`;
+      const goalQuestionButtonClass = isDarkTheme ? "bg-indigo-950 border-indigo-700 text-indigo-100 hover:bg-indigo-900" : "bg-indigo-50 border-indigo-200 text-indigo-900 hover:bg-indigo-100";
+      const chatTurns = buildChatTurns(chatMessages);
+      const chatDataFocus = collectChatDataFocus(chatTurns);
+      const chatSearchCount = chatTurns.filter((turn) => {
+        var _a2;
+        return (_a2 = turn.reply) == null ? void 0 : _a2.spl_query;
+      }).length;
+      const turnCardClass = isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white";
+      const turnJumpClass = isDarkTheme ? "text-gray-100 hover:bg-gray-800" : "text-gray-800 hover:bg-gray-50";
+      const turnChipClass = isDarkTheme ? "border-gray-600 text-gray-200 hover:bg-gray-800" : "border-gray-200 text-gray-700 hover:bg-gray-100";
+      const turnIconButtonClass = `rounded p-1 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-800" : "text-gray-500 hover:text-gray-800 hover:bg-gray-100"}`;
+      const dataFocusChipClass = isDarkTheme ? "border-gray-600 bg-gray-900 text-gray-100 hover:border-indigo-400" : "border-gray-200 bg-white text-gray-800 hover:border-indigo-400";
+      const quietActionClass = isDarkTheme ? "text-gray-400 hover:text-gray-100" : "text-gray-500 hover:text-gray-800";
+      const twoLineClampStyle = { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden", overflowWrap: "anywhere" };
+      const replyToggleIdleClass = isDarkTheme ? "border-gray-700 text-gray-200 hover:bg-gray-800" : "border-gray-200 text-gray-700 hover:bg-gray-50";
+      const replyToggleOpenClass = isDarkTheme ? "border-indigo-500 bg-indigo-950 text-indigo-100" : "border-indigo-300 bg-indigo-50 text-indigo-800";
+      const nextActionButtonClass = isDarkTheme ? "bg-indigo-950 border-indigo-700 text-indigo-100 hover:bg-indigo-900" : "bg-white border-indigo-200 text-indigo-900 hover:bg-indigo-50";
+      const assistantAvatarClass = isDarkTheme ? "bg-indigo-950 text-indigo-300" : "bg-indigo-50 text-indigo-600";
+      return /* @__PURE__ */ React.createElement(
+        "div",
         {
-          type: "button",
-          onClick: () => setIsChatSettingsOpen(true),
-          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
-          title: "Chat settings",
-          "aria-label": "Open chat settings"
+          className: isChatTab ? "fixed inset-x-0 bottom-0 z-40" : "fixed inset-0 bg-black bg-opacity-50 z-50 overflow-y-auto p-3 sm:p-6",
+          style: isChatTab ? { top: `${headerHeight}px` } : void 0
         },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog", "aria-hidden": "true" })
-      ), isChatTab ? /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => exitChatFullscreen({ reopenModal: true }),
-          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
-          title: "Show chat in a window",
-          "aria-label": "Show chat in a window"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-compress-arrows-alt", "aria-hidden": "true" })
-      ) : /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: enterChatFullscreen,
-          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
-          title: "Open chat full screen",
-          "aria-label": "Open chat full screen"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-expand-arrows-alt", "aria-hidden": "true" })
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: startNewChat,
-          disabled: isTyping,
-          className: `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
-          title: isTyping ? "Wait for the answer to finish before clearing the chat" : "Clear chat",
-          "aria-label": "Clear chat history"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash", "aria-hidden": "true" })
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: closeChatSurface,
-          className: `rounded-md p-1.5 ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`,
-          "aria-label": "Close chat"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
-      ))), (() => {
-        const goal = activeChatGoal;
-        const goalBusy = Boolean(chatGoalActivity);
-        const barClass = `px-6 py-3 border-b ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}`;
-        const iconButtonClass = `rounded-md p-1.5 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "text-gray-300 hover:text-gray-100 hover:bg-gray-700" : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"}`;
-        const inputClass = `px-3 py-1.5 text-sm rounded border ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`;
-        const primaryButtonClass = "inline-flex items-center justify-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white whitespace-nowrap transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed";
-        const outlineButtonClass = `inline-flex items-center justify-center rounded-md border px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`;
-        const labelClass = `text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${mutedTextClass}`;
-        const libraryButton = /* @__PURE__ */ React.createElement("button", { type: "button", onClick: openChatGoalLibrary, className: iconButtonClass, title: "Goal library", "aria-label": "Open the goal library" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-book", "aria-hidden": "true" }));
-        const noticeNode = chatGoalNotice && /* @__PURE__ */ React.createElement(
-          "p",
-          {
-            role: chatGoalNotice.tone === "error" ? "alert" : "status",
-            "data-testid": "chat-goal-notice",
-            className: `mt-2 text-xs ${chatGoalNotice.tone === "error" ? isDarkTheme ? "text-red-300" : "text-red-700" : mutedTextClass}`
-          },
-          chatGoalNotice.text
-        );
-        if (!activeChatGoalId) {
-          return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement(
-            "form",
-            {
-              className: "flex items-center gap-3",
-              onSubmit: (event) => {
-                event.preventDefault();
-                createChatGoal(chatMission, { activate: true });
-              }
-            },
-            /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-mission-input", className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"),
-            /* @__PURE__ */ React.createElement(
-              "input",
-              {
-                id: "chat-mission-input",
-                type: "text",
-                value: chatMission,
-                maxLength: CHAT_MISSION_MAX_CHARS,
-                onChange: (event) => setChatMission(event.target.value),
-                placeholder: "Optional. What do you want to find out? For example, why sensor data stopped arriving",
-                title: "Set a goal to list the questions that settle it and keep the assistant focused on it.",
-                className: `flex-1 min-w-0 ${inputClass}`,
-                disabled: chatGoalActivity === "creating"
-              }
-            ),
-            /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: !chatMission.trim() || goalBusy, className: primaryButtonClass }, chatGoalActivity === "creating" ? "Planning..." : "Set goal"),
-            libraryButton
-          ), noticeNode);
-        }
-        if (!goal) {
-          return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement("p", { className: `flex-1 min-w-0 text-sm ${mutedTextClass}` }, "Loading the goal..."), libraryButton, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: leaveChatGoal, className: iconButtonClass, title: "Leave goal", "aria-label": "Leave this goal. It stays in the goal library." }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-sign-out-alt", "aria-hidden": "true" }))), noticeNode);
-        }
-        const items = Array.isArray(goal.items) ? goal.items : [];
-        const progress2 = goal.progress || {};
-        const progressText = progress2.total ? `${progress2.answered} of ${progress2.total} answered` : "No questions tracked";
-        const isChecking = chatGoalCheckingId === goal.id;
-        const pendingTurns = Number(goal.pending_turns || 0);
-        if (isChatGoalEditing) {
-          return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement(
-            "form",
-            {
-              className: "space-y-2",
-              onSubmit: async (event) => {
-                event.preventDefault();
-                if (await saveChatGoalText(goal, chatGoalEditDraft)) {
-                  setIsChatGoalEditing(false);
-                }
-              }
-            },
-            /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("label", { htmlFor: "chat-goal-edit-title", className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Name"), /* @__PURE__ */ React.createElement(
-              "input",
-              {
-                id: "chat-goal-edit-title",
-                type: "text",
-                value: chatGoalEditDraft.title,
-                maxLength: 80,
-                onChange: (event) => setChatGoalEditDraft((prev) => ({ ...prev, title: event.target.value })),
-                placeholder: "Leave empty to name it from the goal",
-                className: `flex-1 min-w-0 ${inputClass}`
-              }
-            )),
-            /* @__PURE__ */ React.createElement(
-              "textarea",
-              {
-                "aria-label": "Goal",
-                value: chatGoalEditDraft.goal,
-                maxLength: CHAT_MISSION_MAX_CHARS,
-                rows: "2",
-                onChange: (event) => setChatGoalEditDraft((prev) => ({ ...prev, goal: event.target.value })),
-                className: `w-full resize-none ${inputClass}`
-              }
-            ),
-            /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setIsChatGoalEditing(false), className: outlineButtonClass }, "Cancel"), /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: goalBusy || !chatGoalEditDraft.goal.trim(), className: primaryButtonClass }, chatGoalActivity === "saving" ? "Saving..." : "Save"))
-          ), noticeNode);
-        }
-        return /* @__PURE__ */ React.createElement("div", { className: barClass, "data-testid": "chat-goal-bar" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye mr-1", "aria-hidden": "true" }), "Goal"), /* @__PURE__ */ React.createElement("p", { className: `flex-1 min-w-0 truncate text-sm font-medium ${headingClass}`, title: goal.goal, "data-testid": "chat-goal-title" }, goal.title), isChecking && /* @__PURE__ */ React.createElement("span", { className: `text-xs whitespace-nowrap ${mutedTextClass}`, role: "status" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-1", "aria-hidden": "true" }), "Checking progress..."), chatMessages.length > 0 && Number(goal.turn_count || 0) === 0 && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: startOnChatGoal, disabled: isTyping, className: primaryButtonClass }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" }), "Start on this goal"), /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("div", { className: isChatTab ? `${workspaceShellWidthClass} mx-auto h-full px-4 sm:px-6 lg:px-8 py-4` : "min-h-full w-full flex items-center justify-center" }, /* @__PURE__ */ React.createElement("div", { className: `${isChatTab ? `h-full min-h-0 rounded-2xl shadow-2xl flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white border border-gray-200"}` : `rounded-xl shadow-2xl w-full max-w-5xl min-h-0 flex flex-col overflow-hidden ${isDarkTheme ? "bg-gray-800 border border-gray-700" : "bg-white"}`}`, style: isChatTab ? void 0 : windowedChatDialogStyle, role: "dialog", "aria-modal": isChatTab ? "false" : "true", "aria-labelledby": "chat-modal-title", onKeyDown: (event) => handleDialogKeyDown(event, closeChatSurface) }, /* @__PURE__ */ React.createElement("div", { className: `px-5 py-2.5 border-b flex justify-between items-center gap-4 ${chatDividerClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-comments text-lg text-indigo-600 mr-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h2", { id: "chat-modal-title", className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Chat")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, /* @__PURE__ */ React.createElement(
           "button",
           {
             type: "button",
-            onClick: () => setIsChatGoalProgressOpen((prev) => !prev),
-            "aria-expanded": isChatGoalProgressOpen,
-            "aria-controls": "chat-goal-progress",
-            "data-testid": "chat-goal-progress-toggle",
-            className: `rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap ${goal.status === "done" ? isDarkTheme ? "border-green-700 bg-green-900 text-green-100" : "border-green-200 bg-green-50 text-green-800" : isDarkTheme ? "border-indigo-700 bg-indigo-950 text-indigo-100" : "border-indigo-200 bg-indigo-50 text-indigo-800"}`
+            onClick: exportChatAsMarkdown,
+            disabled: chatMessages.length === 0,
+            className: `${headerIconButtonClass} disabled:opacity-50 disabled:cursor-not-allowed`,
+            title: chatMessages.length === 0 ? "Nothing to download yet" : "Download this chat as a Markdown file",
+            "aria-label": "Download this chat as Markdown",
+            "data-testid": "chat-export"
           },
-          goal.status === "done" ? `Done, ${progressText}` : progressText,
-          /* @__PURE__ */ React.createElement("i", { className: `fas ${isChatGoalProgressOpen ? "fa-chevron-up" : "fa-chevron-down"} ml-1.5`, "aria-hidden": "true" })
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-download", "aria-hidden": "true" })
         ), /* @__PURE__ */ React.createElement(
           "button",
           {
             type: "button",
-            onClick: () => {
-              setChatGoalEditDraft({ title: goal.title || "", goal: goal.goal || "" });
-              setIsChatGoalEditing(true);
-            },
-            className: iconButtonClass,
-            title: "Edit goal",
-            "aria-label": "Edit this goal"
+            onClick: () => setIsChatSettingsOpen(true),
+            className: headerIconButtonClass,
+            title: "Chat settings",
+            "aria-label": "Open chat settings"
           },
-          /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen", "aria-hidden": "true" })
-        ), libraryButton, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: leaveChatGoal, className: iconButtonClass, title: "Leave goal", "aria-label": "Leave this goal. It stays in the goal library." }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-sign-out-alt", "aria-hidden": "true" }))), isChatGoalProgressOpen && /* @__PURE__ */ React.createElement(
-          "div",
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-cog", "aria-hidden": "true" })
+        ), isChatTab ? /* @__PURE__ */ React.createElement(
+          "button",
           {
-            id: "chat-goal-progress",
-            "data-testid": "chat-goal-progress",
-            className: `mt-3 rounded-lg border p-3 ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}`
+            type: "button",
+            onClick: () => exitChatFullscreen({ reopenModal: true }),
+            className: headerIconButtonClass,
+            title: "Show chat in a window",
+            "aria-label": "Show chat in a window"
           },
-          goal.summary && /* @__PURE__ */ React.createElement("p", { className: `text-sm mb-2 ${subtextClass}` }, goal.summary),
-          items.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: "space-y-1.5 max-h-56 overflow-y-auto" }, items.map((item) => /* @__PURE__ */ React.createElement("li", { key: item.id, className: "flex items-start gap-2 text-sm" }, /* @__PURE__ */ React.createElement(
-            "input",
-            {
-              type: "checkbox",
-              checked: item.status === "answered",
-              onChange: (event) => updateChatGoalItem(goal.id, item.id, { status: event.target.checked ? "answered" : "open" }),
-              disabled: goalBusy,
-              className: "mt-1 h-4 w-4 flex-shrink-0",
-              "aria-label": `Answered: ${item.text}`
-            }
-          ), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: item.status === "answered" ? mutedTextClass : headingClass }, item.text), item.note && /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-0.5 ${mutedTextClass}` }, item.note))))) : /* @__PURE__ */ React.createElement("p", { className: `text-sm ${mutedTextClass}` }, "No questions are tracked yet. Select Plan again to suggest some, or add your own in the goal library."),
-          /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, "Progress is checked after each answer."), pendingTurns > 0 && !isChecking && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => checkChatGoalProgress(goal.id), className: "font-medium ui-link" }, "Check progress now"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => replanChatGoal(goal.id), disabled: goalBusy, className: "font-medium ui-link disabled:opacity-50" }, chatGoalActivity === "planning" ? "Planning..." : "Plan again"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: openChatGoalLibrary, className: "font-medium ui-link" }, "Manage in the goal library"))
-        ), noticeNode);
-      })(), /* @__PURE__ */ React.createElement("div", { className: `flex-1 min-h-0 overflow-y-auto p-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4", style: fullscreenChatConversationStyle }, chatMessages.length === 0 && (activeChatGoal ? /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}`, "data-testid": "chat-goal-empty-state" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-bullseye text-3xl mb-3 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, activeChatGoal.title), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2 max-w-xl mx-auto whitespace-pre-wrap break-words" }, activeChatGoal.goal), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: startOnChatGoal,
-          disabled: isTyping,
-          className: "mt-4 inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" }),
-        "Start on this goal"
-      ), Array.isArray(activeChatGoal.suggested_questions) && activeChatGoal.suggested_questions.length > 0 && /* @__PURE__ */ React.createElement("p", { className: "text-xs mt-3" }, "Or ask one of the next questions below.")) : /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-3xl mb-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, "Ask about your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "For example: which indexes have the most data, what a search does, or how to write an SPL query."))), chatMessages.map((msg) => {
-        var _a2;
-        return /* @__PURE__ */ React.createElement("div", { key: msg.id, className: `flex min-w-0 ${msg.type === "user" ? "justify-end" : "justify-start"}` }, /* @__PURE__ */ React.createElement("div", { className: `max-w-3xl min-w-0 p-4 rounded-lg ${msg.type === "user" ? "bg-indigo-600 text-white" : msg.type === "error" ? isDarkTheme ? "bg-red-900 text-red-100 border border-red-700" : "bg-red-50 text-red-800 border border-red-200" : msg.type === "warning" ? isDarkTheme ? "bg-amber-900 text-amber-100 border border-amber-700" : "bg-amber-50 text-amber-900 border border-amber-200" : isDarkTheme ? "bg-gray-700 text-gray-100 border border-gray-600" : "bg-gray-100 text-gray-800"}`, style: getChatBubbleStyle(msg.type) }, msg.type === "user" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("i", { className: "fas fa-user ml-3 mt-1", "aria-hidden": "true" })), msg.type === "assistant" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot mr-3 mt-1 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), msg.spl_query && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Search that ran"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_query, {
-          originKind: "chat_assistant",
-          originLabel: "Chat assistant response",
-          sourceLabel: "Chat assistant response",
-          contextExcerpt: msg.content,
-          className: "sm:justify-end"
-        })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }), "Suggested search (not run)"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_in_text, {
-          originKind: "chat_assistant_suggestion",
-          originLabel: "Chat assistant suggestion",
-          sourceLabel: "Chat assistant suggestion",
-          contextExcerpt: msg.content,
-          className: "sm:justify-end"
-        })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_in_text))), msg.visualization_spec && /* @__PURE__ */ React.createElement("details", { className: "mt-3", open: true }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm font-medium flex items-center ${isDarkTheme ? "text-cyan-300 hover:text-cyan-100" : "text-cyan-700 hover:text-cyan-900"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line mr-2" }), "Visualization Preview"), renderVisualizationPreview(msg.visualization_spec, {
-          sourceQuery: msg.spl_query || msg.spl_in_text,
-          canOpenSplunk: canUseSplunkDeeplinks,
-          onOpenSplunk: openSplunkSearchFromChat
-        })), Array.isArray(msg.capability_usage) && msg.capability_usage.length > 0 && /* @__PURE__ */ React.createElement(
-          "details",
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-compress-arrows-alt", "aria-hidden": "true" })
+        ) : /* @__PURE__ */ React.createElement(
+          "button",
           {
-            className: "mt-3",
-            "data-testid": "chat-capability-evidence"
+            type: "button",
+            onClick: enterChatFullscreen,
+            className: headerIconButtonClass,
+            title: "Open chat full screen",
+            "aria-label": "Open chat full screen"
           },
-          /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-puzzle-piece mr-2", "aria-hidden": "true" }), "Capability Evidence (", msg.capability_usage.length, ")"),
-          /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-gray-100 text-gray-700 border border-gray-200"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), renderCapabilityReusableQueryCards(usage), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, isSafeLibraryLink(chunk.url) ? /* @__PURE__ */ React.createElement("a", { href: chunk.url, target: "_blank", rel: "noopener noreferrer", className: "text-xs font-medium ui-link break-words" }, chunk.source || "Splunk documentation") : /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-200"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Match score ", chunk.score)), Array.isArray(chunk.why) && chunk.why.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-1 ${mutedTextClass}` }, chunk.why.slice(0, 3).join(" · ")), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))
-        ), msg.status_timeline && msg.status_timeline.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer text-sm font-medium ui-link flex items-center" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2", "aria-hidden": "true" }), "Steps taken (", [msg.iterations ? countLabel(msg.iterations, "round") : "", msg.execution_time].filter(Boolean).join(", "), ")"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between gap-3 px-3 py-2 rounded border-l-4 ${isDarkTheme ? "bg-gray-800 border-indigo-400" : "bg-white border-indigo-500"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs tabular-nums ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, Number(status.time || 0).toFixed(1), "s"))))), msg.mcp_data && /* @__PURE__ */ React.createElement("details", { className: "mt-3" }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer text-sm ${isDarkTheme ? "text-gray-300 hover:text-gray-100" : "text-gray-600 hover:text-gray-800"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-database mr-1", "aria-hidden": "true" }), "Show raw data"), /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), msg.has_follow_on && !(((_a2 = msg.follow_on_actions) == null ? void 0 : _a2.length) > 0 && visibleFollowOnActions(msg).length === 0) && /* @__PURE__ */ React.createElement("div", { className: `mt-3 p-3 border rounded ${isDarkTheme ? "bg-indigo-900 border-indigo-700" : "bg-indigo-50 border-indigo-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold flex items-center mb-2 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1" }), /* @__PURE__ */ React.createElement("span", null, "Suggested next actions")), visibleFollowOnActions(msg).length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, visibleFollowOnActions(msg).map((action, idx) => {
-          const actionLabel = typeof action === "string" ? action : action.label || action.prompt || "Follow-up action";
-          const actionPrompt = typeof action === "string" ? action : action.prompt || action.label || "";
-          return /* @__PURE__ */ React.createElement(
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-expand-arrows-alt", "aria-hidden": "true" })
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: startNewChat,
+            disabled: isTyping,
+            className: `${headerIconButtonClass} disabled:opacity-50 disabled:cursor-not-allowed`,
+            title: isTyping ? "Wait for the answer to finish before clearing the chat" : "Clear chat",
+            "aria-label": "Clear chat history"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-trash", "aria-hidden": "true" })
+        ), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: closeChatSurface,
+            className: headerIconButtonClass,
+            "aria-label": "Close chat"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
+        ))), !showChatSideColumn && renderChatGoalSection("bar"), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 flex" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0 flex flex-col" }, /* @__PURE__ */ React.createElement("div", { ref: chatScrollRef, className: `flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-6 ${isDarkTheme ? "bg-gray-900" : "bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: `${chatColumnClass} space-y-6` }, chatMessages.length === 0 && (activeChatGoal ? /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}`, "data-testid": "chat-goal-empty-state" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-bullseye text-3xl mb-3 ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, activeChatGoal.title), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2 max-w-xl mx-auto whitespace-pre-wrap break-words" }, activeChatGoal.goal), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: startOnChatGoal,
+            disabled: isTyping,
+            className: "mt-4 inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" }),
+          "Start on this goal"
+        ), chatGoalQuestions.length > 0 && !showChatSideColumn && /* @__PURE__ */ React.createElement("div", { className: "mt-6 max-w-xl mx-auto" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs ${mutedTextClass}` }, "Or ask one of these questions:"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-col gap-2" }, chatGoalQuestions.map((question, idx) => /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            key: idx,
+            type: "button",
+            onClick: () => sendSuggestedQuery(question),
+            disabled: isTyping,
+            className: `rounded-lg border px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${goalQuestionButtonClass}`
+          },
+          question
+        ))))) : /* @__PURE__ */ React.createElement("div", { className: `text-center mt-12 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-3xl mb-3", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: `text-base font-medium ${headingClass}` }, "Ask about your Splunk environment"), /* @__PURE__ */ React.createElement("p", { className: "text-sm mt-2" }, "For example: which indexes have the most data, what a search does, or how to write an SPL query."))), chatMessages.map((msg) => {
+          const messageTime = new Date(msg.timestamp).toLocaleTimeString(void 0, { timeStyle: "short" });
+          if (msg.type === "user") {
+            return /* @__PURE__ */ React.createElement("div", { key: msg.id, "data-chat-message-id": msg.id, className: "flex min-w-0 justify-end" }, /* @__PURE__ */ React.createElement("div", { className: `max-w-[85%] min-w-0 rounded-2xl bg-indigo-600 px-4 py-2.5 text-white transition-shadow ${highlightedChatMessageId === msg.id ? "ring-4 ring-amber-300" : ""}` }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-right text-xs" }, messageTime)));
+          }
+          if (msg.type === "error" || msg.type === "warning") {
+            const isError = msg.type === "error";
+            return /* @__PURE__ */ React.createElement("div", { key: msg.id, "data-chat-message-id": msg.id, className: `min-w-0 rounded-lg border p-4 ${isError ? isDarkTheme ? "bg-red-900 text-red-100 border-red-700" : "bg-red-50 text-red-800 border-red-200" : isDarkTheme ? "bg-amber-900 text-amber-100 border-amber-700" : "bg-amber-50 text-amber-900 border-amber-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: `fas ${isError ? "fa-exclamation-triangle text-red-600" : "fa-exclamation-circle text-amber-600"} mr-3 mt-1`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("p", { className: "flex-1 whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xs opacity-80" }, messageTime));
+          }
+          const capabilityUsage = Array.isArray(msg.capability_usage) ? msg.capability_usage : [];
+          const statusTimeline = Array.isArray(msg.status_timeline) ? msg.status_timeline : [];
+          const replyPanels = [
+            msg.spl_query ? { key: "search", label: "Search that ran", icon: "fa-code" } : msg.spl_in_text ? { key: "search", label: "Suggested search (not run)", icon: "fa-code" } : null,
+            msg.visualization_spec ? { key: "chart", label: "Chart", icon: "fa-chart-line" } : null,
+            capabilityUsage.length > 0 ? { key: "evidence", label: `Capability evidence (${capabilityUsage.length})`, icon: "fa-puzzle-piece" } : null,
+            statusTimeline.length > 0 ? { key: "steps", label: `Steps taken (${[msg.iterations ? countLabel(msg.iterations, "round") : "", msg.execution_time].filter(Boolean).join(", ")})`, icon: "fa-tasks" } : null,
+            msg.mcp_data ? { key: "raw", label: "Raw data", icon: "fa-database" } : null
+          ].filter(Boolean);
+          const openReplyPanel = replyPanels.some((panel) => panel.key === chatReplyPanels[msg.id]) ? chatReplyPanels[msg.id] : null;
+          const replyPanelId = (key) => `chat-reply-${msg.id}-${key}`;
+          const nextActions = msg.has_follow_on ? visibleFollowOnActions(msg) : [];
+          return /* @__PURE__ */ React.createElement("div", { key: msg.id, "data-chat-message-id": msg.id, className: "flex min-w-0 items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${assistantAvatarClass}`, "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-xs" })), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("div", { "data-testid": "chat-reply-markdown", className: "space-y-3 text-[15px] leading-7 break-words" }, renderMarkdownDocument(msg.content, { compact: true })), replyPanels.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap gap-2", "data-testid": "chat-reply-toggles" }, replyPanels.map((panel) => {
+            const isOpen = openReplyPanel === panel.key;
+            return /* @__PURE__ */ React.createElement(
+              "button",
+              {
+                key: panel.key,
+                type: "button",
+                onClick: () => toggleChatReplyPanel(msg.id, panel.key),
+                "aria-expanded": isOpen,
+                "aria-controls": isOpen ? replyPanelId(panel.key) : void 0,
+                "data-testid": `chat-reply-toggle-${panel.key}`,
+                className: `inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${isOpen ? replyToggleOpenClass : replyToggleIdleClass}`
+              },
+              /* @__PURE__ */ React.createElement("i", { className: `fas ${panel.icon}`, "aria-hidden": "true" }),
+              panel.label,
+              /* @__PURE__ */ React.createElement("i", { className: `fas ${isOpen ? "fa-chevron-up" : "fa-chevron-down"} opacity-70`, style: { fontSize: "0.65rem" }, "aria-hidden": "true" })
+            );
+          })), openReplyPanel === "search" && msg.spl_query && /* @__PURE__ */ React.createElement("div", { id: replyPanelId("search") }, /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_query, {
+            originKind: "chat_assistant",
+            originLabel: "Chat assistant response",
+            sourceLabel: "Chat assistant response",
+            contextExcerpt: msg.content,
+            className: "sm:justify-end"
+          })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_query))), openReplyPanel === "search" && !msg.spl_query && msg.spl_in_text && /* @__PURE__ */ React.createElement("div", { id: replyPanelId("search") }, /* @__PURE__ */ React.createElement("div", { className: `mt-2 p-3 rounded-md border font-mono text-sm ${summaryCodeClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-sans font-semibold uppercase tracking-wide ${summaryLabelClass}` }, "SPL"), renderSplQueryActionButtons2(msg.spl_in_text, {
+            originKind: "chat_assistant_suggestion",
+            originLabel: "Chat assistant suggestion",
+            sourceLabel: "Chat assistant suggestion",
+            contextExcerpt: msg.content,
+            className: "sm:justify-end"
+          })), /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap break-all" }, msg.spl_in_text))), openReplyPanel === "chart" && /* @__PURE__ */ React.createElement("div", { id: replyPanelId("chart"), className: "mt-2" }, renderVisualizationPreview(msg.visualization_spec, {
+            sourceQuery: msg.spl_query || msg.spl_in_text,
+            canOpenSplunk: canUseSplunkDeeplinks,
+            onOpenSplunk: openSplunkSearchFromChat
+          })), openReplyPanel === "evidence" && /* @__PURE__ */ React.createElement("div", { id: replyPanelId("evidence"), "data-testid": "chat-capability-evidence" }, /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-3" }, msg.capability_usage.map((usage, usageIdx) => /* @__PURE__ */ React.createElement("div", { key: usageIdx, className: `rounded-lg border p-3 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-semibold ${headingClass}` }, usage.title || usage.name || "Capability"), usage.category && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, formatCapabilityCategoryLabel(usage.category)), usage.used_in && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-900 text-gray-200 border border-gray-600" : "bg-gray-100 text-gray-700 border border-gray-200"}` }, formatCapabilityUsageContextLabel(usage.used_in))), usage.contribution && /* @__PURE__ */ React.createElement("div", { className: `text-sm mb-2 ${subtextClass}` }, usage.contribution), renderCapabilityReusableQueryCards(usage), Array.isArray(usage.chunks) && usage.chunks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, usage.chunks.map((chunk, chunkIdx) => /* @__PURE__ */ React.createElement("div", { key: chunkIdx, className: `rounded border p-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, isSafeLibraryLink(chunk.url) ? /* @__PURE__ */ React.createElement("a", { href: chunk.url, target: "_blank", rel: "noopener noreferrer", className: "text-xs font-medium ui-link break-words" }, chunk.source || "Splunk documentation") : /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${headingClass}` }, chunk.source || `artifact_${chunkIdx + 1}`), chunk.source_type && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-200"}` }, formatCapabilitySourceTypeLabel(chunk.source_type))), typeof chunk.score === "number" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Match score ", chunk.score)), Array.isArray(chunk.why) && chunk.why.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `text-xs mb-1 ${mutedTextClass}` }, chunk.why.slice(0, 3).join(" · ")), /* @__PURE__ */ React.createElement("div", { className: `text-xs whitespace-pre-wrap break-words ${subtextClass}`, style: { overflowWrap: "anywhere" } }, chunk.snippet)))))))), openReplyPanel === "steps" && /* @__PURE__ */ React.createElement("div", { id: replyPanelId("steps") }, /* @__PURE__ */ React.createElement("div", { className: "mt-2 space-y-2" }, msg.status_timeline.map((status, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center justify-between gap-3 px-3 py-2 rounded border-l-4 ${isDarkTheme ? "bg-gray-800 border-indigo-400" : "bg-white border-indigo-500"}` }, /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, status.action), /* @__PURE__ */ React.createElement("span", { className: `text-xs tabular-nums ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, Number(status.time || 0).toFixed(1), "s"))))), openReplyPanel === "raw" && /* @__PURE__ */ React.createElement("div", { id: replyPanelId("raw") }, /* @__PURE__ */ React.createElement("pre", { className: `mt-2 p-3 rounded text-xs overflow-x-auto ${isDarkTheme ? "bg-gray-800 text-gray-200" : "bg-gray-200 text-gray-800"}` }, JSON.stringify(msg.mcp_data, null, 2))), nextActions.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3", "data-testid": "chat-next-actions" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold mb-1.5 ${mutedTextClass}` }, "Suggested next actions"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, visibleFollowOnActions(msg).map((action, idx) => {
+            const actionLabel = typeof action === "string" ? action : action.label || action.prompt || "Follow-up action";
+            const actionPrompt = typeof action === "string" ? action : action.prompt || action.label || "";
+            return /* @__PURE__ */ React.createElement(
+              "button",
+              {
+                key: idx,
+                type: "button",
+                onClick: () => actionPrompt && sendSuggestedQuery(actionPrompt),
+                disabled: isTyping,
+                className: `max-w-full rounded-full border px-3 py-1 text-left text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${nextActionButtonClass}`,
+                title: String(actionPrompt).replace(/\*\*|`/g, "")
+              },
+              /* @__PURE__ */ React.createElement("i", { className: "fas fa-arrow-right mr-1.5", "aria-hidden": "true" }),
+              renderMarkdownInline(actionLabel, `${msg.id}-action-${idx}`)
+            );
+          }))), /* @__PURE__ */ React.createElement("div", { className: `mt-2 flex items-center gap-3 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", null, messageTime), String(msg.content || "").trim() && /* @__PURE__ */ React.createElement(
             "button",
             {
-              key: idx,
               type: "button",
-              onClick: () => actionPrompt && sendSuggestedQuery(actionPrompt),
-              className: `w-full text-left rounded border px-3 py-2 transition-colors ${isDarkTheme ? "bg-indigo-950 border-indigo-700 hover:bg-indigo-800 text-indigo-100" : "bg-white border-indigo-200 hover:bg-indigo-100 text-indigo-900"}`,
-              title: "Run this follow-up in chat"
+              onClick: () => copyChatText(`reply-${msg.id}`, msg.content),
+              className: `inline-flex items-center gap-1 font-medium ${quietActionClass}`,
+              "aria-label": "Copy this answer",
+              "data-testid": "chat-reply-copy"
             },
-            /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, actionLabel),
-            typeof action !== "string" && action.prompt && action.prompt !== actionLabel && /* @__PURE__ */ React.createElement("div", { className: `text-xs mt-1 ${isDarkTheme ? "text-indigo-200" : "text-indigo-700"}` }, action.prompt)
-          );
-        })) : /* @__PURE__ */ React.createElement("div", { className: `text-xs ${isDarkTheme ? "text-indigo-200" : "text-indigo-800"}` }, "Follow-up action available.")))), msg.type === "error" && /* @__PURE__ */ React.createElement("div", { className: "flex items-start min-w-0" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-3 mt-1 text-red-600" }), /* @__PURE__ */ React.createElement("p", { className: "flex-1 whitespace-pre-wrap break-words", style: { overflowWrap: "anywhere" } }, msg.content)), msg.type === "warning" && /* @__PURE__ */ React.createElement("div", { className: `flex items-start min-w-0 border-l-4 border-amber-400 p-4 rounded ${isDarkTheme ? "bg-amber-900" : "bg-amber-50"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-circle mr-3 mt-1 text-amber-600" }), /* @__PURE__ */ React.createElement("p", { className: `flex-1 whitespace-pre-wrap break-words ${isDarkTheme ? "text-amber-100" : "text-amber-800"}`, style: { overflowWrap: "anywhere" } }, msg.content)), /* @__PURE__ */ React.createElement("div", { className: "text-xs opacity-70 mt-2" }, new Date(msg.timestamp).toLocaleTimeString(void 0, { timeStyle: "short" }))));
-      }), isTyping && /* @__PURE__ */ React.createElement("div", { className: "flex justify-start" }, /* @__PURE__ */ React.createElement("div", { className: `p-4 rounded-lg border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gray-100 text-gray-800 border-gray-200"}`, role: "status", "aria-live": "polite" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center space-x-3" }, /* @__PURE__ */ React.createElement("i", { className: `fas fa-robot ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "flex space-x-1", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.1s" } }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.2s" } })), /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, "The assistant is working."), chatStatus && /* @__PURE__ */ React.createElement("span", { className: `text-sm ml-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, chatStatus)))), /* @__PURE__ */ React.createElement("div", { ref: chatEndRef }))), /* @__PURE__ */ React.createElement("div", { className: `px-6 py-4 border-t ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, activeChatGoal && Array.isArray(activeChatGoal.suggested_questions) && activeChatGoal.suggested_questions.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mb-3", "data-testid": "chat-goal-questions" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold uppercase tracking-wide mb-2 ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Next questions for your goal"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, activeChatGoal.suggested_questions.map((question, idx) => /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          key: idx,
-          type: "button",
-          onClick: () => sendSuggestedQuery(question),
-          disabled: isTyping,
-          title: "Ask this now",
-          className: `rounded-full border px-3 py-1 text-xs text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isDarkTheme ? "bg-indigo-950 border-indigo-700 text-indigo-100 hover:bg-indigo-900" : "bg-indigo-50 border-indigo-200 text-indigo-900 hover:bg-indigo-100"}`
-        },
-        question
-      )))), /* @__PURE__ */ React.createElement("div", { className: "mb-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-semibold uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, "Suggested Questions"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => setShowSuggestedQueries((prev) => !prev),
-          className: "text-xs ui-link flex items-center",
-          title: showSuggestedQueries ? "Hide suggested questions" : "Show suggested questions",
-          "aria-label": showSuggestedQueries ? "Hide suggested questions" : "Show suggested questions",
-          "aria-expanded": showSuggestedQueries,
-          "aria-controls": "suggested-queries-panel"
-        },
-        /* @__PURE__ */ React.createElement("i", { className: `fas ${showSuggestedQueries ? "fa-chevron-up" : "fa-chevron-down"}`, "aria-hidden": "true" })
-      ))), showSuggestedQueries && /* @__PURE__ */ React.createElement("div", { id: "suggested-queries-panel", className: "grid grid-cols-1 md:grid-cols-2 gap-2" }, suggestedChatQueries.map((query, idx) => /* @__PURE__ */ React.createElement("div", { key: idx, className: `flex items-center border rounded-lg px-2 py-1.5 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => useSuggestedQuery(query),
-          className: `flex-1 text-left text-xs truncate ${isDarkTheme ? "text-gray-200 hover:text-indigo-300" : "text-gray-700 hover:text-indigo-700"}`,
-          title: query
-        },
-        query
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: () => sendSuggestedQuery(query),
-          disabled: isTyping,
-          className: `ml-2 px-2 py-1 text-xs rounded ${isTyping ? isDarkTheme ? "bg-gray-700 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-indigo-600 hover:bg-indigo-700 text-white"}`,
-          title: "Ask this now",
-          "aria-label": `Ask now: ${query}`
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-play", "aria-hidden": "true" })
-      ))))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
-        "textarea",
-        {
-          ref: chatInputRef,
-          value: chatInput,
-          onChange: (e) => setChatInput(e.target.value),
-          onKeyPress: (e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              sendChatMessage();
-            }
+            /* @__PURE__ */ React.createElement("i", { className: `fas ${chatCopyState(`reply-${msg.id}`) === "copied" ? "fa-check" : "fa-copy"}`, "aria-hidden": "true" }),
+            chatCopyState(`reply-${msg.id}`) === "copied" ? "Copied" : chatCopyState(`reply-${msg.id}`) === "failed" ? "Copy failed" : "Copy"
+          ))));
+        }), isTyping && /* @__PURE__ */ React.createElement("div", { className: "flex min-w-0 items-start gap-3", role: "status", "aria-live": "polite" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${assistantAvatarClass}`, "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-xs" })), /* @__PURE__ */ React.createElement("div", { className: `flex items-center gap-3 rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-700" : "bg-gray-50 text-gray-800 border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex space-x-1", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce" }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.1s" } }), /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-indigo-500 rounded-full motion-safe:animate-bounce", style: { animationDelay: "0.2s" } })), /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, "The assistant is working."), chatStatus && /* @__PURE__ */ React.createElement("span", { className: `text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, chatStatus))), /* @__PURE__ */ React.createElement("div", { ref: chatEndRef }))), /* @__PURE__ */ React.createElement("div", { className: `px-4 sm:px-6 py-3 border-t ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: chatColumnClass }, !showChatSideColumn && showChatGoalQuestions && chatGoalQuestions.length > 0 && /* @__PURE__ */ React.createElement("div", { id: "chat-goal-questions-panel", "data-testid": "chat-goal-questions", className: "mb-3 max-h-48 overflow-y-auto scroll-container" }, /* @__PURE__ */ React.createElement("p", { className: chatSectionLabelClass }, "Next questions for your goal"), /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 flex flex-wrap gap-2" }, chatGoalQuestions.map((question, idx) => /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            key: idx,
+            type: "button",
+            onClick: () => sendSuggestedQuery(question),
+            disabled: isTyping,
+            title: "Ask this now",
+            className: `rounded-full border px-3 py-1 text-xs text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${goalQuestionButtonClass}`
           },
-          placeholder: "Ask me about your Splunk environment...",
-          "aria-label": "Chat message input",
-          className: `flex-1 p-3 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`,
-          rows: "3",
-          disabled: isTyping
-        }
-      ), /* @__PURE__ */ React.createElement(
-        "button",
-        {
-          type: "button",
-          onClick: sendChatMessage,
-          disabled: !chatInput.trim() || isTyping,
-          "aria-label": isTyping ? "Sending chat message" : "Send chat message",
-          title: isTyping ? "Sending chat message" : "Send chat message",
-          className: `px-5 py-3 rounded-lg font-medium ${chatInput.trim() && !isTyping ? "bg-indigo-600 hover:bg-indigo-700 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-300 text-gray-500 cursor-not-allowed"}`
-        },
-        /* @__PURE__ */ React.createElement("i", { className: "fas fa-paper-plane", "aria-hidden": "true" })
-      )), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-2 ${isDarkTheme ? "text-gray-400" : "text-gray-500"}` }, "Press Enter to send and Shift+Enter for a new line. The conversation is kept until you clear it."))))
-    ), isChatSettingsOpen && (() => {
+          question
+        )))), /* @__PURE__ */ React.createElement("div", { className: "flex items-end gap-2" }, /* @__PURE__ */ React.createElement(
+          "textarea",
+          {
+            ref: chatInputRef,
+            value: chatInput,
+            onChange: (e) => setChatInput(e.target.value),
+            onKeyPress: (e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendChatMessage();
+              }
+            },
+            placeholder: "Ask me about your Splunk environment...",
+            "aria-label": "Chat message input",
+            className: `flex-1 px-3 py-2.5 leading-6 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent resize-none ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`,
+            style: { maxHeight: `${CHAT_INPUT_MAX_HEIGHT_PX}px` },
+            rows: "1",
+            disabled: isTyping
+          }
+        ), isTyping ? /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: stopChatAnswer,
+            "aria-label": "Stop the answer",
+            title: "Stop the answer",
+            "data-testid": "chat-stop",
+            className: `h-[46px] px-4 rounded-lg border font-medium ${isDarkTheme ? "border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700" : "border-gray-300 bg-white text-gray-800 hover:bg-gray-100"}`
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-stop", "aria-hidden": "true" })
+        ) : /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => sendChatMessage(),
+            disabled: !chatInput.trim(),
+            "aria-label": "Send chat message",
+            title: "Send chat message",
+            className: `h-[46px] px-4 rounded-lg font-medium ${chatInput.trim() ? "bg-indigo-600 hover:bg-indigo-700 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-300 text-gray-500 cursor-not-allowed"}`
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-paper-plane", "aria-hidden": "true" })
+        )), /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs" }, !showChatSideColumn && chatGoalQuestions.length > 0 ? /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => setShowChatGoalQuestions((prev) => !prev),
+            className: "inline-flex items-center gap-1.5 font-medium ui-link",
+            "aria-expanded": showChatGoalQuestions,
+            "aria-controls": "chat-goal-questions-panel",
+            "data-testid": "chat-goal-questions-toggle"
+          },
+          /* @__PURE__ */ React.createElement("i", { className: "fas fa-bullseye", "aria-hidden": "true" }),
+          "Next questions for your goal (",
+          chatGoalQuestions.length,
+          ")",
+          /* @__PURE__ */ React.createElement("i", { className: `fas ${showChatGoalQuestions ? "fa-chevron-down" : "fa-chevron-up"}`, "aria-hidden": "true" })
+        ) : /* @__PURE__ */ React.createElement("span", null), /* @__PURE__ */ React.createElement("span", { className: isDarkTheme ? "text-gray-400" : "text-gray-500" }, isTyping ? "Stop ends this answer early." : "Enter sends and Shift+Enter adds a line. The chat is kept until you clear it."))))), showChatSideColumn && /* @__PURE__ */ React.createElement(
+          "aside",
+          {
+            className: `w-80 xl:w-96 flex-shrink-0 min-h-0 overflow-y-auto scroll-container border-l ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-gray-50"}`,
+            "aria-label": "Goal and conversation",
+            "data-testid": "chat-side-column"
+          },
+          renderChatGoalSection("column"),
+          chatGoalQuestions.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `p-4 border-b ${chatDividerClass}`, "data-testid": "chat-goal-questions" }, /* @__PURE__ */ React.createElement("p", { className: chatSectionLabelClass }, "Next questions for your goal"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-2" }, chatGoalQuestions.map((question, idx) => /* @__PURE__ */ React.createElement("li", { key: idx }, /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              type: "button",
+              onClick: () => sendSuggestedQuery(question),
+              disabled: isTyping,
+              title: "Ask this now",
+              className: `w-full rounded-lg border px-3 py-2 text-left text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${goalQuestionButtonClass}`
+            },
+            question
+          ))))),
+          /* @__PURE__ */ React.createElement("section", { className: "p-4", "aria-labelledby": "chat-conversation-title", "data-testid": "chat-conversation-panel" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-baseline justify-between gap-2" }, /* @__PURE__ */ React.createElement("h3", { id: "chat-conversation-title", className: chatSectionLabelClass }, "In this chat"), chatTurns.length > 0 && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, countLabel(chatTurns.length, "question"), ", ", countLabel(chatSearchCount, "search", "searches"))), chatTurns.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${mutedTextClass}` }, "Your questions show up here with the searches they ran, so you can jump back to an answer, copy a search, or open it in Splunk.") : /* @__PURE__ */ React.createElement(React.Fragment, null, chatDataFocus.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3", "data-testid": "chat-data-focus" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs font-medium ${mutedTextClass}` }, "Data searched"), /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 flex flex-wrap gap-1.5" }, chatDataFocus.map((item) => /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              key: item.term,
+              type: "button",
+              onClick: () => addTermToChatInput(item.term),
+              title: "Add to the message box",
+              className: `max-w-full truncate rounded-md border px-2 py-0.5 font-mono text-xs transition-colors ${dataFocusChipClass}`
+            },
+            item.term
+          )))), /* @__PURE__ */ React.createElement("ol", { className: "mt-3 space-y-2", "aria-label": "Questions in this chat", "data-testid": "chat-turn-list" }, chatTurns.map((turn, idx) => {
+            const reply = turn.reply;
+            const ranQuery = String((reply == null ? void 0 : reply.spl_query) || "").trim();
+            const suggestedQuery = !ranQuery ? String((reply == null ? void 0 : reply.spl_in_text) || "").trim() : "";
+            const shownQuery = ranQuery || suggestedQuery;
+            const isAnswering = !reply && !turn.error && isTyping && idx === chatTurns.length - 1;
+            const copyKey = `turn-${turn.question.id}`;
+            return /* @__PURE__ */ React.createElement("li", { key: turn.question.id, className: `overflow-hidden rounded-lg border ${turnCardClass}`, "data-testid": "chat-turn" }, /* @__PURE__ */ React.createElement(
+              "button",
+              {
+                type: "button",
+                onClick: () => jumpToChatMessage(turn.question.id),
+                className: `block w-full px-3 pt-2 pb-1.5 text-left transition-colors ${turnJumpClass}`,
+                title: "Jump to this question"
+              },
+              /* @__PURE__ */ React.createElement("span", { className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 text-xs tabular-nums ${mutedTextClass}` }, idx + 1), /* @__PURE__ */ React.createElement("span", { className: "flex-1 min-w-0 text-sm", style: twoLineClampStyle }, turn.question.content)),
+              shownQuery && /* @__PURE__ */ React.createElement("code", { className: `mt-1 block truncate font-mono text-xs ${mutedTextClass}` }, shownQuery)
+            ), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-1.5 px-3 pb-2" }, isAnswering && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Answering..."), turn.error && !reply && /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-exclamation-triangle mr-1", "aria-hidden": "true" }), "No answer"), reply && shownQuery && /* @__PURE__ */ React.createElement(
+              "button",
+              {
+                type: "button",
+                onClick: () => jumpToChatMessage(turn.question.id, { replyId: reply.id, panel: "search" }),
+                className: `inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs transition-colors ${turnChipClass}`,
+                title: ranQuery ? "Show the search that ran" : "Show the suggested search"
+              },
+              /* @__PURE__ */ React.createElement("i", { className: "fas fa-code", "aria-hidden": "true" }),
+              ranQuery ? "Search" : "Not run"
+            ), reply && reply.visualization_spec && /* @__PURE__ */ React.createElement(
+              "button",
+              {
+                type: "button",
+                onClick: () => jumpToChatMessage(turn.question.id, { replyId: reply.id, panel: "chart" }),
+                className: `inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs transition-colors ${turnChipClass}`,
+                title: "Show the chart"
+              },
+              /* @__PURE__ */ React.createElement("i", { className: "fas fa-chart-line", "aria-hidden": "true" }),
+              "Chart"
+            ), shownQuery && /* @__PURE__ */ React.createElement("span", { className: "ml-auto flex items-center gap-0.5" }, /* @__PURE__ */ React.createElement(
+              "button",
+              {
+                type: "button",
+                onClick: () => copyChatText(copyKey, shownQuery),
+                className: turnIconButtonClass,
+                title: chatCopyState(copyKey) === "copied" ? "Copied" : chatCopyState(copyKey) === "failed" ? "Copy failed" : "Copy the search",
+                "aria-label": "Copy the search"
+              },
+              /* @__PURE__ */ React.createElement("i", { className: `fas ${chatCopyState(copyKey) === "copied" ? "fa-check" : "fa-copy"} text-xs`, "aria-hidden": "true" })
+            ), canUseSplunkDeeplinks && /* @__PURE__ */ React.createElement(
+              "button",
+              {
+                type: "button",
+                onClick: () => openSplunkSearchFromChat(shownQuery),
+                className: turnIconButtonClass,
+                title: "Open the search in Splunk",
+                "aria-label": "Open the search in Splunk"
+              },
+              /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt text-xs", "aria-hidden": "true" })
+            ))));
+          }))))
+        ))))
+      );
+    })(), isChatSettingsOpen && (() => {
       var _a2, _b2, _c2, _d2;
       const closeChatSettings = () => setIsChatSettingsOpen(false);
       const sectionClass = `rounded-lg border p-5 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}`;
@@ -11903,7 +12307,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           },
           /* @__PURE__ */ React.createElement("i", { className: "fas fa-times text-xl", "aria-hidden": "true" })
         )),
-        /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 flex flex-col md:flex-row" }, /* @__PURE__ */ React.createElement("aside", { className: `md:w-80 flex-shrink-0 flex flex-col min-h-0 max-h-72 md:max-h-none border-b md:border-b-0 md:border-r ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement(
+        /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 flex flex-col md:flex-row" }, /* @__PURE__ */ React.createElement("aside", { className: `md:w-80 flex-shrink-0 flex flex-col min-h-0 max-h-[50%] md:max-h-[none] border-b md:border-b-0 md:border-r ${isDarkTheme ? "border-gray-700" : "border-gray-200"}`, "data-testid": "chat-goal-library-list" }, /* @__PURE__ */ React.createElement(
           "form",
           {
             className: `p-4 space-y-2 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}`,
@@ -11926,7 +12330,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
             }
           ),
           /* @__PURE__ */ React.createElement("button", { type: "submit", disabled: !chatGoalLibraryDraft.trim() || goalBusy, className: `${primaryButtonClass} w-full` }, chatGoalActivity === "creating" ? "Planning..." : "Add goal")
-        ), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto" }, chatGoalLibrary.length === 0 && /* @__PURE__ */ React.createElement("p", { className: `p-4 text-sm ${mutedTextClass}` }, isChatGoalLibraryLoading ? "Loading goals..." : "No goals yet. Add one here or set one in chat."), /* @__PURE__ */ React.createElement("ul", { "aria-label": "Goals" }, chatGoalLibrary.map((goal) => {
+        ), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto scroll-container" }, chatGoalLibrary.length === 0 && /* @__PURE__ */ React.createElement("p", { className: `p-4 text-sm ${mutedTextClass}` }, isChatGoalLibraryLoading ? "Loading goals..." : "No goals yet. Add one here or set one in chat."), /* @__PURE__ */ React.createElement("ul", { "aria-label": "Goals" }, chatGoalLibrary.map((goal) => {
           const isSelected = goal.id === chatGoalLibrarySelectedId;
           return /* @__PURE__ */ React.createElement("li", { key: goal.id }, /* @__PURE__ */ React.createElement(
             "button",
@@ -11944,7 +12348,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
             /* @__PURE__ */ React.createElement("span", { className: `block text-xs mt-1 ${mutedTextClass}` }, progressText(goal), ", ", countLabel(goal.chat_count, "saved chat")),
             /* @__PURE__ */ React.createElement("span", { className: `block text-xs mt-0.5 ${mutedTextClass}` }, "Updated ", formatMissionDateTime(goal.updated_at))
           ));
-        })))), /* @__PURE__ */ React.createElement("section", { className: "flex-1 min-h-0 overflow-y-auto p-6 space-y-6", "aria-label": "Goal details" }, chatGoalNotice && /* @__PURE__ */ React.createElement(
+        })))), /* @__PURE__ */ React.createElement("section", { className: "flex-1 min-h-0 overflow-y-auto scroll-container p-6 space-y-6", "aria-label": "Goal details" }, chatGoalNotice && /* @__PURE__ */ React.createElement(
           "div",
           {
             role: chatGoalNotice.tone === "error" ? "alert" : "status",

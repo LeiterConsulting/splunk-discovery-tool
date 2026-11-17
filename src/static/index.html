@@ -116,9 +116,13 @@
             to { transform: translateX(0); }
         }
 
-        .scroll-container {
-            scrollbar-width: thin;
-            scrollbar-color: rgb(var(--ui-scrollbar-thumb)) rgb(var(--ui-scrollbar-track));
+        /* Chromium ignores the ::-webkit-scrollbar rules below once scrollbar-width or scrollbar-color is set,
+           and macOS then hides the bar until scrolling, so only browsers without those rules get the standard ones. */
+        @supports not selector(::-webkit-scrollbar) {
+            .scroll-container {
+                scrollbar-width: thin;
+                scrollbar-color: rgb(var(--ui-scrollbar-thumb)) rgb(var(--ui-scrollbar-track));
+            }
         }
 
         .scroll-container::-webkit-scrollbar {

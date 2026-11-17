@@ -970,7 +970,8 @@ async function runWorkspaceSmoke(baseUrl) {
         {
             type: 'response',
             data: {
-                response: 'Start from the saved internal sourcetype rollup query and adapt it only if the scope changes.',
+                response: 'Start from the **saved** internal sourcetype rollup query and adapt it only if the scope changes.',
+                spl_query: libraryQuery,
                 capability_usage: [
                     {
                         name: 'rag_chromadb',
@@ -1133,13 +1134,18 @@ async function runWorkspaceSmoke(baseUrl) {
         await firstLibraryCard.getByRole('button', { name: 'Use in Chat' }).click();
         await assertChatPromptContains(page, libraryQuery);
         await page.getByRole('button', { name: 'Send chat message' }).click();
+        const replyMarkdown = page.getByTestId('chat-reply-markdown').last();
+        await replyMarkdown.waitFor({ state: 'visible' });
+        assert(await replyMarkdown.locator('strong').count() === 1, 'Expected the chat reply to render Markdown emphasis.');
+        assert(!((await replyMarkdown.textContent()) || '').includes('**'), 'Expected the chat reply to hide raw Markdown markers.');
+        // Reply extras stay folded into a row of toggles until the user opens one.
+        assert(await page.getByTestId('chat-capability-evidence').count() === 0, 'Expected capability evidence to stay collapsed by default even when reusable SPL candidates are present.');
+        const evidenceToggle = page.getByTestId('chat-reply-toggle-evidence').last();
+        assert(await evidenceToggle.getAttribute('aria-expanded') === 'false', 'Expected the capability evidence toggle to start closed.');
+        await evidenceToggle.click();
         const capabilityEvidence = page.getByTestId('chat-capability-evidence');
         await capabilityEvidence.waitFor({ state: 'visible' });
-        const evidenceAutoExpanded = await capabilityEvidence.evaluate((element) => element.hasAttribute('open'));
-        assert(evidenceAutoExpanded === false, 'Expected capability evidence to stay collapsed by default even when reusable SPL candidates are present.');
-        await capabilityEvidence.locator('summary').click();
-        const evidenceExpandedAfterClick = await capabilityEvidence.evaluate((element) => element.hasAttribute('open'));
-        assert(evidenceExpandedAfterClick === true, 'Expected capability evidence to expand after the user opens it.');
+        assert(await evidenceToggle.getAttribute('aria-expanded') === 'true', 'Expected capability evidence to expand after the user opens it.');
         const reusableQueryCard = page.getByTestId('chat-capability-reusable-query-card').first();
         await reusableQueryCard.waitFor({ state: 'visible' });
         const chatReuseBadgeText = ((await reusableQueryCard.getByTestId('chat-capability-reusable-query-reuse-tier').textContent()) || '').trim();
@@ -1152,6 +1158,55 @@ async function runWorkspaceSmoke(baseUrl) {
         assert(chatFeedbackBadgeText.includes('Observed Runs: 3 success / 1 failure'), `Expected reusable-query observed-run counts, but received: ${chatFeedbackBadgeText}`);
         const chatReusableQueryText = ((await reusableQueryCard.getByTestId('chat-capability-reusable-query').textContent()) || '').trim();
         assert(chatReusableQueryText.includes(libraryQuery), `Expected reusable-query card to include the saved query, but received: ${chatReusableQueryText}`);
+
+        // The side column lists each question with the search it ran, in place of the old suggested questions.
+        const sideColumn = page.getByTestId('chat-side-column');
+        await sideColumn.waitFor({ state: 'visible' });
+        assert(await sideColumn.getByText('Suggested questions').count() === 0, 'Expected the old suggested questions list to be gone.');
+        const chatTurns = page.getByTestId('chat-turn');
+        assert(await chatTurns.count() === 1, `Expected 1 question in the side column, received ${await chatTurns.count()}.`);
+        const chatTurnText = ((await chatTurns.first().textContent()) || '').trim();
+        assert(chatTurnText.includes(libraryQuery), `Expected the side column to show the search that ran, but received: ${chatTurnText}`);
+        const dataFocus = page.getByTestId('chat-data-focus');
+        await dataFocus.getByRole('button', { name: 'index=_internal', exact: true }).click();
+        const chatInput = page.getByLabel('Chat message input');
+        assert((await chatInput.inputValue()).includes('index=_internal'), 'Expected a data chip to add its term to the message box.');
+        await chatInput.fill('');
+        await chatTurns.first().getByRole('button', { name: 'Search', exact: true }).click();
+        assert(await page.getByTestId('chat-reply-toggle-search').last().getAttribute('aria-expanded') === 'true', 'Expected the Search shortcut to open the search that ran.');
+        await chatTurns.first().locator('button').first().click();
+        await page.locator('[data-chat-message-id] .ring-4').first().waitFor({ state: 'visible' });
+
+        const replyCopy = page.getByTestId('chat-reply-copy').last();
+        await replyCopy.click();
+        await replyCopy.getByText('Copied', { exact: true }).waitFor({ state: 'visible' });
+
+        const [chatDownload] = await Promise.all([
+            page.waitForEvent('download'),
+            page.getByTestId('chat-export').click(),
+        ]);
+        const chatExportName = chatDownload.suggestedFilename();
+        assert(/^chat-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}\.md$/.test(chatExportName), `Unexpected chat download name: ${chatExportName}`);
+        const chatExport = await readFile(await chatDownload.path(), 'utf8');
+        for (const expected of ['# Chat export', '## You (', '## Assistant (', 'Start from the **saved** internal', `\`\`\`spl\n${libraryQuery}\n\`\`\``]) {
+            assert(chatExport.includes(expected), `Expected the chat download to include ${JSON.stringify(expected)}, but received:\n${chatExport}`);
+        }
+
+        // Stop ends an answer that is still running and says so in the chat.
+        await page.unroute(`${baseUrl}/chat/stream`);
+        let heldChatRequest = null;
+        await page.route(`${baseUrl}/chat/stream`, (route) => {
+            heldChatRequest = route;
+        });
+        await chatInput.fill('Count events by host');
+        await page.getByRole('button', { name: 'Send chat message' }).click();
+        const stopButton = page.getByTestId('chat-stop');
+        await stopButton.waitFor({ state: 'visible' });
+        await page.getByTestId('chat-turn').last().getByText('Answering...').waitFor({ state: 'visible' });
+        await stopButton.click();
+        await page.getByText('You stopped this answer before it finished.').waitFor({ state: 'visible' });
+        await stopButton.waitFor({ state: 'hidden' });
+        assert(heldChatRequest !== null, 'Expected the stopped question to reach the chat endpoint.');
 
         return {
             reportSplCardCount,

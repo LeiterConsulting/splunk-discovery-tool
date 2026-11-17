@@ -103,12 +103,15 @@ The header holds the connection status, Chat, sign-in, and Settings. Each tab ke
 - **Knowledge Base**: Library health (how well public Splunk references, Splunkbase, and versioned docs cover your environment, with gaps to fix), searchable Splunk documentation for your versions and installed apps, managed knowledge assets, the SPL Library, reusable query evidence, and context previews
 - **Capabilities**: Optional add-ons for the knowledge base, exports, charts, and Splunk search links. Each can be installed, turned on or off, tested, and removed
 - **Capability tabs**: An enabled capability can add its own tab after the core tabs. The M-26-14 Readiness Advisor adds an M-26-14 tab
-- **Chat and Summary**: Investigation chat (in a window or full screen) plus the runbook and summary views when you need more detail
+- **Chat and Summary**: Investigation chat, which opens as a Chat tab or in a window, plus the runbook and summary views when you need more detail
 
 ## 💬 Chat, Goals, and Chat Settings
 
 Chat answers questions about your Splunk environment with live searches through the MCP server, using what discovery found to pick indexes, sourcetypes, and hosts.
 
+- **Layout**: chat opens as a Chat tab. On wide screens, a side column next to the conversation holds the goal and **In this chat**. The window button in the chat header shows chat in a window instead, and the app remembers your choice
+- **Answers**: replies are formatted with headings, lists, tables, and code. The search that ran, the steps taken, charts, and evidence sit behind buttons under each reply, and a suggested next action runs as soon as you select it. Each reply has **Copy**, the download button in the chat header saves the whole chat as Markdown, and **Stop** ends an answer early
+- **In this chat**: lists each question with the search it ran. Jump back to an answer, open its search or chart, copy the search, or open it in Splunk. **Data searched** shows the indexes, sourcetypes, and hosts the answers searched; select one to add it to your message
 - **Goals**: type what you want to find out and select **Set goal**. The AI model breaks the goal into 3 to 6 questions that settle it and suggests the first questions to ask. **Start on this goal** sends a first message that runs the first search
 - **Progress**: after each answer, the app checks which tracked questions the answer settled (only answers backed by search evidence count), may add up to 2 new open questions, and refreshes the suggestions. The goal bar shows progress such as "1 of 4 answered" and opens a checklist you can tick by hand, with **Plan again** and **Check progress now**
 - **Goal Library**: add, rename, rewrite, finish, and delete goals; edit the tracked questions; and open, rename, and delete the chats saved under each goal. Each recorded answer saves the chat under its goal
@@ -117,7 +120,9 @@ Chat answers questions about your Splunk environment with live searches through 
 
 Goals and saved chats are kept per user when sign-in is on and in one shared library when it is off, under `output/chat_data/`.
 
-![Chat with a goal, its progress checklist, and suggested next questions](docs/screenshots/chat-goal-current.png)
+![Chat answer with its search and next action, and In this chat listing the question, the search it ran, and the data searched](docs/screenshots/chat-conversation-current.png)
+
+![Chat with a goal, its progress checklist, and the next questions for the goal in the side column](docs/screenshots/chat-goal-current.png)
 
 ![Goal Library with a goal, its tracked questions, and a saved chat](docs/screenshots/chat-goal-library-current.png)
 

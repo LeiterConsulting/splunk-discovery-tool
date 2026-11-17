@@ -1530,6 +1530,17 @@ class ChatHelperTests(unittest.TestCase):
         self.assertIn("_time", analysis["sample_fields"])
         self.assertNotIn("_raw", analysis["sample_fields"])
 
+    def test_analyze_result_rows_does_not_offer_multivalue_lists_as_filter_values(self):
+        rows = [
+            {"device_name": "192-0-2-186", "oid_name": ["sysLocation.0", "sysName.0"], "count": str(5 - i)}
+            for i in range(3)
+        ] + [{"device_name": "router-01", "oid_name": ["sysUpTime.0"], "count": "1"}]
+
+        analysis = web_app.analyze_result_rows(rows)
+
+        self.assertNotIn("oid_name", [item["field"] for item in analysis["top_dimensions"]])
+        self.assertFalse(any("[" in pivot for pivot in analysis["next_pivots"]))
+
     def test_persona_playbooks_ignore_non_mapping_recommendations(self):
         overview = type(
             "OverviewStub",
@@ -1616,6 +1627,44 @@ class ChatHelperTests(unittest.TestCase):
         self.assertIn('"type": "response"', sse_body)
         self.assertIn('"response": "Completed"', sse_body)
 
+    def test_chat_stream_cancels_chat_work_when_the_stream_closes_early(self):
+        original_process_chat = web_app.process_chat_with_streaming
+        outcome = {"started": False, "cancelled": False}
+
+        async def slow_chat(_request, status_queue, runtime_config=None, goal_owner=None):
+            outcome["started"] = True
+            await status_queue.put({"type": "status", "message": "Searching"})
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                outcome["cancelled"] = True
+                raise
+
+        class StubHttpRequest:
+            def __init__(self):
+                self.state = type("State", (), {"auth_user": None})()
+
+        async def read_one_update_then_stop():
+            response = await web_app.chat_with_splunk_stream(StubHttpRequest(), {"message": "Test"})
+            body = response.body_iterator
+            first = await body.__anext__()
+            # Closing the iterator is what the server does when the browser aborts the request.
+            await body.aclose()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            # Read before asyncio.run returns, because asyncio.run cancels leftover tasks on its own.
+            cancelled_while_running = outcome["cancelled"]
+            return (first.decode("utf-8") if isinstance(first, bytes) else first), cancelled_while_running
+
+        web_app.process_chat_with_streaming = slow_chat
+        try:
+            first_chunk, cancelled_while_running = asyncio.run(read_one_update_then_stop())
+        finally:
+            web_app.process_chat_with_streaming = original_process_chat
+
+        self.assertIn('"message": "Searching"', first_chunk)
+        self.assertTrue(outcome["started"])
+        self.assertTrue(cancelled_while_running)
     def test_finalize_user_facing_response_text_uses_fallback_after_sanitization(self):
         self.assertEqual(
             web_app.finalize_user_facing_response_text(

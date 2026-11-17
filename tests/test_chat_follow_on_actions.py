@@ -127,6 +127,32 @@ class ChatFollowOnActionTests(unittest.TestCase):
         self.assertIn("Make this more cyber-thriller", prompts)
         self.assertNotIn("Make this", prompts)
 
+    def test_statement_ending_in_a_colon_before_a_fact_list_is_not_an_offer(self):
+        actions = web_app.build_follow_on_actions(
+            "can you tell me the current value of snmp devices being reported?",
+            {"entities": {}, "last_result": {}},
+            assistant_response=(
+                "The latest successful SNMP readings I can see in `netops` are from device **192.0.2.186** "
+                "(`192-0-2-186`), polled at **2026-11-17 12:35:25 -05:00**:\n\n"
+                "- **Location:** `lab-east`\n"
+                "- **System name:** `edge-sensor-01`\n"
+                "- **Uptime:** `8d 4h 48m 57s`\n\n"
+                "Searched `index=netops sourcetype=snmp4splunk:poll` over **-24h to now**."
+            ),
+        )
+
+        self.assertFalse([action for action in actions if action["kind"] == "assistant_response_follow_up"])
+
+    def test_follow_on_prompts_and_labels_drop_markdown_markers(self):
+        actions = web_app.build_follow_on_actions(
+            "What next?",
+            {"entities": {}, "last_result": {}},
+            assistant_response="If you'd like, I can compare **router-01** with `web-02` over the last day.",
+        )
+
+        self.assertEqual(actions[0]["prompt"], "Compare router-01 with web-02 over the last day")
+        self.assertEqual(actions[0]["label"], "Compare router-01 with web-02 over the last day")
+
 
 if __name__ == "__main__":
     unittest.main()

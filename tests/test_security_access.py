@@ -1635,6 +1635,30 @@ Environment summary.
             web_app.summarization_progress = original_summarization_progress
             web_app._persist_runtime_state()
 
+    def test_completed_discovery_outcome_summary_leaves_the_time_to_the_finished_field(self):
+        outcome = web_app._build_discovery_last_run_outcome(
+            {"status": "completed", "completed_at": "2026-11-16T16:35:18.203890", "report_count": 4}
+        )
+
+        self.assertEqual(outcome["summary"], "The run produced 4 reports.")
+        self.assertEqual(outcome["completed_at"], "2026-11-16T16:35:18.203890")
+        single = web_app._build_discovery_last_run_outcome({"status": "completed", "report_count": 1})
+        self.assertEqual(single["summary"], "The run produced 1 report.")
+
+        restored = web_app._restore_discovery_runtime_state({
+            "status": "completed",
+            "report_count": 4,
+            "last_run_outcome": {
+                "status": "completed",
+                "title": "Discovery run completed",
+                "summary": "Finished at 2026-11-16T16:35:18.203890 and produced 4 reports.",
+                "completed_at": "2026-11-16T16:35:18.203890",
+                "report_count": 4,
+            },
+        })
+        self.assertEqual(restored["last_run_outcome"]["summary"], "The run produced 4 reports.")
+        self.assertEqual(restored["last_run_outcome"]["completed_at"], "2026-11-16T16:35:18.203890")
+
     def test_runtime_state_restore_marks_saved_summary_complete_after_restart(self):
         original_summarization_progress = copy.deepcopy(web_app.summarization_progress)
 

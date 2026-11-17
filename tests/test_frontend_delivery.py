@@ -127,7 +127,7 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("data-testid=\"discovery-report-session-toggle\"", template_source)
         self.assertIn("data-testid=\"discovery-report-row\"", template_source)
         self.assertIn("data-testid=\"report-viewer-markdown\"", template_source)
-        self.assertIn("const renderMarkdownDocument = (source) => {", template_source)
+        self.assertIn("const renderMarkdownDocument = (source, options = {}) => {", template_source)
         self.assertIn("const newestReportGroupKeys = (() => {", template_source)
         self.assertNotIn("dangerouslySetInnerHTML", template_source)
 
@@ -572,6 +572,50 @@ class FrontendDeliveryTests(unittest.TestCase):
         # The goal's next-step suggestion is hidden once the chat has no goal.
         self.assertIn("{visibleFollowOnActions(msg).map((action, idx) => {", template_source)
 
+    def test_chat_surface_layout_and_conversation_tools_are_declared(self):
+        template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
+
+        # Chat opens as a full page unless the user last chose a window.
+        self.assertIn("const loadChatLayoutPreference = () => {", template_source)
+        self.assertIn("saveChatLayoutPreference('page');", template_source)
+        self.assertIn("saveChatLayoutPreference('window');", template_source)
+        # Replies render Markdown, and their extras sit behind one row of toggles.
+        self.assertIn("renderMarkdownDocument(msg.content, { compact: true })", template_source)
+        self.assertIn("onClick={() => toggleChatReplyPanel(msg.id, panel.key)}", template_source)
+        # The side column lists this chat's questions, searches, and data in place of the old suggested questions.
+        for test_id in (
+            "chat-side-column",
+            "chat-conversation-panel",
+            "chat-turn-list",
+            "chat-turn",
+            "chat-data-focus",
+            "chat-export",
+            "chat-stop",
+            "chat-reply-copy",
+            "chat-goal-questions-toggle",
+        ):
+            self.assertIn(f'data-testid="{test_id}"', template_source)
+        for helper in (
+            "const buildChatTurns = (messages) => {",
+            "const collectChatDataFocus = (turns) => {",
+            "const buildChatMarkdownExport = (messages, { goal = null, exportedAt = new Date() } = {}) => {",
+            "const jumpToChatMessage = (messageId, options = {}) => {",
+        ):
+            self.assertIn(helper, template_source)
+        for retired in ("suggestedChatQueries", "useSuggestedQuery", "chat-suggestions-panel", "Suggested questions"):
+            self.assertNotIn(retired, template_source)
+        # Stop aborts the request; the abort is reported as a notice rather than an error.
+        self.assertIn("signal: requestController.signal", template_source)
+        self.assertIn("chatAbortControllerRef.current?.abort();", template_source)
+        self.assertIn("if (error?.name === 'AbortError') {", template_source)
+        # Copy works on plain-http pages, where the clipboard API is missing.
+        self.assertIn("const writeTextToClipboard = async (value) => {", template_source)
+        self.assertIn("if (await writeTextToClipboard(text)) {", template_source)
+        # Tailwind 2 has no max-h-none utility, so the goal list used to stay capped at max-h-72.
+        self.assertIn("max-h-[50%] md:max-h-[none]", template_source)
+        self.assertNotIn("md:max-h-none", template_source)
+        # Chromium hides themed scrollbars when the standard scrollbar properties are also set.
+        self.assertIn("@supports not selector(::-webkit-scrollbar) {", template_source)
     def test_chat_settings_modal_declares_auto_and_custom_modes(self):
         template_source = (ROOT / "src" / "frontend_legacy_template.html").read_text(encoding="utf-8")
 

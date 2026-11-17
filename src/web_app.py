@@ -3656,7 +3656,7 @@ def _build_discovery_last_run_outcome(snapshot: Dict[str, Any]) -> Dict[str, Any
 
     if status == "completed":
         title = "Discovery run completed"
-        summary = f"Finished at {completed_at or 'the latest checkpoint'} and produced {report_count} report{'s' if report_count != 1 else ''}."
+        summary = f"The run produced {report_count} report{'s' if report_count != 1 else ''}."
     elif status == "interrupted":
         title = "Discovery run interrupted"
         summary = f"The app restarted during {phase_title.lower()}. Review the latest checkpoint and rerun when ready."
@@ -3933,6 +3933,11 @@ def _restore_discovery_runtime_state(snapshot: Any) -> Dict[str, Any]:
     raw_phase_plan = snapshot.get("phase_plan")
     restored["phase_plan"] = copy.deepcopy(raw_phase_plan) if isinstance(raw_phase_plan, list) else []
     restored["activity_log"] = _normalize_discovery_activity_log(snapshot.get("activity_log"))
+
+    saved_outcome = restored.get("last_run_outcome")
+    if isinstance(saved_outcome, dict) and str(saved_outcome.get("status") or "").strip().lower() == "completed":
+        # Summaries saved by earlier versions embedded the raw ISO completion time.
+        saved_outcome["summary"] = _build_discovery_last_run_outcome(saved_outcome)["summary"]
 
     if restored["status"] in DISCOVERY_ACTIVE_STATUSES:
         if _is_runtime_worker_process() or _is_process_running(restored.get("worker_pid")):
@@ -4505,7 +4510,8 @@ def _make_follow_on_action(label: str, prompt: str, kind: str) -> Dict[str, str]
 
 
 def _normalize_response_follow_on_text(action_text: str) -> str:
-    cleaned = re.sub(r'\s+', ' ', str(action_text or '')).strip(" \t\r\n:-*•")
+    cleaned = re.sub(r'\*\*|__|`', '', str(action_text or ''))
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip(" \t\r\n:-*•")
     cleaned = cleaned.strip("`'\"")
     cleaned = re.sub(r'^to\s+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'^also\s+', '', cleaned, flags=re.IGNORECASE)
@@ -4673,13 +4679,15 @@ def _extract_response_follow_on_actions(assistant_response: str) -> List[Dict[st
     if not cleaned_response:
         return []
 
+    # The list must start on the same line: a colon that ends a statement ("polled at 12:35:") followed by a
+    # bulleted list of facts is not an offer. Line-start lists after an offer are handled by the list extractor.
     inline_list_patterns = [
-        r"\bif you(?:'d|’d|\swould)? like,?\s+i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
-        r"\bif you want(?:\s+[^,.!?\n]+)?[,;]?\s+i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
-        r"\bif helpful,?\s+i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
-        r"\bor i can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
-        r"\bi can also\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
-        r"\bi can\s+(?P<action>[^\n]+?:\s*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bif you(?:'d|’d|\swould)? like,?\s+i can\s+(?P<action>[^\n]+?:[ \t]*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bif you want(?:\s+[^,.!?\n]+)?[,;]?\s+i can\s+(?P<action>[^\n]+?:[ \t]*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bif helpful,?\s+i can\s+(?P<action>[^\n]+?:[ \t]*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bor i can\s+(?P<action>[^\n]+?:[ \t]*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bi can also\s+(?P<action>[^\n]+?:[ \t]*(?:\d+[.)]|[-*•])[^\n]*)",
+        r"\bi can\s+(?P<action>(?:list|show|compare|check|validate|investigate|review|summarize|break down|trend|prototype|measure|explain|help you find|run|turn|make)\b[^\n]+?:[ \t]*(?:\d+[.)]|[-*•])[^\n]*)",
     ]
     patterns = [
         r"\ba good follow[ -]?up(?: question| step| action)?\s+(?:would be(?: to)?|is|might be|could be)\s+(?P<action>[^.!?\n]+)",
@@ -16830,6 +16838,7 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
     
     async def generate_sse():
         """Generator for Server-Sent Events."""
+        chat_task = None
         try:
             # Process chat in background task
             chat_task = asyncio.create_task(
@@ -16889,6 +16898,11 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
             import traceback
             traceback.print_exc()
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        finally:
+            # The stream closes early when the browser stops the answer or goes away; stop the
+            # work too so it does not keep running searches and model calls nobody will see.
+            if chat_task is not None and not chat_task.done():
+                chat_task.cancel()
     
     return StreamingResponse(generate_sse(), media_type="text/event-stream")
 
@@ -18195,7 +18209,8 @@ def analyze_result_rows(rows: Any) -> Dict[str, Any]:
         counts: Dict[str, float] = {}
         for row in ranking_rows:
             value = row.get(field)
-            if value in (None, ''):
+            # Multivalue fields arrive as lists; their printed form is not a value anyone can filter on.
+            if value in (None, '') or isinstance(value, (list, dict)):
                 continue
             text = str(value).strip()
             if not text or len(text) > 80:

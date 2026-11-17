@@ -2101,6 +2101,16 @@ class CapabilityFrameworkTests(unittest.TestCase):
         )
         self.assertTrue(bar_preview["points"][1]["label"].endswith("..."))
 
+        # Index time and other Splunk bookkeeping fields are numbers, but charting them says nothing about the data.
+        with self.assertRaises(ValueError):
+            provider.build_preview(
+                [
+                    {"_time": f"2026-11-17T12:3{minute}:00", "_indextime": str(1794936927 + minute), "linecount": "1"}
+                    for minute in range(4)
+                ],
+                payload={"query_shape": "event_sample"},
+            )
+
     def test_visualization_install_enable_test_and_build_flow(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

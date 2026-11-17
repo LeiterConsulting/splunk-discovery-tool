@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Each chat reply has a Copy button, the chat header has a button that downloads the conversation as a Markdown file, and a Stop button replaces Send while an answer is coming in. Stopping an answer, or closing the page, also stops the work for that answer on the server
+
+### Changed
+- Chat opens as a full page in the Chat tab, and the conversation uses the full height of the page. On wide screens, a side column shows the goal, its questions, and a summary of the conversation. The window button still shows chat in a window, and the app remembers your choice
+- Replies are formatted as Markdown, with headings, lists, tables, and code. The evidence, search, chart, and other extras under a reply are collapsed into one row of buttons, and only one opens at a time. Next steps appear as small buttons, and the message box grows as you type
+- The suggested questions panel is replaced by "In this chat", which lists each question in the conversation. Click a question to jump to its answer, and use the shortcuts beside it to open its search or chart, copy the search, or open it in Splunk. Questions whose search didn't run are marked "Not run". "Data searched" shows the indexes, sourcetypes, and hosts the answers searched; click one to add it to the message box. In the window layout and on narrow screens, "Next questions for your goal" under the message box shows the goal's questions
+- The Goal Library list now fills the height of the dialog and scrolls, with a scroll bar that stays visible
+
+### Fixed
+- Suggested next questions could be built from statements in the reply, or include Markdown symbols such as `**`
+- Follow-up searches no longer filter on fields that hold more than one value, which produced broken SPL
+- Charts no longer plot Splunk internal fields such as `_indextime` as numbers
+- The time under your own chat messages was hard to read in the Neo theme
+- The Discovery status card on the Overview tab repeated the finish time as a raw timestamp, such as `2026-11-16T16:35:18.203890`. It now says how many reports the run produced, and the formatted time stays in the Finished field
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
