@@ -1,6 +1,6 @@
 # Splunk Discovery Tool Developer Reference
 
-This reference is for developers who extend Splunk Discovery Tool or reuse it in their own projects. It describes release 2.0.2.
+This reference is for developers who extend Splunk Discovery Tool or reuse it in their own projects. It describes release 2.1.0.
 
 ## 1) Runtime Topology
 

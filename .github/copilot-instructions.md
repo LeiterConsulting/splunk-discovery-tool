@@ -1,4 +1,4 @@
-# Splunk Discovery Tool: Assistant Instructions (v2.0.2)
+# Splunk Discovery Tool: Assistant Instructions (v2.1.0)
 
 ## Project Overview
 Splunk Discovery Tool finds what a Splunk environment contains through the Splunk MCP server, saves discovery reports, and answers questions in a chat grounded in live Splunk searches. It runs as a FastAPI app with a React browser UI, encrypted settings, and installers for Windows, macOS, and Linux.

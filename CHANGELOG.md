@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
+- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
+- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.1.0] - 2026-11-17
+
+Version 2.1.0 reworks chat. It opens as a full page with formatted replies and a side column that follows the goal and the conversation, and it adds Copy, Markdown export, and Stop. The Goal Library list now fills its dialog.
+
+### ⬆️ Upgrading from 2.0.2
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+- Chat now opens as a Chat tab. To use the window layout instead, select the window button in the chat header once; the app remembers your choice
+- Saved chats and goals keep working
+
 ### Added
 - Each chat reply has a Copy button, the chat header has a button that downloads the conversation as a Markdown file, and a Stop button replaces Send while an answer is coming in. Stopping an answer, or closing the page, also stops the work for that answer on the server
 
@@ -22,11 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Charts no longer plot Splunk internal fields such as `_indextime` as numbers
 - The time under your own chat messages was hard to read in the Neo theme
 - The Discovery status card on the Overview tab repeated the finish time as a raw timestamp, such as `2026-11-16T16:35:18.203890`. It now says how many reports the run produced, and the formatted time stays in the Finished field
-
-### Planned
-- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
-- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
-- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
 
 ## [2.0.2] - 2026-11-17
 
@@ -594,7 +603,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.0
 [2.0.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.2
 [2.0.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1
 [2.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0
