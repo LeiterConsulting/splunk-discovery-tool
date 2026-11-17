@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-2.0.1-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1)
+[![Version](https://img.shields.io/badge/version-2.0.2-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.2)
 
 > Finds what a Splunk environment contains, explains what to do next, and answers questions with live Splunk searches through the Splunk MCP server.
 
-**Current release: [2.0.1](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1)** (November 16, 2026). It fixes certificate errors with AI providers and adds support for OpenAI's GPT-6 models. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
+**Current release: [2.0.2](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.2)** (November 17, 2026). Chat now runs the searches it says it will run instead of answering with only a plan, which GPT-6 models often did. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
 
 ## ✨ What's Included
 

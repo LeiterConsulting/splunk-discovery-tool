@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Universal Installer for Splunk Discovery Tool
 # Supports Windows (Git Bash/WSL), macOS, and Linux
-# Version: 2.0.1
+# Version: 2.0.2
 
 set -e
 
@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Version and metadata
-VERSION="2.0.1"
+VERSION="2.0.2"
 APP_NAME="Splunk Discovery Tool"
 APP_SHORT="Splunk Discovery Tool"
 LAUNCH_DIR="$(pwd)"

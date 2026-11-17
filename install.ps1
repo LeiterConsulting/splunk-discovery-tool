@@ -1,6 +1,6 @@
 # Universal Installer for Splunk Discovery Tool
 # PowerShell version for Windows
-# Version: 2.0.1
+# Version: 2.0.2
 
 param(
     [Parameter(Position=0)]
@@ -68,7 +68,7 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 }
 
 # Version and metadata
-$VERSION = "2.0.1"
+$VERSION = "2.0.2"
 $APP_NAME = "Splunk Discovery Tool"
 $APP_SHORT = "Splunk Discovery Tool"
 $INSTALL_DIR = $PSScriptRoot

@@ -7,16 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
+- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
+- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.0.2] - 2026-11-17
+
+Version 2.0.2 makes chat run the Splunk searches it says it will run, instead of answering with only a plan. GPT-6 models did this most often, `gpt-6-luna` most of all.
+
+### ⬆️ Upgrading from 2.0.1
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+- Saved chats keep working. Earlier replies that only described a search are left out of what the AI model sees, so asking the question again runs the search
+
 ### Fixed
 - Chat often answered with only a plan, such as "I’ll check recent events in `index=ping`...", and never ran the search, most often with GPT-6 models. The app now notices these replies even when they use a typographic apostrophe or verbs such as "inspect" or "look in", and when a reply wrongly says it can't run a live search. It then asks the model for the search, once more if the first reply comes back empty. If the search still doesn't run, the answer says so instead of ending on the plan
 - GPT-5.4 and newer models label the note they write before a tool call as `commentary`. A reply that stops after that note now counts as a search that didn't run, and the app sends the note back with its `commentary` label when it asks for the search, as OpenAI recommends
 - Earlier chat replies that only promised a search are no longer sent back to the AI model, because they taught it to answer the next question the same way
 - Some GPT-6 replies repeated the same message twice, and chat showed both copies. Repeated messages now appear once
 - The chat instructions now say that writing a TOOL_CALL runs the search, and that the model should not end on a plan, ask permission for a read-only search, or tell the user to run SPL it can run itself
-### Planned
-- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
-- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
-- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
 
 ## [2.0.1] - 2026-11-16
 
@@ -569,7 +578,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.2
 [2.0.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1
 [2.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.0
 [1.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v1.0.0
