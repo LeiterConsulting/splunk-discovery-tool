@@ -7,15 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- Discovery didn't add its new reports to the Knowledge Base, so chat couldn't find them and the Knowledge Base showed Reindex needed after every run until someone selected Reindex. When the Knowledge Base is installed and turned on, discovery now updates its index after saving the reports and the report catalog, and the activity log says when the update starts. A saved AI summary updates the index again before the summary is reported complete
-- If an automatic update fails, the reports and summary stay saved, and the discovery log, the discovery progress, or the summary shows a warning that says to select Reindex. Details go to the server log
-- The Reindex needed notice now says that discovery reports and AI summaries update the index on their own, and that Reindex is for other file changes or to retry an update
-
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
 - **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.1.1] - 2026-11-19
+
+Version 2.1.1 keeps the Knowledge Base index up to date. Discovery and AI summaries now update it after saving, so chat can search new reports without a manual Reindex.
+
+### ⬆️ Upgrading from 2.1.0
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+- Reports saved before 2.1.1 are not indexed on their own. If the Knowledge Base shows Reindex needed after the upgrade, select Reindex once
+- Automatic updates run only while the Knowledge Base capability is installed and turned on. The upgrade doesn't install or turn on anything
+
+### Fixed
+- Discovery didn't add its new reports to the Knowledge Base, so chat couldn't find them and the Knowledge Base showed Reindex needed after every run until someone selected Reindex. When the Knowledge Base is installed and turned on, discovery now updates its index after saving the reports and the report catalog, and the activity log says when the update starts. A saved AI summary updates the index again before the summary is reported complete
+- If an automatic update fails, the reports and summary stay saved, and the discovery log, the discovery progress, or the summary shows a warning that says to select Reindex. Details go to the server log
+- The Reindex needed notice now says that discovery reports and AI summaries update the index on their own, and that Reindex is for other file changes or to retry an update
 
 ## [2.1.0] - 2026-11-17
 
@@ -608,7 +617,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.1
 [2.1.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.0
 [2.0.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.2
 [2.0.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.1

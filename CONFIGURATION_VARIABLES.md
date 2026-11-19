@@ -612,4 +612,4 @@ FRESHNESS_EXEMPT_DIRS = {"runtime_jobs"}
 ---
 
 *Last Updated: 2026-11-16*
-*Version: 2.1.0*
+*Version: 2.1.1*
