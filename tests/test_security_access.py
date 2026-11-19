@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import copy
+import importlib.util
 import json
 import os
 import sys
@@ -24,6 +25,7 @@ if str(SRC_DIR) not in sys.path:
 
 
 from capabilities import CapabilityManager
+from capabilities.rag.indexer import ArtifactSourceIndexer
 from config_manager import ConfigManager
 from security_manager import SecurityManager
 import web_app
@@ -984,6 +986,234 @@ class WebAppLocalAuthTests(unittest.TestCase):
         self.assertEqual(
             payload["advisory"]["llm_analysis"]["recommended_adjustments"],
             ["Confirm that the highest-value indexes preserve at least six months of immediately searchable history."],
+        )
+
+    def test_discovery_updates_knowledge_base_before_completion_and_preserves_reports_on_index_failure(self):
+        if importlib.util.find_spec("chromadb") is None:
+            self.skipTest("chromadb is not installed in the active environment")
+        capability = self.config_manager.get_capability("rag_chromadb")
+        capability.installed = True
+        capability.enabled = True
+        capability.config.update(
+            source_dir=str(self.temp_path / "output"),
+            storage_dir=str(self.temp_path / "output/rag/chromadb"),
+        )
+        self.config_manager.save_capability(capability)
+        self.config_manager.update_mcp(url="https://splunk.example/services/mcp", token="test-token")
+
+        for fail_index in (False, True):
+            with self.subTest(fail_index=fail_index):
+                timestamp = f"20260101_00000{int(fail_index)}"
+                report_name = f"v2_operator_runbook_{timestamp}.md"
+
+                async def save_reports(*args):
+                    output_dir = Path("output")
+                    output_dir.mkdir(exist_ok=True)
+                    (output_dir / report_name).write_text(
+                        "# Scheduler evidence\n\nScheduler backlog requires queue validation.",
+                        encoding="utf-8",
+                    )
+                    return {
+                        "timestamp": timestamp,
+                        "overview": SimpleNamespace(),
+                        "report_paths": [report_name],
+                        "artifact_payload": {"readiness_score": 80},
+                    }
+
+                def reindex():
+                    self.assertTrue((Path("output") / report_name).exists())
+                    self.assertIn(timestamp, [item["timestamp"] for item in web_app.load_discovery_sessions()])
+                    self.assertNotEqual(web_app._snapshot_discovery_runtime_state()["status"], "completed")
+                    if fail_index:
+                        raise RuntimeError("Index storage unavailable")
+                    return original_reindex()
+
+                original_reindex = ArtifactSourceIndexer(
+                    capability, web_app.capability_registry.get_definition("rag_chromadb")
+                ).reindex
+                with patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+                     patch.object(web_app, "DISCOVERY_PIPELINE_VERSION", "v2"), \
+                     patch.object(web_app, "discover_mcp_tools", new=AsyncMock(return_value=["splunk_get_info"])), \
+                     patch.object(web_app, "get_or_create_llm_client"), \
+                     patch.object(web_app, "DiscoveryEngine"), \
+                     patch.object(web_app, "build_persona_playbooks", return_value={}), \
+                     patch.object(web_app.DiscoveryV2Pipeline, "run", new=AsyncMock(side_effect=save_reports)), \
+                     patch("capabilities.rag.chromadb_provider.ChromaRAGProvider.reindex", side_effect=reindex), \
+                     patch.object(web_app, "discovery_runtime_state", web_app._build_discovery_runtime_state()), \
+                     patch.dict(web_app.discovery_runtime_states, {}, clear=True):
+                    result = asyncio.run(web_app.run_discovery())
+                    snapshot = web_app._snapshot_discovery_runtime_state()
+
+                self.assertEqual(result["status"], "success")
+                self.assertEqual(snapshot["status"], "completed")
+                self.assertTrue((Path("output") / report_name).exists())
+                if fail_index:
+                    self.assertIn("Knowledge Base", snapshot["progress"]["description"])
+                    self.assertTrue(any("Reindex" in str(item) for item in snapshot["activity_log"]))
+                else:
+                    indexer = ArtifactSourceIndexer(capability, web_app.capability_registry.get_definition("rag_chromadb"))
+                    self.assertEqual(indexer.get_index_freshness()["state"], "current")
+                    result = indexer.search("scheduler backlog queue validation")
+                    self.assertIn(report_name, [chunk["metadata"]["source_name"] for chunk in result["chunks"]])
+
+    def test_saved_summary_is_indexed_after_updating_the_discovery_catalog(self):
+        if importlib.util.find_spec("chromadb") is None:
+            self.skipTest("chromadb is not installed in the active environment")
+        timestamp = "20260101_000000"
+        self._register_discovery_session_fixture(timestamp)
+        capability = self.config_manager.get_capability("rag_chromadb")
+        capability.installed = True
+        capability.enabled = True
+        capability.config.update(
+            source_dir=str(self.temp_path / "output"),
+            storage_dir=str(self.temp_path / "output/rag/chromadb"),
+        )
+        self.config_manager.save_capability(capability)
+        llm = SimpleNamespace(generate_response=AsyncMock(side_effect=[
+            "{}",
+            "[]",
+            "Scheduler backlog evidence calls for queue validation.",
+            "[]",
+        ]))
+
+        with patch.object(web_app, "_is_runtime_worker_process", return_value=True), \
+             patch.object(web_app, "get_or_create_llm_client", return_value=llm), \
+             patch.dict(web_app.summarization_progress, {}, clear=True):
+            summary = asyncio.run(web_app._summarize_session_impl({"timestamp": timestamp}))
+            self.assertEqual(web_app._get_summarization_progress(timestamp)["stage"], "complete")
+
+        self.assertTrue(summary["success"])
+        self.assertNotIn("knowledge_base_warning", summary)
+        manifest_path = Path("output/discovery_sessions.json")
+        manifest_mtime = manifest_path.stat().st_mtime_ns
+        sessions = web_app.load_discovery_sessions()
+        summary_name = f"v2_ai_summary_{timestamp}.json"
+        self.assertIn(summary_name, sessions[0]["report_paths"])
+        self.assertEqual(manifest_path.stat().st_mtime_ns, manifest_mtime)
+        indexer = ArtifactSourceIndexer(capability, web_app.capability_registry.get_definition("rag_chromadb"))
+        self.assertEqual(indexer.get_index_freshness()["state"], "current")
+        result = indexer.search("scheduler backlog queue validation")
+        self.assertIn(summary_name, [chunk["metadata"]["source_name"] for chunk in result["chunks"]])
+
+    def test_summary_index_failure_preserves_the_summary_and_returns_a_warning(self):
+        timestamp = "20260101_000000"
+        self._register_discovery_session_fixture(timestamp)
+        capability = self.config_manager.get_capability("rag_chromadb")
+        capability.installed = True
+        capability.enabled = True
+        self.config_manager.save_capability(capability)
+
+        with patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+             patch("capabilities.rag.chromadb_provider.ChromaRAGProvider.reindex", side_effect=RuntimeError("Index storage unavailable")), \
+             patch.dict(web_app.summarization_progress, {}, clear=True):
+            warning = asyncio.run(web_app._save_summary_and_index(timestamp, {"ai_summary": "Saved evidence"}))
+
+        self.assertIn("Reindex", warning)
+        self.assertEqual(
+            json.loads(web_app._summary_artifact_path(timestamp).read_text(encoding="utf-8")),
+            {"ai_summary": "Saved evidence"},
+        )
+
+    def test_summary_cache_waits_for_indexing_and_preserves_index_warnings(self):
+        timestamp = "20260101_000000"
+        self._register_discovery_session_fixture(timestamp)
+        web_app._summary_artifact_path(timestamp).write_text(json.dumps({
+            "schema_version": "2.0",
+            "trend_signals": {},
+            "risk_register": [],
+            "recursive_investigations": [],
+        }), encoding="utf-8")
+
+        with patch.dict(web_app.summarization_progress, {}, clear=True), \
+             patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+             patch.object(web_app, "_is_process_running", return_value=True):
+            web_app._set_summarization_progress(timestamp, stage="indexing", progress=98, worker_pid=123)
+            _, restored = web_app._load_persisted_runtime_state()
+            self.assertEqual(restored[timestamp]["stage"], "indexing")
+            self.assertIsNone(web_app._load_cached_summary_if_available(
+                timestamp, mark_from_cache=True, completion_message="Summary available."
+            ))
+
+            warning = "The Knowledge Base could not be updated. Select Reindex to retry."
+            web_app._set_summarization_progress(
+                timestamp, stage="complete", progress=100, worker_pid=None,
+                message=warning, knowledge_base_warning=warning,
+            )
+            summary = web_app._load_cached_summary_if_available(
+                timestamp, mark_from_cache=True, completion_message="Summary available."
+            )
+            self.assertEqual(summary["knowledge_base_warning"], warning)
+            _, restored = web_app._load_persisted_runtime_state()
+            self.assertIn(warning, restored[timestamp]["message"])
+
+    def test_discovery_does_not_index_an_uninstalled_or_disabled_knowledge_base(self):
+        capability = self.config_manager.get_capability("rag_chromadb")
+        for installed, enabled in ((False, False), (False, True), (True, False)):
+            with self.subTest(installed=installed, enabled=enabled):
+                capability.installed = installed
+                capability.enabled = enabled
+                self.config_manager.save_capability(capability)
+                with patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+                     patch.object(web_app.capability_manager, "reindex_capability") as reindex:
+                    self.assertIsNone(asyncio.run(web_app._refresh_discovery_knowledge_base()))
+                reindex.assert_not_called()
+
+        capability.installed = True
+        capability.enabled = True
+        current_config = copy.deepcopy(self.config_manager.get())
+        current_config.capabilities["rag_chromadb"].enabled = False
+        with patch.object(web_app, "_is_runtime_worker_process", return_value=True), \
+             patch.object(self.config_manager, "load", return_value=current_config), \
+             patch.object(web_app.capability_manager, "reindex_capability") as reindex:
+            self.assertIsNone(asyncio.run(web_app._refresh_discovery_knowledge_base()))
+        reindex.assert_not_called()
+
+    def test_knowledge_base_refresh_reports_its_start_and_never_raises(self):
+        capability = self.config_manager.get_capability("rag_chromadb")
+        capability.installed = False
+        capability.enabled = False
+        self.config_manager.save_capability(capability)
+        started = []
+        with patch.object(web_app, "_is_runtime_worker_process", return_value=False):
+            self.assertIsNone(asyncio.run(
+                web_app._refresh_discovery_knowledge_base(on_start=lambda: started.append(True))
+            ))
+        self.assertEqual(started, [])
+
+        capability.installed = True
+        capability.enabled = True
+        self.config_manager.save_capability(capability)
+        # A failure outside the indexer, such as saving the capability state, must not fail a finished run.
+        with patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+             patch.object(web_app.capability_manager, "reindex_capability", side_effect=KeyError("health")):
+            warning = asyncio.run(
+                web_app._refresh_discovery_knowledge_base(on_start=lambda: started.append(True))
+            )
+
+        self.assertEqual(started, [True])
+        self.assertTrue(warning.startswith("The discovery reports were saved, but the Knowledge Base could not be updated"))
+        self.assertIn("Reindex", warning)
+
+    def test_saving_a_summary_without_a_knowledge_base_skips_the_indexing_stage(self):
+        timestamp = "20260101_000000"
+        self._register_discovery_session_fixture(timestamp)
+        capability = self.config_manager.get_capability("rag_chromadb")
+        capability.installed = False
+        capability.enabled = False
+        self.config_manager.save_capability(capability)
+
+        with patch.object(web_app, "_is_runtime_worker_process", return_value=False), \
+             patch.dict(web_app.summarization_progress, {}, clear=True):
+            web_app._set_summarization_progress(timestamp, stage="saving", progress=95, message="Saving results...")
+            self.assertIsNone(asyncio.run(web_app._save_summary_and_index(timestamp, {"ai_summary": "Saved evidence"})))
+            self.assertEqual(web_app._get_summarization_progress(timestamp)["stage"], "saving")
+            # A value JSON cannot encode only produces a warning; the summary response is still returned.
+            warning = asyncio.run(web_app._save_summary_and_index(timestamp, {"generated_at": object()}))
+
+        self.assertIn("could not be saved", warning)
+        self.assertEqual(
+            json.loads(web_app._summary_artifact_path(timestamp).read_text(encoding="utf-8")),
+            {"ai_summary": "Saved evidence"},
         )
 
     def test_discovery_status_endpoint_returns_runtime_snapshot(self):

@@ -2315,6 +2315,7 @@
       generating_tasks: 4,
       finalizing: 5,
       saving: 5,
+      indexing: 5,
       complete: 6,
       error: 0,
       interrupted: 0,
@@ -2932,6 +2933,16 @@
         loadKnowledgeLibrary();
       }
     }, [isCapabilitiesRagView]);
+    useEffect(() => {
+      if (discoveryStatus === "completed") {
+        loadCapabilities();
+      }
+    }, [discoveryStatus]);
+    useEffect(() => {
+      if (summaryStageNormalized === "complete") {
+        loadCapabilities();
+      }
+    }, [summaryStageNormalized]);
     useEffect(() => {
       var _a2, _b2;
       if (!isCapabilitiesRagView || ((_b2 = (_a2 = knowledgeLibrary.data) == null ? void 0 : _a2.refresh) == null ? void 0 : _b2.state) !== "running") {
@@ -5433,14 +5444,14 @@
       }
       const changedTypes = Object.entries(ragIndexFreshness.changed_by_type || {}).map(([sourceType, count]) => `${formatCapabilitySourceTypeLabel(sourceType)}: ${count}`).join(", ");
       const since = ragIndexFreshness.last_indexed_at ? `since the last index on ${formatMissionDateTime(ragIndexFreshness.last_indexed_at)}` : "since the last index";
-      return `${countLabel(ragIndexFreshness.changed_count, "file")} changed ${since}${changedTypes ? ` (${changedTypes})` : ""}. Chat cannot find what changed until you select Reindex.`;
+      return `${countLabel(ragIndexFreshness.changed_count, "file")} changed ${since}${changedTypes ? ` (${changedTypes})` : ""}. These changes are not searchable yet.`;
     };
     const renderRagReindexNotice = (testId) => {
       const noticeText = describeRagReindexNeed();
       if (!noticeText) {
         return null;
       }
-      return /* @__PURE__ */ React.createElement("div", { "data-testid": testId, role: "status", className: `mt-4 rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-900"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("i", { className: "fa-solid fa-triangle-exclamation mt-0.5", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Reindex needed"), /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-sm" }, noticeText), /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-xs" }, "Reindexing runs only when you select it. Downloaded Splunk documentation has its own index, so it does not need a reindex."))));
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": testId, role: "status", className: `mt-4 rounded-lg border px-4 py-3 ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-900"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("i", { className: "fa-solid fa-triangle-exclamation mt-0.5", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Reindex needed"), /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-sm" }, noticeText), /* @__PURE__ */ React.createElement("p", { className: "mt-1 text-xs" }, "Discovery reports and AI summaries update this index automatically after saving. Use Reindex for other file changes or to retry an update. Downloaded Splunk documentation has its own index."))));
     };
     const renderRagReindexButton = () => /* @__PURE__ */ React.createElement(
       "button",
@@ -12737,7 +12748,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: `flex-shrink-0 rounded-md px-3 py-1.5 text-sm font-medium bg-red-600 text-white hover:bg-red-700 ${isAbortingSummary ? "cursor-wait" : ""}`
         },
         isAbortingSummary ? "Stopping..." : "Stop Summary"
-      ))))) : summaryData ? /* @__PURE__ */ React.createElement("div", null, activeTab === "summary" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-summary", role: "tabpanel", "aria-labelledby": "summary-tab-summary", className: "space-y-6" }, renderExecutiveControlSummary(), summaryInfographicCapability.available && /* @__PURE__ */ React.createElement("div", { className: "flex justify-center pb-2" }, /* @__PURE__ */ React.createElement(
+      ))))) : summaryData ? /* @__PURE__ */ React.createElement("div", null, summaryData.knowledge_base_warning && /* @__PURE__ */ React.createElement("div", { role: "status", className: `mb-4 rounded-lg border px-4 py-3 text-sm ${isDarkTheme ? "border-amber-800 bg-amber-950 text-amber-100" : "border-amber-200 bg-amber-50 text-amber-900"}` }, summaryData.knowledge_base_warning), activeTab === "summary" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-summary", role: "tabpanel", "aria-labelledby": "summary-tab-summary", className: "space-y-6" }, renderExecutiveControlSummary(), summaryInfographicCapability.available && /* @__PURE__ */ React.createElement("div", { className: "flex justify-center pb-2" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",

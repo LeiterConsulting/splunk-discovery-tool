@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Discovery didn't add its new reports to the Knowledge Base, so chat couldn't find them and the Knowledge Base showed Reindex needed after every run until someone selected Reindex. When the Knowledge Base is installed and turned on, discovery now updates its index after saving the reports and the report catalog, and the activity log says when the update starts. A saved AI summary updates the index again before the summary is reported complete
+- If an automatic update fails, the reports and summary stay saved, and the discovery log, the discovery progress, or the summary shows a warning that says to select Reindex. Details go to the server log
+- The Reindex needed notice now says that discovery reports and AI summaries update the index on their own, and that Reindex is for other file changes or to retry an update
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

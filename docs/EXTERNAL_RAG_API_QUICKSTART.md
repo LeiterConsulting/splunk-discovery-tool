@@ -18,7 +18,7 @@ It lets another tool, script, analyst workflow, or agent client query the Knowle
 1. Start Splunk Discovery Tool.
 2. Enable the external API. In the app, open Settings, then the Security tab, turn on Enable External REST API under Sign-in and API Settings, and click Save Settings.
 3. Issue an `external_api` token with the scopes your client needs. In the app, use Create Token under Access Tokens on the Security tab and choose the External REST API token type. Only admins can issue tokens when sign-in is on.
-4. If you want useful search results, make sure the Knowledge Base capability (`rag_chromadb`) is installed, turned on, and indexed. If the Knowledge Base shows a Reindex needed notice, reindex it first; report changes are never indexed on their own.
+4. If you want useful search results, make sure the Knowledge Base capability (`rag_chromadb`) is installed, turned on, and indexed. If the Knowledge Base shows a Reindex needed notice, reindex it first. While the Knowledge Base is turned on, discovery and AI summaries update its index after saving, so the notice mostly appears before the first index, after other file changes, or after an automatic update fails.
 
 Supported scopes:
 

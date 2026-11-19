@@ -523,7 +523,7 @@ These endpoints should mirror the operational style already used by credentials,
 
 ## Discovery Pipeline Integration Points
 
-**Proposal.** None of these hooks shipped. In particular, discovery does not queue a reindex; the Knowledge Base shows a Reindex needed notice instead (see [Shipped Additions](#shipped-additions)).
+**Partly shipped.** The first hook shipped in a simpler form. When the Knowledge Base is installed and turned on, discovery rebuilds its index after saving the reports and the report catalog, and a saved AI summary rebuilds it again (`_refresh_discovery_knowledge_base` in `src/web_app.py`). There is no queue: the run waits for the rebuild before it reports completion, and a failed rebuild becomes a warning with the Reindex needed notice as the fallback (see [Shipped Additions](#shipped-additions)). The other hooks did not ship.
 
 The current docs already define clean discovery extension points in `docs/DEVELOPER_REFERENCE.md`.
 
@@ -642,7 +642,7 @@ Remove calls `POST /api/capabilities/{name}/uninstall`. The capability is turned
 
 ### Index freshness and the Reindex needed notice
 
-The Knowledge Base health details include `index_freshness`. Its `state` is `current`, `not_indexed`, `nothing_to_index`, or `outdated` (with a `reason` of `changed_files` or `index_format`, plus counts of changed files by source type). When the index is missing or outdated, the Knowledge Base shows a Reindex needed notice. New or changed report files are never indexed on their own; reindexing runs only when someone selects Reindex. Importing, deleting, checking in, or checking out a Knowledge Base document is the one exception: it reindexes right away while `auto_reindex_on_asset_change` is on (the default).
+The Knowledge Base health details include `index_freshness`. Its `state` is `current`, `not_indexed`, `nothing_to_index`, or `outdated` (with a `reason` of `changed_files` or `index_format`, plus counts of changed files by source type). When the index is missing or outdated, the Knowledge Base shows a Reindex needed notice. While the Knowledge Base is installed and turned on, discovery and AI summaries rebuild the index after saving, so their reports do not leave it outdated. Other changed source files, a failed automatic update, or an older index format still show the notice until someone selects Reindex. Importing, deleting, checking in, or checking out a Knowledge Base document is the one exception: it reindexes right away while `auto_reindex_on_asset_change` is on (the default).
 
 ### The knowledge library is separate from the Knowledge Base index
 

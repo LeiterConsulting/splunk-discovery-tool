@@ -3439,6 +3439,7 @@
                 generating_tasks: 4,
                 finalizing: 5,
                 saving: 5,
+                indexing: 5,
                 complete: 6,
                 error: 0,
                 interrupted: 0,
@@ -4185,6 +4186,18 @@
                     loadKnowledgeLibrary();
                 }
             }, [isCapabilitiesRagView]);
+
+            useEffect(() => {
+                if (discoveryStatus === 'completed') {
+                    loadCapabilities();
+                }
+            }, [discoveryStatus]);
+
+            useEffect(() => {
+                if (summaryStageNormalized === 'complete') {
+                    loadCapabilities();
+                }
+            }, [summaryStageNormalized]);
 
             useEffect(() => {
                 if (!isCapabilitiesRagView || knowledgeLibrary.data?.refresh?.state !== 'running') {
@@ -7613,7 +7626,7 @@
                 const since = ragIndexFreshness.last_indexed_at
                     ? `since the last index on ${formatMissionDateTime(ragIndexFreshness.last_indexed_at)}`
                     : 'since the last index';
-                return `${countLabel(ragIndexFreshness.changed_count, 'file')} changed ${since}${changedTypes ? ` (${changedTypes})` : ''}. Chat cannot find what changed until you select Reindex.`;
+                return `${countLabel(ragIndexFreshness.changed_count, 'file')} changed ${since}${changedTypes ? ` (${changedTypes})` : ''}. These changes are not searchable yet.`;
             };
 
             const renderRagReindexNotice = (testId) => {
@@ -7628,7 +7641,7 @@
                             <div className="min-w-0">
                                 <div className="text-sm font-semibold">Reindex needed</div>
                                 <p className="mt-1 text-sm">{noticeText}</p>
-                                <p className="mt-1 text-xs">Reindexing runs only when you select it. Downloaded Splunk documentation has its own index, so it does not need a reindex.</p>
+                                <p className="mt-1 text-xs">Discovery reports and AI summaries update this index automatically after saving. Use Reindex for other file changes or to retry an update. Downloaded Splunk documentation has its own index.</p>
                             </div>
                         </div>
                     </div>
@@ -19595,6 +19608,11 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         </div>
                                     ) : summaryData ? (
                                         <div>
+                                            {summaryData.knowledge_base_warning && (
+                                                <div role="status" className={`mb-4 rounded-lg border px-4 py-3 text-sm ${isDarkTheme ? 'border-amber-800 bg-amber-950 text-amber-100' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
+                                                    {summaryData.knowledge_base_warning}
+                                                </div>
+                                            )}
                                             {/* Executive Summary Tab */}
                                             {activeTab === 'summary' && (
                                                 <div id="summary-tabpanel-summary" role="tabpanel" aria-labelledby="summary-tab-summary" className="space-y-6">

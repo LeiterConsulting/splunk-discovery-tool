@@ -33,7 +33,7 @@ from urllib.parse import quote, urlencode
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Callable, List, Dict, Any, Optional, Tuple
 import uvicorn
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -3972,7 +3972,12 @@ def _restore_summarization_progress(snapshot: Any) -> Dict[str, Dict[str, Any]]:
 
         storage_key = _summary_progress_storage_key(session_id, scope_key)
         entry = _normalize_summarization_progress_entry(session_id, payload, scope_key=scope_key)
-        if _summary_artifact_path(session_id, scope_key).exists():
+        if entry["stage"] not in SUMMARIZATION_TERMINAL_STAGES and (
+            _is_runtime_worker_process() or _is_process_running(entry.get("worker_pid"))
+        ):
+            restored[storage_key] = entry
+            continue
+        if _summary_artifact_path(session_id, scope_key).exists() and entry["stage"] != "complete":
             entry = _normalize_summarization_progress_entry(
                 session_id,
                 {
@@ -3985,10 +3990,6 @@ def _restore_summarization_progress(snapshot: Any) -> Dict[str, Dict[str, Any]]:
                 existing=entry,
             )
         elif entry["stage"] not in SUMMARIZATION_TERMINAL_STAGES:
-            if _is_runtime_worker_process() or _is_process_running(entry.get("worker_pid")):
-                restored[storage_key] = entry
-                continue
-
             entry = _normalize_summarization_progress_entry(
                 session_id,
                 {
@@ -10820,6 +10821,37 @@ async def abort_discovery(request: Request):
     return {"status": "Discovery aborted", "discovery": discovery_snapshot}
 
 
+async def _refresh_discovery_knowledge_base(
+    *,
+    saved_label: str = "The discovery reports were saved",
+    on_start: Optional[Callable[[], None]] = None,
+) -> Optional[str]:
+    if _is_runtime_worker_process():
+        config_manager._config = config_manager.load()
+    capability = config_manager.get_capability("rag_chromadb")
+    if capability is None or not capability.installed or not capability.enabled:
+        return None
+
+    if on_start is not None:
+        on_start()
+    # The reports are already saved, so no indexing problem may turn the run into a failure.
+    try:
+        result = await asyncio.to_thread(capability_manager.reindex_capability, "rag_chromadb")
+    except Exception as exc:
+        failure_detail = str(exc)
+    else:
+        if result.ok:
+            return None
+        failure_detail = str(result.details.get("error") or result.message)
+
+    warning = (
+        f"{saved_label}, but the Knowledge Base could not be updated automatically. "
+        "Open Knowledge Base and select Reindex to retry; restart the app first if it asks you to."
+    )
+    print(f"Warning: {warning} Details: {failure_detail}")
+    return warning
+
+
 async def run_discovery(
     runtime_config: Any = None,
     *,
@@ -10960,6 +10992,11 @@ async def run_discovery(
                 discovery_quality=discovery_quality,
             )
 
+            indexing_warning = await _refresh_discovery_knowledge_base(
+                on_start=lambda: display.info("Updating the Knowledge Base index with the new reports..."),
+            )
+            if indexing_warning:
+                display.warning(indexing_warning)
             if discovery_quality["status"] == "partial":
                 display.warning(
                     "⚠️ Discovery finished with gaps: "
@@ -10975,7 +11012,7 @@ async def run_discovery(
                     "percentage": 100,
                     "current_step": 100,
                     "total_steps": 100,
-                    "description": "Discovery complete. Outputs are ready for review.",
+                    "description": f"Discovery complete. {indexing_warning}" if indexing_warning else "Discovery complete. Outputs are ready for review.",
                     "eta_seconds": 0,
                     "eta_method": "stage_calibrated",
                 },
@@ -11407,6 +11444,11 @@ async def run_discovery(
             readiness_score=readiness_score,
             discovery_scope=resolved_scope_info,
         )
+        indexing_warning = await _refresh_discovery_knowledge_base(
+            on_start=lambda: display.info("Updating the Knowledge Base index with the new reports..."),
+        )
+        if indexing_warning:
+            display.warning(indexing_warning)
         
         # Phase 7: Complete Discovery
         display.phase("✅ Discovery Complete")
@@ -11425,7 +11467,7 @@ async def run_discovery(
                 "percentage": 100,
                 "current_step": 100,
                 "total_steps": 100,
-                "description": "Discovery complete. Outputs are ready for review.",
+                "description": f"Discovery complete. {indexing_warning}" if indexing_warning else "Discovery complete. Outputs are ready for review.",
                 "eta_seconds": 0,
                 "eta_method": "stage_calibrated",
             },
@@ -15075,6 +15117,9 @@ def _load_cached_summary_if_available(
     summary_file = _summary_artifact_path(session_id, scope_key)
     if not summary_file.exists():
         return None
+    progress_entry = _get_summarization_progress(session_id, scope_key)
+    if progress_entry.get("stage") in {"saving", "indexing"} and _is_process_running(progress_entry.get("worker_pid")):
+        return None
 
     try:
         with open(summary_file, 'r', encoding='utf-8') as summary_handle:
@@ -15113,12 +15158,15 @@ def _load_cached_summary_if_available(
             except Exception as cache_patch_error:
                 print(f"Error backfilling context explorer for cached summary: {cache_patch_error}")
 
+        indexing_warning = progress_entry.get("knowledge_base_warning")
+        if indexing_warning:
+            existing_summary["knowledge_base_warning"] = indexing_warning
         _set_summarization_progress(
             session_id,
             scope_key=scope_key,
             stage="complete",
             progress=100,
-            message=completion_message,
+            message=f"{completion_message} {indexing_warning}" if indexing_warning else completion_message,
             worker_pid=None,
         )
         if mark_from_cache:
@@ -15203,6 +15251,7 @@ async def _handle_summary_background_request(
     session = _require_accessible_discovery_session(safe_timestamp, scope_key=scope_key)
     session_scope_key = _get_discovery_session_scope_key(session)
     json_file = _discovery_scope_output_dir(session_scope_key, create=False) / f"v2_intelligence_blueprint_{safe_timestamp}.json"
+    _sync_runtime_state_from_disk()
     cached_summary = _load_cached_summary_if_available(
         safe_timestamp,
         json_file,
@@ -15213,7 +15262,6 @@ async def _handle_summary_background_request(
     if cached_summary is not None:
         return cached_summary
 
-    _sync_runtime_state_from_disk()
     existing_progress = _get_summarization_progress(safe_timestamp, session_scope_key)
     existing_stage = str(existing_progress.get("stage") or "idle").strip().lower() or "idle"
     existing_worker_pid = _coerce_process_id(existing_progress.get("worker_pid"))
@@ -15254,6 +15302,35 @@ async def _handle_summary_background_request(
         completed_at=None,
     )
     return await _wait_for_summary_result(safe_timestamp, scope_key=session_scope_key)
+
+
+async def _save_summary_and_index(
+    session_id: str,
+    summary: Dict[str, Any],
+    *,
+    scope_key: Optional[str] = None,
+) -> Optional[str]:
+    summary_file = _summary_artifact_path(session_id, scope_key)
+    try:
+        summary_file.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    except (OSError, TypeError, ValueError) as exc:
+        warning = "The summary was generated but could not be saved or added to the Knowledge Base."
+        print(f"Warning: {warning} Details: {exc}")
+        return warning
+
+    print(f"Saved summary to {summary_file}")
+    # Include the catalog's new summary entry in the same index build.
+    load_discovery_sessions()
+    return await _refresh_discovery_knowledge_base(
+        saved_label="The summary was saved",
+        on_start=lambda: _set_summarization_progress(
+            session_id,
+            scope_key=scope_key,
+            stage="indexing",
+            progress=98,
+            message="Updating the Knowledge Base with the saved summary...",
+        ),
+    )
 
 
 async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key: Optional[str] = None):
@@ -15301,7 +15378,6 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
     classification_file = output_dir / f"v2_developer_handoff_{timestamp}.md"
     executive_file = output_dir / f"v2_insights_brief_{timestamp}.md"
 
-    summary_file = output_dir / f"v2_ai_summary_{safe_timestamp}.json"
     existing_cached_summary = _load_cached_summary_if_available(
         safe_timestamp,
         json_file,
@@ -16353,14 +16429,11 @@ Return ONLY the JSON array, no other text."""
         message="Saving results...",
     )
     
-    # Save summary for future use
-    try:
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            json.dump(response_data, f, indent=2)
-        print(f"Saved summary to {summary_file}")
-    except Exception as e:
-        print(f"Error saving summary: {e}")
-        # Don't fail the request if save fails
+    indexing_warning = await _save_summary_and_index(
+        timestamp, response_data, scope_key=request_scope_key
+    )
+    if indexing_warning:
+        response_data["knowledge_base_warning"] = indexing_warning
     
     # Update progress - Complete
     _set_summarization_progress(
@@ -16368,7 +16441,8 @@ Return ONLY the JSON array, no other text."""
         scope_key=request_scope_key,
         stage="complete",
         progress=100,
-        message="Analysis complete!",
+        message=f"Analysis complete. {indexing_warning}" if indexing_warning else "Analysis complete!",
+        knowledge_base_warning=indexing_warning,
     )
     
     return response_data

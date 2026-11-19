@@ -17,7 +17,7 @@
 - **Chat goals**: set a goal, and the AI model breaks it into questions, tracks which ones your answers settle, and suggests what to ask next. The Goal Library keeps goals, tracked questions, and saved chats
 - **Settings tuned to the model**: model profiles, ranking, and auto-tuning for hosted and local models. Chat Settings start from the model's tuning and show each value as Auto or Custom
 - **Knowledge library**: the environment profile from discovery, Splunk Security Content, Splunkbase records, and help.splunk.com documentation for your Splunk version and installed apps, downloaded for offline search, with a coverage scorecard and library packs for servers without internet access
-- **Knowledge Base** (optional capability): managed knowledge assets, the SPL Library, and context previews, with a Reindex needed notice when its sources change
+- **Knowledge Base** (optional capability): managed knowledge assets, the SPL Library, and context previews. Discovery and AI summaries update its index after saving, and a Reindex needed notice shows when other sources change
 - **Troubleshooting**: Settings > Troubleshoot explains why an MCP server or AI model connection or save fails, without saving anything
 - **Security**: optional local sign-in and OIDC, per-user MCP assignment, scoped tokens for a read-only external RAG API and an inbound MCP surface (HTTP plus a stdio bridge), and Fernet-encrypted settings with no plaintext secrets
 - **Themes and accessibility**: Light, Dark, Neo, and System themes that meet WCAG AA contrast, checked by a browser test in CI
@@ -136,7 +136,7 @@ Library health on the Knowledge Base tab scores how well reference sources cover
 - **Documentation**: **Download documentation** saves the help.splunk.com manuals for your platform version and installed apps (up to 8,000 pages) into a local search index. Downloads are slow on purpose and stop when the site refuses requests. Chat uses the pages only when Search the Knowledge Base is on
 - **Online sources are off by default**. An admin turns on **Download sources from the internet** under Sources. Requests go only to `api.github.com`, `raw.githubusercontent.com`, `splunkbase.splunk.com`, and `help.splunk.com` over HTTPS
 - **Servers without internet access**: **Export library pack** on a connected server and **Import library pack** on the offline one (up to 100 MB, checked before anything is saved)
-- The documentation has its own index, so it never needs a Knowledge Base reindex. The Knowledge Base shows **Reindex needed** when it was never indexed, when reports or other source files changed after the last index, or when the index uses an older format. Report changes are never indexed on their own; documents you import into the Knowledge Base are indexed when you import them
+- The documentation has its own index, so it never needs a Knowledge Base reindex. When the Knowledge Base is installed and turned on, discovery updates its index after saving reports and the report catalog; AI summaries update it again after saving. Documents you import are indexed when you import them. **Reindex needed** can still appear before the first index, after other file changes, after an automatic update fails, or when the index uses an older format. Select **Reindex** to rebuild or retry. An indexing failure does not discard saved discovery results; the discovery log or summary progress explains that the update needs attention
 
 ## 📸 Current Workspace Snapshots
 
