@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
+- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
+- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.2.0] - 2026-11-19
+
+Version 2.2.0 adds incognito mode. When it is on, the AI model sees stand-ins such as `host_0012` instead of your host names, IP addresses, users, custom indexes, apps, and saved searches, and you still see the real names in the app. Admins can require it while a cloud AI model is in use, and anyone can download a chat or report with stand-ins to share.
+
+### ⬆️ Upgrading from 2.1.1
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+- Incognito mode is off until a user turns it on or an admin changes the defaults on the Settings **Security** tab. Nothing changes for the AI model until then
+- Incognito mode learns your names from discovery reports. Run discovery once before you rely on it, and add names discovery cannot find under **Always replace these terms**
+- Names that are also ordinary words, such as an index named `web`, are replaced only where they appear as a value (for example `index=web`), not in sentences. Add one to **Always replace these terms** if the word itself is sensitive
+- Incognito files are encrypted with a key derived from `.config.key`. Back up `.config.key` together with `output/`
+- Summaries and other AI output made before 2.2.0, or while incognito mode was off, keep the real names they were made with
+
 ### Added
 - **Incognito mode**: an **Incognito** button in the top bar turns it on or off for you, and explains why when it is locked. Each user has their own choice when sign-in is on. Before anything goes to the AI model, the app replaces hosts, IP addresses (keeping subnets together), users, custom indexes, apps that are not Splunk's own, saved searches, knowledge objects, KV store collections, roles, email addresses, domains, MAC addresses, GUIDs, Windows SIDs, and secrets with stand-ins, and puts the real names back in the reply. Splunk's own indexes, sourcetypes, fields, and apps stay visible
 - Incognito mode covers chat (including Knowledge Base passages and search results), chat goals, discovery analysis, AI summaries, task verification, remediation steps, the M-26-14 AI Review, and summary infographics. Background jobs keep the state they started with
@@ -20,11 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - The Settings warning that the server is still running the code it had before an update was hard to read in dark themes (dark text on a dark background). Its text is now light in dark themes
-
-### Planned
-- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
-- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
-- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
 
 ## [2.1.1] - 2026-11-19
 
@@ -631,7 +643,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0
 [2.1.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.1
 [2.1.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.0
 [2.0.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.0.2

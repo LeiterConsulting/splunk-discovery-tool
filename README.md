@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-2.1.1-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.1)
+[![Version](https://img.shields.io/badge/version-2.2.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0)
 
 > Finds what a Splunk environment contains, explains what to do next, and answers questions with live Splunk searches through the Splunk MCP server.
 
-**Current release: [2.1.1](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.1)** (November 19, 2026). Discovery and AI summaries now keep the Knowledge Base index up to date, so chat can search new reports without a manual Reindex. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
+**Current release: [2.2.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0)** (November 19, 2026). Incognito mode shows the AI model stand-ins such as `host_0012` instead of your own names, admins can require it for cloud AI models, and chats and reports can be downloaded with stand-ins to share. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
 
 ## ✨ What's Included
 
