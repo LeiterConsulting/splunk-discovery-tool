@@ -289,6 +289,15 @@ chat_goal_item_endpoint = "/api/chat/goals/{goal_id}/items/{item_id}"   # PATCH,
 chat_goal_progress_endpoint = "/api/chat/goals/{goal_id}/progress"
 chat_goal_chat_endpoint = "/api/chat/goals/{goal_id}/chats/{chat_id}"   # GET, PUT, PATCH, DELETE
 
+# Incognito Mode
+incognito_status_endpoint = "/api/incognito/status"                    # GET
+incognito_preference_endpoint = "/api/incognito/preference"            # POST {"enabled": true|false|null}
+incognito_policy_endpoint = "/api/incognito/policy"                    # GET, POST (admin)
+incognito_rotate_endpoint = "/api/incognito/rotate"                    # POST (admin)
+incognito_preview_endpoint = "/api/incognito/preview"                  # POST (admin)
+incognito_ledger_endpoint = "/api/incognito/ledger/{ledger_id}"        # GET (the person who asked)
+incognito_export_endpoint = "/api/incognito/export"                    # POST {"text", "filename"}
+incognito_report_export_endpoint = "/api/incognito/export/report/{filename}"  # GET
 # Knowledge Library
 knowledge_library_status_endpoint = "/api/knowledge-library/status"
 knowledge_library_settings_endpoint = "/api/knowledge-library/settings"
@@ -330,6 +339,7 @@ chat_settings_file = "output/chat_data/chat_settings.json"         # src/chat_se
 chat_goals_directory = "output/chat_data/goals/"                   # src/chat_goals.py
 knowledge_library_directory = "output/knowledge_library/"          # src/knowledge_library/
 library_docs_database = "output/knowledge_library/docs/library_docs.sqlite3"
+incognito_directory = "output/incognito/"                          # src/incognito/store.py (encrypted)
 
 # Current Artifact Naming
 v2_blueprint_pattern = "v2_intelligence_blueprint_<timestamp>.json"
@@ -572,6 +582,44 @@ FRESHNESS_EXEMPT_DIRS = {"runtime_jobs"}
 
 ---
 
+## 16. Incognito Mode (src/incognito/, src/web_app.py)
+```python
+# src/web_app.py
+INCOGNITO_ROOT = "output/incognito"            # policy.enc, preferences.enc, vaults/, ledger/
+INCOGNITO_VAULT_SCOPE = "installation"         # One stand-in mapping for the whole installation
+INCOGNITO_EXPORT_MAX_CHARS = 5_000_000         # Largest chat or report exported with stand-ins
+# Preview text limit: 20,000 characters (POST /api/incognito/preview)
+# Files are encrypted with config_manager.derived_fernet("incognito"):
+#   Fernet key = HKDF-SHA256(.config.key, info="dt4sms:incognito")
+
+# src/incognito/store.py
+class IncognitoPolicy:
+    force_for_cloud: bool = False              # Require incognito mode while a cloud AI model is in use
+    default_on: bool = False                   # On for anyone who has not chosen
+    always_mask_terms: list = []               # Admin terms replaced with term_NNNN
+    keep_visible_terms: list = []              # Admin terms never replaced
+MAX_TERMS = 500                                # Per term list
+MAX_TERM_LENGTH = 200                          # Characters per term (shorter than 2 is dropped)
+LEDGER_LIMIT = 300                             # Newest records of what the AI saw that are kept
+
+# State, first match wins (resolve_state):
+# 1. force_for_cloud and a cloud AI model: on, locked ("required_for_cloud")
+# 2. The person's own choice ("user_choice")
+# 3. default_on ("default")
+# 4. Off
+# An unreadable policy acts as force_for_cloud=True, default_on=True until an admin saves it again.
+# A background job that started in incognito mode stays on ("job_started_incognito").
+
+# src/incognito/session.py
+MAX_LEDGER_CALLS = 24                          # Requests kept per record
+MAX_LEDGER_TEXT = 60000                        # Characters kept per text in a record, cut in the middle
+
+# src/incognito/provider.py: provider_kind()
+# "local": endpoint on this machine or a private network, or Ollama without an endpoint
+# "cloud": Azure OpenAI, Anthropic, Gemini, Cohere, Bedrock, Vertex, and anything not confirmed local
+```
+
+---
 ## Summary of Key Thresholds
 
 | Category | Parameter | Value | Unit | Notes |
@@ -595,6 +643,11 @@ FRESHNESS_EXEMPT_DIRS = {"runtime_jobs"}
 | **Knowledge Library** | Auto Refresh | 7 | days | Only when online sources are allowed |
 | **Knowledge Library** | Documentation Pages | 8000 | pages | Total cap |
 | **Knowledge Library** | Pack Import Size | 100 | MB | Per pack |
+| **Incognito** | Records Kept | 300 | records | Newest kept |
+| **Incognito** | Requests per Record | 24 | count | Newest kept |
+| **Incognito** | Term Lists | 500 | terms | Per list, 200 characters per term |
+| **Incognito** | Preview | 20000 | characters | Admin preview text |
+| **Incognito** | Export with Stand-ins | 5000000 | characters | Chat or report |
 | **WebSocket** | Receive Timeout | 0.1 | seconds | 100ms polling |
 | **Server** | Port | 8003 | port | Next 20 ports tried when busy |
 | **Tokens** | Default Max (auto_tune off) | 16000 | tokens | Per request |
@@ -611,5 +664,5 @@ FRESHNESS_EXEMPT_DIRS = {"runtime_jobs"}
 
 ---
 
-*Last Updated: 2026-11-16*
+*Last Updated: 2026-11-19*
 *Version: 2.1.1*

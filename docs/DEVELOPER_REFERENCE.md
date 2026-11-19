@@ -109,12 +109,14 @@ LLM flow:
 - Tool-call extraction (extract_recoverable_tool_call) accepts tagged JSON, misspelled or missing closing tags, python-like dicts, and a tool-call JSON object that ends the reply (bare, backticked, or fenced)
 - A reply with no tool call that promises a search, says it cannot run one (chat_agent.announces_unexecuted_search), or stops after a Responses API `commentary` preamble (OpenAIClient returns a `PreambleReply` with `ends_on_preamble`) gets a nudge asking for the TOOL_CALL, tried twice at most. The nudge sends the preamble back with `phase: "commentary"`; OpenAIClient keeps `phase` on assistant messages for the Responses API and drops it for Chat Completions, and other providers ignore it
 - Promise-only assistant replies are left out of the history and continuity context sent to the model
+- get_or_create_llm_client() returns the provider client wrapped in `incognito.IncognitoLLMClient`. When the current incognito session (a context variable) is on, `generate_response` and `analyze_data` mask the request, record what was sent, and restore names in the reply. Chat masks MCP result rows field by field before they go back to the model (`incognito_rows_for_llm`, raw events left out) and skips a tool call that uses stand-ins the model was never shown (`incognito_unknown_stand_ins`). See [INCOGNITO_MODE.md](INCOGNITO_MODE.md)
 
 ### Guidance
 
 - Keep deterministic paths for high-value queries
 - Reserve free-form agentic behavior for exploratory questions
 - Track and expose reasoning timeline to users for transparency
+- Run every new AI call that sends Splunk data inside `incognito_session_scope(incognito_session_for_request(request, "feature name"))`, and return `attach_incognito_result(session, result)` so the UI can show What the AI saw. Background jobs carry `incognito_job_payload(owner)` and open their session with `open_incognito_session_for_job`. Catch `IncognitoBlocked` and show its message; never retry without masking
 - HTTPX AI requests, aiohttp provider generation, and the AI troubleshooter use `llm.factory.create_llm_ssl_context()`: Python's system CA store plus certifi's public CAs, with hostname and certificate verification enabled. `SSL_CERT_FILE` and `SSL_CERT_DIR`, when set before startup, replace that combined trust store. Keep new AI request paths on the same helper; MCP retains its separate Verify SSL and CA bundle settings.
 
 ## 6) Settings Surface (Preserved)
@@ -175,6 +177,10 @@ Every button should communicate purpose:
 - `GET /api/knowledge-library/pack/export` → Download the loaded sources and documentation text as a library pack zip (404 when none are loaded)
 - `POST /api/knowledge-library/search` → Rank downloaded Splunk documentation passages for a question, as chat does (400 for an empty question)
 - `GET /reports` → Report/session list
+- `GET /api/incognito/status` and `POST /api/incognito/preference` → The caller's incognito state and choice (409 when the policy locks it on)
+- `GET` and `POST /api/incognito/policy`, `POST /api/incognito/rotate`, `POST /api/incognito/preview` → Incognito admin settings, stand-in reset, and preview (admin)
+- `GET /api/incognito/ledger/{ledger_id}` → What the AI saw for one answer (only the person who asked)
+- `POST /api/incognito/export` and `GET /api/incognito/export/report/{filename}` → A chat text or saved report with stand-ins (409 when a known name would remain, 400 for pictures)
 
 ### Capability notes
 

@@ -136,6 +136,20 @@ from spl.spl_utils import (
     scope_spl_to_index,
 )
 from frontend_legacy import get_frontend_html
+from incognito import (
+    IncognitoBlocked,
+    IncognitoLLMClient,
+    IncognitoPolicy,
+    IncognitoSession,
+    IncognitoState,
+    IncognitoStore,
+    clean_terms as clean_incognito_terms,
+    current_session as current_incognito_session,
+    provider_kind as incognito_provider_kind,
+    row_hint_for_tool as incognito_row_hint,
+    session_scope as incognito_session_scope,
+)
+from incognito.seeding import seed_from_outputs as seed_incognito_names
 from security_manager import SecurityManager
 
 # Ensure console/log prints do not crash on Windows code pages (cp1252, etc.)
@@ -2776,12 +2790,17 @@ def get_or_create_llm_client(config):
         raise ValueError(f"Provider '{config.llm.provider}' requires endpoint_url")
 
     tuning = resolve_active_llm_tuning(config, allow_fetch=True)
-    _cached_llm_client = LLMClientFactory.create_client(
-        provider=provider_name,
-        custom_endpoint=endpoint_url,
-        api_key=config.llm.api_key,
-        model=config.llm.model,
-        tuning=client_tuning(tuning),
+    # Every model call goes through the incognito wrapper; it does nothing unless the
+    # request or job set an active incognito session.
+    _cached_llm_client = IncognitoLLMClient(
+        LLMClientFactory.create_client(
+            provider=provider_name,
+            custom_endpoint=endpoint_url,
+            api_key=config.llm.api_key,
+            model=config.llm.model,
+            tuning=client_tuning(tuning),
+        ),
+        current_incognito_session,
     )
     print(
         f"[LLM Cache] Created {provider_name} client ({config.llm.model}): "
@@ -2791,6 +2810,146 @@ def get_or_create_llm_client(config):
 
     _cached_config_hash = config_hash
     return _cached_llm_client
+
+
+# ==================== Incognito mode ====================
+
+INCOGNITO_ROOT = Path("output") / "incognito"
+# One stand-in mapping for the whole installation, so a name gets the same stand-in in chat,
+# summaries, discovery, and exports no matter whose request or which connection produced it.
+INCOGNITO_VAULT_SCOPE = "installation"
+incognito_store = IncognitoStore(INCOGNITO_ROOT, config_manager.derived_fernet("incognito"))
+
+
+def incognito_owner(request: Optional[Request] = None, auth_user: Optional[Dict[str, Any]] = None) -> str:
+    """Whose incognito choice applies: the signed-in user, or the shared choice when sign-in is off."""
+    if not is_auth_enabled():
+        return owner_key(None)
+    user = auth_user if isinstance(auth_user, dict) else getattr(getattr(request, "state", None), "auth_user", None)
+    return owner_key(user if isinstance(user, dict) else None)
+
+
+def llm_provider_kind(config: Any = None) -> str:
+    llm = getattr(config if config is not None else config_manager.get(), "llm", None)
+    return incognito_provider_kind(getattr(llm, "provider", ""), getattr(llm, "endpoint_url", ""))
+
+
+def open_incognito_session(
+    owner: Optional[str],
+    feature: str,
+    *,
+    config: Any = None,
+    keep_on: bool = False,
+) -> IncognitoSession:
+    """Incognito state for one request or job.
+
+    ``keep_on`` is for background jobs that started in incognito mode: they stay masked even if
+    the choice changes while they run.
+    """
+    owner = str(owner or owner_key(None))
+    kind = llm_provider_kind(config)
+    state = incognito_store.resolve_state(owner, kind)
+    if keep_on and not state.active:
+        state = IncognitoState(True, state.locked, "job_started_incognito", kind, owner)
+    session = incognito_store.open_session(
+        owner=owner, provider_kind=kind, scope=INCOGNITO_VAULT_SCOPE, feature=feature, state=state
+    )
+    if session.active and session.masker is not None:
+        try:
+            seed_incognito_names(session.masker, Path("output"))
+        except Exception as exc:  # noqa: BLE001 - without discovery names, masking would miss short host names
+            print(f"⚠️ [INCOGNITO] Could not load discovery names: {exc}")
+            return IncognitoSession(
+                state,
+                None,
+                feature=feature,
+                error="Incognito mode could not load the names found by discovery, so nothing was sent to the AI model.",
+            )
+    return session
+
+
+def incognito_session_for_request(request: Optional[Request], feature: str, config: Any = None) -> IncognitoSession:
+    return open_incognito_session(incognito_owner(request), feature, config=config)
+
+
+def incognito_job_payload(owner: Optional[str], config: Any = None) -> Dict[str, Any]:
+    """What a background job needs to apply the requester's incognito state in its own process."""
+    owner = str(owner or owner_key(None))
+    state = incognito_store.resolve_state(owner, llm_provider_kind(config))
+    return {"owner": owner, "active": bool(state.active)}
+
+
+def open_incognito_session_for_job(payload: Any, feature: str, config: Any = None) -> IncognitoSession:
+    details = payload.get("incognito") if isinstance(payload, dict) and isinstance(payload.get("incognito"), dict) else {}
+    return open_incognito_session(details.get("owner"), feature, config=config, keep_on=bool(details.get("active")))
+
+
+def finish_incognito_session(session: Optional[IncognitoSession]) -> Optional[Dict[str, Any]]:
+    """Save the record of what the AI saw and return the summary to put in an API response."""
+    if session is None or not session.active:
+        return None
+    try:
+        incognito_store.save_ledger(session)
+    except Exception as exc:  # noqa: BLE001 - losing the record must not lose the answer
+        print(f"⚠️ [INCOGNITO] Could not save the record of what the AI saw: {exc}")
+    return session.describe()
+
+
+def attach_incognito_result(session: Optional[IncognitoSession], result: Any) -> Any:
+    summary = finish_incognito_session(session)
+    if summary is not None and isinstance(result, dict):
+        result["incognito"] = summary
+    return result
+
+
+def incognito_image_fields(session: Optional[IncognitoSession]) -> Dict[str, Any]:
+    if session is None or not session.active:
+        return {}
+    return {
+        "incognito": session.describe(),
+        "incognito_note": "Incognito mode was on, so the picture shows stand-ins instead of real names.",
+    }
+
+
+def incognito_blocked_message(error: IncognitoBlocked) -> str:
+    return str(error) or "Incognito mode stopped this request, so nothing was sent to the AI model."
+
+
+def incognito_unknown_stand_ins(value: Any) -> List[str]:
+    """Stand-ins in a model's tool call that it was never shown, so the call cannot run as intended."""
+    session = current_incognito_session()
+    if session is None or not session.active:
+        return []
+    return session.unknown_in(value)
+
+
+def build_unknown_stand_in_feedback(step: int, unknown: List[str], remaining_steps: int) -> str:
+    shown = ", ".join(unknown[:8]) + (f" and {len(unknown) - 8} more" if len(unknown) > 8 else "")
+    lines = [
+        f"TOOL RESULT (step {step}): not run, because it uses stand-in names that do not appear in this "
+        f"conversation: {shown}. Use only stand-ins exactly as they appear above, or search without them."
+    ]
+    if remaining_steps > 0:
+        lines.append(f"Make a corrected TOOL_CALL or answer the user now ({remaining_steps} tool steps left).")
+    else:
+        lines.append("No tool steps are left. Reply to the user now from the evidence above, without a TOOL_CALL.")
+    return "\n".join(lines)
+
+
+def incognito_rows_for_llm(rows: Any, tool_name: str, tool_args: Optional[Dict[str, Any]] = None) -> Any:
+    """Result rows as the model sees them in incognito mode: masked field by field, raw events left out."""
+    session = current_incognito_session()
+    if session is None or not session.active or not isinstance(rows, list) or not rows:
+        return rows
+    hint, splunk_apps = incognito_row_hint(tool_name, tool_args or {})
+    return session.mask_rows(rows, hint=hint, splunk_apps=splunk_apps)
+
+
+def incognito_outcome_for_llm(outcome: Dict[str, Any], tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+    if not outcome.get("rows"):
+        return outcome
+    masked = incognito_rows_for_llm(outcome["rows"], tool_name, tool_args)
+    return outcome if masked is outcome["rows"] else {**outcome, "rows": masked}
 
 
 app = FastAPI(
@@ -9740,7 +9899,7 @@ async def _build_m26_14_llm_analysis_payload(
         "findings": _normalize_m26_14_advisory_list(validation_summary.get("findings"), limit=5),
         "row_count": validation_summary.get("row_count"),
         "sample_fields": validation_summary.get("sample_fields") or [],
-        "sample_rows": _sample_m26_14_validation_rows(rows, limit=5),
+        "sample_rows": incognito_rows_for_llm(_sample_m26_14_validation_rows(rows, limit=5), "splunk_run_query"),
     }
 
     prompt_payload = {
@@ -10708,6 +10867,7 @@ async def start_discovery(request: Request, background_tasks: BackgroundTasks):
                 "runtime_binding": worker_binding,
                 "requested_at": _utcnow_iso(),
                 "pipeline_version": DISCOVERY_PIPELINE_VERSION,
+                "incognito": incognito_job_payload(incognito_owner(request)),
             },
         )
     except Exception as exc:
@@ -10915,6 +11075,9 @@ async def run_discovery(
         # Initialize LLM client (cached for performance)
         llm_client = get_or_create_llm_client(config)
         display.success("✅ LLM client initialized")
+        incognito = current_incognito_session()
+        if incognito is not None and incognito.active:
+            display.info("🔒 Incognito mode is on: names are replaced with stand-ins before the AI model sees them.")
         
         # Only a real tools/list result is shared with the engine; with the fallback set it lists tools itself.
         discovery_engine = DiscoveryEngine(
@@ -11756,14 +11919,16 @@ async def run_m26_14_validation(request: Request, validation_request: M2614Valid
     normalized_result = extract_results_from_mcp_response(tool_result)
     rows = normalized_result.get("results", []) if isinstance(normalized_result.get("results", []), list) else []
     validation_summary = summarize_m26_14_validation_results(validation_pack, rows)
-    advisory_payload = await _build_m26_14_validation_advisory_payload(
-        validation_pack,
-        validation_request,
-        validation_summary,
-        rows,
-        capability_state,
-        scope_key=scope_key,
-    )
+    incognito_session = incognito_session_for_request(request, "M-26-14 advisor", runtime_config)
+    with incognito_session_scope(incognito_session):
+        advisory_payload = await _build_m26_14_validation_advisory_payload(
+            validation_pack,
+            validation_request,
+            validation_summary,
+            rows,
+            capability_state,
+            scope_key=scope_key,
+        )
     response_payload = {
         "status": "success",
         "pack": validation_pack,
@@ -11784,7 +11949,7 @@ async def run_m26_14_validation(request: Request, validation_request: M2614Valid
         "advisory": advisory_payload,
     }
     _store_cached_m26_14_validation_result(cache_key, response_payload)
-    return response_payload
+    return attach_incognito_result(incognito_session, dict(response_payload))
 
 
 @app.get("/api/discovery/runbook")
@@ -13733,6 +13898,232 @@ async def reset_chat_settings():
         raise HTTPException(status_code=500, detail=f"Could not save chat settings: {exc}") from None
     return _chat_settings_response(refresh_chat_session_settings())
 
+# ==================== Incognito mode API ====================
+
+
+def _is_admin_or_open(user: Optional[Dict[str, Any]]) -> bool:
+    return user is None or str(user.get("role") or "").strip().lower() == "admin"
+
+
+def _incognito_policy_view(policy: IncognitoPolicy) -> Dict[str, Any]:
+    view = policy.to_dict()
+    view["stand_in_counts"] = incognito_store.vault(INCOGNITO_VAULT_SCOPE).counts()
+    return view
+
+
+@app.get("/api/incognito/status")
+async def get_incognito_status(request: Request):
+    """The caller's incognito state for the AI model in use, and whether they can change it."""
+    user = require_authenticated_user(request)
+    owner = incognito_owner(request, user)
+    policy = incognito_store.load_policy()
+    kind = llm_provider_kind(resolve_effective_runtime_config(request=request))
+    preference = incognito_store.get_preference(owner)
+    state = incognito_store.resolve_state(owner, kind, policy)
+    return {
+        "state": state.to_dict(),
+        "preference": preference,
+        "policy": {
+            "force_for_cloud": policy.force_for_cloud,
+            "default_on": policy.default_on,
+            "unreadable": policy.unreadable,
+        },
+        "can_manage": _is_admin_or_open(user),
+    }
+
+
+@app.post("/api/incognito/preference")
+async def set_incognito_preference(request: Request):
+    """Turn incognito mode on or off for the caller. ``enabled: null`` goes back to the server default."""
+    user = require_authenticated_user(request)
+    owner = incognito_owner(request, user)
+    payload = await _goal_payload(request)
+    enabled = payload.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be true, false, or null")
+    policy = incognito_store.load_policy()
+    kind = llm_provider_kind(resolve_effective_runtime_config(request=request))
+    current = incognito_store.resolve_state(owner, kind, policy)
+    if current.locked and enabled is False:
+        raise HTTPException(
+            status_code=409,
+            detail="Your administrator requires incognito mode while a cloud AI model is in use.",
+        )
+    try:
+        incognito_store.set_preference(owner, enabled)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save your choice: {exc}") from None
+    return await get_incognito_status(request)
+
+
+@app.get("/api/incognito/policy")
+async def get_incognito_policy(request: Request):
+    require_admin_user(request)
+    return {"policy": _incognito_policy_view(incognito_store.load_policy())}
+
+
+@app.post("/api/incognito/policy")
+async def update_incognito_policy(request: Request):
+    """Admin settings: require incognito mode for cloud models, the default, and term lists."""
+    user = require_admin_user(request)
+    payload = await _goal_payload(request)
+    current = incognito_store.load_policy()
+    updated = IncognitoPolicy(
+        force_for_cloud=current.force_for_cloud,
+        default_on=current.default_on,
+        always_mask_terms=list(current.always_mask_terms),
+        keep_visible_terms=list(current.keep_visible_terms),
+    )
+    for key in ("force_for_cloud", "default_on"):
+        if key in payload:
+            if not isinstance(payload[key], bool):
+                raise HTTPException(status_code=400, detail=f"{key} must be true or false")
+            setattr(updated, key, payload[key])
+    for key in ("always_mask_terms", "keep_visible_terms"):
+        if key in payload:
+            values = payload[key]
+            if isinstance(values, str):
+                values = values.splitlines()
+            if not isinstance(values, list):
+                raise HTTPException(status_code=400, detail=f"{key} must be a list of terms")
+            setattr(updated, key, clean_incognito_terms(values))
+    try:
+        saved = incognito_store.save_policy(updated, updated_by=str((user or {}).get("username") or "local"))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save the incognito settings: {exc}") from None
+    return {"policy": _incognito_policy_view(saved)}
+
+
+@app.post("/api/incognito/rotate")
+async def rotate_incognito_stand_ins(request: Request):
+    """Forget every stand-in so the AI model sees new ones from the next request on."""
+    require_admin_user(request)
+    try:
+        incognito_store.rotate(INCOGNITO_VAULT_SCOPE)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not reset the stand-ins: {exc}") from None
+    return {"status": "rotated", "policy": _incognito_policy_view(incognito_store.load_policy())}
+
+
+def _incognito_masking_session(request: Request, feature: str) -> IncognitoSession:
+    """A session that masks with the installation's stand-ins whatever the caller's own choice is."""
+    state = IncognitoState(True, False, "user_choice", llm_provider_kind(), incognito_owner(request))
+    try:
+        masker = incognito_store.masker(INCOGNITO_VAULT_SCOPE)
+        seed_incognito_names(masker, Path("output"))
+        return IncognitoSession(state, masker, feature=feature)
+    except Exception as exc:  # noqa: BLE001 - report the failure instead of returning unmasked text
+        return IncognitoSession(state, None, feature=feature, error=f"Incognito mode could not start: {exc}")
+
+
+@app.post("/api/incognito/preview")
+async def preview_incognito_masking(request: Request):
+    """Show how a piece of text would look to the AI model, for checking the term lists."""
+    require_admin_user(request)
+    payload = await _goal_payload(request)
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="Enter some text to preview.")
+    if len(text) > 20000:
+        raise HTTPException(status_code=400, detail="The preview is limited to 20,000 characters.")
+    session = _incognito_masking_session(request, "preview")
+    try:
+        masked = session.mask_text(text)
+    except IncognitoBlocked as blocked:
+        return {"masked": None, "blocked": incognito_blocked_message(blocked), "masked_counts": {}}
+    return {"masked": masked, "blocked": None, "masked_counts": session.masked_counts()}
+
+
+INCOGNITO_EXPORT_MAX_CHARS = 5_000_000
+
+
+def _shareable_export_filename(name: Any, default: str) -> str:
+    try:
+        cleaned = sanitize_filename(str(name or ""))
+    except HTTPException:
+        cleaned = default
+    path = Path(cleaned)
+    return f"{path.stem}-stand-ins{path.suffix or '.txt'}"
+
+
+def _shareable_export_blocked(blocked: IncognitoBlocked) -> HTTPException:
+    if blocked.reason == "leak":
+        kinds = ", ".join(blocked.namespaces) or "some values"
+        detail = f"Some values could not be replaced ({kinds}), so the shareable copy was not created."
+    else:
+        detail = "Incognito mode could not start, so the shareable copy was not created."
+    return HTTPException(status_code=409, detail=detail)
+
+
+def _mask_for_export(session: IncognitoSession, content: str, *, as_json: bool) -> str:
+    if as_json:
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return session.mask_export(content)
+        return json.dumps(session.mask_export(data), indent=2, ensure_ascii=False)
+    return session.mask_export(content)
+
+
+@app.post("/api/incognito/export")
+async def export_text_with_stand_ins(request: Request):
+    """A copy of some text, such as a chat transcript, with stand-ins in place of real names."""
+    require_authenticated_user(request)
+    payload = await _goal_payload(request)
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="There is nothing to export.")
+    if len(text) > INCOGNITO_EXPORT_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="This is too large to export with stand-ins.")
+    filename = _shareable_export_filename(payload.get("filename"), "export.md")
+    session = _incognito_masking_session(request, "shareable export")
+    try:
+        masked = await asyncio.to_thread(_mask_for_export, session, text, as_json=filename.lower().endswith(".json"))
+    except IncognitoBlocked as blocked:
+        raise _shareable_export_blocked(blocked) from None
+    return {"content": masked, "filename": filename, "masked_counts": session.masked_counts()}
+
+
+@app.get("/api/incognito/export/report/{filename}")
+async def export_report_with_stand_ins(filename: str, request: Request):
+    """A copy of a saved report with stand-ins in place of real names, safe to share."""
+    require_authenticated_user(request)
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    file_path = _resolve_accessible_output_artifact_path(filename, scope_key)
+    if file_path.suffix.lower() in IMAGE_ARTIFACT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Names in pictures cannot be replaced. Share a text report instead.",
+        )
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise HTTPException(status_code=500, detail="Failed to read report") from None
+    if len(content) > INCOGNITO_EXPORT_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="This report is too large to export with stand-ins.")
+    session = _incognito_masking_session(request, "shareable export")
+    try:
+        masked = await asyncio.to_thread(
+            _mask_for_export, session, content, as_json=file_path.suffix.lower() == ".json"
+        )
+    except IncognitoBlocked as blocked:
+        raise _shareable_export_blocked(blocked) from None
+    return {
+        "content": masked,
+        "filename": _shareable_export_filename(file_path.name, "report.txt"),
+        "masked_counts": session.masked_counts(),
+    }
+
+
+@app.get("/api/incognito/ledger/{ledger_id}")
+async def get_incognito_ledger(ledger_id: str, request: Request):
+    """What the AI model was sent for one answer. Only the person who asked can see it."""
+    user = require_authenticated_user(request)
+    record = incognito_store.load_ledger(incognito_owner(request, user), ledger_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="That record is not available.")
+    return {"record": record}
+
 # ==================== Chat Goals API ====================
 
 chat_goal_store = ChatGoalStore(CHAT_DATA_ROOT)
@@ -13803,6 +14194,8 @@ async def _ask_llm_for_goal_json(messages: List[Dict[str, str]], fraction: float
             max_tokens=llm_call_budget(config, fraction, floor=400, ceiling=ceiling),
             temperature=0.2,
         )
+    except IncognitoBlocked as blocked:
+        return None, incognito_blocked_message(blocked)
     except Exception as exc:
         return None, f"The AI model could not answer: {exc}"
     parsed = _extract_json_object_from_llm_text(raw_response)
@@ -13847,7 +14240,9 @@ async def create_chat_goal(request: Request):
     goal_text = clean_goal_text(payload.get("goal"), MAX_GOAL_CHARS)
     if not goal_text:
         raise HTTPException(status_code=400, detail="Describe the goal first.")
-    plan, planned_by, message = await _plan_chat_goal(goal_text)
+    incognito = open_incognito_session(owner, "goal planning")
+    with incognito_session_scope(incognito):
+        plan, planned_by, message = await _plan_chat_goal(goal_text)
     try:
         goal = chat_goal_store.create_goal(
             owner,
@@ -13859,7 +14254,7 @@ async def create_chat_goal(request: Request):
         )
     except (GoalLimitError, OSError) as exc:
         raise _goal_http_error(exc) from None
-    return {"goal": goal, "message": message}
+    return attach_incognito_result(incognito, {"goal": goal, "message": message})
 
 
 @app.get("/api/chat/goals/{goal_id}")
@@ -13901,12 +14296,14 @@ async def replan_chat_goal(goal_id: str, request: Request):
         goal = chat_goal_store.get_raw_goal(owner, goal_id)
     except (GoalNotFoundError, OSError) as exc:
         raise _goal_http_error(exc) from None
-    plan, planned_by, message = await _plan_chat_goal(str(goal.get("goal") or ""))
+    incognito = open_incognito_session(owner, "goal planning")
+    with incognito_session_scope(incognito):
+        plan, planned_by, message = await _plan_chat_goal(str(goal.get("goal") or ""))
     try:
         detail = chat_goal_store.replace_plan(owner, goal_id, plan["items"], plan["questions"], planned_by)
     except (GoalNotFoundError, OSError) as exc:
         raise _goal_http_error(exc) from None
-    return {"goal": detail, "message": message}
+    return attach_incognito_result(incognito, {"goal": detail, "message": message})
 
 
 @app.post("/api/chat/goals/{goal_id}/items")
@@ -13950,20 +14347,22 @@ async def check_chat_goal_progress(goal_id: str, request: Request):
     turns = pending_goal_turns(goal)
     if not turns:
         return {"goal": goal_detail(goal), "updated": False, "message": ""}
-    data, reason = await _ask_llm_for_goal_json(build_progress_messages(goal, turns), fraction=0.25, ceiling=1500)
+    incognito = open_incognito_session(owner, "goal progress check")
+    with incognito_session_scope(incognito):
+        data, reason = await _ask_llm_for_goal_json(build_progress_messages(goal, turns), fraction=0.25, ceiling=1500)
     evaluation = parse_progress(data, goal) if data else None
     if evaluation is None:
-        return {
+        return attach_incognito_result(incognito, {
             "goal": goal_detail(goal),
             "updated": False,
             "message": reason or "The AI model did not return a usable progress check.",
-        }
+        })
     turn_ids = [turn.get("id") for turn in goal.get("turns") or [] if isinstance(turn, dict) and not turn.get("evaluated")]
     try:
         detail = chat_goal_store.apply_progress(owner, goal_id, evaluation, turn_ids)
     except (GoalNotFoundError, OSError) as exc:
         raise _goal_http_error(exc) from None
-    return {"goal": detail, "updated": True, "message": ""}
+    return attach_incognito_result(incognito, {"goal": detail, "updated": True, "message": ""})
 
 
 @app.get("/api/chat/goals/{goal_id}/chats/{chat_id}")
@@ -14363,6 +14762,16 @@ async def generate_summary_infographic(request: SummaryInfographicRequest, http_
         }
 
     prompt = build_summary_infographic_prompt(timestamp, request.summary_data)
+    incognito = incognito_session_for_request(http_request, "summary infographic", config)
+    if incognito.active:
+        # A picture cannot have real names put back, so it keeps the stand-ins.
+        try:
+            prompt = incognito.mask_text(prompt)
+        except IncognitoBlocked as blocked:
+            finish_incognito_session(incognito)
+            raise HTTPException(status_code=409, detail=incognito_blocked_message(blocked)) from None
+        incognito.record(prompt=prompt)
+        finish_incognito_session(incognito)
     payload = {
         "model": OPENAI_IMAGE_MODEL,
         "prompt": prompt,
@@ -14410,6 +14819,7 @@ async def generate_summary_infographic(request: SummaryInfographicRequest, http_
             "filename": filename,
             "artifact_path": str(artifact_path),
             "reused_existing": False,
+            **incognito_image_fields(incognito),
         }
 
     if image_url:
@@ -14439,6 +14849,7 @@ async def generate_summary_infographic(request: SummaryInfographicRequest, http_
                 "filename": filename,
                 "artifact_path": str(artifact_path),
                 "reused_existing": False,
+                **incognito_image_fields(incognito),
             }
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"OpenAI image download failed: {exc}")
@@ -14446,6 +14857,7 @@ async def generate_summary_infographic(request: SummaryInfographicRequest, http_
             "status": "success",
             "model": OPENAI_IMAGE_MODEL,
             "image_url": image_url,
+            **incognito_image_fields(incognito),
         }
 
     raise HTTPException(status_code=502, detail="OpenAI image generation returned no image payload")
@@ -15238,6 +15650,7 @@ async def _handle_summary_background_request(
     request: Dict[str, Any],
     *,
     scope_key: Optional[str] = None,
+    incognito_owner_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     timestamp = request.get("timestamp")
     if not timestamp:
@@ -15275,6 +15688,7 @@ async def _handle_summary_background_request(
                 "scope_key": session_scope_key,
                 "timestamp": safe_timestamp,
                 "requested_at": _utcnow_iso(),
+                "incognito": incognito_job_payload(incognito_owner_key),
             },
         )
     except Exception as exc:
@@ -15333,7 +15747,12 @@ async def _save_summary_and_index(
     )
 
 
-async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key: Optional[str] = None):
+async def _summarize_session_impl(
+    request: Dict[str, Any],
+    *,
+    request_scope_key: Optional[str] = None,
+    incognito_owner_key: Optional[str] = None,
+):
     """
     Generate AI-powered summary with SPL queries and contextual questions.
     
@@ -15368,7 +15787,9 @@ async def _summarize_session_impl(request: Dict[str, Any], *, request_scope_key:
         request_scope_key = _normalize_discovery_scope_key(request.get("scope_key"))
 
     if not _is_runtime_worker_process():
-        return await _handle_summary_background_request(request, scope_key=request_scope_key)
+        return await _handle_summary_background_request(
+            request, scope_key=request_scope_key, incognito_owner_key=incognito_owner_key
+        )
 
     output_dir = _discovery_scope_output_dir(request_scope_key, create=False)
 
@@ -16419,6 +16840,9 @@ Return ONLY the JSON array, no other text."""
         },
         "from_cache": False
     }
+    incognito_summary = finish_incognito_session(current_incognito_session())
+    if incognito_summary is not None:
+        response_data["incognito"] = incognito_summary
     
     # Update progress - Saving results
     _set_summarization_progress(
@@ -16451,11 +16875,20 @@ Return ONLY the JSON array, no other text."""
 @app.post("/summarize-session")
 async def summarize_session(request: Dict[str, Any], http_request: Request):
     request_scope_key = _build_discovery_scope_metadata(request=http_request).get("scope_key")
-    return await _summarize_session_impl(request, request_scope_key=request_scope_key)
+    return await _summarize_session_impl(
+        request, request_scope_key=request_scope_key, incognito_owner_key=incognito_owner(http_request)
+    )
 
 
 @app.post("/verify-task")
-async def verify_task(request: Dict[str, Any]):
+async def verify_task(request: Dict[str, Any], http_request: Request = None):
+    session = incognito_session_for_request(http_request, "task verification")
+    with incognito_session_scope(session):
+        result = await _verify_task_impl(request)
+    return attach_incognito_result(session, result)
+
+
+async def _verify_task_impl(request: Dict[str, Any]):
     """
     Execute verification SPL query and analyze results against expected outcome.
     
@@ -16534,7 +16967,9 @@ async def verify_task(request: Dict[str, Any]):
             }
 
         rows = outcome.get("rows") or []
-        rows_text, rows_shown = render_rows_for_llm(rows, max_rows=20, max_chars=3000)
+        rows_text, rows_shown = render_rows_for_llm(
+            incognito_rows_for_llm(rows, "splunk_run_query"), max_rows=20, max_chars=3000
+        )
         if rows:
             total_rows = outcome.get("total_rows")
             row_summary = f"{len(rows)} rows returned" + (
@@ -16597,6 +17032,13 @@ Return ONLY the JSON object, no other text."""
             if not isinstance(analysis.get("message"), str) or not analysis.get("message", "").strip():
                 analysis["message"] = "The model did not explain its verdict; review the query results."
             
+        except IncognitoBlocked as blocked:
+            analysis = {
+                "status": "unknown",
+                "message": incognito_blocked_message(blocked),
+                "metrics": {},
+                "recommendations": ["Review the query results manually"],
+            }
         except Exception as e:
             print(f"Error analyzing verification results: {e}")
             # Fallback analysis
@@ -16642,7 +17084,14 @@ Return ONLY the JSON object, no other text."""
 
 
 @app.post("/get-remediation")
-async def get_remediation(request: Dict[str, Any]):
+async def get_remediation(request: Dict[str, Any], http_request: Request = None):
+    session = incognito_session_for_request(http_request, "remediation steps")
+    with incognito_session_scope(session):
+        result = await _get_remediation_impl(request)
+    return attach_incognito_result(session, result)
+
+
+async def _get_remediation_impl(request: Dict[str, Any]):
     """
     Generate AI-powered remediation steps for failed/partial verification.
     
@@ -16749,7 +17198,10 @@ Return ONLY the JSON object."""
             print(f"Error generating remediation: {e}")
             # Fallback remediation
             remediation = {
-                "root_cause": "Unable to automatically determine the root cause. Manual investigation required.",
+                "root_cause": (
+                    incognito_blocked_message(e) if isinstance(e, IncognitoBlocked)
+                    else "Unable to automatically determine the root cause. Manual investigation required."
+                ),
                 "remediation_steps": [
                     {
                         "number": 1,
@@ -18600,11 +19052,19 @@ async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue
             })
         
         # Call chat logic with streaming callback
-        result = await chat_with_splunk_logic(request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner)
+        result = await run_chat_turn(request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner)
         record_chat_goal_turn(goal_owner, request, result)
         await status_queue.put({'type': 'done', 'data': result})
     except Exception as e:
         await status_queue.put({'type': 'error', 'error': str(e)})
+
+
+async def run_chat_turn(request: dict, status_callback=None, runtime_config: Any = None, goal_owner: Optional[str] = None):
+    """Answer one chat message under the asker's incognito state."""
+    session = open_incognito_session(goal_owner, "chat", config=runtime_config)
+    with incognito_session_scope(session):
+        result = await chat_with_splunk_logic(request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner)
+    return attach_incognito_result(session, result)
 
 
 async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_config: Any = None, goal_owner: Optional[str] = None):
@@ -19913,6 +20373,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 })
 
                 sweep_signature = index_agnostic_signature(tool_name, tool_args)
+                unknown_stand_ins = incognito_unknown_stand_ins(tool_args)
                 if signature in seen_signatures or sweep_signature in empty_sweeps:
                     stalled_steps += 1
                     remaining_steps = 0 if stalled_steps >= stall_limit else max(0, max_iterations - iteration)
@@ -19935,6 +20396,11 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                     else:
                         feedback_lines.append("No tool steps are left. Reply to the user now from the evidence above, without a TOOL_CALL.")
                     feedback = "\n".join(feedback_lines)
+                elif unknown_stand_ins:
+                    stalled_steps += 1
+                    remaining_steps = 0 if stalled_steps >= stall_limit else max(0, max_iterations - iteration)
+                    await push_status(status_timeline, "🔒 Skipped a search with unknown stand-in names", iteration)
+                    feedback = build_unknown_stand_in_feedback(iteration, unknown_stand_ins, remaining_steps)
                 else:
                     seen_signatures[signature] = iteration
                     action = "🔍 Querying Splunk" if tool_name in MCP_QUERY_TOOL_NAMES else f"⚙️ Executing {tool_name}"
@@ -19986,7 +20452,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                         step=iteration,
                         tool_name=tool_name,
                         args=tool_args,
-                        outcome=outcome,
+                        outcome=incognito_outcome_for_llm(outcome, tool_name, tool_args),
                         evidence_rows=evidence_rows,
                         evidence_chars=evidence_chars,
                         analysis_brief=format_result_summary_for_llm(result_summary) if outcome["status"] == "data" else "",
@@ -20159,6 +20625,9 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             "has_follow_on": len(follow_on_actions) > 0,
             "follow_on_actions": follow_on_actions
         }
+    except IncognitoBlocked as blocked:
+        print(f"🔒 [CHAT] Incognito mode stopped a model call ({blocked.reason})")
+        return {"error": incognito_blocked_message(blocked), "incognito_blocked": True}
     except Exception as e:
         # Log the full error to terminal for debugging
         print(f"ERROR in chat_with_splunk_logic: {str(e)}")
@@ -20172,7 +20641,7 @@ async def chat_with_splunk(http_request: Request, request: dict):
     """Handle chat requests (non-streaming version for backward compatibility)."""
     runtime_config = resolve_effective_runtime_config(request=http_request)
     goal_owner = chat_goal_owner(http_request)
-    result = await chat_with_splunk_logic(request, status_callback=None, runtime_config=runtime_config, goal_owner=goal_owner)
+    result = await run_chat_turn(request, status_callback=None, runtime_config=runtime_config, goal_owner=goal_owner)
     record_chat_goal_turn(goal_owner, request, result)
     return result
 

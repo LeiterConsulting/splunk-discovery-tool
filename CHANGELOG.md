@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Incognito mode**: an **Incognito** button in the top bar turns it on or off for you, and explains why when it is locked. Each user has their own choice when sign-in is on. Before anything goes to the AI model, the app replaces hosts, IP addresses (keeping subnets together), users, custom indexes, apps that are not Splunk's own, saved searches, knowledge objects, KV store collections, roles, email addresses, domains, MAC addresses, GUIDs, Windows SIDs, and secrets with stand-ins, and puts the real names back in the reply. Splunk's own indexes, sourcetypes, fields, and apps stay visible
+- Incognito mode covers chat (including Knowledge Base passages and search results), chat goals, discovery analysis, AI summaries, task verification, remediation steps, the M-26-14 AI Review, and summary infographics. Background jobs keep the state they started with
+- **What the AI saw**: answers made in incognito mode have a button that shows how many stand-ins the AI model saw and the exact masked text of each request and reply. Only the person who asked can open it, and the newest 300 records are kept
+- Requests stop, and nothing is sent, when a known name would remain after masking or the stand-in files cannot be used. Chat shows the reason in place of an answer
+- **Incognito Mode settings** for admins on the Settings **Security** tab: require incognito mode while a cloud AI model is in use (the server enforces the lock), turn it on by default, list terms to always or never replace, preview what the AI model would get, and reset the stand-ins
+- **Share with stand-ins**: a button in the chat header downloads the conversation with stand-ins, and **Export with Stand-ins** in the report viewer does the same for a text or JSON report. Copies use the same stand-ins as the AI model, work whether or not incognito mode is on, and are refused when a name would remain
+- The stand-in mapping, choices, settings, and records are stored encrypted under `output/incognito/` and never leave the server
+- [docs/INCOGNITO_MODE.md](docs/INCOGNITO_MODE.md) explains what is replaced, how requests are protected, and the limits
+- The UI contrast browser check now audits the incognito popover, the What the AI saw panel and dialog, and the admin settings and preview in every theme, plus the Settings warning about a server that still runs old code
+
+### Fixed
+- The Settings warning that the server is still running the code it had before an update was hard to read in dark themes (dark text on a dark background). Its text is now light in dark themes
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

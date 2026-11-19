@@ -581,7 +581,9 @@ class FrontendDeliveryTests(unittest.TestCase):
         self.assertIn("saveChatLayoutPreference('window');", template_source)
         # Replies render Markdown, and their extras sit behind one row of toggles.
         self.assertIn("renderMarkdownDocument(msg.content, { compact: true })", template_source)
-        self.assertIn("onClick={() => toggleChatReplyPanel(msg.id, panel.key)}", template_source)
+        self.assertIn("toggleChatReplyPanel(msg.id, panel.key);", template_source)
+        # Opening "What the AI saw" loads the saved record of what was sent.
+        self.assertIn("if (panel.key === 'incognito' && !isOpen && msg.incognito?.ledger_id) {", template_source)
         # The side column lists this chat's questions, searches, and data in place of the old suggested questions.
         for test_id in (
             "chat-side-column",

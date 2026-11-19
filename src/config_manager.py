@@ -3,6 +3,7 @@ Encrypted Configuration Manager
 Handles secure storage of MCP and LLM credentials using Fernet encryption
 """
 
+import base64
 import copy
 import json
 import os
@@ -12,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional, Tuple
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from dataclasses import dataclass, asdict, field
 
 from app_version import APP_VERSION
@@ -217,6 +220,11 @@ class ConfigManager:
             except Exception as chmod_error:
                 print(f"Warning: Could not set file permissions: {chmod_error}")
     
+    def derived_fernet(self, purpose: str) -> Fernet:
+        """A separate key for one feature's encrypted files, derived from the configuration key."""
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=f"dt4sms:{purpose}".encode("utf-8"))
+        return Fernet(base64.urlsafe_b64encode(hkdf.derive(base64.urlsafe_b64decode(self._key))))
+
     def _create_default_config(self) -> AppConfig:
         """Create default configuration"""
         return AppConfig(

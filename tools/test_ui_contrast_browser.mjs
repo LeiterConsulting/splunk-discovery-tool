@@ -51,6 +51,23 @@ const SEEDED_CHAT_REPLY = {
         status_timeline: [{ action: 'Ran the search', time: 0.4 }],
         iterations: 1,
         execution_time: '0.4s',
+        incognito: { active: true, calls: 1, masked: { host: 2, index: 1 }, ledger_id: 'ledger_contrast_chat' },
+    },
+};
+// What the AI saw for one answer, served in place of the saved record so the panel and dialog have content.
+const SEEDED_INCOGNITO_LEDGER = {
+    record: {
+        trimmed_calls: 0,
+        calls: [{
+            feature: 'chat',
+            at: '2026-05-22T01:02:03Z',
+            earlier_messages: 2,
+            messages: [
+                { role: 'system', content: 'You answer questions about a Splunk deployment.' },
+                { role: 'user', content: 'Which sourcetypes are in index_0003 on host_0012?' },
+            ],
+            reply: 'Two sourcetypes report into index_0003.',
+        }],
     },
 };
 const REQUIRED_SURFACES = [
@@ -68,7 +85,14 @@ const REQUIRED_SURFACES = [
     'chat-goal-library',
     'chat-goal',
     'connection-details',
+    'incognito-details',
+    'incognito-details-on',
+    'chat-incognito',
+    'incognito-ledger',
     'settings-connections',
+    'settings-access',
+    'settings-incognito-preview',
+    'settings-server-stale',
     'settings-connection-forms',
     'settings-save-mcp',
     'settings-save-llm',
@@ -148,7 +172,10 @@ async function seedOutput(outputDir) {
         [`v2_insights_brief_${timestamp}.md`]: '# Intelligence Brief\n\n## Highest Value Gaps\n- Admin login failures are not tied to an explicit alert.\n',
         [`v2_operator_runbook_${timestamp}.md`]: '# Operator Runbook\n\n## Action Queue\n1. Validate authentication monitoring coverage (high)\n',
         [`v2_developer_handoff_${timestamp}.md`]: '# Developer Handoff\n\n## What this bundle contains\n- `intelligence_blueprint.json`\n  - **Readiness:** 78 of 100\n\n| Area | Status |\n| --- | --- |\n| Authentication | Needs an alert |\n\n> Advisory only.\n\n```spl\nindex=_internal | stats count by sourcetype\n```\n',
-        [`v2_ai_summary_${timestamp}.json`]: JSON.stringify(buildOperatorFixtureSummary(timestamp), null, 2),
+        [`v2_ai_summary_${timestamp}.json`]: JSON.stringify({
+            ...buildOperatorFixtureSummary(timestamp),
+            incognito: { active: true, calls: 2, masked: { host: 3, ip: 1, user: 1 }, ledger_id: 'ledger_contrast_summary' },
+        }, null, 2),
     };
     await mkdir(path.join(outputDir, 'exports'), { recursive: true });
     for (const [name, content] of Object.entries(reports)) {
@@ -397,6 +424,8 @@ async function closeDialogs(page) {
 async function auditTheme(browser, baseUrl, themeName) {
     const theme = THEMES[themeName];
     if (!theme) throw new Error(`Unknown theme "${themeName}". Known: ${Object.keys(THEMES).join(', ')}`);
+    const reset = await fetch(`${baseUrl}/api/incognito/preference`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: null }) });
+    if (!reset.ok) throw new Error(`Could not reset incognito mode: HTTP ${reset.status}`);
     const context = await browser.newContext({ viewport: { width, height }, colorScheme: theme.colorScheme, deviceScaleFactor: 1 });
     await context.addInitScript(({ preference }) => {
         window.localStorage.setItem('dt4sms_theme_preference', preference);
@@ -406,6 +435,11 @@ async function auditTheme(browser, baseUrl, themeName) {
     const surfaces = [];
     page.on('pageerror', (error) => pageErrors.push(String(error)));
     page.on('dialog', (dialog) => dialog.dismiss().catch(() => {}));
+    await context.route('**/api/incognito/ledger/**', (route) => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(SEEDED_INCOGNITO_LEDGER),
+    }));
     const capture = async (surface, rootSelector = null, fullPage = false) => {
         if (outDir) {
             await page.screenshot({ path: path.join(outDir, `${themeName}__${surface}.png`), fullPage }).catch(() => {});
@@ -462,12 +496,34 @@ async function auditTheme(browser, baseUrl, themeName) {
                 await settle(page, 800);
                 await capture(`summary-${label}`, '[role="dialog"]');
             }
+            if (await clickIfPresent(page.getByTestId('summary-incognito-note').getByRole('button', { name: 'What the AI saw' }))) {
+                const ledgerModal = page.getByTestId('incognito-ledger-modal');
+                await ledgerModal.getByTestId('incognito-ledger').waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                await settle(page, 400);
+                await capture('incognito-ledger', '[data-testid="incognito-ledger-modal"]');
+                await clickIfPresent(ledgerModal.getByRole('button', { name: 'Close what the AI saw' }));
+                await ledgerModal.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+            }
             await closeDialogs(page);
             await summaryDialog.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
         }
 
         await clickIfPresent(page.locator('#workspace-tab-overview'));
         await settle(page);
+        // Incognito starts off for each theme, so the popover is audited off and on, and the chat below runs with it on.
+        if (await clickIfPresent(page.getByTestId('header-incognito'))) {
+            const popover = page.getByTestId('incognito-popover');
+            await popover.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+            await settle(page, 400);
+            await capture('incognito-details', '#incognito-popover');
+            if (await clickIfPresent(popover.getByTestId('incognito-switch'))) {
+                await popover.locator('[data-testid="incognito-switch"][aria-checked="true"]').waitFor({ timeout: 5000 }).catch(() => {});
+                await settle(page, 400);
+                await capture('incognito-details-on', '#incognito-popover');
+            }
+            await clickIfPresent(popover.getByRole('button', { name: 'Close incognito mode details' }));
+            await popover.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+        }
         if (await clickIfPresent(page.getByRole('button', { name: 'Open chat', exact: true }))) {
             await settle(page, 1000);
             await capture('chat', '[role="dialog"]');
@@ -484,6 +540,11 @@ async function auditTheme(browser, baseUrl, themeName) {
                 await page.getByTestId('chat-reply-markdown').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
                 await settle(page, 600);
                 await capture('chat-conversation', '[role="dialog"]');
+                if (await clickIfPresent(page.getByTestId('chat-reply-toggle-incognito').first())) {
+                    await page.getByTestId('chat-incognito-panel').getByTestId('incognito-ledger').waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                    await settle(page, 400);
+                    await capture('chat-incognito', '[role="dialog"]');
+                }
                 // The goal surfaces below expect an empty chat.
                 await clickIfPresent(page.getByRole('button', { name: 'Clear chat history' }));
                 await settle(page, 300);
@@ -527,6 +588,18 @@ async function auditTheme(browser, baseUrl, themeName) {
                     await capture(`settings-${tab}`, '.settings-modal-shell');
                 }
             }
+            if (await clickIfPresent(page.getByTestId('settings-tab-access'))) {
+                await settle(page, 400);
+                const previewText = page.getByTestId('incognito-preview-text');
+                if (await previewText.isVisible().catch(() => false)) {
+                    await previewText.fill('Failed logins on web-01.contoso.com from 10.20.30.40 for alice@contoso.com in index=contoso_web');
+                    await clickIfPresent(page.getByTestId('incognito-preview-run'));
+                    await page.getByTestId('incognito-preview-result').waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                    await page.getByTestId('incognito-preview-result').scrollIntoViewIfNeeded().catch(() => {});
+                    await settle(page, 400);
+                    await capture('settings-incognito-preview', '.settings-modal-shell');
+                }
+            }
             if (await clickIfPresent(page.getByTestId('settings-tab-connections'))) {
                 await settle(page, 600);
                 await clickIfPresent(page.getByRole('button', { name: 'Add MCP Server' }));
@@ -548,6 +621,27 @@ async function auditTheme(browser, baseUrl, themeName) {
             }
             await closeDialogs(page);
         }
+
+        // Settings warns at the top when the server still runs old code. Probes of other ports are refused so
+        // copies of the app running on this computer cannot change what the warning says.
+        const staleServerRoute = (route) => (route.request().url().startsWith(`${baseUrl}/`)
+            ? route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ stale: true, install_dir: '/opt/splunk-discovery-tool', started_at: '2026-05-22T01:02:03+00:00' }),
+            })
+            : route.abort());
+        await page.route('**/api/troubleshoot/server-status', staleServerRoute);
+        if (await clickIfPresent(page.getByRole('button', { name: 'Open settings' }))) {
+            const banner = page.getByTestId('settings-server-stale-banner');
+            await banner.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+            await settle(page, 600);
+            if (await banner.isVisible().catch(() => false)) {
+                await capture('settings-server-stale', '[data-testid="settings-server-stale-banner"]');
+            }
+            await closeDialogs(page);
+        }
+        await page.unroute('**/api/troubleshoot/server-status', staleServerRoute);
     } finally {
         await context.close();
     }
@@ -655,6 +749,19 @@ async function main() {
                 problems.push(`${themeName}: summary dialog was not reached`);
             }
             for (const error of pageErrors) problems.push(`${themeName}: page error ${error}`);
+            // Incognito content that is missing would otherwise pass as a surface with nothing to fail on.
+            for (const [surface, expected] of [
+                ['settings-access', 'Incognito Mode'],
+                ['incognito-details-on', 'On'],
+                ['chat', 'Incognito mode is on.'],
+                ['chat-incognito', 'Request 1: Chat'],
+                ['incognito-ledger', 'Request 1: Chat'],
+                ['settings-incognito-preview', 'host_'],
+                ['settings-server-stale', 'still running the code it had before an update'],
+            ]) {
+                const entry = surfaces.find((item) => item.surface === surface);
+                if (entry && !entry.text.includes(expected)) problems.push(`${themeName}/${surface}: expected to show "${expected}"`);
+            }
             for (const entry of surfaces) {
                 const enabled = entry.failures.filter((failure) => !failure.disabled);
                 console.log(`${themeName.padEnd(12)} ${entry.surface.padEnd(30)} checked ${String(entry.checked).padStart(4)}  failures ${enabled.length}`);

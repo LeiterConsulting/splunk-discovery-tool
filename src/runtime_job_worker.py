@@ -72,7 +72,12 @@ async def _run_discovery_job(payload: Dict[str, Any]) -> None:
         execution_mode="worker",
     )
     runtime_config = _build_discovery_runtime_config(payload.get("runtime_binding") or {})
-    await web_app.run_discovery(runtime_config=runtime_config, scope_key=scope_key, scope_info=scope_info)
+    incognito = web_app.open_incognito_session_for_job(payload, "discovery analysis", runtime_config)
+    try:
+        with web_app.incognito_session_scope(incognito):
+            await web_app.run_discovery(runtime_config=runtime_config, scope_key=scope_key, scope_info=scope_info)
+    finally:
+        web_app.finish_incognito_session(incognito)
 
 
 async def _run_summary_job(payload: Dict[str, Any]) -> None:
@@ -89,7 +94,14 @@ async def _run_summary_job(payload: Dict[str, Any]) -> None:
         worker_pid=os.getpid(),
         execution_mode="worker",
     )
-    result = await web_app._summarize_session_impl({"timestamp": session_id, "scope_key": scope_key})
+    incognito = web_app.open_incognito_session_for_job(payload, "AI summary")
+    try:
+        with web_app.incognito_session_scope(incognito):
+            result = await web_app._summarize_session_impl({"timestamp": session_id, "scope_key": scope_key})
+    finally:
+        # The summary saves its own record when it finishes; this covers a run that stopped early.
+        if incognito.ledger_id is None:
+            web_app.finish_incognito_session(incognito)
     if isinstance(result, dict) and result.get("error"):
         raise RuntimeError(str(result.get("error")))
 

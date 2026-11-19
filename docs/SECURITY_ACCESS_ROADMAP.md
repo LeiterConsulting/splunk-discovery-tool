@@ -1,6 +1,6 @@
 # Security, Access, and External API Roadmap
 
-> Historical note: this document started as the implementation roadmap for Splunk Discovery Tool security and external access. As of release 2.1.1, local sign-in, OIDC sign-in, per-user MCP assignment, token issuance, the read-only external RAG API, the inbound MCP surface, and browser coverage of account functions all ship. An in-app audit view has not shipped yet; audit events are recorded in the security database only. The phase sections below remain useful as implementation history and extension notes.
+> Historical note: this document started as the implementation roadmap for Splunk Discovery Tool security and external access. As of release 2.1.1, local sign-in, OIDC sign-in, per-user MCP assignment, token issuance, the read-only external RAG API, the inbound MCP surface, browser coverage of account functions, and incognito mode for the AI model all ship. An in-app audit view has not shipped yet; audit events are recorded in the security database only. The phase sections below remain useful as implementation history and extension notes.
 
 ## Goal
 
@@ -14,6 +14,7 @@ This roadmap covers:
 - inbound API and MCP token management
 - a read-only external RAG API and inbound MCP server surface
 - data that is kept per user when sign-in is on
+- incognito mode, which keeps the deployment's own names away from the AI model
 
 ## Guardrails
 
@@ -121,6 +122,18 @@ Both use inbound tokens issued by Splunk Discovery Tool. They are not the same a
 
 When sign-in is on, chat goals and the saved chats under each goal are stored per user under `output/chat_data/goals/`. When sign-in is off, everyone shares one goal library. Chat settings (`output/chat_data/chat_settings.json`) are one install-wide file in both modes.
 
+Incognito choices and records of what the AI saw follow the same rule: per user when sign-in is on, shared when it is off. The incognito policy and the stand-in mapping are install-wide, so a name gets the same stand-in for everyone.
+
+### 7. Incognito mode for the AI model
+
+Incognito mode (release 2.2.0) limits what the app sends to its AI model. When it is on, `src/incognito/` replaces the deployment's own names (hosts, IP addresses, users, custom indexes, non-Splunk apps, saved searches, knowledge objects, KV store collections, roles, emails, domains, and secrets) with stand-ins before each request and restores them in the reply. See [INCOGNITO_MODE.md](INCOGNITO_MODE.md).
+
+- Each user's choice is stored per user when sign-in is on and shared when it is off
+- Admins can require incognito mode while a cloud AI model is in use. The server enforces the lock: `POST /api/incognito/preference` returns 409 for a request to turn it off, and every AI path resolves the state on the server, not from the browser
+- The policy, choices, stand-in mapping, and records of what the AI saw live under `output/incognito/`, encrypted with a Fernet key derived from `.config.key` (HKDF-SHA256). None of them leave the server
+- A request stops, and nothing is sent, when a known name remains after masking or when the stand-in files cannot be used
+- Records of what the AI saw open only for the person who asked
+- The external RAG API and inbound MCP surface do not use the AI model and are not changed by incognito mode
 ## Settings Information Architecture
 
 The roadmap proposed a dedicated Security or Access area with the pages below. The shipped Settings tabs are Connections, Users, Security, Appearance, and Troubleshoot. Each proposed page maps to them as follows.
@@ -164,6 +177,14 @@ Shipped on the Security tab under Access Tokens:
 - choose scopes, expiry in days, and an optional owner
 - show last used time and owner
 
+### Incognito Mode
+
+Shipped on the Security tab under Incognito Mode (admins only), with the user's own switch in the top bar:
+
+- require incognito mode while a cloud AI model is in use, and turn it on by default
+- terms to always replace and terms to never replace
+- reset the stand-ins
+- preview what the AI model would get for a piece of text
 ### Audit
 
 Not shipped as a page. The app records these events in the `audit_events` table:

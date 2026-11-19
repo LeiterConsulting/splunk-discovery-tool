@@ -19,6 +19,7 @@
 - **Knowledge library**: the environment profile from discovery, Splunk Security Content, Splunkbase records, and help.splunk.com documentation for your Splunk version and installed apps, downloaded for offline search, with a coverage scorecard and library packs for servers without internet access
 - **Knowledge Base** (optional capability): managed knowledge assets, the SPL Library, and context previews. Discovery and AI summaries update its index after saving, and a Reindex needed notice shows when other sources change
 - **Troubleshooting**: Settings > Troubleshoot explains why an MCP server or AI model connection or save fails, without saving anything
+- **Incognito mode**: the AI model sees stand-ins such as `host_0012` instead of your host names, IP addresses, users, custom indexes, apps, and saved searches, while you still see the real names. Admins can require it for cloud AI models, and you can download chats and reports with stand-ins to share
 - **Security**: optional local sign-in and OIDC, per-user MCP assignment, scoped tokens for a read-only external RAG API and an inbound MCP surface (HTTP plus a stdio bridge), and Fernet-encrypted settings with no plaintext secrets
 - **Themes and accessibility**: Light, Dark, Neo, and System themes that meet WCAG AA contrast, checked by a browser test in CI
 - **Installers** for Windows (`install.ps1`) and macOS or Linux (`install.sh`)
@@ -128,6 +129,18 @@ Goals and saved chats are kept per user when sign-in is on and in one shared lib
 
 ![Chat Settings showing Auto values that come from the AI model's tuning](docs/screenshots/chat-settings-current.png)
 
+## 🕶️ Incognito Mode
+
+Incognito mode keeps your own names away from the AI model. When it is on, host names, IP addresses, users, custom indexes, apps, saved searches, and similar values are replaced with stand-ins such as `host_0012` before anything is sent, and the real names are put back in the reply. Splunk's own indexes, sourcetypes, fields, and apps stay visible.
+
+- **Turn it on** with **Incognito** in the top bar. Each user has their own choice when sign-in is on
+- **Admins** can turn it on by default, require it while a cloud AI model is in use (the server enforces the lock), add terms to always or never replace, preview the result, and reset the stand-ins, on the Settings **Security** tab
+- **What the AI saw** under each answer shows the exact masked text that was sent. Only the person who asked can open it
+- **Nothing leaks silently**: if a known name would still be sent, the request stops and nothing goes to the AI model
+- **Share with stand-ins**: download a chat or a text report with stand-ins in place of real names, even when incognito mode is off
+- Chat, chat goals, discovery analysis, AI summaries, task verification, remediation, the M-26-14 AI Review, and infographics all use it. The stand-in mapping is encrypted and never leaves the server
+
+See [docs/INCOGNITO_MODE.md](docs/INCOGNITO_MODE.md) for what is replaced, how requests are protected, and the limits.
 ## 📚 Knowledge Library and Splunk Documentation
 
 Library health on the Knowledge Base tab scores how well reference sources cover the environment from your latest discovery and lists gaps with a next action (missing or turned-off add-ons, outdated or archived apps, apps not marked Cloud compatible, and busy sourcetypes no public reference describes).
@@ -188,6 +201,7 @@ The SPL Library keeps reusable SPL in the managed context workspace so operators
 - Configurable SSL verification and CA bundle support
 - Host/CORS protections available via server settings
 - Knowledge library downloads are off until an admin turns them on, and reach only four allowed HTTPS hosts
+- Incognito mode replaces your names with stand-ins before anything reaches the AI model; admins can require it while a cloud AI model is in use
 
 ## 📁 Key Paths
 
@@ -203,6 +217,7 @@ src/discovery/                  Discovery engine, v2 pipeline, and environment p
 src/chat_agent.py               Grounded chat prompts, tool outcomes, and evidence
 src/chat_settings.py            Chat settings with Auto values from the model's tuning
 src/chat_goals.py               Chat goals, tracked questions, and saved chats
+src/incognito/                  Incognito mode: stand-ins, masking, and records of what the AI saw
 src/llm/                        AI provider clients, model profiles, and auto-tuning
 src/knowledge_library/          Library sources, documentation index, ranking, and scorecard
 src/capabilities/               Optional capabilities (Knowledge Base, exports, charts, links, M-26-14)
@@ -215,7 +230,7 @@ tools/check_frontend_sync.py    Validate frontend bundle sync before release
 tools/test_*_browser.mjs        Browser regression suites (Playwright)
 tools/run_account_function_tests.mjs Account/auth regression entrypoint
 .github/workflows/repo-validation.yml  GitHub Actions validation workflow for repo quality gates
-output/                         Discovery reports, summaries, chat data, and the knowledge library
+output/                         Discovery reports, summaries, chat data, the knowledge library, and incognito files
 ```
 
 ## 📚 Documentation
@@ -226,6 +241,7 @@ output/                         Discovery reports, summaries, chat data, and the
 - [docs/DISCOVERY_ARCHITECTURE_GUIDE.md](docs/DISCOVERY_ARCHITECTURE_GUIDE.md): discovery artifacts, the workspace model, and chat architecture
 - [docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md](docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md): the optional capability model (Knowledge Base, exports, charts, links, capability tabs)
 - [docs/SECURITY_ACCESS_ROADMAP.md](docs/SECURITY_ACCESS_ROADMAP.md): the shipped security model plus extension notes
+- [docs/INCOGNITO_MODE.md](docs/INCOGNITO_MODE.md): incognito mode, what it replaces, admin settings, and shareable copies
 - [docs/AUTH_TESTING.md](docs/AUTH_TESTING.md): local-password, OIDC, and account-function test guidance
 - [docs/EXTERNAL_RAG_API_QUICKSTART.md](docs/EXTERNAL_RAG_API_QUICKSTART.md): read-only external RAG API setup and examples
 - [docs/EXTERNAL_MCP_QUICKSTART.md](docs/EXTERNAL_MCP_QUICKSTART.md): inbound MCP setup, helper client, and stdio bridge usage

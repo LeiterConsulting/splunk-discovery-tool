@@ -1159,6 +1159,7 @@ class DiscoveryEngine:
             counts["knowledge_objects"], len(user_list), counts["kv_collections"]
         )
 
+        self._share_known_names()
         notable_patterns = await self._notable_patterns_with_fallback(indexes_list, sourcetypes_list)
 
         overview = EnvironmentOverview(
@@ -1666,6 +1667,37 @@ class DiscoveryEngine:
         """Fallback classification; kept for backwards compatibility."""
         return await self.classify_data()
 
+    def _share_known_names(self) -> None:
+        """Give discovered names to a model client that hides them before sending (incognito mode).
+
+        Without this, a first discovery would rely on field names alone to spot custom index,
+        host, and user names in the analysis data.
+        """
+        learn = getattr(self.llm_client, "learn_names", None)
+        # Test doubles such as AsyncMock answer every attribute; only a plain method is a real hook.
+        if not callable(learn) or asyncio.iscoroutinefunction(learn):
+            return
+        inventory = getattr(self, "_inventory", None) or {}
+        ledger: List[Dict[str, Any]] = []
+        for item in getattr(self, "discovery_results", None) or []:
+            data = item.get("data") if isinstance(item, dict) else getattr(item, "data", None)
+            if isinstance(data, dict):
+                ledger.append({"kind": result_kind(item), "data": data})
+        for surface, kind in (("indexes", KIND_INDEX), ("hosts", KIND_HOST), ("users", KIND_USER),
+                              ("kv_collections", KIND_KV_COLLECTION)):
+            ledger.extend({"kind": kind, "data": row} for row in inventory.get(surface) or [] if isinstance(row, dict))
+        ledger.extend(
+            {"kind": KIND_KNOWLEDGE_OBJECT, "data": {"ko_type": "saved_searches", **row}}
+            for row in inventory.get("saved_searches") or [] if isinstance(row, dict)
+        )
+        try:
+            learn({
+                "finding_ledger": ledger,
+                "environment_profile": {"installed_apps": {"items": list(getattr(self, "installed_apps", None) or [])}},
+            })
+        except Exception as exc:  # noqa: BLE001 - the client blocks later calls itself when this fails
+            print(f"⚠️ Could not share discovered names with the incognito filter: {exc}")
+
     def _compact_overview(self) -> Dict[str, Any]:
         overview = getattr(self, "environment_overview", None)
         if overview is None:
@@ -1753,6 +1785,7 @@ class DiscoveryEngine:
             "total_interesting_findings": sum(len(getattr(r, "interesting_findings", []) or []) for r in results),
         })
 
+        self._share_known_names()
         try:
             recommendations_result = await self.llm_client.analyze_data(analysis_data, "recommendations")
         except Exception as exc:
@@ -1879,6 +1912,7 @@ class DiscoveryEngine:
             ),
         })
 
+        self._share_known_names()
         try:
             use_cases_result = await self.llm_client.analyze_data(use_case_data, "creative_use_cases")
         except Exception as exc:
