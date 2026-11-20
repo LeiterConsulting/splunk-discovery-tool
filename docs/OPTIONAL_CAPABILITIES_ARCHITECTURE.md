@@ -239,12 +239,11 @@ RAG should not only index free-form text files. It should have typed source cate
 - `handoff`
 - `uploaded_document`
 - `generated_summary`
-- `chat_memory_derived`
 - `tool_result_snapshot`
 
 This allows better filtering and better UX when showing evidence.
 
-**Shipped.** The indexer uses these source types and adds `knowledge_asset` for documents imported into the Knowledge Base.
+**Shipped.** The indexer uses these source types and adds `knowledge_asset` for documents imported into the Knowledge Base. Chat scratchpads are private to each user and are not indexed; versions before 2.2.2 indexed them as `chat_memory_derived`, and such an index is rebuilt before its next search. Passages from discovery reports reach chat only for the scope that ran the discovery.
 
 ## Make RAG Value Obvious
 

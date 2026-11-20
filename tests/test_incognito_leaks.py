@@ -423,8 +423,8 @@ class IncognitoLeakSuite(unittest.TestCase):
 
         with mock.patch.object(web_app, "discover_mcp_tools", tools_list), \
                 mock.patch.object(web_app, "execute_mcp_tool_call", splunk), \
-                mock.patch.object(web_app, "_get_memory_store_path", lambda session_id: self.temp_path / f"{session_id}.json"), \
-                mock.patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: None), \
+                mock.patch.object(web_app, "_get_memory_store_path", lambda session_id, owner=None: self.temp_path / f"{session_id}.json"), \
+                mock.patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: dict(web_app.chat_session_settings)), \
                 mock.patch.dict(web_app.chat_session_settings, {"enable_splunk_augmentation": True, "enable_rag_context": False}), \
                 mock.patch.dict(web_app.chat_agent_memory, {}, clear=True):
             result = asyncio.run(web_app.run_chat_turn({

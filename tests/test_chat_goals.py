@@ -342,12 +342,21 @@ class ChatGoalApiTests(unittest.TestCase):
         ])
         self.assertEqual(replanned["planned_by"], "model")
 
+    def test_goal_planning_describes_the_askers_discovery_scope(self):
+        scoped = Path("output") / "scopes" / "bWNwOnRlbmFudC1i"
+        with mock.patch.object(web_app, "request_discovery_dir", return_value=scoped), \
+                mock.patch.object(web_app, "load_latest_report_knowledge", return_value={"prompt_context_compact": "Indexes: tenant_b"}) as reports:
+            goal = self._create()["goal"]
+            self.client.post(f"/api/chat/goals/{goal['id']}/plan")
+        self.assertEqual([call.args[1] for call in reports.call_args_list], [scoped, scoped])
+        self.assertIn("Indexes: tenant_b", self.llm_prompts[0][1]["content"])
+
     def test_chat_answers_with_a_goal_are_recorded_and_progress_is_checked(self):
         self.llm_replies.append({"title": "Silent sensors", "items": ["Which sensors stopped?", "Since when?"], "questions": ["q"]})
         goal = self._create()["goal"]
         first_item = goal["items"][0]["id"]
 
-        async def fake_chat(request, status_callback=None, runtime_config=None, goal_owner=None):
+        async def fake_chat(request, status_callback=None, runtime_config=None, goal_owner=None, discovery_dir=None):
             return {"response": "Sensors s1 and s2 stopped on Monday.", "chat_session_id": request.get("chat_session_id")}
 
         with mock.patch.object(web_app, "chat_with_splunk_logic", side_effect=fake_chat):

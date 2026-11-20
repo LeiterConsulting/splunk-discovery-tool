@@ -1,5 +1,6 @@
 """Chroma-backed RAG provider for indexed Splunk Discovery Tool artifacts."""
 
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from capabilities.models import CapabilityConfig, CapabilityDefinition
@@ -15,8 +16,8 @@ class ChromaRAGProvider(BaseRAGProvider):
         self.definition = definition
         self.indexer = ArtifactSourceIndexer(config=config, definition=definition)
 
-    def get_context(self, user_message: str, max_chunks: int = 3) -> Dict[str, Any]:
-        return self.indexer.search(user_message=user_message, max_chunks=max_chunks)
+    def get_context(self, user_message: str, max_chunks: int = 3, discovery_dir: Optional[Path] = None) -> Dict[str, Any]:
+        return self.indexer.search(user_message=user_message, max_chunks=max_chunks, discovery_dir=discovery_dir)
 
     def reindex(self) -> Dict[str, Any]:
         return self.indexer.reindex()

@@ -1355,6 +1355,19 @@ class ChatSettingsTests(unittest.TestCase):
         self.assertIn("enable_rag_context", settings["custom"])
         self.assertFalse(self._get()["enable_rag_context"])
 
+    def test_each_answer_keeps_its_own_copy_of_the_settings(self):
+        self._post({"max_iterations": 4})
+        answer_settings = web_app.sync_chat_settings_for_request(self.config)
+        shared_before = web_app.chat_session_settings
+
+        self._post({"max_iterations": 8})
+
+        self.assertEqual(answer_settings["max_iterations"], 4)
+        self.assertEqual(web_app.chat_session_settings["max_iterations"], 8)
+        # The shared values are swapped in whole, so a reader holding the old ones never sees them emptied.
+        self.assertEqual(shared_before["max_iterations"], 4)
+        self.assertEqual(set(shared_before), set(web_app.chat_session_settings))
+
     def test_custom_values_are_saved_across_restarts(self):
         self._post({"max_tokens": 3000, "temperature": 0.6, "max_iterations": 7})
         self._restart()
@@ -1458,7 +1471,7 @@ class ChatSettingsTests(unittest.TestCase):
 class ChatHelperTests(unittest.TestCase):
     def setUp(self):
         # These tests set chat_session_settings directly; keep chat requests from recomputing them.
-        patcher = patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: None)
+        patcher = patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: dict(web_app.chat_session_settings))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1595,7 +1608,7 @@ class ChatHelperTests(unittest.TestCase):
         original_process_chat = web_app.process_chat_with_streaming
         original_wait_for = web_app.asyncio.wait_for
 
-        async def immediate_chat(_request, status_queue, runtime_config=None, goal_owner=None):
+        async def immediate_chat(_request, status_queue, runtime_config=None, goal_owner=None, discovery_dir=None):
             await status_queue.put({"type": "status", "message": "Finishing"})
             await status_queue.put({"type": "done", "data": {"response": "Completed"}})
 
@@ -1631,7 +1644,7 @@ class ChatHelperTests(unittest.TestCase):
         original_process_chat = web_app.process_chat_with_streaming
         outcome = {"started": False, "cancelled": False}
 
-        async def slow_chat(_request, status_queue, runtime_config=None, goal_owner=None):
+        async def slow_chat(_request, status_queue, runtime_config=None, goal_owner=None, discovery_dir=None):
             outcome["started"] = True
             await status_queue.put({"type": "status", "message": "Searching"})
             try:
@@ -2297,7 +2310,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
 
             try:
                 memory = web_app.update_chat_memory(
@@ -2334,10 +2347,10 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
-            web_app.capability_manager.get_rag_context = lambda user_message, max_chunks=3: {
+            web_app.capability_manager.get_rag_context = lambda user_message, max_chunks=3, discovery_dir=None: {
                 "capability": "rag_local",
                 "provider": "lightweight",
                 "context_text": "Recovered queue pressure evidence from exported artifacts.",
@@ -2401,7 +2414,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.extract_recoverable_tool_call = lambda *args, **kwargs: None
@@ -2428,7 +2441,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
                     },
                 },
             )()
-            web_app.capability_manager.get_rag_context = lambda user_message, max_chunks=3: {
+            web_app.capability_manager.get_rag_context = lambda user_message, max_chunks=3, discovery_dir=None: {
                 "capability": "rag_local",
                 "provider": "lightweight",
                 "context_text": "Recovered known-good SPL guidance for internal sourcetype analysis.",
@@ -2537,7 +2550,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
             web_app.execute_mcp_tool_call = stub_execute_mcp_tool_call
             web_app.capability_manager.list_rag_assets = lambda name="rag_chromadb": StubAssetListResult()
@@ -2588,9 +2601,9 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
-            web_app.get_context_manager = lambda: StubContextManager()
+            web_app.get_context_manager = lambda output_dir=None: StubContextManager()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
 
@@ -2655,9 +2668,9 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
-            web_app.get_context_manager = lambda: StubContextManager()
+            web_app.get_context_manager = lambda output_dir=None: StubContextManager()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
 
@@ -2700,7 +2713,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
@@ -2740,7 +2753,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
@@ -2781,7 +2794,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: StubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
@@ -2824,7 +2837,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: CapturingStubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
@@ -2888,7 +2901,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: CapturingStubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.chat_session_settings["enable_splunk_augmentation"] = False
@@ -2974,7 +2987,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: CapturingStubLLMClient()
             web_app.config_manager.get = lambda: stub_config
             web_app.load_latest_report_knowledge = lambda *_: None
@@ -3070,9 +3083,9 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.load_latest_report_knowledge = lambda *_: report_knowledge
-            web_app.capability_manager.get_rag_context = lambda user_message, max_chunks=3: {
+            web_app.capability_manager.get_rag_context = lambda user_message, max_chunks=3, discovery_dir=None: {
                 "capability": "rag_local",
                 "provider": "lightweight",
                 "context_text": "Recovered platform telemetry guidance from uploaded runbooks.",
@@ -3175,7 +3188,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.load_latest_report_knowledge = lambda *_: report_knowledge
             web_app.chat_session_settings["enable_rag_context"] = False
             web_app.chat_session_settings["enable_splunk_augmentation"] = True
@@ -3233,7 +3246,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.discover_mcp_tools = stub_discover_mcp_tools
             web_app.execute_mcp_tool_call = stub_execute_mcp_tool_call
@@ -3295,7 +3308,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.discover_mcp_tools = stub_discover_mcp_tools
             web_app.execute_mcp_tool_call = stub_execute_mcp_tool_call
@@ -3410,7 +3423,7 @@ Verification SPL: | tstats count where index=_internal by sourcetype
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             web_app.chat_agent_memory.clear()
-            web_app._get_memory_store_path = lambda session_id: temp_path / f"{session_id}.json"
+            web_app._get_memory_store_path = lambda session_id, owner=None: temp_path / f"{session_id}.json"
             web_app.get_or_create_llm_client = lambda config: SequencedStubLLMClient()
             web_app.load_latest_report_knowledge = lambda *_: None
             web_app.discover_mcp_tools = stub_discover_mcp_tools

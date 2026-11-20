@@ -8,6 +8,7 @@ import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
 from importlib import metadata
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from capabilities.health import CapabilityHealthService
@@ -877,7 +878,11 @@ class CapabilityManager:
             details={"export": export_payload},
         )
 
-    def get_rag_context(self, user_message: str, max_chunks: int = 3) -> Dict[str, Any]:
+    def get_rag_context(self, user_message: str, max_chunks: int = 3, discovery_dir: Optional[Path] = None) -> Dict[str, Any]:
+        """Context from the first enabled Knowledge Base provider that finds any.
+
+        ``discovery_dir`` is the requester's discovery scope folder; passages from other scopes' reports are left out.
+        """
         preferred_order = {"rag_chromadb": 0, "rag_local": 1}
         definitions = sorted(
             self.registry.rag_definitions(),
@@ -890,7 +895,7 @@ class CapabilityManager:
             provider = self._get_rag_provider(definition, config)
             if provider is None:
                 continue
-            result = provider.get_context(user_message=user_message, max_chunks=max_chunks)
+            result = provider.get_context(user_message=user_message, max_chunks=max_chunks, discovery_dir=discovery_dir)
             if result.get("context_text"):
                 return result
         return {

@@ -2,7 +2,8 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -27,5 +28,6 @@ class BaseRAGProvider(ABC):
     """Abstract base for optional retrieval providers."""
 
     @abstractmethod
-    def get_context(self, user_message: str, max_chunks: int = 3) -> Dict[str, Any]:
+    def get_context(self, user_message: str, max_chunks: int = 3, discovery_dir: Optional[Path] = None) -> Dict[str, Any]:
+        """Passages for one message; with ``discovery_dir``, discovery reports only from that scope's folder."""
         raise NotImplementedError

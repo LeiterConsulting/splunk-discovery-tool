@@ -200,13 +200,15 @@ MAX_TITLE_CHARS = 80           # Goal and chat title length
 
 Goals are stored as one JSON file per library owner under `output/chat_data/goals/`. When sign-in is on, each user has their own library (`user_<id>.json`). When sign-in is off, everyone shares one library (`local.json`).
 
+Each chat's scratchpad is stored the same way, under `output/chat_data/memory/<owner>/chat_memory_<chat session>.json` (`CHAT_MEMORY_DIR_NAME = "memory"` in `src/web_app.py`).
+
 ---
 
 ## 4. Discovery Data Management
 
 ### 4.1 Discovery Freshness (src/web_app.py)
 ```python
-load_latest_report_knowledge(staleness_days=7)  # Chat passes discovery_freshness_days (default 7)
+load_latest_report_knowledge(staleness_days=7, output_dir=None)  # Chat passes discovery_freshness_days (default 7) and the asker's scope folder
 # Fresh: bundle age <= discovery_freshness_days
 # Warning: older than the window but no more than twice the window
 # Stale: older than twice the window
@@ -573,12 +575,18 @@ DOCS_DB_NAME = "library_docs.sqlite3"      # output/knowledge_library/docs/libra
 
 ## 15. Knowledge Base Index Freshness (src/capabilities/rag/indexer.py)
 ```python
-FRESHNESS_EXEMPT_SOURCE_TYPES = {"chat_memory_derived", "knowledge_asset"}
+FRESHNESS_EXEMPT_SOURCE_TYPES = {"knowledge_asset"}
 FRESHNESS_EXEMPT_FILENAMES = {"runtime_state.json"}
 FRESHNESS_EXEMPT_DIRS = {"runtime_jobs"}
+RETIRED_SOURCE_TYPES = {"chat_memory_derived"}    # An index that still holds these is rebuilt before the next search
+LEGACY_CHAT_MEMORY_DIR_NAME = "chat_memory"       # Old scratchpad folder; never indexed
+SCOPES_DIR_NAME = "scopes"                        # output/scopes/<scope>/ holds each sign-in scope's reports
+DISCOVERY_SOURCE_TYPES = {"discovery_artifact", "generated_summary", "handoff", "runbook", "tool_result_snapshot"}
 ```
 
 `get_index_freshness()` reports the index as `not_indexed`, `nothing_to_index`, `outdated` (older index format, or source files changed after the last index), or `current`. Files matching the exempt names, folders, and source types do not make the index outdated. The result appears as `index_freshness` in the capability health and install status.
+
+Chat searches the Knowledge Base with the asker's scope folder. Passages of the `DISCOVERY_SOURCE_TYPES` come only from that scope; imports and other documents are shared by every scope.
 
 ---
 

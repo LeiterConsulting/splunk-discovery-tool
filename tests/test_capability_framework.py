@@ -2360,5 +2360,101 @@ class CapabilityFrameworkTests(unittest.TestCase):
                 os.chdir(original_cwd)
 
 
+class KnowledgeBasePrivacyAndScopeTests(unittest.TestCase):
+    SCOPE_FOLDER = "bWNwOnRlbmFudC1i"
+
+    @staticmethod
+    def _indexer(output_dir):
+        definition = CapabilityRegistry().get_definition("rag_chromadb")
+        config = CapabilityConfig(
+            name="rag_chromadb",
+            installed=True,
+            enabled=True,
+            config={**definition.default_config, "source_dir": str(output_dir), "storage_dir": str(output_dir / "rag" / "chromadb")},
+        )
+        return ArtifactSourceIndexer(config, definition)
+
+    def _write_reports(self, output_dir):
+        scoped_dir = output_dir / "scopes" / self.SCOPE_FOLDER
+        scoped_dir.mkdir(parents=True)
+        (output_dir / "v2_operator_runbook_20260101_000000.md").write_text(
+            "## Queue pressure\n\nGlobal marker: queue pressure on the contoso indexers needs review in _internal.", encoding="utf-8"
+        )
+        (scoped_dir / "v2_operator_runbook_20260102_000000.md").write_text(
+            "## Queue pressure\n\nScoped marker: queue pressure on the example indexers needs review in _internal.", encoding="utf-8"
+        )
+        (output_dir / "queue_reference.md").write_text(
+            "## Queue pressure\n\nShared marker: queue pressure reference guide for every team that reviews _internal.", encoding="utf-8"
+        )
+        return scoped_dir
+
+    def test_chat_scratchpads_are_never_indexed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            runbook = output_dir / "v2_operator_runbook_20260101_000000.md"
+            for path in (
+                runbook,
+                output_dir / "chat_memory" / "chat_memory_chat_1.json",
+                output_dir / "chat_data" / "memory" / "local" / "chat_memory_chat_1.json",
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('{"last_user_message": "a private question about the contoso payroll hosts"}', encoding="utf-8")
+            self.assertEqual(self._indexer(output_dir)._select_source_files(), [runbook])
+
+    def test_an_index_that_still_holds_chat_scratchpads_is_rebuilt_before_the_next_search(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            indexer = self._indexer(Path(temp_dir) / "output")
+            indexer.get_storage_dir().mkdir(parents=True)
+            summary = {
+                "index_schema_version": ArtifactSourceIndexer.INDEX_SCHEMA_VERSION,
+                "document_count": 4,
+                "last_indexed_at": "2026-01-01T00:00:00+00:00",
+                "source_type_counts": {"runbook": 4},
+            }
+            indexer.get_summary_path().write_text(json.dumps(summary), encoding="utf-8")
+            with patch.object(indexer, "reindex", return_value={"rebuilt": True}) as reindex:
+                self.assertEqual(indexer._ensure_asset_index_current()["document_count"], 4)
+                reindex.assert_not_called()
+
+                summary["source_type_counts"]["chat_memory_derived"] = 2
+                indexer.get_summary_path().write_text(json.dumps(summary), encoding="utf-8")
+                self.assertEqual(indexer._ensure_asset_index_current(), {"rebuilt": True})
+                reindex.assert_called_once()
+
+    def test_search_keeps_discovery_reports_to_the_askers_scope(self):
+        if importlib.util.find_spec("chromadb") is None:
+            self.skipTest("chromadb is not installed in the active environment")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            scoped_dir = self._write_reports(output_dir)
+            indexer = self._indexer(output_dir)
+            indexer.reindex()
+
+            def markers(discovery_dir):
+                text = indexer.search("queue pressure review", max_chunks=6, discovery_dir=discovery_dir)["context_text"]
+                return {marker for marker in ("Global marker", "Scoped marker", "Shared marker") if marker in text}
+
+            self.assertEqual(markers(output_dir), {"Global marker", "Shared marker"})
+            self.assertEqual(markers(scoped_dir), {"Scoped marker", "Shared marker"})
+            self.assertEqual(markers(None), {"Global marker", "Scoped marker", "Shared marker"})
+
+    def test_quick_report_search_reads_the_askers_scope_folder(self):
+        from capabilities.rag.lightweight import LightweightRAGProvider
+
+        definition = CapabilityRegistry().get_definition("rag_local")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            scoped_dir = self._write_reports(output_dir)
+            config = CapabilityConfig(name="rag_local", installed=True, enabled=True, config={**definition.default_config, "source_dir": str(output_dir)})
+            provider = LightweightRAGProvider(config, definition)
+
+            global_text = provider.get_context("queue pressure", max_chunks=6, discovery_dir=output_dir)["context_text"]
+            scoped_text = provider.get_context("queue pressure", max_chunks=6, discovery_dir=scoped_dir)["context_text"]
+        self.assertIn("Global marker", global_text)
+        self.assertNotIn("Scoped marker", global_text)
+        self.assertIn("Scoped marker", scoped_text)
+        self.assertNotIn("Global marker", scoped_text)
+
+
 if __name__ == "__main__":
     unittest.main()

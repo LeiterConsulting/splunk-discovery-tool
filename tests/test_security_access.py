@@ -3941,11 +3941,12 @@ Environment summary.
         original_chat_logic = web_app.chat_with_splunk_logic
         original_build_deeplink = web_app.capability_manager.build_deeplink
 
-        async def stub_chat_logic(request_payload: dict, status_callback=None, runtime_config=None, goal_owner=None):
+        async def stub_chat_logic(request_payload: dict, status_callback=None, runtime_config=None, goal_owner=None, discovery_dir=None):
             return {
                 "message": request_payload.get("message"),
                 "mcp_url": runtime_config.mcp.url if runtime_config else None,
                 "active_mcp_config_name": getattr(runtime_config, "active_mcp_config_name", None),
+                "discovery_dir": str(discovery_dir),
             }
 
         class StubDeeplinkResult:
@@ -3981,6 +3982,8 @@ Environment summary.
             self.assertEqual(analyst_chat.status_code, 200)
             self.assertEqual(analyst_chat.json()["mcp_url"], "https://tenant-b.example.com/mcp")
             self.assertEqual(analyst_chat.json()["active_mcp_config_name"], "tenant-b")
+            # Chat describes tenant B from the reports discovery saved for tenant B.
+            self.assertEqual(analyst_chat.json()["discovery_dir"], str(web_app._discovery_scope_output_dir("mcp:tenant-b", create=False)))
 
             analyst_deeplink = self.client.post(
                 "/api/capabilities/deeplinks/build",

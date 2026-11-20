@@ -66,7 +66,10 @@ Chat combines:
 3. Plan hints from discovery, including facts for the indexes, sourcetypes, sources, and hosts that the question or goal names
 4. Optional context: Knowledge Base passages and downloaded Splunk documentation, ranked together, only when Search the Knowledge Base is on
 5. Chat goals (`src/chat_goals.py`): a request with `goal_id` uses the goal as the mission; after each answer the browser asks `POST /api/chat/goals/{goal_id}/progress` which tracked questions the answer settled
-6. Chat settings (`src/chat_settings.py`): Auto values from the AI model's tuning, with Custom values saved per model
+6. Chat settings (`src/chat_settings.py`): Auto values from the AI model's tuning, with Custom values saved per model. Each answer keeps its own copy for the whole answer
+7. A scratchpad per chat with the indexes, hosts, and recent turns it mentioned, saved privately for each user under `output/chat_data/memory/<owner>/` and never indexed
+
+Chat describes the environment the asker can search. With sign-in on, discovery saves each scope's reports under `output/scopes/<scope>/` (an assigned MCP connection is its own scope), and chat, context requests, hints after a search, Knowledge Base passages from discovery reports, and goal planning read the asker's scope (`request_discovery_dir`). With sign-in off, everything uses the global scope in `output/`.
 
 When adding new intents:
 

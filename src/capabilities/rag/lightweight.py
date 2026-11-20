@@ -2,10 +2,17 @@
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from capabilities.models import CapabilityConfig, CapabilityDefinition
 from capabilities.rag.base import BaseRAGProvider, RetrievalChunk
+
+
+def _is_subfolder(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve() != root.resolve() and path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
 
 
 class LightweightRAGProvider(BaseRAGProvider):
@@ -15,8 +22,11 @@ class LightweightRAGProvider(BaseRAGProvider):
         self.config = config
         self.definition = definition
 
-    def get_context(self, user_message: str, max_chunks: int = 3) -> Dict[str, Any]:
+    def get_context(self, user_message: str, max_chunks: int = 3, discovery_dir: Optional[Path] = None) -> Dict[str, Any]:
         source_dir = Path(str(self.config.config.get("source_dir") or self.definition.default_config.get("source_dir") or "output"))
+        # A sign-in scope's reports are in its own subfolder; read that one instead of the global reports.
+        if discovery_dir is not None and _is_subfolder(Path(discovery_dir), source_dir):
+            source_dir = Path(discovery_dir)
         if not source_dir.exists():
             return self._empty_result()
 

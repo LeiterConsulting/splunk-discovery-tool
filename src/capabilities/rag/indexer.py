@@ -26,8 +26,15 @@ from knowledge_library.ranking import query_terms as ranking_query_terms
 
 # Hashed-vector similarity and BM25 count equally when ranking Knowledge Base passages.
 KB_FUSION_WEIGHTS = (1.0, 1.0)
-# Chat memory changes after every chat turn, and searches reindex changed imports first, so neither makes the index outdated.
-FRESHNESS_EXEMPT_SOURCE_TYPES = frozenset({"chat_memory_derived", "knowledge_asset"})
+# Searches reindex changed imports first, so imports never make the index outdated.
+FRESHNESS_EXEMPT_SOURCE_TYPES = frozenset({"knowledge_asset"})
+# Older versions indexed each chat's private scratchpad from output/chat_memory as "chat_memory_derived".
+# Scratchpads now live with the asker's chat data, and an index that still lists them is rebuilt before its next search.
+LEGACY_CHAT_MEMORY_DIR_NAME = "chat_memory"
+RETIRED_SOURCE_TYPES = frozenset({"chat_memory_derived"})
+# Discovery saves the reports of each sign-in scope under scopes/<scope folder>/; the rest of the output folder is the global scope.
+SCOPES_DIR_NAME = "scopes"
+DISCOVERY_SOURCE_TYPES = frozenset({"discovery_artifact", "generated_summary", "handoff", "runbook", "tool_result_snapshot"})
 # The web app rewrites its runtime state and job request files while it runs; they are bookkeeping, not new knowledge.
 FRESHNESS_EXEMPT_FILENAMES = frozenset({"runtime_state.json"})
 FRESHNESS_EXEMPT_DIRS = frozenset({"runtime_jobs"})
@@ -99,8 +106,6 @@ def _path_is_within(path: Path, root: Path) -> bool:
 def _artifact_source_type(path: Path) -> str:
     lowered = path.name.lower()
     parent_lowered = [part.lower() for part in path.parts]
-    if "chat_memory" in parent_lowered:
-        return "chat_memory_derived"
     if "rag" in parent_lowered and "assets" in parent_lowered:
         return "knowledge_asset"
     if lowered.startswith("v2_operator_runbook_"):
@@ -116,6 +121,18 @@ def _artifact_source_type(path: Path) -> str:
     if lowered.endswith(".md") or lowered.endswith(".txt"):
         return "uploaded_document"
     return "discovery_artifact"
+
+
+def _visible_in_scope(metadata: Dict[str, Any], scope: Optional[str]) -> bool:
+    """Whether a requester in ``scope`` (a scope folder relative to the source folder, "" for global) may see a passage.
+
+    Imports and reference documents are shared; discovery reports belong to the scope that ran them.
+    """
+    if scope is None or str(metadata.get("source_type") or "") not in DISCOVERY_SOURCE_TYPES:
+        return True
+    parts = str(metadata.get("source_path") or "").replace("\\", "/").split("/")
+    document_scope = "/".join(parts[:2]) if len(parts) > 2 and parts[0] == SCOPES_DIR_NAME else ""
+    return document_scope == scope
 
 
 def _normalize_preview_text(text: Any) -> str:
@@ -520,8 +537,11 @@ class ArtifactSourceIndexer:
         return detail
 
     def _ensure_asset_index_current(self) -> Dict[str, Any]:
-        asset_summary = self.get_knowledge_asset_summary()
         index_summary = self.get_index_summary()
+        source_type_counts = index_summary.get("source_type_counts")
+        if isinstance(source_type_counts, dict) and RETIRED_SOURCE_TYPES.intersection(source_type_counts):
+            return self.reindex()
+        asset_summary = self.get_knowledge_asset_summary()
         latest_asset_update = max(
             (
                 _parse_iso_timestamp(asset.get("updated_at") or asset.get("created_at"))
@@ -562,8 +582,10 @@ class ArtifactSourceIndexer:
             if _path_is_within(path, storage_dir):
                 continue
             relative_parts = path.relative_to(source_dir).parts
-            # The library and saved chat data have their own stores; indexing them would crowd out reports.
+            # The library and saved chat data have their own stores, and chat data is private to each user.
             if LIBRARY_DIR_NAME in relative_parts or CHAT_DATA_DIR_NAME in relative_parts:
+                continue
+            if relative_parts[0] == LEGACY_CHAT_MEMORY_DIR_NAME:
                 continue
             files.append(path)
             if len(files) >= max_files:
@@ -679,8 +701,9 @@ class ArtifactSourceIndexer:
         self.get_summary_path().write_text(json.dumps(summary, indent=2), encoding="utf-8")
         return summary
 
-    def search(self, user_message: str, max_chunks: int = 3) -> Dict[str, Any]:
-        summary, chunks = self._query_chunks(user_message=user_message, max_chunks=max_chunks)
+    def search(self, user_message: str, max_chunks: int = 3, discovery_dir: Optional[Path] = None) -> Dict[str, Any]:
+        """Passages for one message; with ``discovery_dir``, discovery reports only from that scope's folder."""
+        summary, chunks = self._query_chunks(user_message=user_message, max_chunks=max_chunks, scope=self._discovery_scope(discovery_dir))
         if not chunks:
             return self._empty_result(summary)
 
@@ -1015,11 +1038,19 @@ class ArtifactSourceIndexer:
             "message": f"Built context preview from {len(chunks)} indexed knowledge chunk(s).",
         }
 
+    def _discovery_scope(self, discovery_dir: Optional[Path]) -> Optional[str]:
+        """The scope folder relative to the source folder ("" for global), or None to leave every report in."""
+        if discovery_dir is None or not _path_is_within(Path(discovery_dir), self.get_source_dir()):
+            return None
+        relative = _safe_relative_path(Path(discovery_dir), self.get_source_dir())
+        return "" if relative == "." else relative
+
     def _query_chunks(
         self,
         user_message: str,
         max_chunks: int = 3,
         source_type: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> Any:
         summary = self._ensure_asset_index_current()
         if int(summary.get("document_count") or 0) <= 0:
@@ -1066,15 +1097,18 @@ class ArtifactSourceIndexer:
         for index, snippet in enumerate(result_documents):
             if not isinstance(snippet, str) or not snippet.strip():
                 continue
+            metadata = result_metadatas[index] if index < len(result_metadatas) and isinstance(result_metadatas[index], dict) else {}
+            if not _visible_in_scope(metadata, scope):
+                continue
             key = str(result_ids[index]) if index < len(result_ids) else f"vector-{index}"
             vector_order.append(key)
             candidates[key] = {
                 "snippet": snippet,
-                "metadata": result_metadatas[index] if index < len(result_metadatas) and isinstance(result_metadatas[index], dict) else {},
+                "metadata": metadata,
                 "distance": result_distances[index] if index < len(result_distances) else None,
                 "vector_rank": index,
             }
-        hybrid_scores = self._hybrid_scores(collection, summary, user_message, candidates, vector_order, candidate_count, source_type)
+        hybrid_scores = self._hybrid_scores(collection, summary, user_message, candidates, vector_order, candidate_count, source_type, scope)
 
         chunks: List[RetrievalChunk] = []
         for key, candidate in candidates.items():
@@ -1139,6 +1173,7 @@ class ArtifactSourceIndexer:
         vector_order: List[str],
         candidate_count: int,
         source_type: Optional[str],
+        scope: Optional[str] = None,
     ) -> Optional[Dict[str, int]]:
         """Fuse the hashed-vector ranking with BM25 so exact names and rare terms count; adds lexical-only matches to `candidates`."""
         terms = ranking_query_terms(user_message)
@@ -1151,7 +1186,8 @@ class ArtifactSourceIndexer:
             scores = corpus["bm25"].scores(terms)
             eligible = [
                 position for position in scores
-                if not source_type or corpus["metadatas"][position].get("source_type") == source_type
+                if (not source_type or corpus["metadatas"][position].get("source_type") == source_type)
+                and _visible_in_scope(corpus["metadatas"][position], scope)
             ]
             for position in sorted(eligible, key=lambda item: (-scores[item], item))[:candidate_count]:
                 key = corpus["ids"][position]

@@ -612,12 +612,14 @@ class DiscoveryContextManager:
         return "\n".join(context_lines) if context_lines else ""
 
 
-_context_manager: Optional[DiscoveryContextManager] = None
+_context_managers: Dict[str, DiscoveryContextManager] = {}
 
 
-def get_context_manager() -> DiscoveryContextManager:
-    """Get or create the global context manager instance."""
-    global _context_manager
-    if _context_manager is None:
-        _context_manager = DiscoveryContextManager()
-    return _context_manager
+def get_context_manager(output_dir: Optional[Path] = None) -> DiscoveryContextManager:
+    """The context manager for one discovery scope's folder; the global output folder by default."""
+    folder = Path(output_dir) if output_dir is not None else Path("output")
+    key = str(folder)
+    manager = _context_managers.get(key)
+    if manager is None:
+        manager = _context_managers[key] = DiscoveryContextManager(folder)
+    return manager

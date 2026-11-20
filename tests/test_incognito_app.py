@@ -112,8 +112,8 @@ class IncognitoAppCase(unittest.TestCase):
                 mock.patch.object(web_app, "load_latest_report_knowledge", lambda *_: None), \
                 mock.patch.object(web_app, "discover_mcp_tools", discover), \
                 mock.patch.object(web_app, "execute_mcp_tool_call", mcp), \
-                mock.patch.object(web_app, "_get_memory_store_path", lambda session_id: self.temp_path / f"{session_id}.json"), \
-                mock.patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: None), \
+                mock.patch.object(web_app, "_get_memory_store_path", lambda session_id, owner=None: self.temp_path / f"{session_id}.json"), \
+                mock.patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: dict(web_app.chat_session_settings)), \
                 mock.patch.dict(web_app.chat_session_settings, {"enable_splunk_augmentation": True, "enable_rag_context": False}), \
                 mock.patch.dict(web_app.chat_agent_memory, {}, clear=True):
             yield lambda request: asyncio.run(web_app.run_chat_turn(request, goal_owner=owner))

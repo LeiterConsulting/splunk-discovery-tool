@@ -75,11 +75,11 @@ def chat_harness(llm, mcp, tools=("splunk_run_query", "splunk_get_indexes")):
             patch.object(web_app, "load_latest_report_knowledge", lambda *_: None), \
             patch.object(web_app, "discover_mcp_tools", discover), \
             patch.object(web_app, "execute_mcp_tool_call", mcp), \
-            patch.object(web_app, "_get_memory_store_path", lambda session_id: Path(temp_dir) / f"{session_id}.json"), \
-            patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: None), \
+            patch.object(web_app, "_get_memory_store_path", lambda session_id, owner=None: Path(temp_dir) / f"{session_id}.json"), \
+            patch.object(web_app, "sync_chat_settings_for_request", lambda *_args, **_kwargs: dict(web_app.chat_session_settings)), \
             patch.dict(web_app.chat_session_settings, {"enable_splunk_augmentation": True, "enable_rag_context": False}), \
             patch.dict(web_app.chat_agent_memory, {}, clear=True):
-        yield lambda request: asyncio.run(web_app.chat_with_splunk_logic(request))
+        yield lambda request, **kwargs: asyncio.run(web_app.chat_with_splunk_logic(request, **kwargs))
 
 
 def _system_text(messages):
@@ -591,6 +591,130 @@ class ChatToolLoopTests(unittest.TestCase):
         self.assertEqual(missing_goal["chat_memory"]["mission"], "")
 
 
+class ChatScopeAndPrivacyTests(unittest.TestCase):
+    SCOPED = Path("output") / "scopes" / "bWNwOnRlbmFudC1i"
+
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        previous_cwd = os.getcwd()
+        os.chdir(temp_dir.name)
+        self.addCleanup(os.chdir, previous_cwd)
+        self.legacy_dir = Path(temp_dir.name) / "output" / "chat_memory"
+        for patcher in (
+            patch.object(web_app, "LEGACY_CHAT_MEMORY_DIR", self.legacy_dir),
+            patch.dict(web_app.chat_agent_memory, {}, clear=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_scratchpads_are_kept_per_user_in_the_chat_data_folder(self):
+        with patch.object(web_app, "is_auth_enabled", return_value=True):
+            web_app.update_chat_memory("chat_1", "How many events are in index=alpha?", owner="user_a")
+            web_app.update_chat_memory("chat_1", "How many events are in index=beta?", owner="user_b")
+            web_app.chat_agent_memory.clear()
+            alpha = web_app.load_chat_memory("chat_1", "user_a")
+            beta = web_app.load_chat_memory("chat_1", "user_b")
+
+        self.assertEqual(alpha["entities"]["indexes"], ["alpha"])
+        self.assertEqual(beta["entities"]["indexes"], ["beta"])
+        memory_root = Path("output") / "chat_data" / "memory"
+        self.assertTrue((memory_root / "user_a" / "chat_memory_chat_1.json").is_file())
+        self.assertTrue((memory_root / "user_b" / "chat_memory_chat_1.json").is_file())
+        self.assertFalse(self.legacy_dir.exists())
+
+    def test_old_shared_scratchpads_are_adopted_only_while_sign_in_is_off(self):
+        self.legacy_dir.mkdir(parents=True)
+        legacy = self.legacy_dir / "chat_memory_chat_old.json"
+        legacy.write_text(json.dumps({"mission": "Find silent sensors"}), encoding="utf-8")
+
+        with patch.object(web_app, "is_auth_enabled", return_value=True):
+            self.assertEqual(web_app.load_chat_memory("chat_old", "user_a")["mission"], "")
+            self.assertEqual(web_app.load_chat_memory("chat_old")["mission"], "")
+        self.assertTrue(legacy.exists())
+
+        web_app.chat_agent_memory.clear()
+        with patch.object(web_app, "is_auth_enabled", return_value=False):
+            self.assertEqual(web_app.load_chat_memory("chat_old")["mission"], "Find silent sensors")
+        self.assertFalse(legacy.exists())
+        self.assertTrue((Path("output") / "chat_data" / "memory" / "local" / "chat_memory_chat_old.json").is_file())
+
+    def test_chat_reads_reports_hints_and_knowledge_base_from_the_askers_scope(self):
+        llm = ScriptedLLM([
+            _tool_call("| tstats count where index=main by sourcetype"),
+            "index=main has 12 events from syslog in the last 24 hours.",
+            "tstats reads indexed fields from tsidx files, so it is much faster than a raw search.",
+        ])
+        mcp = RecordingMCP(lambda _call: _rows_result([{"sourcetype": "syslog", "count": "12"}]))
+        report_dirs, rag_dirs, hint_dirs = [], [], []
+
+        def fake_reports(_staleness_days, output_dir=None):
+            report_dirs.append(output_dir)
+            return None
+
+        def fake_rag(_message, max_chunks=3, discovery_dir=None):
+            rag_dirs.append(discovery_dir)
+            return "", []
+
+        class Hints:
+            def get_context_after_tool_call(self, **_kwargs):
+                return ""
+
+        def fake_context_manager(output_dir=None):
+            hint_dirs.append(output_dir)
+            return Hints()
+
+        with chat_harness(llm, mcp) as run, \
+                patch.object(web_app, "load_latest_report_knowledge", fake_reports), \
+                patch.object(web_app, "get_optional_rag_context", fake_rag), \
+                patch.object(web_app, "get_context_manager", fake_context_manager), \
+                patch.dict(web_app.chat_session_settings, {"enable_rag_context": True}):
+            scoped = run(
+                {"message": "Which sourcetypes are in index=main and how many events does each have?", "history": [], "chat_session_id": "scope_1"},
+                discovery_dir=self.SCOPED,
+            )
+            default = run({"message": "Explain what the tstats command does in SPL.", "history": [], "chat_session_id": "scope_2"})
+
+        self.assertIn("12 events", scoped["response"])
+        self.assertIn("tstats", default["response"])
+        self.assertEqual(report_dirs, [self.SCOPED, Path("output")])
+        self.assertEqual(rag_dirs, [self.SCOPED, Path("output")])
+        self.assertEqual(hint_dirs, [self.SCOPED])
+
+    def test_report_knowledge_comes_from_the_requested_scope_folder(self):
+        seen = []
+
+        def fake_uncached(output_dir, _staleness_days, report_files):
+            seen.append((output_dir, sorted(path.name for _, path, _, _ in report_files)))
+            return {"dir": str(output_dir)}
+
+        self.SCOPED.mkdir(parents=True)
+        (Path("output") / "v2_insights_brief_20260101_000000.md").write_text("global", encoding="utf-8")
+        (self.SCOPED / "v2_insights_brief_20260102_000000.md").write_text("scoped", encoding="utf-8")
+        with patch.object(web_app, "_load_latest_report_knowledge_uncached", fake_uncached), \
+                patch.dict(web_app._report_knowledge_cache, {"key": None, "expires_at": 0.0, "value": None}):
+            self.assertEqual(web_app.load_latest_report_knowledge(7, self.SCOPED), {"dir": str(self.SCOPED)})
+            self.assertEqual(web_app.load_latest_report_knowledge(7), {"dir": "output"})
+        self.assertEqual(seen, [
+            (self.SCOPED, ["v2_insights_brief_20260102_000000.md"]),
+            (Path("output"), ["v2_insights_brief_20260101_000000.md"]),
+        ])
+
+    def test_discovery_context_is_kept_per_scope_folder(self):
+        from discovery import context_manager
+
+        self.SCOPED.mkdir(parents=True)
+        (Path("output") / "v2_intelligence_blueprint_20260101_000000.json").write_text("{}", encoding="utf-8")
+        (self.SCOPED / "v2_intelligence_blueprint_20260102_000000.json").write_text("{}", encoding="utf-8")
+        with patch.dict(context_manager._context_managers, {}, clear=True):
+            scoped = context_manager.get_context_manager(self.SCOPED)
+            default = context_manager.get_context_manager()
+            self.assertIs(scoped, context_manager.get_context_manager(self.SCOPED))
+            self.assertIsNot(scoped, default)
+            self.assertEqual(scoped.get_latest_discovery_file().parent, self.SCOPED)
+            self.assertEqual(default.get_latest_discovery_file().parent, Path("output"))
+
+
 class FollowOnActionTests(unittest.TestCase):
     def _memory(self, **last_result):
         base = {"index": "main", "row_count": 0, "earliest_time": "-24h", "latest_time": "now"}
@@ -818,7 +942,7 @@ class DiscoveryReportingTests(unittest.TestCase):
 
     def test_chat_memory_writes_are_atomic(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
-                patch.object(web_app, "_get_memory_store_path", lambda session_id: Path(temp_dir) / f"{session_id}.json"), \
+                patch.object(web_app, "_get_memory_store_path", lambda session_id, owner=None: Path(temp_dir) / f"{session_id}.json"), \
                 patch.dict(web_app.chat_agent_memory, {}, clear=True):
             memory = web_app.load_chat_memory("atomic-test")
             memory["mission"] = "Track failed logins"

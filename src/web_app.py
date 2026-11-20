@@ -2740,7 +2740,7 @@ def _chat_settings_model_info(tuning: Dict[str, Any], identity: Dict[str, str]) 
 
 def refresh_chat_session_settings(config: Any = None) -> ChatSettingsView:
     """Recompute Auto values from the model's tuning and apply the saved custom values."""
-    global chat_settings_view
+    global chat_settings_view, chat_session_settings
     tuning, identity = _chat_settings_inputs(config)
     view = resolve_chat_settings(
         chat_settings_store,
@@ -2749,18 +2749,23 @@ def refresh_chat_session_settings(config: Any = None) -> ChatSettingsView:
         should_enable_rag_context_by_default(),
         model_info=_chat_settings_model_info(tuning, identity),
     )
-    chat_session_settings.clear()
-    chat_session_settings.update(view.effective)
+    # Swapped in whole rather than cleared and refilled, so no reader ever sees it half filled.
+    chat_session_settings = dict(view.effective)
     chat_settings_view = view
     return view
 
 
-def sync_chat_settings_for_request(config: Any = None) -> None:
-    """Pick up model, tuning, and Knowledge Base changes before a chat answer."""
+def sync_chat_settings_for_request(config: Any = None) -> Dict[str, Any]:
+    """The settings for one chat answer: current model, tuning, and Knowledge Base state, plus custom values.
+
+    The answer keeps this copy until it finishes, so a settings change or another request
+    made meanwhile cannot change its limits halfway through.
+    """
     try:
         refresh_chat_session_settings(config)
     except Exception as exc:
         print(f"⚠️ [CHAT] Could not refresh chat settings: {exc}")
+    return dict(chat_session_settings)
 
 
 def chat_custom_settings() -> Dict[str, Any]:
@@ -4380,8 +4385,11 @@ discovery_runtime_state = discovery_runtime_states.get(DISCOVERY_SCOPE_GLOBAL, _
 discovery_runtime_states[DISCOVERY_SCOPE_GLOBAL] = discovery_runtime_state
 _persist_runtime_state()
 
+# Keyed by "<owner>/<chat session>" so one user's chat can never load another user's scratchpad.
 chat_agent_memory: Dict[str, Dict[str, Any]] = {}
 _chat_memory_write_lock = threading.Lock()
+CHAT_MEMORY_DIR_NAME = "memory"
+LEGACY_CHAT_MEMORY_DIR = Path(__file__).resolve().parent.parent / "output" / "chat_memory"
 
 
 def sanitize_chat_session_id(chat_session_id: str) -> str:
@@ -4392,12 +4400,31 @@ def sanitize_chat_session_id(chat_session_id: str) -> str:
     return cleaned[:64] if cleaned else "default"
 
 
-def _get_memory_store_path(chat_session_id: str) -> Path:
-    """Get per-chat memory persistence path."""
-    project_root = Path(__file__).resolve().parent.parent
-    memory_dir = project_root / "output" / "chat_memory"
+def _chat_memory_owner(owner: Optional[str]) -> str:
+    return sanitize_chat_session_id(owner) if owner else owner_key(None)
+
+
+def _get_memory_store_path(chat_session_id: str, owner: Optional[str] = None) -> Path:
+    """Per-chat scratchpad file, in the asker's own folder under the chat data the Knowledge Base never indexes."""
+    memory_dir = CHAT_DATA_ROOT / CHAT_MEMORY_DIR_NAME / _chat_memory_owner(owner)
     memory_dir.mkdir(parents=True, exist_ok=True)
     return memory_dir / f"chat_memory_{sanitize_chat_session_id(chat_session_id)}.json"
+
+
+def _adopt_legacy_chat_memory(chat_session_id: str, owner: Optional[str], path: Path) -> None:
+    """Move a scratchpad from the old shared folder into the shared owner's folder.
+
+    Old scratchpads have no owner, so they are adopted only while sign-in is off and every
+    chat belongs to the shared owner; with sign-in on they are never read.
+    """
+    if path.exists() or is_auth_enabled() or _chat_memory_owner(owner) != owner_key(None):
+        return
+    legacy_path = LEGACY_CHAT_MEMORY_DIR / f"chat_memory_{sanitize_chat_session_id(chat_session_id)}.json"
+    try:
+        if legacy_path.is_file():
+            os.replace(legacy_path, path)
+    except OSError:
+        pass
 
 
 def _default_chat_memory(chat_session_id: str) -> Dict[str, Any]:
@@ -4428,14 +4455,16 @@ def _default_chat_memory(chat_session_id: str) -> Dict[str, Any]:
     }
 
 
-def load_chat_memory(chat_session_id: str) -> Dict[str, Any]:
-    """Load chat memory from cache or disk."""
+def load_chat_memory(chat_session_id: str, owner: Optional[str] = None) -> Dict[str, Any]:
+    """Load the asker's scratchpad for one chat from cache or disk."""
     session_key = sanitize_chat_session_id(chat_session_id)
-    if session_key in chat_agent_memory:
-        return chat_agent_memory[session_key]
+    cache_key = f"{_chat_memory_owner(owner)}/{session_key}"
+    if cache_key in chat_agent_memory:
+        return chat_agent_memory[cache_key]
 
     memory = _default_chat_memory(session_key)
-    path = _get_memory_store_path(session_key)
+    path = _get_memory_store_path(session_key, owner)
+    _adopt_legacy_chat_memory(session_key, owner, path)
     if path.exists():
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -4445,18 +4474,18 @@ def load_chat_memory(chat_session_id: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    chat_agent_memory[session_key] = memory
+    chat_agent_memory[cache_key] = memory
     return memory
 
 
-def save_chat_memory(chat_session_id: str, memory: Dict[str, Any]) -> None:
-    """Persist chat memory in cache and on disk."""
+def save_chat_memory(chat_session_id: str, memory: Dict[str, Any], owner: Optional[str] = None) -> None:
+    """Persist the asker's scratchpad for one chat in cache and on disk."""
     session_key = sanitize_chat_session_id(chat_session_id)
     memory["chat_session_id"] = session_key
     memory["updated_at"] = datetime.now().isoformat()
-    chat_agent_memory[session_key] = memory
+    chat_agent_memory[f"{_chat_memory_owner(owner)}/{session_key}"] = memory
 
-    path = _get_memory_store_path(session_key)
+    path = _get_memory_store_path(session_key, owner)
     # Concurrent chat requests for one session must never leave a half-written memory file behind.
     temp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
@@ -5338,9 +5367,10 @@ def update_chat_memory(
     report_intent: Optional[str] = None,
     record_user_turn: bool = True,
     update_focus: bool = True,
+    owner: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Update chat memory with latest user message, optional tool activity, and optional assistant response."""
-    memory = load_chat_memory(chat_session_id)
+    memory = load_chat_memory(chat_session_id, owner)
     signals = _extract_memory_signals(user_message)
 
     if isinstance(user_message, str) and user_message.strip():
@@ -5400,7 +5430,7 @@ def update_chat_memory(
             memory["current_focus"] = focus
 
     memory["entities"] = entities
-    save_chat_memory(chat_session_id, memory)
+    save_chat_memory(chat_session_id, memory, owner)
     return memory
 
 
@@ -6292,9 +6322,14 @@ def get_library_docs_context(user_message: str, max_chunks: int = 3) -> Tuple[st
     return "\n".join(lines), [usage]
 
 
-def get_optional_rag_context(user_message: str, max_chunks: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
-    """Return optional RAG context and normalized capability usage details, including downloaded documentation."""
-    rag_result = capability_manager.get_rag_context(user_message=user_message, max_chunks=max_chunks)
+def get_optional_rag_context(
+    user_message: str, max_chunks: int = 3, discovery_dir: Optional[Path] = None
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return optional RAG context and normalized capability usage details, including downloaded documentation.
+
+    With ``discovery_dir``, Knowledge Base passages from discovery reports come only from that scope's folder.
+    """
+    rag_result = capability_manager.get_rag_context(user_message=user_message, max_chunks=max_chunks, discovery_dir=discovery_dir)
     context_text = str(rag_result.get("context_text") or "") if isinstance(rag_result, dict) else ""
     capability_usage = build_capability_usage_from_rag_result(rag_result)
     docs_text, docs_usage = get_library_docs_context(user_message, max_chunks=max_chunks)
@@ -7801,6 +7836,13 @@ def _discovery_session_manifest_path() -> Path:
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
     return output_dir / "discovery_sessions.json"
+
+
+def request_discovery_dir(request: Optional[Request]) -> Path:
+    """The folder holding the discovery reports of the requester's scope, so chat and goal planning
+    describe the environment the requester can search, not whichever one ran discovery last."""
+    scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
+    return _discovery_scope_output_dir(scope_key, create=False)
 
 
 def _discovery_scope_output_dir(scope_key: Optional[str] = None, *, create: bool = True) -> Path:
@@ -14211,9 +14253,9 @@ async def _ask_llm_for_goal_json(messages: List[Dict[str, str]], fraction: float
     return parsed, ""
 
 
-def _goal_environment_brief() -> str:
+def _goal_environment_brief(discovery_dir: Optional[Path] = None) -> str:
     try:
-        knowledge = load_latest_report_knowledge(chat_session_settings.get("discovery_freshness_days", 7))
+        knowledge = load_latest_report_knowledge(chat_session_settings.get("discovery_freshness_days", 7), discovery_dir)
     except Exception:
         return ""
     if not isinstance(knowledge, dict):
@@ -14221,10 +14263,10 @@ def _goal_environment_brief() -> str:
     return str(knowledge.get("prompt_context_compact") or knowledge.get("greeting_context") or "")
 
 
-async def _plan_chat_goal(goal_text: str) -> Tuple[Dict[str, Any], str, str]:
+async def _plan_chat_goal(goal_text: str, discovery_dir: Optional[Path] = None) -> Tuple[Dict[str, Any], str, str]:
     """Plan from the AI model, or the starter plan when it is unavailable. Returns (plan, planned_by, message)."""
     data, reason = await _ask_llm_for_goal_json(
-        build_plan_messages(goal_text, _goal_environment_brief()), fraction=0.25, ceiling=1200
+        build_plan_messages(goal_text, _goal_environment_brief(discovery_dir)), fraction=0.25, ceiling=1200
     )
     plan = parse_plan(data, goal_text) if data else None
     if plan is not None:
@@ -14249,7 +14291,7 @@ async def create_chat_goal(request: Request):
         raise HTTPException(status_code=400, detail="Describe the goal first.")
     incognito = open_incognito_session(owner, "goal planning")
     with incognito_session_scope(incognito):
-        plan, planned_by, message = await _plan_chat_goal(goal_text)
+        plan, planned_by, message = await _plan_chat_goal(goal_text, request_discovery_dir(request))
     try:
         goal = chat_goal_store.create_goal(
             owner,
@@ -14305,7 +14347,7 @@ async def replan_chat_goal(goal_id: str, request: Request):
         raise _goal_http_error(exc) from None
     incognito = open_incognito_session(owner, "goal planning")
     with incognito_session_scope(incognito):
-        plan, planned_by, message = await _plan_chat_goal(str(goal.get("goal") or ""))
+        plan, planned_by, message = await _plan_chat_goal(str(goal.get("goal") or ""), request_discovery_dir(request))
     try:
         detail = chat_goal_store.replace_plan(owner, goal_id, plan["items"], plan["questions"], planned_by)
     except (GoalNotFoundError, OSError) as exc:
@@ -17392,6 +17434,7 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
     status_queue = asyncio.Queue()
     runtime_config = resolve_effective_runtime_config(request=http_request)
     goal_owner = chat_goal_owner(http_request)
+    discovery_dir = request_discovery_dir(http_request)
     
     async def generate_sse():
         """Generator for Server-Sent Events."""
@@ -17399,7 +17442,9 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
         try:
             # Process chat in background task
             chat_task = asyncio.create_task(
-                process_chat_with_streaming(request, status_queue, runtime_config=runtime_config, goal_owner=goal_owner)
+                process_chat_with_streaming(
+                    request, status_queue, runtime_config=runtime_config, goal_owner=goal_owner, discovery_dir=discovery_dir
+                )
             )
             
             # Stream status updates as they come in
@@ -18137,13 +18182,14 @@ _REPORT_KNOWLEDGE_CACHE_TTL_SECONDS = 60.0
 _report_knowledge_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "value": None}
 
 
-def load_latest_report_knowledge(staleness_days: int = 7) -> Optional[Dict[str, Any]]:
+def load_latest_report_knowledge(staleness_days: int = 7, output_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Load the latest viable report bundle and synthesize a reusable knowledge object.
 
-    Chat calls this on every turn, so the parsed bundle is reused until a report file
-    changes or the short TTL (which bounds report-age drift) expires.
+    ``output_dir`` is the discovery scope's folder (see request_discovery_dir); the global
+    output folder by default. Chat calls this on every turn, so the parsed bundle is reused
+    until a report file changes or the short TTL (which bounds report-age drift) expires.
     """
-    output_dir = Path('output')
+    output_dir = Path(output_dir) if output_dir is not None else Path('output')
     if not output_dir.exists():
         return None
 
@@ -19070,7 +19116,13 @@ def extract_suggested_spl_from_answer(text: Any) -> Optional[str]:
             candidate = generic.group(1).strip()
     return candidate or None
 
-async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue, runtime_config: Any = None, goal_owner: Optional[str] = None):
+async def process_chat_with_streaming(
+    request: dict,
+    status_queue: asyncio.Queue,
+    runtime_config: Any = None,
+    goal_owner: Optional[str] = None,
+    discovery_dir: Optional[Path] = None,
+):
     """Process chat request and push status updates to queue."""
     try:
         # Define callback that pushes to queue
@@ -19083,30 +19135,48 @@ async def process_chat_with_streaming(request: dict, status_queue: asyncio.Queue
             })
         
         # Call chat logic with streaming callback
-        result = await run_chat_turn(request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner)
+        result = await run_chat_turn(
+            request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner, discovery_dir=discovery_dir
+        )
         record_chat_goal_turn(goal_owner, request, result)
         await status_queue.put({'type': 'done', 'data': result})
     except Exception as e:
         await status_queue.put({'type': 'error', 'error': str(e)})
 
 
-async def run_chat_turn(request: dict, status_callback=None, runtime_config: Any = None, goal_owner: Optional[str] = None):
+async def run_chat_turn(
+    request: dict,
+    status_callback=None,
+    runtime_config: Any = None,
+    goal_owner: Optional[str] = None,
+    discovery_dir: Optional[Path] = None,
+):
     """Answer one chat message under the asker's incognito state."""
     session = open_incognito_session(goal_owner, "chat", config=runtime_config)
     with incognito_session_scope(session):
-        result = await chat_with_splunk_logic(request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner)
+        result = await chat_with_splunk_logic(
+            request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner, discovery_dir=discovery_dir
+        )
     return attach_incognito_result(session, result)
 
 
-async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_config: Any = None, goal_owner: Optional[str] = None):
+async def chat_with_splunk_logic(
+    request: dict,
+    status_callback=None,
+    runtime_config: Any = None,
+    goal_owner: Optional[str] = None,
+    discovery_dir: Optional[Path] = None,
+):
     """Core chat logic that can optionally stream status updates.
     
     Args:
         request: The chat request dict
         status_callback: Optional async function to call with status updates
                         Signature: async def callback(action: str, iteration: int, time: float)
-        goal_owner: Whose goal library a goal_id in the request belongs to (see chat_goals.owner_key)
+        goal_owner: Whose goal library and chat scratchpad to use (see chat_goals.owner_key)
+        discovery_dir: Where the asker's discovery reports are (see request_discovery_dir); the global output folder by default
     """
+    report_dir = Path(discovery_dir) if discovery_dir is not None else Path("output")
     try:
         print(f"🔵 [CHAT] Request received: {request.get('message', '')[:50]}")
         user_message = request.get('message', '')
@@ -19130,7 +19200,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         
         # Load configuration
         config = runtime_config or config_manager.get()
-        sync_chat_settings_for_request(config)
+        turn_settings = sync_chat_settings_for_request(config)
         request_started_at = time.time()
 
         async def push_status(timeline: List[Dict[str, Any]], action: str, iteration: int = 0):
@@ -19141,8 +19211,8 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 await status_callback(action, iteration, elapsed)
 
         # Load and update persistent chat memory for this session
-        update_chat_memory(chat_session_id, user_message)
-        chat_memory = load_chat_memory(chat_session_id)
+        update_chat_memory(chat_session_id, user_message, owner=goal_owner)
+        chat_memory = load_chat_memory(chat_session_id, goal_owner)
         active_goal = load_active_chat_goal(goal_owner, request.get("goal_id"))
         goal_progress = progress_brief(active_goal) if active_goal else None
         if active_goal or "mission" in request or "goal_id" in request:
@@ -19151,7 +19221,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             if requested_mission != str(chat_memory.get("mission") or "") or requested_open_items != list(chat_memory.get("goal_open_items") or []):
                 chat_memory["mission"] = requested_mission
                 chat_memory["goal_open_items"] = requested_open_items
-                save_chat_memory(chat_session_id, chat_memory)
+                save_chat_memory(chat_session_id, chat_memory, goal_owner)
         mission = normalize_mission(chat_memory.get("mission"))
         memory_context = build_chat_memory_context(chat_memory)
 
@@ -19162,7 +19232,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             'use case', 'compliance', 'security', 'improve', 'assess', 'risk', 'gap', 'priority'
         ])
 
-        report_knowledge = load_latest_report_knowledge(chat_session_settings["discovery_freshness_days"])
+        report_knowledge = load_latest_report_knowledge(turn_settings["discovery_freshness_days"], report_dir)
         discovery_context = ""
         discovery_age_warning = None
 
@@ -19182,7 +19252,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         else:
             discovery_age_warning = "⚠️ No discovery data found. Run a discovery first to get environment context."
 
-        report_intent = detect_report_intent(user_message, report_knowledge) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+        report_intent = detect_report_intent(user_message, report_knowledge) if bool(turn_settings.get("enable_splunk_augmentation", True)) else None
 
         query_plan_context = build_query_plan_brief(user_message, report_knowledge, chat_memory)
 
@@ -19191,9 +19261,9 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             report_capability_usage: List[Dict[str, Any]] = []
             structured_report_request = extract_structured_report_request(user_message)
             await push_status(report_status_timeline, "📚 Synthesizing discovery knowledge", 0)
-            if bool(chat_session_settings.get("enable_rag_context", False)):
-                rag_max_chunks = _safe_int(chat_session_settings.get("rag_max_chunks", 3))
-                _, report_capability_usage = get_optional_rag_context(user_message, max_chunks=rag_max_chunks)
+            if bool(turn_settings.get("enable_rag_context", False)):
+                rag_max_chunks = _safe_int(turn_settings.get("rag_max_chunks", 3))
+                _, report_capability_usage = get_optional_rag_context(user_message, max_chunks=rag_max_chunks, discovery_dir=report_dir)
             focused_report_response = build_focused_report_response(report_intent, report_knowledge, structured_report_request)
             if focused_report_response:
                 response_text, report_insights = focused_report_response
@@ -19215,6 +19285,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 assistant_response=response_text,
                 report_intent=report_intent,
                 record_user_turn=False,
+                owner=goal_owner,
             )
             await push_status(report_status_timeline, "✅ Returning report-backed guidance", 0)
             return {
@@ -19339,6 +19410,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                     latest_tool_calls,
                     assistant_response=response_text,
                     record_user_turn=False,
+                    owner=goal_owner,
                 )
                 follow_on_actions = build_follow_on_actions(
                     user_message,
@@ -19441,6 +19513,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 latest_tool_calls,
                 assistant_response=response_text,
                 record_user_turn=False,
+                owner=goal_owner,
             )
             follow_on_actions = build_follow_on_actions(
                 user_message,
@@ -19467,7 +19540,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 "follow_on_actions": follow_on_actions
             }
 
-        if bool(chat_session_settings.get("enable_splunk_augmentation", True)) and detect_edge_processor_template_request(user_message):
+        if bool(turn_settings.get("enable_splunk_augmentation", True)) and detect_edge_processor_template_request(user_message):
             skill_status_timeline: List[Dict[str, Any]] = []
             skill_tool_calls: List[Dict[str, Any]] = []
 
@@ -19599,6 +19672,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 skill_tool_calls,
                 assistant_response=response_text,
                 record_user_turn=False,
+                owner=goal_owner,
             )
             follow_on_actions = build_follow_on_actions(
                 user_message,
@@ -19625,7 +19699,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 "follow_on_actions": follow_on_actions
             }
 
-        offline_target = detect_last_offline_target(user_message) if bool(chat_session_settings.get("enable_splunk_augmentation", True)) else None
+        offline_target = detect_last_offline_target(user_message) if bool(turn_settings.get("enable_splunk_augmentation", True)) else None
         if offline_target:
             offline_status_timeline: List[Dict[str, Any]] = []
             offline_tool_calls: List[Dict[str, Any]] = []
@@ -19743,6 +19817,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 offline_tool_calls,
                 assistant_response=response_text,
                 record_user_turn=False,
+                owner=goal_owner,
             )
             follow_on_actions = build_follow_on_actions(
                 user_message,
@@ -19770,7 +19845,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             }
 
         basic_intent = None
-        if bool(chat_session_settings.get("enable_splunk_augmentation", True)) and not should_bypass_basic_inventory_intent(request):
+        if bool(turn_settings.get("enable_splunk_augmentation", True)) and not should_bypass_basic_inventory_intent(request):
             basic_intent = detect_basic_inventory_intent(user_message, chat_memory)
         if basic_intent:
             basic_status_timeline: List[Dict[str, Any]] = []
@@ -20122,6 +20197,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 basic_tool_calls,
                 assistant_response=response_text,
                 record_user_turn=False,
+                owner=goal_owner,
             )
             follow_on_actions = build_follow_on_actions(
                 user_message,
@@ -20150,9 +20226,9 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
         
         rag_context = ""
         capability_usage: List[Dict[str, Any]] = []
-        if bool(chat_session_settings.get("enable_rag_context", False)):
-            rag_max_chunks = _safe_int(chat_session_settings.get("rag_max_chunks", 3))
-            rag_context, capability_usage = get_optional_rag_context(user_message, max_chunks=rag_max_chunks)
+        if bool(turn_settings.get("enable_rag_context", False)):
+            rag_max_chunks = _safe_int(turn_settings.get("rag_max_chunks", 3))
+            rag_context, capability_usage = get_optional_rag_context(user_message, max_chunks=rag_max_chunks, discovery_dir=report_dir)
 
         llm_client = get_or_create_llm_client(config)
         chat_runtime_profile = build_chat_runtime_profile(config, llm_client)
@@ -20165,9 +20241,9 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             f"initial_max_tokens={chat_runtime_profile['initial_max_tokens']}"
         )
 
-        max_iterations = max(1, _safe_int(chat_session_settings.get("max_iterations", 5)) or 5)
-        max_execution_time = max(10, _safe_int(chat_session_settings.get("max_execution_time", 90)) or 90)
-        stall_limit = max(2, _safe_int(chat_session_settings.get("convergence_detection", 3)) or 3)
+        max_iterations = max(1, _safe_int(turn_settings.get("max_iterations", 5)) or 5)
+        max_execution_time = max(10, _safe_int(turn_settings.get("max_execution_time", 90)) or 90)
+        stall_limit = max(2, _safe_int(turn_settings.get("convergence_detection", 3)) or 3)
         evidence_rows = int(chat_runtime_profile.get("evidence_rows") or 10)
         evidence_chars = int(chat_runtime_profile.get("evidence_chars") or 6000)
         followup_max_tokens = chat_runtime_profile["followup_max_tokens"]
@@ -20323,7 +20399,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             requested_context_type = context_request_match.group(1).strip()
             formatted_context = ""
             try:
-                ctx_mgr = get_context_manager()
+                ctx_mgr = get_context_manager(report_dir)
                 specific_context = ctx_mgr.get_specific_context(requested_context_type)
                 if specific_context:
                     formatted_context = ctx_mgr.format_context_for_llm({requested_context_type: specific_context})
@@ -20471,7 +20547,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
 
                     post_tool_context = ""
                     try:
-                        post_tool_context = get_context_manager().get_context_after_tool_call(
+                        post_tool_context = get_context_manager(report_dir).get_context_after_tool_call(
                             tool_name=tool_name,
                             tool_args=tool_args,
                             tool_result=mcp_result,
@@ -20587,6 +20663,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
                 all_tool_calls,
                 assistant_response=user_facing_final_answer,
                 record_user_turn=False,
+                owner=goal_owner,
             )
             follow_on_actions = build_follow_on_actions(
                 user_message,
@@ -20636,6 +20713,7 @@ async def chat_with_splunk_logic(request: dict, status_callback=None, runtime_co
             user_message,
             assistant_response=direct_response,
             record_user_turn=False,
+            owner=goal_owner,
         )
         follow_on_actions = build_follow_on_actions(
             user_message,
@@ -20672,7 +20750,13 @@ async def chat_with_splunk(http_request: Request, request: dict):
     """Handle chat requests (non-streaming version for backward compatibility)."""
     runtime_config = resolve_effective_runtime_config(request=http_request)
     goal_owner = chat_goal_owner(http_request)
-    result = await run_chat_turn(request, status_callback=None, runtime_config=runtime_config, goal_owner=goal_owner)
+    result = await run_chat_turn(
+        request,
+        status_callback=None,
+        runtime_config=runtime_config,
+        goal_owner=goal_owner,
+        discovery_dir=request_discovery_dir(http_request),
+    )
     record_chat_goal_turn(goal_owner, request, result)
     return result
 

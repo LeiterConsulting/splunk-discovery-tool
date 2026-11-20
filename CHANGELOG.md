@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Chat scratchpads in the Knowledge Base**: each chat's scratchpad (recent questions and answers, and the indexes and hosts they named) was saved where the Knowledge Base indexed it, so one user's questions could appear as passages in anyone's chat answers and pushed reports out of the index. Scratchpads are now saved privately for each user under `output/chat_data/memory/`, never indexed, and an index that still holds them is rebuilt before its next search
+- **Chat in the wrong environment**: with sign-in on and an MCP connection assigned, chat, goal planning, and the hints after each search described the global discovery reports instead of the reports of the connection the user searches. They now read the user's own discovery scope, and Knowledge Base passages from discovery reports come only from that scope
+- Each chat answer keeps one copy of the chat settings, so changing settings or another user's question while an answer runs no longer changes its limits halfway through
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
