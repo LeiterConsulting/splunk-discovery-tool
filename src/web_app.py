@@ -43,7 +43,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 # DT4SMS: Use encrypted config manager instead of YAML
 from app_version import APP_VERSION
-from config_manager import MASKED_SECRET, ConfigManager, is_unset_secret
+from config_manager import MASKED_SECRET, ConfigManager, clean_secret, is_unset_secret
 from troubleshooting import capture_startup_state, run_llm_diagnostics, run_mcp_diagnostics, server_code_status
 from capabilities import CapabilityManager, CapabilityRegistry
 from discovery.engine import DiscoveryEngine
@@ -12428,8 +12428,15 @@ async def update_config(request: Request, config_update: ConfigUpdate):
         if config_update.llm:
             try:
                 update_data = config_update.llm.dict(exclude_unset=True)
-                if 'api_key' in update_data and is_unset_secret(update_data['api_key']):
-                    update_data.pop('api_key')
+                api_key_unset = is_unset_secret(update_data.get('api_key'))
+                if api_key_unset:
+                    update_data.pop('api_key', None)
+                current_llm = config_manager.get().llm
+                if 'provider' in update_data and normalize_provider_name(update_data['provider']) != normalize_provider_name(current_llm.provider):
+                    # A stored endpoint and key belong to the provider they were saved for.
+                    update_data.setdefault('endpoint_url', None)
+                    if api_key_unset:
+                        update_data['api_key'] = ''
                 if update_data:
                     success = config_manager.update_llm(**update_data)
                     if not success:
@@ -14448,6 +14455,8 @@ async def list_models(request: Request):
             if not endpoint_url and normalize_provider_name(active_llm.provider) == provider:
                 endpoint_url = str(active_llm.endpoint_url or '').strip() or None
             api_key = config_manager.resolve_llm_api_key(None, provider, endpoint_url)
+        else:
+            api_key = clean_secret(api_key)
 
         async with httpx.AsyncClient(verify=create_llm_ssl_context(), timeout=12.0) as client:
             if provider == 'openai':
@@ -14901,6 +14910,29 @@ def _llm_settings_view(llm_payload: Dict[str, Any], current_llm: Any, **override
     return SimpleNamespace(**values)
 
 
+def _llm_form_target(llm_payload: Dict[str, Any], current_llm: Any) -> Tuple[str, Optional[str], str]:
+    """Provider, endpoint, and key for a check run from the settings form.
+
+    The form leaves out the endpoint for OpenAI and sends a saved key as blank. A missing
+    endpoint means the active one only when the provider matches, and a blank or masked key
+    resolves to a stored key only for the same provider and endpoint, so a key typed for one
+    provider is never sent to another provider's server.
+    """
+    provider = normalize_provider_name(llm_payload.get("provider", current_llm.provider))
+    if "endpoint_url" in llm_payload:
+        endpoint_url = str(llm_payload.get("endpoint_url") or "").strip() or None
+    elif normalize_provider_name(current_llm.provider) == provider:
+        endpoint_url = str(current_llm.endpoint_url or "").strip() or None
+    else:
+        endpoint_url = None
+    raw_api_key = llm_payload.get("api_key")
+    if is_unset_secret(raw_api_key):
+        api_key = config_manager.resolve_llm_api_key(None, provider, endpoint_url)
+    else:
+        api_key = clean_secret(raw_api_key)
+    return provider, endpoint_url, api_key
+
+
 def _tuning_source_label(profile: Any) -> str:
     sources = list(getattr(profile, "sources", []) or [])
     if "endpoint" in sources:
@@ -14962,10 +14994,8 @@ async def assess_max_tokens(request: Request):
         config = config_manager.get()
         llm_payload = payload.get("llm", {}) if isinstance(payload.get("llm"), dict) else payload
 
-        provider = normalize_provider_name(llm_payload.get("provider", config.llm.provider))
-        api_key = llm_payload.get("api_key", config.llm.api_key)
+        provider, endpoint_url, api_key = _llm_form_target(llm_payload, config.llm)
         model = llm_payload.get("model", config.llm.model)
-        endpoint_url = llm_payload.get("endpoint_url", config.llm.endpoint_url)
 
         if provider == "ollama":
             endpoint_url = normalize_ollama_endpoint_url(endpoint_url)
@@ -15031,10 +15061,8 @@ async def _run_llm_connection_test(payload: Dict[str, Any]) -> Dict[str, Any]:
         current_config = config_manager.get()
         llm_payload = payload.get("llm", {}) if isinstance(payload.get("llm"), dict) else payload
 
-        provider = normalize_provider_name(llm_payload.get("provider", current_config.llm.provider))
-        api_key = llm_payload.get("api_key", current_config.llm.api_key)
+        provider, endpoint_url, api_key = _llm_form_target(llm_payload, current_config.llm)
         model = llm_payload.get("model", current_config.llm.model)
-        endpoint_url = llm_payload.get("endpoint_url", current_config.llm.endpoint_url)
         try:
             temperature = float(llm_payload.get("temperature", current_config.llm.temperature or 0.7))
         except (TypeError, ValueError):
@@ -15227,6 +15255,7 @@ async def _run_llm_connection_test(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "error": str(connection_error)
             }
             results["status"] = "error"
+            results["message"] = results["tests"]["connection"]["message"]
             return results
 
         if uses_openai_image_generation:
@@ -15236,6 +15265,7 @@ async def _run_llm_connection_test(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "message": f"Image model '{model}' is not listed for this OpenAI credential"
                 }
                 results["status"] = "error"
+                results["message"] = results["tests"]["model"]["message"]
                 return results
 
             results["tests"]["model"] = {
@@ -15315,6 +15345,7 @@ async def _run_llm_connection_test(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "error": str(model_error)
             }
             results["status"] = "error"
+            results["message"] = results["tests"]["model"]["message"]
             return results
 
         # Test 3: Auto-tuned runtime configuration

@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import certifi
+import httpx
 from fastapi.testclient import TestClient
 
 
@@ -394,6 +395,91 @@ class TroubleshootApiTests(unittest.TestCase):
         self.assertEqual(elsewhere.status_code, 400, elsewhere.text)
         self.assertEqual(other_auth, [])
         self.assertEqual(wrong_provider.status_code, 400, wrong_provider.text)
+
+    def test_openai_test_from_the_form_never_uses_another_providers_endpoint(self):
+        self.config_manager.update_llm(provider="ollama", api_key="", model="llama3", endpoint_url="http://127.0.0.1:11434")
+        seen = []
+
+        def openai_rejects(request):
+            seen.append((request.url.host, request.headers.get("authorization")))
+            return httpx.Response(401, json={"error": {"message": "Incorrect API key provided"}})
+
+        real_async_client = httpx.AsyncClient
+
+        def offline_client(*args, **kwargs):
+            kwargs.pop("verify", None)
+            return real_async_client(*args, transport=httpx.MockTransport(openai_rejects), **kwargs)
+
+        form = {"provider": "openai", "model": "gpt-4o-mini", "max_tokens": 16000, "temperature": 0.7}
+        with patch.object(web_app.httpx, "AsyncClient", offline_client):
+            typed = self.client.post("/api/llm/test-connection", json={**form, "api_key": f" Bearer {GOOD_TOKEN} "}).json()
+            typed_hosts = list(seen)
+            blank = self.client.post("/api/llm/test-connection", json={**form, "api_key": ""}).json()
+
+        self.assertEqual(typed["endpoint"], "https://api.openai.com", typed)
+        self.assertEqual(typed_hosts, [("api.openai.com", f"Bearer {GOOD_TOKEN}")])
+        self.assertEqual(typed["status"], "error")
+        self.assertIn("Connection probe failed", typed["message"])
+        self.assertEqual(blank["status"], "error")
+        self.assertEqual(blank["message"], "Provider 'openai' requires api_key")
+        self.assertEqual(seen, typed_hosts)
+
+    def test_connection_test_reuses_the_saved_key_only_for_the_same_provider_and_endpoint(self):
+        routes = {
+            "/v1/models": (200, {"data": [{"id": "gpt-4o-mini"}]}),
+            "/v1/chat/completions": (200, {"choices": [{"message": {"content": "test successful"}}]}),
+        }
+        with _FakeServer(routes=routes) as server, _FakeServer(routes=routes) as other:
+            self.config_manager.update_llm(
+                provider="openai", api_key=GOOD_TOKEN, model="gpt-4o-mini", endpoint_url=f"http://127.0.0.1:{server.port}/v1"
+            )
+            results = {
+                api_key: self.client.post("/api/llm/test-connection", json={"provider": "openai", "model": "gpt-4o-mini", "api_key": api_key}).json()
+                for api_key in ("", "***")
+            }
+            elsewhere = self.client.post("/api/llm/test-connection", json={
+                "provider": "openai", "model": "gpt-4o-mini", "api_key": "", "endpoint_url": f"http://127.0.0.1:{other.port}/v1",
+            }).json()
+            server_auth = server.get_auth + server.received
+            other_auth = other.get_auth + other.received
+
+        for api_key, result in results.items():
+            with self.subTest(api_key=api_key):
+                self.assertEqual(result["status"], "success", result)
+                self.assertEqual(result["tests"]["model"]["response_preview"], "test successful")
+        self.assertEqual(set(server_auth), {f"Bearer {GOOD_TOKEN}"})
+        self.assertEqual(elsewhere["message"], "Provider 'openai' requires api_key")
+        self.assertEqual(other_auth, [])
+
+    def test_failed_model_reply_explains_the_failure(self):
+        routes = {
+            "/v1/models": (200, {"data": [{"id": "gpt-4o-mini"}]}),
+            "/v1/chat/completions": (404, {"error": {"message": "The model does not exist"}}),
+        }
+        with _FakeServer(routes=routes) as server:
+            result = self.client.post("/api/llm/test-connection", json={
+                "provider": "openai", "model": "gpt-4o-mini", "api_key": GOOD_TOKEN, "endpoint_url": f"http://127.0.0.1:{server.port}/v1",
+            }).json()
+
+        self.assertEqual(result["status"], "error", result)
+        self.assertTrue(result["message"].startswith("Model test failed"), result)
+        self.assertEqual(result["message"], result["tests"]["model"]["message"])
+
+    def test_saving_a_different_provider_drops_the_old_endpoint_and_key(self):
+        def save(**llm):
+            response = self.client.post("/api/config", json={"llm": {"max_tokens": 16000, "temperature": 0.7, **llm}})
+            self.assertEqual(response.status_code, 200, response.text)
+            return self.config_manager.get().llm
+
+        self.config_manager.update_llm(provider="ollama", api_key="ollama-key", model="llama3", endpoint_url="http://ollama.example.com:11434")
+        kept = save(provider="ollama", model="llama3", api_key="***")
+        self.assertEqual((kept.endpoint_url, kept.api_key), ("http://ollama.example.com:11434", "ollama-key"))
+
+        switched = save(provider="openai", model="gpt-4o-mini", api_key=GOOD_TOKEN)
+        self.assertEqual((switched.provider, switched.endpoint_url, switched.api_key), ("openai", None, GOOD_TOKEN))
+
+        blank = save(provider="anthropic", model="claude-sonnet-4-5", api_key="")
+        self.assertEqual((blank.provider, blank.endpoint_url, blank.api_key), ("anthropic", None, ""))
     def test_https_url_on_a_plain_http_port(self):
         with _FakeServer() as server:
             report = self._mcp(url=f"https://127.0.0.1:{server.port}/services/mcp", token=GOOD_TOKEN)
