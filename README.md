@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-2.2.3-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.3)
+[![Version](https://img.shields.io/badge/version-2.3.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.3.0)
 
 > Finds what a Splunk environment contains, explains what to do next, and answers questions with live Splunk searches through the Splunk MCP server.
 
-**Current release: [2.2.3](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.3)** (November 20, 2026). Chat runs the search again when an OpenAI model answers with only a short note about the search it plans, and What the AI saw lists requests that failed. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
+**Current release: [2.3.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.3.0)** (November 20, 2026). Overview shows what changed in each Splunk environment since the app last looked, and chat starts from what the app already knows about the environment. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
 
 ## ✨ What's Included
 

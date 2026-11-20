@@ -722,5 +722,5 @@ MAX_LEDGER_TEXT = 60000                        # Characters kept per text in a r
 
 ---
 
-*Last Updated: 2026-11-19*
-*Version: 2.2.3*
+*Last Updated: 2026-11-20*
+*Version: 2.3.0*

@@ -10,7 +10,7 @@ This document explores an optional capabilities model for Splunk Discovery Tool 
 
 The goal is not to make RAG or enhancement tooling mandatory. The default product should remain lightweight and functional with the current deterministic routes, report-aware reasoning, and MCP integration. Optional capabilities should act as force multipliers.
 
-## Status in Release 2.2.3
+## Status in Release 2.3.0
 
 This document began as a proposal. Most of the framework has shipped. Sections below are marked **Shipped**, **Partly shipped**, or **Proposal**, and notes describe where the shipped code differs from the original design.
 
@@ -29,7 +29,7 @@ Capabilities can be installed, turned on, turned off, removed, tested, reindexed
 
 ## Current State
 
-> Historical: this section describes the app when the proposal was written. In 2.2.3, chat settings persist in `output/chat_data/chat_settings.json`, Quick Report Search (`rag_local`) formalizes the snippet retrieval, the registry and install manager exist, and the UI source lives in `src/frontend_legacy_template.html` instead of inline in `src/web_app.py`. `build_lightweight_rag_context()` still exists in `src/web_app.py` but now calls the capability-aware `get_optional_rag_context()`.
+> Historical: this section describes the app when the proposal was written. In 2.3.0, chat settings persist in `output/chat_data/chat_settings.json`, Quick Report Search (`rag_local`) formalizes the snippet retrieval, the registry and install manager exist, and the UI source lives in `src/frontend_legacy_template.html` instead of inline in `src/web_app.py`. `build_lightweight_rag_context()` still exists in `src/web_app.py` but now calls the capability-aware `get_optional_rag_context()`.
 
 The application at the time already had several pieces that made this feasible:
 
@@ -48,7 +48,7 @@ Constraints in the current implementation:
 
 ## Design Principles
 
-**Shipped.** These principles hold in 2.2.3, with one change to principle 5: install, turn on, turn off, remove, test, and configure all happen on the Capabilities workspace tab. Settings has no capability section.
+**Shipped.** These principles hold in 2.3.0, with one change to principle 5: install, turn on, turn off, remove, test, and configure all happen on the Capabilities workspace tab. Settings has no capability section.
 
 1. Optional first
 
@@ -117,7 +117,7 @@ flowchart TD
     Tools --> Outputs[Charts + Files + Splunk Links]
 ```
 
-In 2.2.3 the install controls sit on the Capabilities workspace tab rather than in the Settings modal; the rest of the flow matches the diagram.
+In 2.3.0 the install controls sit on the Capabilities workspace tab rather than in the Settings modal; the rest of the flow matches the diagram.
 
 ## Proposed Backend Structure
 
@@ -291,7 +291,7 @@ Use retrieved documents to contextualize tool results, for example matching a sp
 
 ## How RAG Should Influence Discovery
 
-**Proposal.** Discovery does not use RAG retrieval in 2.2.3.
+**Proposal.** Discovery does not use RAG retrieval in 2.3.0.
 
 The discovery flow should remain grounded in actual Splunk data, but optional RAG can improve synthesis.
 
@@ -561,7 +561,7 @@ Original suggested response payload addition:
 
 ## Implementation Phases
 
-Status in 2.2.3: Phase 1 shipped (capability cards live on the Capabilities tab, not in Settings). Phase 2 shipped the evidence display; retrieval-aware follow-on actions are partly built through reusable queries. Phase 3 shipped. Phase 4 shipped without PDF or PPTX export. Phase 5 is still a proposal.
+Status in 2.3.0: Phase 1 shipped (capability cards live on the Capabilities tab, not in Settings). Phase 2 shipped the evidence display; retrieval-aware follow-on actions are partly built through reusable queries. Phase 3 shipped. Phase 4 shipped without PDF or PPTX export. Phase 5 is still a proposal.
 
 ### Phase 1: capability framework
 

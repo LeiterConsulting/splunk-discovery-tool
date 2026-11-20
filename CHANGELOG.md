@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
+- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
+- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.3.0] - 2026-11-20
+
+Version 2.3.0 remembers the indexes, sourcetypes, and hosts of each Splunk environment, shows what changed on Overview, and gives chat a short summary of what the app already knows about the environment.
+
+### ⬆️ Upgrading from 2.2.3
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+- The environment record is built the first time Overview, chat, or the API reads it, starting from the last two discovery runs in `output/`. If there are none, run discovery once, and run it again later to see changes
+- Scheduled checks are off until an admin turns on **Run Scheduled Checks** in **Settings > Connections > Environment Memory**. Scheduled checks and **Check Now** need the MCP URL and token
+- Records are kept in `output/environment_memory/` for the Global scope and in `output/scopes/<scope>/environment_memory/` for each MCP connection scope. Back them up with the rest of `output/`
+
 ### Added
 - **What changed** on Overview: the app keeps a record of the indexes, sourcetypes, and hosts it has seen in each Splunk environment and lists what changed. **New** is something seen for the first time, **Went quiet** has sent no events for 24 hours (by default), **Back** sends events again, **Volume shift** has 24-hour event counts up or down by more than half, and **Gone** is an index that discovery no longer lists. Filter by type, select **Ask in Chat** to start a focused question about a change, and, as an admin, select **Check Now** to look for changes between discovery runs. The count comparison of two runs is still there under **Compare two runs by counts**
 - The record learns from each discovery run, from the rows that chat searches return, and from an optional scheduled check (two light `tstats` searches over the last 24 hours). A new record starts from the last two discovery runs, so changes show at once. Chat keeps only names that are in Splunk's results, never the question, and it can add New items but never mark anything quiet. A kind reports changes only after a discovery run or check has covered it in full, so the first run records what exists without calling all of it new
@@ -18,12 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Ask a focused follow-up**, the suggestion shown when an answer had no other next step, sent its own instruction ("Ask a focused plain-language question about one index, host, or sourcetype for deeper analysis.") to chat as your question. It is gone. When chat has no other suggestion, it now offers **Investigate unusual events** for the index the chat last named or the busiest index the app knows, and otherwise offers nothing
-- **Chat said a search did not run without asking for it** when the model wrote "I'll compare event counts by hour" or "I wasn't able to run the Splunk search" instead of the search. Chat now asks the model for the search after replies that promise to compare, chart, or plot data, and after replies that say it could not, was unable to, or wasn't able to run a search
-
-### Planned
-- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
-- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
-- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+- **Chat answered without running the search it described** when the model wrote "I'll compare event counts by hour" or "I wasn't able to run the Splunk search" instead of the search. Chat now asks the model for the search after replies that promise to compare, chart, or plot data, and after replies that say it could not, was unable to, or wasn't able to run a search
 
 ## [2.2.3] - 2026-11-20
 
@@ -694,7 +704,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.3...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.3.0
 [2.2.3]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.3
 [2.2.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.2
 [2.2.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.1
