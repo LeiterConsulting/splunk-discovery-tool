@@ -20366,8 +20366,10 @@ async def chat_with_splunk_logic(
             latest: str,
         ) -> Tuple[List[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
             """Ask for the TOOL_CALL a reply described. Returns the messages sent, the reply, and the parsed call."""
+            # The note goes back without its "commentary" phase. Followed by a user message instead of a
+            # tool call, a commentary note makes newer GPT models return an empty reply about one time in four.
             nudge_messages = list(base_messages) + [
-                {"role": "assistant", "content": announced_text, "phase": "commentary"},
+                {"role": "assistant", "content": announced_text},
                 {"role": "user", "content": UNEXECUTED_SEARCH_NUDGE},
             ]
             reply = ""

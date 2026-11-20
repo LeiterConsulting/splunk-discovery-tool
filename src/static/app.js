@@ -5206,7 +5206,7 @@
             (_a2 = message == null ? void 0 : message.content) != null ? _a2 : "",
             `message-${messageIdx}`
           );
-        }), (call == null ? void 0 : call.prompt) && renderIncognitoLedgerText("Prompt", call.prompt, "prompt"), (call == null ? void 0 : call.data) && renderIncognitoLedgerText("Data", call.data, "data"), (call == null ? void 0 : call.reply) && renderIncognitoLedgerText("Reply from the AI model", call.reply, "reply")));
+        }), (call == null ? void 0 : call.prompt) && renderIncognitoLedgerText("Prompt", call.prompt, "prompt"), (call == null ? void 0 : call.data) && renderIncognitoLedgerText("Data", call.data, "data"), (call == null ? void 0 : call.reply) && renderIncognitoLedgerText("Reply from the AI model", call.reply, "reply"), (call == null ? void 0 : call.error) && renderIncognitoLedgerText("No reply: the request failed", call.error, "error")));
       }));
     };
     const renderIncognitoReport = (incognito) => {

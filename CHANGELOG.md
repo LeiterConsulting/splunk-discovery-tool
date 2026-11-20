@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Chat said "The search described above did not run"** about one time in four when an OpenAI model such as `gpt-6-luna` answered with only a short note like "I'll check event counts by index." The app asked again for the search but sent the note back labeled as `commentary`, and the model then returned an empty reply. The note now goes back without the label, and the search runs
+- **What the AI saw** left out requests that failed, such as those empty replies, even though their masked text had been sent. Failed requests are now listed with their error, with anything shaped like a key or token hidden
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

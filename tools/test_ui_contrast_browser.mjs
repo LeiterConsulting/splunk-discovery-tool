@@ -67,6 +67,12 @@ const SEEDED_INCOGNITO_LEDGER = {
                 { role: 'user', content: 'Which sourcetypes are in index_0003 on host_0012?' },
             ],
             reply: 'Two sourcetypes report into index_0003.',
+        }, {
+            feature: 'chat',
+            at: '2026-05-22T01:02:09Z',
+            earlier_messages: 3,
+            messages: [{ role: 'user', content: 'If live Splunk data is needed, reply with only the TOOL_CALL now.' }],
+            error: 'Failed to generate OpenAI response: OpenAI API returned an empty response payload for model gpt-6-luna',
         }],
     },
 };
@@ -98,6 +104,11 @@ const REQUIRED_SURFACES = [
     'settings-save-llm',
     'settings-appearance',
 ];
+// A record with more than one request starts collapsed; open every request so its text is audited.
+async function openLedgerRequests(page) {
+    await page.locator('[data-testid="incognito-ledger"] details').evaluateAll((items) => items.forEach((item) => { item.open = true; }));
+}
+
 // Visible text must not show raw identifiers, broken plurals, or retired names and jargon.
 const LANGUAGE_RULES = [
     { label: 'old product name', pattern: /\bDT4SMS\b|Splunk MCP Discovery Tool/ },
@@ -499,6 +510,7 @@ async function auditTheme(browser, baseUrl, themeName) {
             if (await clickIfPresent(page.getByTestId('summary-incognito-note').getByRole('button', { name: 'What the AI saw' }))) {
                 const ledgerModal = page.getByTestId('incognito-ledger-modal');
                 await ledgerModal.getByTestId('incognito-ledger').waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                await openLedgerRequests(page);
                 await settle(page, 400);
                 await capture('incognito-ledger', '[data-testid="incognito-ledger-modal"]');
                 await clickIfPresent(ledgerModal.getByRole('button', { name: 'Close what the AI saw' }));
@@ -542,6 +554,7 @@ async function auditTheme(browser, baseUrl, themeName) {
                 await capture('chat-conversation', '[role="dialog"]');
                 if (await clickIfPresent(page.getByTestId('chat-reply-toggle-incognito').first())) {
                     await page.getByTestId('chat-incognito-panel').getByTestId('incognito-ledger').waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                    await openLedgerRequests(page);
                     await settle(page, 400);
                     await capture('chat-incognito', '[role="dialog"]');
                 }
@@ -755,7 +768,9 @@ async function main() {
                 ['incognito-details-on', 'On'],
                 ['chat', 'Incognito mode is on.'],
                 ['chat-incognito', 'Request 1: Chat'],
+                ['chat-incognito', 'returned an empty response payload'],
                 ['incognito-ledger', 'Request 1: Chat'],
+                ['incognito-ledger', 'returned an empty response payload'],
                 ['settings-incognito-preview', 'host_'],
                 ['settings-server-stale', 'still running the code it had before an update'],
             ]) {

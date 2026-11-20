@@ -467,6 +467,42 @@ class ClientTests(_TempStore, unittest.TestCase):
             asyncio.run(client.generate_response("web01"))
         self.assertEqual(inner.calls, [])
 
+    def test_failed_request_is_recorded_with_its_error_and_no_credentials(self):
+        class FailingModel(RecordingModel):
+            async def generate_response(self, prompt=None, messages=None, max_tokens=1000, temperature=0.7):
+                self.calls.append({"messages": messages})
+                raise RuntimeError(
+                    "OpenAI API returned an empty response payload (Authorization: Bearer abc.def-123, "
+                    "key sk-proj-ABCDEFGH123, api_key=plainvalue)"
+                )
+
+            async def analyze_data(self, data, analysis_type):
+                self.calls.append({"data": data})
+                raise RuntimeError("")
+
+        inner = FailingModel()
+        session = self.store.open_session(owner="o", provider_kind="cloud", scope="global",
+                                          state=IncognitoState(active=True))
+        session.masker.seed({"host": ["web01"], "index": ["contoso_prod"]})
+        client = IncognitoLLMClient(inner, lambda: session)
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(client.generate_response(messages=[{"role": "user", "content": "Is web01 healthy?"}]))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(client.analyze_data({"indexes": ["contoso_prod"]}, "recommendations"))
+
+        self.assertEqual(len(session.calls), 2)
+        chat_call, analysis_call = session.calls
+        recorded = json.dumps(chat_call["messages"])
+        self.assertIn("host_0001", recorded)
+        self.assertNotIn("web01", recorded)
+        self.assertNotIn("reply", chat_call)
+        self.assertIn("empty response payload", chat_call["error"])
+        for secret in ("abc.def-123", "ABCDEFGH123", "plainvalue"):
+            self.assertNotIn(secret, chat_call["error"])
+        self.assertNotIn("contoso_prod", analysis_call["data"])
+        self.assertEqual(analysis_call["error"], "RuntimeError")
+
 
 def contoso_blueprint(extra_hosts=()):
     return {

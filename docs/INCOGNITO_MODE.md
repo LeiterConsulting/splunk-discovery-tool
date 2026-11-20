@@ -108,7 +108,7 @@ Not covered:
 Each answer made in incognito mode has a **What the AI saw** button (a reply toggle in chat, and a note on summaries, verification, remediation, and the M-26-14 AI Review). It shows:
 
 - how many stand-ins of each kind the AI model saw
-- each request: the instructions, the messages or data, and the reply, exactly as sent after masking
+- each request: the instructions, the messages or data, and the reply, exactly as sent after masking. A request that was sent but got no reply shows the error instead
 - any stand-ins the AI model wrote that it was never shown
 
 Records are kept per person: with sign-in on, only the user who asked can open a record. The app keeps the newest 300 records. Each record keeps up to 24 requests, and very long texts are shortened in the middle.

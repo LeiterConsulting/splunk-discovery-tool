@@ -59,8 +59,14 @@ class IncognitoLLMClient:
         if session is None:
             return await self._forward(prompt, messages, args, kwargs)
         masked_prompt, masked_messages = session.mask_request(prompt=prompt, messages=messages)
-        reply = await self._forward(masked_prompt, masked_messages, args, kwargs)
-        session.record(prompt=masked_prompt if masked_messages is None else None, messages=masked_messages, reply=reply)
+        recorded_prompt = masked_prompt if masked_messages is None else None
+        try:
+            reply = await self._forward(masked_prompt, masked_messages, args, kwargs)
+        except Exception as error:
+            # The masked text was sent even though no reply came back, so it belongs in the record.
+            session.record(prompt=recorded_prompt, messages=masked_messages, error=error)
+            raise
+        session.record(prompt=recorded_prompt, messages=masked_messages, reply=reply)
         return _same_kind(reply, session.restore_text(reply))
 
     def learn_names(self, blueprint: Any) -> int:
@@ -75,6 +81,11 @@ class IncognitoLLMClient:
         if session is None:
             return await self._inner.analyze_data(data, analysis_type)
         masked = session.mask_data(data)
-        result = await self._inner.analyze_data(masked, analysis_type)
-        session.record(feature=f"discovery analysis: {analysis_type}", data=masked, reply=result)
+        feature = f"discovery analysis: {analysis_type}"
+        try:
+            result = await self._inner.analyze_data(masked, analysis_type)
+        except Exception as error:
+            session.record(feature=feature, data=masked, error=error)
+            raise
+        session.record(feature=feature, data=masked, reply=result)
         return session.restore_data(result)

@@ -426,7 +426,7 @@ class ChatToolLoopTests(unittest.TestCase):
 
         self.assertEqual(len(mcp.calls), 1)
         self.assertIn("included no TOOL_CALL", llm.calls[1][-1]["content"])
-        self.assertEqual(llm.calls[1][-2], {"role": "assistant", "content": "Let me run a search for that.", "phase": "commentary"})
+        self.assertEqual(llm.calls[1][-2], {"role": "assistant", "content": "Let me run a search for that."})
         self.assertIn("42 events", result["response"])
 
     def test_typographic_apostrophe_preamble_gets_the_search_run(self):

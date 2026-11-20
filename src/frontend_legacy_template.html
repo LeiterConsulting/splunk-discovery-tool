@@ -7135,6 +7135,7 @@
                                         {call?.prompt && renderIncognitoLedgerText('Prompt', call.prompt, 'prompt')}
                                         {call?.data && renderIncognitoLedgerText('Data', call.data, 'data')}
                                         {call?.reply && renderIncognitoLedgerText('Reply from the AI model', call.reply, 'reply')}
+                                        {call?.error && renderIncognitoLedgerText('No reply: the request failed', call.error, 'error')}
                                     </div>
                                 </details>
                             );

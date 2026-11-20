@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -32,6 +33,7 @@ INCOGNITO_NOTICE = (
 
 MAX_LEDGER_CALLS = 24
 MAX_LEDGER_TEXT = 60000
+MAX_LEDGER_ERROR = 500
 
 REASON_LABELS = {
     "off": "Incognito mode is off.",
@@ -72,6 +74,22 @@ def _clip(text: Any) -> Any:
         tail = MAX_LEDGER_TEXT - head
         return text[:head] + f"\n...[{len(text) - MAX_LEDGER_TEXT} characters not shown]...\n" + text[-tail:]
     return text
+
+
+# Provider errors can echo request details, so anything shaped like a credential is hidden before it is recorded.
+_ERROR_SECRET_PATTERNS = (
+    (re.compile(r"(?i)\bbearer\s+[^\s\"',;]+"), "Bearer [hidden]"),
+    (re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_*\-]{6,}"), "[hidden key]"),
+    (re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|token|password|secret|authorization)(\"?\s*[:=]\s*\"?)[^\s\"',;}]+"),
+     r"\1\2[hidden]"),
+)
+
+
+def _error_text(error: Any) -> str:
+    text = str(error or "").strip() or type(error).__name__
+    for pattern, replacement in _ERROR_SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text[:MAX_LEDGER_ERROR]
 
 
 def _with_notice(messages: List[Any]) -> List[Any]:
@@ -283,7 +301,9 @@ class IncognitoSession:
     # ----- record of what the AI saw -------------------------------------------------------
 
     def record(self, *, feature: Optional[str] = None, prompt: Optional[str] = None,
-               messages: Optional[Sequence[Any]] = None, data: Any = None, reply: Any = None) -> None:
+               messages: Optional[Sequence[Any]] = None, data: Any = None, reply: Any = None,
+               error: Any = None) -> None:
+        """Add one request to the record. ``error`` marks a request that was sent but got no usable reply."""
         entry: Dict[str, Any] = {
             "feature": feature or self.feature,
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -308,6 +328,8 @@ class IncognitoSession:
             entry["data"] = _clip(json.dumps(data, indent=1, default=str))
         if reply is not None:
             entry["reply"] = _clip(reply if isinstance(reply, str) else json.dumps(reply, indent=1, default=str))
+        if error is not None:
+            entry["error"] = _error_text(error)
         with self._lock:
             self.calls.append(entry)
             if len(self.calls) > MAX_LEDGER_CALLS:
