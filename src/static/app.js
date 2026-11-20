@@ -265,6 +265,570 @@
     })).filter((action) => action.prompt) : [];
     return dedupeAssistantFollowOnActions([...responseActions, ...normalizedExistingActions], 3);
   };
+  const DASHBOARD_TIME_RANGE_OPTIONS = [
+    { value: "-15m", label: "Last 15 minutes" },
+    { value: "-1h", label: "Last hour" },
+    { value: "-24h", label: "Last 24 hours" },
+    { value: "-7d", label: "Last 7 days" }
+  ];
+  const DASHBOARD_LIMITS = {
+    title: 120,
+    purpose: 500,
+    requirements: 1200,
+    query: 8e3,
+    pageName: 60,
+    panel: 240,
+    finding: 300,
+    pages: 2,
+    panelsPerPage: 4,
+    panelsTotal: 6,
+    findings: 4
+  };
+  const DASHBOARD_INDEX_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}$/;
+  const DASHBOARD_SOURCETYPE_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,199}$/;
+  const DASHBOARD_STAGE_LABELS = {
+    accepted: "Splunk accepted the plan.",
+    authoring: "Constellation is writing the dashboard.",
+    validating: "Constellation is checking the dashboard.",
+    saving_draft: "Constellation is saving the draft.",
+    saving_native: "Constellation is saving the dashboard in Splunk."
+  };
+  const DASHBOARD_STATUS_LABELS = {
+    sending: "Sending",
+    running: "Building",
+    created: "Created",
+    draft_only: "Draft saved",
+    needs_input: "Needs more detail",
+    failed: "Not created",
+    indeterminate: "Not confirmed",
+    not_found: "No record in Splunk",
+    unconfirmed: "Waiting for Splunk",
+    error: "Stopped"
+  };
+  const DASHBOARD_ACTIVE_STATUSES = ["sending", "running", "unconfirmed"];
+  const DASHBOARD_POLL_MS = 2500;
+  const dashboardString = (value, limit) => typeof value === "string" ? value.slice(0, limit) : "";
+  const dashboardHttpsUrl = (value) => typeof value === "string" && value.length <= 2048 && /^https:\/\/\S+$/i.test(value) ? value : "";
+  const dashboardSingleLine = (value) => String(value != null ? value : "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  const dashboardApiError = (data, fallback) => typeof (data == null ? void 0 : data.detail) === "string" && data.detail.trim() ? data.detail : fallback;
+  const sanitizeDashboardBrief = (brief) => {
+    var _a;
+    if (!brief || typeof brief !== "object") {
+      return null;
+    }
+    const source = brief.source && typeof brief.source === "object" ? brief.source : {};
+    const cleanSource = source.kind === "spl" ? { kind: "spl", query: dashboardString(source.query, DASHBOARD_LIMITS.query * 2) } : { kind: "index", index: dashboardString(source.index, 400), sourcetype: dashboardString(source.sourcetype, 400) };
+    const clean = {
+      title: dashboardString(brief.title, DASHBOARD_LIMITS.title * 2),
+      purpose: dashboardString(brief.purpose, DASHBOARD_LIMITS.purpose * 2),
+      requirements: dashboardString(brief.requirements, DASHBOARD_LIMITS.requirements * 2),
+      source: cleanSource,
+      time_range: { earliest: dashboardString((_a = brief.time_range) == null ? void 0 : _a.earliest, 8), latest: "now" },
+      pages: (Array.isArray(brief.pages) ? brief.pages : []).slice(0, 4).map((page) => ({
+        name: dashboardString(page == null ? void 0 : page.name, DASHBOARD_LIMITS.pageName * 2),
+        panels: (Array.isArray(page == null ? void 0 : page.panels) ? page.panels : []).slice(0, 8).map((panel) => dashboardString(panel, DASHBOARD_LIMITS.panel * 2))
+      })),
+      findings: (Array.isArray(brief.findings) ? brief.findings : []).slice(0, 8).map((item) => dashboardString(item, DASHBOARD_LIMITS.finding * 2))
+    };
+    if (brief.provenance && typeof brief.provenance === "object" && ["conversation", "discovery_report"].includes(brief.provenance.kind)) {
+      clean.provenance = { kind: brief.provenance.kind, label: dashboardString(brief.provenance.label, 120) };
+    }
+    return clean;
+  };
+  const buildDashboardBriefPayload = (draft) => {
+    var _a;
+    const brief = sanitizeDashboardBrief(draft) || sanitizeDashboardBrief({});
+    const source = brief.source.kind === "spl" ? { kind: "spl", query: String(brief.source.query || "").trim() } : { kind: "index", index: dashboardSingleLine(brief.source.index) };
+    if (brief.source.kind !== "spl" && dashboardSingleLine(brief.source.sourcetype)) {
+      source.sourcetype = dashboardSingleLine(brief.source.sourcetype);
+    }
+    const payload = {
+      title: dashboardSingleLine(brief.title),
+      purpose: dashboardSingleLine(brief.purpose),
+      source,
+      time_range: { earliest: brief.time_range.earliest, latest: "now" },
+      pages: brief.pages.map((page) => ({
+        name: dashboardSingleLine(page.name),
+        panels: page.panels.map(dashboardSingleLine).filter(Boolean)
+      }))
+    };
+    const requirements = dashboardSingleLine(brief.requirements);
+    if (requirements) {
+      payload.requirements = requirements;
+    }
+    const findings = brief.findings.map(dashboardSingleLine).filter(Boolean);
+    if (findings.length > 0) {
+      payload.findings = findings;
+    }
+    if ((_a = brief.provenance) == null ? void 0 : _a.label) {
+      payload.provenance = brief.provenance;
+    }
+    return payload;
+  };
+  const findDashboardBriefProblems = (draft) => {
+    const brief = buildDashboardBriefPayload(draft);
+    const limits = DASHBOARD_LIMITS;
+    const problems = [];
+    const add = (field, message) => problems.push({ field, message });
+    if (!brief.title) {
+      add("title", "Add a title.");
+    } else if (brief.title.length > limits.title) {
+      add("title", `Shorten the title to ${limits.title} characters or fewer.`);
+    }
+    if (!brief.purpose) {
+      add("purpose", "Describe the question the dashboard answers and who it is for.");
+    } else if (brief.purpose.length > limits.purpose) {
+      add("purpose", `Shorten the purpose to ${limits.purpose} characters or fewer.`);
+    }
+    if ((brief.requirements || "").length > limits.requirements) {
+      add("requirements", `Shorten the requirements to ${limits.requirements} characters or fewer.`);
+    }
+    if (brief.source.kind === "spl") {
+      if (!brief.source.query) {
+        add("source.query", "Enter the search the dashboard should use.");
+      } else if (brief.source.query.length > limits.query) {
+        add("source.query", `Shorten the search to ${limits.query} characters or fewer.`);
+      }
+    } else {
+      if (!brief.source.index) {
+        add("source.index", "Enter the index the dashboard should use.");
+      } else if (!DASHBOARD_INDEX_RE.test(brief.source.index)) {
+        add("source.index", "Enter a single index name using letters, numbers, dots, dashes, or underscores.");
+      }
+      if (brief.source.sourcetype && !DASHBOARD_SOURCETYPE_RE.test(brief.source.sourcetype)) {
+        add("source.sourcetype", "Enter a single sourcetype using letters, numbers, dots, colons, dashes, or underscores.");
+      }
+    }
+    if (!DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === brief.time_range.earliest)) {
+      add("time_range", "Pick a time range: last 15 minutes, last hour, last 24 hours, or last 7 days.");
+    }
+    if (brief.pages.length === 0) {
+      add("pages", "Add at least one page with one panel.");
+    }
+    if (brief.pages.length > limits.pages) {
+      add("pages", `Use ${limits.pages} pages or fewer.`);
+    }
+    const seenNames = /* @__PURE__ */ new Set();
+    let totalPanels = 0;
+    brief.pages.forEach((page, position) => {
+      const label = `page ${position + 1}`;
+      const key = page.name.toLowerCase();
+      if (!page.name) {
+        add(`pages.${position}.name`, `Name ${label}.`);
+      } else if (page.name.length > limits.pageName) {
+        add(`pages.${position}.name`, `Shorten the name of ${label} to ${limits.pageName} characters or fewer.`);
+      } else if (seenNames.has(key)) {
+        add(`pages.${position}.name`, "Give each page a different name.");
+      }
+      seenNames.add(key);
+      if (page.panels.length === 0) {
+        add(`pages.${position}.panels`, `Describe at least one panel on ${label}.`);
+      } else if (page.panels.length > limits.panelsPerPage) {
+        add(`pages.${position}.panels`, `Use ${limits.panelsPerPage} panels or fewer on ${label}.`);
+      }
+      page.panels.forEach((panel, panelPosition) => {
+        if (panel.length > limits.panel) {
+          add(`pages.${position}.panels.${panelPosition}`, `Shorten panel ${panelPosition + 1} on ${label} to ${limits.panel} characters or fewer.`);
+        }
+      });
+      totalPanels += page.panels.length;
+    });
+    if (totalPanels > limits.panelsTotal) {
+      add("pages", `Use ${limits.panelsTotal} panels or fewer across all pages.`);
+    }
+    const findings = brief.findings || [];
+    if (findings.length > limits.findings) {
+      add("findings", `Keep ${limits.findings} findings or fewer.`);
+    }
+    findings.forEach((finding, position) => {
+      if (finding.length > limits.finding) {
+        add(`findings.${position}`, `Shorten finding ${position + 1} to ${limits.finding} characters or fewer.`);
+      }
+    });
+    return problems;
+  };
+  const sanitizeDashboardProblems = (problems) => (Array.isArray(problems) ? problems : []).filter((problem) => problem && typeof problem.message === "string" && problem.message.trim()).slice(0, 20).map((problem) => ({ field: dashboardString(problem.field, 80), message: problem.message.slice(0, 400) }));
+  const sanitizeDashboardProposal = (proposal) => {
+    if (!proposal || typeof proposal !== "object" || typeof proposal.proposal_id !== "string" || !proposal.proposal_id) {
+      return null;
+    }
+    const brief = sanitizeDashboardBrief(proposal.brief);
+    if (!brief) {
+      return null;
+    }
+    return {
+      proposal_id: proposal.proposal_id.slice(0, 64),
+      binding_key: dashboardString(proposal.binding_key, 64),
+      brief,
+      problems: sanitizeDashboardProblems(proposal.problems),
+      notes: (Array.isArray(proposal.notes) ? proposal.notes : []).filter((note) => typeof note === "string" && note.trim()).slice(0, 6).map((note) => note.slice(0, 400)),
+      drafted_by: proposal.drafted_by === "ai" ? "ai" : "starter",
+      created_at: dashboardString(proposal.created_at, 40),
+      connection_label: dashboardString(proposal.connection_label, 200),
+      splunk_user: dashboardString(proposal.splunk_user, 200),
+      splunk_web_url: dashboardHttpsUrl(proposal.splunk_web_url),
+      splunk_web_url_source: dashboardString(proposal.splunk_web_url_source, 20)
+    };
+  };
+  const sanitizeDashboardOperation = (operation) => {
+    if (!operation || typeof operation !== "object" || typeof operation.request_id !== "string" || !operation.request_id) {
+      return null;
+    }
+    const receipt = operation.receipt && typeof operation.receipt === "object" ? operation.receipt : null;
+    const error = operation.error && typeof operation.error === "object" ? operation.error : null;
+    return {
+      request_id: operation.request_id.slice(0, 80),
+      proposal_id: dashboardString(operation.proposal_id, 64),
+      status: dashboardString(operation.status, 32),
+      title: dashboardString(operation.title, 200),
+      receipt: receipt ? {
+        status: dashboardString(receipt.status, 32),
+        stage: dashboardString(receipt.stage, 32),
+        message: dashboardString(receipt.message, 500),
+        question: dashboardString(receipt.question, 1e3),
+        code: dashboardString(receipt.code, 64),
+        title: dashboardString(receipt.title, 200),
+        view_url: dashboardHttpsUrl(receipt.view_url),
+        edit_url: dashboardHttpsUrl(receipt.edit_url),
+        warnings: (Array.isArray(receipt.warnings) ? receipt.warnings : []).slice(0, 9).map((warning) => ({ code: dashboardString(warning == null ? void 0 : warning.code, 64), message: dashboardString(warning == null ? void 0 : warning.message, 300) })).filter((warning) => warning.code)
+      } : null,
+      code_message: dashboardString(operation.code_message, 400),
+      error: error ? { code: dashboardString(error.code, 64), message: dashboardString(error.message, 400) } : null,
+      check_note: dashboardString(operation.check_note, 400),
+      brief: sanitizeDashboardBrief(operation.brief),
+      connection_label: dashboardString(operation.connection_label, 200),
+      splunk_user: dashboardString(operation.splunk_user, 200),
+      created_at: dashboardString(operation.created_at, 40),
+      updated_at: dashboardString(operation.updated_at, 40),
+      resent: !!operation.resent,
+      polling: !!operation.polling,
+      wait_stopped: !!operation.wait_stopped,
+      can_check: !!operation.can_check,
+      can_retry: !!operation.can_retry,
+      missing: !!operation.missing
+    };
+  };
+  const fetchDashboardOperation = async (requestId) => {
+    try {
+      const response = await fetch(`/api/dashboards/operations/${encodeURIComponent(requestId)}`);
+      if (response.status === 404) {
+        return { missing: true };
+      }
+      const data = await response.json().catch(() => ({}));
+      return response.ok ? { operation: sanitizeDashboardOperation(data.operation) } : null;
+    } catch (error) {
+      return null;
+    }
+  };
+  const formatDashboardTime = (value) => {
+    const parsed = value ? new Date(value) : null;
+    return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString(void 0, { dateStyle: "medium", timeStyle: "short" }) : "";
+  };
+  function DashboardPlanCard({ proposal, operation = null, dismissed = false, isDarkTheme, headingClass, subtextClass, mutedTextClass, incognitoActive = false, testIdPrefix = "dashboard-plan", onChange }) {
+    var _a, _b;
+    const [editing, setEditing] = useState(false);
+    const [retrying, setRetrying] = useState(false);
+    const [draft, setDraft] = useState(() => sanitizeDashboardBrief((operation == null ? void 0 : operation.brief) || (proposal == null ? void 0 : proposal.brief)) || sanitizeDashboardBrief({}));
+    const [busy, setBusy] = useState("");
+    const [requestError, setRequestError] = useState("");
+    const [serverProblems, setServerProblems] = useState([]);
+    const [pollTick, setPollTick] = useState(0);
+    const requestId = (operation == null ? void 0 : operation.request_id) || "";
+    const status = (operation == null ? void 0 : operation.status) || "";
+    const isPolling = !!(operation == null ? void 0 : operation.polling) && !dismissed;
+    const notify = (patch) => {
+      if (typeof onChange === "function") {
+        onChange(patch);
+      }
+    };
+    useEffect(() => {
+      if (!requestId || !isPolling) {
+        return void 0;
+      }
+      let cancelled = false;
+      const timer = setTimeout(async () => {
+        const latest = await fetchDashboardOperation(requestId);
+        if (cancelled) {
+          return;
+        }
+        if (latest == null ? void 0 : latest.operation) {
+          notify({ dashboard_operation: latest.operation });
+        } else if (latest == null ? void 0 : latest.missing) {
+          notify({ dashboard_operation: { ...operation, polling: false, missing: true } });
+        }
+        setPollTick((tick) => tick + 1);
+      }, DASHBOARD_POLL_MS);
+      return () => {
+        cancelled = true;
+        clearTimeout(timer);
+      };
+    }, [requestId, isPolling, pollTick]);
+    useEffect(() => {
+      if (!requestId || (operation == null ? void 0 : operation.polling) || (operation == null ? void 0 : operation.missing) || !DASHBOARD_ACTIVE_STATUSES.includes(status)) {
+        return void 0;
+      }
+      let cancelled = false;
+      fetchDashboardOperation(requestId).then((latest) => {
+        if (!cancelled && (latest == null ? void 0 : latest.operation)) {
+          notify({ dashboard_operation: latest.operation });
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [requestId]);
+    const cardClass = isDarkTheme ? "border-indigo-800 bg-gray-900" : "border-indigo-200 bg-white";
+    const inputClass = `w-full rounded-md border px-3 py-2 text-sm ${isDarkTheme ? "bg-gray-950 border-gray-600 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`;
+    const labelClass = `block text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`;
+    const secondaryButton = `inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60 ${isDarkTheme ? "border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700" : "border-gray-300 bg-white text-gray-800 hover:bg-gray-50"}`;
+    const primaryButton = "inline-flex items-center gap-1.5 rounded-md border border-transparent bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60";
+    const toneClasses = {
+      info: isDarkTheme ? "border-sky-800 bg-sky-950 text-sky-100" : "border-sky-200 bg-sky-50 text-sky-900",
+      success: isDarkTheme ? "border-emerald-800 bg-emerald-950 text-emerald-100" : "border-emerald-200 bg-emerald-50 text-emerald-900",
+      warning: isDarkTheme ? "border-amber-800 bg-amber-950 text-amber-100" : "border-amber-200 bg-amber-50 text-amber-900",
+      error: isDarkTheme ? "border-red-800 bg-red-950 text-red-100" : "border-red-200 bg-red-50 text-red-800"
+    };
+    const fieldId = (name) => `${testIdPrefix}-${String((proposal == null ? void 0 : proposal.proposal_id) || "plan").slice(0, 12)}-${name}`;
+    if (dismissed) {
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": `${testIdPrefix}-cancelled`, className: `mt-3 rounded-lg border px-4 py-3 text-sm ${cardClass} ${mutedTextClass}` }, "You cancelled this dashboard plan. Nothing was sent to Splunk.");
+    }
+    const splunkUser = (operation == null ? void 0 : operation.splunk_user) || (proposal == null ? void 0 : proposal.splunk_user) || "";
+    const connectionLabel = (operation == null ? void 0 : operation.connection_label) || (proposal == null ? void 0 : proposal.connection_label) || "";
+    const identityLine = /* @__PURE__ */ React.createElement("p", { className: `text-xs ${mutedTextClass}`, "data-testid": `${testIdPrefix}-identity` }, splunkUser ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Splunk user ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, splunkUser)) : "Splunk user not confirmed", connectionLabel ? /* @__PURE__ */ React.createElement(React.Fragment, null, " through ", connectionLabel) : null);
+    const updateDraft = (updater) => {
+      setDraft((current) => updater(sanitizeDashboardBrief(current) || sanitizeDashboardBrief({})));
+      setServerProblems([]);
+      setRequestError("");
+    };
+    const createDashboard = async () => {
+      const problems = findDashboardBriefProblems(draft);
+      if (problems.length > 0) {
+        setEditing(true);
+        return;
+      }
+      setBusy("create");
+      setRequestError("");
+      setServerProblems([]);
+      try {
+        const response = await fetch("/api/dashboards/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            proposal_id: proposal.proposal_id,
+            binding_key: proposal.binding_key,
+            brief: buildDashboardBriefPayload(draft)
+          })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const returnedProblems = sanitizeDashboardProblems(data.problems);
+          if (returnedProblems.length > 0) {
+            setServerProblems(returnedProblems);
+            setEditing(true);
+          } else {
+            setRequestError(dashboardApiError(data, "The dashboard request could not start. Try again."));
+          }
+          return;
+        }
+        const started = sanitizeDashboardOperation(data.operation);
+        setEditing(false);
+        setRetrying(false);
+        notify({
+          dashboard_proposal: { ...proposal, brief: sanitizeDashboardBrief(draft), problems: [] },
+          dashboard_operation: started
+        });
+      } catch (error) {
+        setRequestError("Could not reach Splunk Discovery Tool. Check your connection and try again.");
+      } finally {
+        setBusy("");
+      }
+    };
+    const checkStatus = async () => {
+      if (!requestId) {
+        return;
+      }
+      setBusy("check");
+      setRequestError("");
+      try {
+        const response = await fetch(`/api/dashboards/operations/${encodeURIComponent(requestId)}/check`, { method: "POST" });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          setRequestError(dashboardApiError(data, "Could not check this request. Try again."));
+          return;
+        }
+        notify({ dashboard_operation: sanitizeDashboardOperation(data.operation) });
+      } catch (error) {
+        setRequestError("Could not reach Splunk Discovery Tool. Check your connection and try again.");
+      } finally {
+        setBusy("");
+      }
+    };
+    if (operation && !retrying) {
+      const receipt = operation.receipt || {};
+      const describe = () => {
+        var _a2, _b2, _c;
+        if (operation.missing) {
+          return { tone: "warning", icon: "fa-circle-exclamation", heading: "This request is no longer in the app", body: "The app keeps dashboard requests for 7 days." };
+        }
+        switch (status) {
+          case "sending":
+            return { tone: "info", icon: "fa-spinner fa-spin", heading: "Sending the plan to Splunk", body: splunkUser ? `Constellation builds the dashboard as ${splunkUser}.` : "Constellation builds the dashboard as your Splunk user." };
+          case "running":
+            return { tone: "info", icon: "fa-spinner fa-spin", heading: "Building the dashboard", body: DASHBOARD_STAGE_LABELS[receipt.stage] || receipt.message || "Constellation is working on the dashboard." };
+          case "created":
+            return { tone: "success", icon: "fa-circle-check", heading: "Dashboard created", body: receipt.message || "Splunk saved the dashboard." };
+          case "draft_only":
+            return { tone: "success", icon: "fa-file-pen", heading: "Saved as a Constellation draft", body: receipt.message || "Constellation saved a draft but not a Splunk dashboard. Open the draft to finish it." };
+          case "needs_input":
+            return { tone: "warning", icon: "fa-circle-question", heading: "Constellation needs more detail", body: receipt.question || "Change the plan and try again." };
+          case "failed":
+            return { tone: "error", icon: "fa-circle-xmark", heading: "The dashboard was not created", body: ((_a2 = operation.error) == null ? void 0 : _a2.message) || operation.code_message || "Dashboard creation did not finish.", detail: receipt.message };
+          case "indeterminate":
+            return { tone: "warning", icon: "fa-circle-exclamation", heading: "Splunk could not confirm the result", body: [operation.code_message, "Check status, or look in the Constellation app in Splunk Web."].filter(Boolean).join(" "), detail: receipt.message };
+          case "not_found":
+            return { tone: "warning", icon: "fa-circle-exclamation", heading: "Splunk has no record of this request", body: "Nothing was created through this connection. Change the plan and try again." };
+          case "unconfirmed":
+            return { tone: "warning", icon: "fa-hourglass-half", heading: "Waiting for Splunk to confirm", body: ((_b2 = operation.error) == null ? void 0 : _b2.message) || "Splunk has not confirmed the result yet. Check status." };
+          default:
+            return { tone: "error", icon: "fa-circle-exclamation", heading: "The dashboard request stopped", body: ((_c = operation.error) == null ? void 0 : _c.message) || "Check status, or start a new request." };
+        }
+      };
+      const view = describe();
+      const stoppedFollowing = !operation.missing && DASHBOARD_ACTIVE_STATUSES.includes(status) && !operation.polling;
+      const showCheck = !operation.missing && operation.can_check && !operation.polling && !["created", "draft_only", "failed", "needs_input"].includes(status);
+      const warnings = Array.isArray(receipt.warnings) ? receipt.warnings : [];
+      const hasLinks = !!(receipt.view_url || receipt.edit_url);
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": `${testIdPrefix}-receipt`, "data-status": operation.missing ? "missing" : status, className: `mt-3 rounded-lg border p-4 ${cardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, "Splunk dashboard"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-semibold break-words ${headingClass}`, "data-testid": `${testIdPrefix}-receipt-title` }, operation.title || ((_a = proposal == null ? void 0 : proposal.brief) == null ? void 0 : _a.title) || "Untitled dashboard"), identityLine), operation.created_at && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, formatDashboardTime(operation.created_at))), /* @__PURE__ */ React.createElement("div", { role: "status", className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses[view.tone]}`, "data-testid": `${testIdPrefix}-receipt-status` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("i", { className: `fas ${view.icon} mt-1`, "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("p", { className: "font-semibold" }, view.heading), /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words" }, view.body), view.detail && view.detail !== view.body && /* @__PURE__ */ React.createElement("p", { className: "mt-1 break-words opacity-90" }, view.detail)))), (status === "created" || status === "draft_only" || status === "indeterminate") && !hasLinks && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${mutedTextClass}` }, "No link came back that matches this connection's Splunk Web address. Open the Constellation app in Splunk Web to find it."), warnings.length > 0 && /* @__PURE__ */ React.createElement("ul", { className: `mt-2 list-disc space-y-1 pl-5 text-xs ${subtextClass}`, "data-testid": `${testIdPrefix}-receipt-warnings` }, warnings.map((warning, index) => /* @__PURE__ */ React.createElement("li", { key: `${warning.code}-${index}` }, warning.message || `Constellation noted ${warning.code}.`))), operation.check_note && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}` }, operation.check_note), stoppedFollowing && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}` }, "The app is not checking this request right now. Click Check Status to ask Splunk."), requestError && /* @__PURE__ */ React.createElement("p", { role: "alert", className: `mt-2 text-sm ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, requestError), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-2" }, receipt.view_url && /* @__PURE__ */ React.createElement("a", { href: receipt.view_url, target: "_blank", rel: "noopener noreferrer", className: primaryButton, "data-testid": `${testIdPrefix}-open-dashboard` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt", "aria-hidden": "true" }), "Open Dashboard"), receipt.edit_url && /* @__PURE__ */ React.createElement("a", { href: receipt.edit_url, target: "_blank", rel: "noopener noreferrer", className: receipt.view_url ? secondaryButton : primaryButton, "data-testid": `${testIdPrefix}-edit-constellation` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen-to-square", "aria-hidden": "true" }), "Edit in Constellation"), showCheck && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: checkStatus, disabled: busy === "check", className: secondaryButton, "data-testid": `${testIdPrefix}-check-status` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${busy === "check" ? "fa-spinner fa-spin" : "fa-rotate"}`, "aria-hidden": "true" }), busy === "check" ? "Checking..." : "Check Status"), operation.can_retry && !operation.missing && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => {
+            setDraft(sanitizeDashboardBrief(operation.brief || (proposal == null ? void 0 : proposal.brief)) || sanitizeDashboardBrief({}));
+            setRequestError("");
+            setRetrying(true);
+            setEditing(true);
+          },
+          className: secondaryButton,
+          "data-testid": `${testIdPrefix}-retry`
+        },
+        /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen", "aria-hidden": "true" }),
+        "Change the Plan"
+      )));
+    }
+    const payload = buildDashboardBriefPayload(draft);
+    const liveProblems = findDashboardBriefProblems(draft);
+    const shownProblems = [...liveProblems, ...serverProblems.filter((problem) => !liveProblems.some((live) => live.message === problem.message))];
+    const notes = Array.isArray(proposal == null ? void 0 : proposal.notes) ? proposal.notes : [];
+    const createBlocked = shownProblems.length > 0 || incognitoActive || !(proposal == null ? void 0 : proposal.binding_key) || !!busy;
+    const timeRangeLabel = (DASHBOARD_TIME_RANGE_OPTIONS.find((option) => option.value === payload.time_range.earliest) || {}).label || "Not set";
+    const totalPanels = draft.pages.reduce((sum, page) => sum + page.panels.length, 0);
+    const setPage = (pageIndex, updater) => updateDraft((current) => ({
+      ...current,
+      pages: current.pages.map((page, index) => index === pageIndex ? updater(page) : page)
+    }));
+    return /* @__PURE__ */ React.createElement("div", { "data-testid": testIdPrefix, className: `mt-3 rounded-lg border p-4 ${cardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, retrying ? "Change the dashboard plan" : "Dashboard plan"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${isDarkTheme ? "border-gray-600 text-gray-200" : "border-gray-300 text-gray-700"}` }, (proposal == null ? void 0 : proposal.drafted_by) === "ai" ? "Drafted by the AI model" : "Starter plan")), identityLine, (proposal == null ? void 0 : proposal.splunk_web_url) && /* @__PURE__ */ React.createElement("p", { className: `text-xs break-all ${mutedTextClass}` }, "Links open at ", proposal.splunk_web_url, proposal.splunk_web_url_source === "derived" ? " (guessed from the connection)" : "")), ((_b = payload.provenance) == null ? void 0 : _b.label) && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, payload.provenance.kind === "conversation" ? "Based on this chat" : `Based on ${payload.provenance.label}`)), editing ? /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-3", "data-testid": `${testIdPrefix}-editor` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("title"), className: labelClass }, "Title"), /* @__PURE__ */ React.createElement("input", { id: fieldId("title"), type: "text", maxLength: DASHBOARD_LIMITS.title, value: draft.title, onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, title: value }));
+    }, className: `mt-1 ${inputClass}` })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("purpose"), className: labelClass }, "Purpose"), /* @__PURE__ */ React.createElement("textarea", { id: fieldId("purpose"), rows: 2, maxLength: DASHBOARD_LIMITS.purpose, value: draft.purpose, onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, purpose: value }));
+    }, className: `mt-1 ${inputClass}`, placeholder: "The question the dashboard answers and who it is for" })), /* @__PURE__ */ React.createElement("div", { className: "grid gap-3 sm:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("source-kind"), className: labelClass }, "Data"), /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        id: fieldId("source-kind"),
+        value: draft.source.kind,
+        onChange: (event) => {
+          const kind = event.target.value === "spl" ? "spl" : "index";
+          updateDraft((current) => ({ ...current, source: kind === "spl" ? { kind: "spl", query: "" } : { kind: "index", index: "", sourcetype: "" } }));
+        },
+        className: `mt-1 ${inputClass}`
+      },
+      /* @__PURE__ */ React.createElement("option", { value: "index" }, "An index"),
+      /* @__PURE__ */ React.createElement("option", { value: "spl" }, "A search")
+    )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("time-range"), className: labelClass }, "Time range"), /* @__PURE__ */ React.createElement("select", { id: fieldId("time-range"), value: draft.time_range.earliest, onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, time_range: { earliest: value, latest: "now" } }));
+    }, className: `mt-1 ${inputClass}` }, !DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === draft.time_range.earliest) && /* @__PURE__ */ React.createElement("option", { value: draft.time_range.earliest }, "Pick a time range"), DASHBOARD_TIME_RANGE_OPTIONS.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.label))))), draft.source.kind === "spl" ? /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("query"), className: labelClass }, "Search"), /* @__PURE__ */ React.createElement("textarea", { id: fieldId("query"), rows: 3, maxLength: DASHBOARD_LIMITS.query, value: draft.source.query, onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, source: { kind: "spl", query: value } }));
+    }, className: `mt-1 font-mono ${inputClass}`, placeholder: "index=web sourcetype=access_combined | stats count by status" }), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs ${mutedTextClass}` }, "Splunk runs this search as your Splunk user.")) : /* @__PURE__ */ React.createElement("div", { className: "grid gap-3 sm:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("index"), className: labelClass }, "Index"), /* @__PURE__ */ React.createElement("input", { id: fieldId("index"), type: "text", maxLength: 120, value: draft.source.index, onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, source: { ...current.source, kind: "index", index: value } }));
+    }, className: `mt-1 font-mono ${inputClass}`, placeholder: "main" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("sourcetype"), className: labelClass }, "Sourcetype (optional)"), /* @__PURE__ */ React.createElement("input", { id: fieldId("sourcetype"), type: "text", maxLength: 200, value: draft.source.sourcetype || "", onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, source: { ...current.source, kind: "index", sourcetype: value } }));
+    }, className: `mt-1 font-mono ${inputClass}` }))), draft.pages.map((page, pageIndex) => /* @__PURE__ */ React.createElement("fieldset", { key: `page-${pageIndex}`, className: `rounded-md border p-3 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}`, "data-testid": `${testIdPrefix}-page` }, /* @__PURE__ */ React.createElement("legend", { className: `px-1 text-xs font-semibold ${headingClass}` }, "Page ", pageIndex + 1), /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId(`page-${pageIndex}-name`), className: labelClass }, "Page name"), /* @__PURE__ */ React.createElement("input", { id: fieldId(`page-${pageIndex}-name`), type: "text", maxLength: DASHBOARD_LIMITS.pageName, value: page.name, onChange: (event) => {
+      const value = event.target.value;
+      setPage(pageIndex, (current) => ({ ...current, name: value }));
+    }, className: `mt-1 ${inputClass}` }), /* @__PURE__ */ React.createElement("div", { className: `mt-2 ${labelClass}` }, "Panels"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 space-y-2" }, page.panels.map((panel, panelIndex) => /* @__PURE__ */ React.createElement("div", { key: `panel-${panelIndex}`, className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "text",
+        "aria-label": `Panel ${panelIndex + 1} on page ${pageIndex + 1}`,
+        maxLength: DASHBOARD_LIMITS.panel,
+        value: panel,
+        onChange: (event) => {
+          const value = event.target.value;
+          setPage(pageIndex, (current) => ({ ...current, panels: current.panels.map((item, index) => index === panelIndex ? value : item) }));
+        },
+        className: inputClass,
+        placeholder: "Event arrivals over time"
+      }
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => setPage(pageIndex, (current) => ({ ...current, panels: current.panels.filter((_, index) => index !== panelIndex) })),
+        className: secondaryButton,
+        "aria-label": `Remove panel ${panelIndex + 1} on page ${pageIndex + 1}`
+      },
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-xmark", "aria-hidden": "true" })
+    )))), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => setPage(pageIndex, (current) => ({ ...current, panels: [...current.panels, ""] })),
+        disabled: page.panels.length >= DASHBOARD_LIMITS.panelsPerPage || totalPanels >= DASHBOARD_LIMITS.panelsTotal,
+        className: secondaryButton
+      },
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus", "aria-hidden": "true" }),
+      "Add Panel"
+    ), draft.pages.length > 1 && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => updateDraft((current) => ({ ...current, pages: current.pages.filter((_, index) => index !== pageIndex) })), className: secondaryButton }, "Remove Page")))), draft.pages.length < DASHBOARD_LIMITS.pages && /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => updateDraft((current) => ({ ...current, pages: [...current.pages, { name: `Page ${current.pages.length + 1}`, panels: [""] }] })),
+        disabled: totalPanels >= DASHBOARD_LIMITS.panelsTotal,
+        className: secondaryButton
+      },
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus", "aria-hidden": "true" }),
+      "Add Page"
+    ), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("findings"), className: labelClass }, "Findings to show (optional, one per line)"), /* @__PURE__ */ React.createElement("textarea", { id: fieldId("findings"), rows: 3, value: draft.findings.join("\n"), onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, findings: value.split("\n") }));
+    }, className: `mt-1 ${inputClass}` })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("requirements"), className: labelClass }, "Requirements (optional)"), /* @__PURE__ */ React.createElement("textarea", { id: fieldId("requirements"), rows: 2, maxLength: DASHBOARD_LIMITS.requirements, value: draft.requirements, onChange: (event) => {
+      const value = event.target.value;
+      updateDraft((current) => ({ ...current, requirements: value }));
+    }, className: `mt-1 ${inputClass}`, placeholder: "Units, metric definitions, exclusions, and how to treat missing data" }))) : /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-3 text-sm", "data-testid": `${testIdPrefix}-summary` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `font-semibold break-words ${headingClass}`, "data-testid": `${testIdPrefix}-title` }, payload.title || "Untitled dashboard"), payload.purpose && /* @__PURE__ */ React.createElement("p", { className: `mt-1 break-words ${subtextClass}` }, payload.purpose)), /* @__PURE__ */ React.createElement("div", { className: `grid gap-2 sm:grid-cols-2 ${subtextClass}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Data"), payload.source.kind === "spl" ? /* @__PURE__ */ React.createElement("pre", { className: `mt-1 whitespace-pre-wrap break-all rounded border px-2 py-1 text-xs ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, payload.source.query || "No search yet") : /* @__PURE__ */ React.createElement("span", { className: "mt-1 block break-words" }, payload.source.index ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Index ", /* @__PURE__ */ React.createElement("code", null, payload.source.index)) : "No index yet", payload.source.sourcetype ? /* @__PURE__ */ React.createElement(React.Fragment, null, ", sourcetype ", /* @__PURE__ */ React.createElement("code", null, payload.source.sourcetype)) : null)), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Time range"), /* @__PURE__ */ React.createElement("span", { className: "mt-1 block" }, timeRangeLabel))), payload.pages.map((page, pageIndex) => /* @__PURE__ */ React.createElement("div", { key: `summary-page-${pageIndex}`, className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, payload.pages.length > 1 ? `Page ${pageIndex + 1}: ${page.name || "Unnamed"}` : `Panels on ${page.name || "the page"}`), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, page.panels.map((panel, panelIndex) => /* @__PURE__ */ React.createElement("li", { key: `summary-panel-${panelIndex}`, className: "break-words" }, panel))))), Array.isArray(payload.findings) && payload.findings.length > 0 && /* @__PURE__ */ React.createElement("div", { className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Findings"), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, payload.findings.map((finding, index) => /* @__PURE__ */ React.createElement("li", { key: `finding-${index}`, className: "break-words" }, finding)))), payload.requirements && /* @__PURE__ */ React.createElement("div", { className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Requirements"), /* @__PURE__ */ React.createElement("p", { className: "mt-1 break-words" }, payload.requirements))), shownProblems.length > 0 && /* @__PURE__ */ React.createElement("div", { role: "alert", className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.error}`, "data-testid": `${testIdPrefix}-problems` }, /* @__PURE__ */ React.createElement("p", { className: "font-semibold" }, "Fix these before you create the dashboard:"), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, shownProblems.map((problem, index) => /* @__PURE__ */ React.createElement("li", { key: `${problem.field}-${index}` }, problem.message)))), notes.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`, "data-testid": `${testIdPrefix}-notes` }, /* @__PURE__ */ React.createElement("ul", { className: "list-disc space-y-0.5 pl-5" }, notes.map((note, index) => /* @__PURE__ */ React.createElement("li", { key: `note-${index}` }, note)))), incognitoActive && /* @__PURE__ */ React.createElement("p", { className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`, "data-testid": `${testIdPrefix}-incognito` }, "Turn incognito mode off to create this dashboard. Constellation sends the plan to its own AI model with the real names."), requestError && /* @__PURE__ */ React.createElement("p", { role: "alert", className: `mt-3 text-sm ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, requestError), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: createDashboard, disabled: createBlocked, className: primaryButton, "data-testid": `${testIdPrefix}-create` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${busy === "create" ? "fa-spinner fa-spin" : "fa-chart-pie"}`, "aria-hidden": "true" }), busy === "create" ? "Sending..." : "Create Dashboard"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setEditing((current) => !current), disabled: !!busy, className: secondaryButton, "data-testid": `${testIdPrefix}-edit` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${editing ? "fa-check" : "fa-pen"}`, "aria-hidden": "true" }), editing ? "Done Editing" : "Edit Plan"), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => {
+          if (retrying) {
+            setRetrying(false);
+            setEditing(false);
+            setRequestError("");
+            return;
+          }
+          notify({ dashboard_dismissed: true });
+        },
+        disabled: !!busy,
+        className: secondaryButton,
+        "data-testid": `${testIdPrefix}-cancel`
+      },
+      "Cancel"
+    ), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Nothing goes to Splunk until you click Create Dashboard.")));
+  }
   const compactPersistedChatMessages = (items, limit = 24) => {
     if (!Array.isArray(items)) return [];
     return items.slice(-limit).map((msg, idx) => {
@@ -321,6 +885,9 @@
             why: Array.isArray(chunk == null ? void 0 : chunk.why) ? chunk.why.filter((item) => typeof item === "string").slice(0, 3) : void 0
           })).filter((chunk) => chunk.snippet) : []
         })) : [],
+        dashboard_proposal: sanitizeDashboardProposal(msg == null ? void 0 : msg.dashboard_proposal) || void 0,
+        dashboard_operation: sanitizeDashboardOperation(msg == null ? void 0 : msg.dashboard_operation) || void 0,
+        dashboard_dismissed: (msg == null ? void 0 : msg.dashboard_dismissed) ? true : void 0,
         has_follow_on: followOnActions.length > 0,
         follow_on_actions: followOnActions,
         status_timeline: Array.isArray(msg == null ? void 0 : msg.status_timeline) ? msg.status_timeline.slice(-8) : [],
@@ -1263,7 +1830,7 @@
     tabs[nextIndex].click();
   };
   function App() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa, _ya;
     const THEME_PREFERENCE_KEY = "dt4sms_theme_preference";
     const OPERATOR_VOICE_PREFERENCE_KEY = "dt4sms_operator_voice";
     const OPERATOR_VOICE_OPTIONS = [
@@ -1490,6 +2057,12 @@
     const [capabilityActionTick, setCapabilityActionTick] = useState(() => Date.now());
     const [capabilityNotice, setCapabilityNotice] = useState(null);
     const [selectedCapabilityDetailName, setSelectedCapabilityDetailName] = useState(null);
+    const [dashboardStatus, setDashboardStatus] = useState({ status: "idle", data: null, error: "" });
+    const [dashboardOperations, setDashboardOperations] = useState({ status: "idle", items: [], error: "" });
+    const [capabilityConnections, setCapabilityConnections] = useState({});
+    const [dashboardWebUrlDrafts, setDashboardWebUrlDrafts] = useState({});
+    const [dashboardWebUrlSave, setDashboardWebUrlSave] = useState({ saving: false, error: "", notice: "" });
+    const [reportDashboardPlans, setReportDashboardPlans] = useState({});
     const [deeplinkDrafts, setDeeplinkDrafts] = useState({
       splunk_deeplink_tools: {
         query: "search index=_internal | head 20",
@@ -1588,6 +2161,7 @@
     const authEnableGateActive = !securityConfig.auth_enabled && !hasReviewedAuthEnableInfo;
     const currentAuthUser = (authStatus == null ? void 0 : authStatus.user) || null;
     const authAccountsEnabled = !!(authStatus == null ? void 0 : authStatus.auth_enabled);
+    const isCapabilityAdmin = !authAccountsEnabled || String((currentAuthUser == null ? void 0 : currentAuthUser.role) || "").toLowerCase() === "admin";
     const headerAuthVisible = authAccountsEnabled && !!currentAuthUser && !!(authStatus == null ? void 0 : authStatus.authenticated);
     const headerAuthProviderLabel = (authStatus == null ? void 0 : authStatus.auth_provider) === "oidc" ? "OpenID Connect" : "Local account";
     const headerAuthRoleLabel = (currentAuthUser == null ? void 0 : currentAuthUser.role) ? `${currentAuthUser.role} access` : "Authenticated";
@@ -1675,36 +2249,38 @@
     const deeplinkCapability = ((_e = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _e.splunk_deeplink_tools) || null;
     const exportCapability = ((_f = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _f.export_tools) || null;
     const ragCapability = ((_g = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _g.rag_chromadb) || null;
-    const selectedCapabilityDetail = selectedCapabilityDetailName ? ((_h = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _h[selectedCapabilityDetailName]) || null : null;
+    const dashboardCapability = ((_h = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _h.splunk_dashboards) || null;
+    const dashboardsCapabilityOn = !!((dashboardCapability == null ? void 0 : dashboardCapability.installed) && (dashboardCapability == null ? void 0 : dashboardCapability.enabled) && !(dashboardCapability == null ? void 0 : dashboardCapability.restart_required));
+    const selectedCapabilityDetail = selectedCapabilityDetailName ? ((_i = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _i[selectedCapabilityDetailName]) || null : null;
     const ragIndexSummary = (ragCapability == null ? void 0 : ragCapability.index_summary) && typeof ragCapability.index_summary === "object" ? ragCapability.index_summary : null;
     const ragIndexedDocumentCount = Number((ragIndexSummary == null ? void 0 : ragIndexSummary.document_count) || 0);
     const ragIndexFreshness = (ragCapability == null ? void 0 : ragCapability.index_freshness) && typeof ragCapability.index_freshness === "object" ? ragCapability.index_freshness : null;
     const ragKnowledgeAssetSummary = (ragCapability == null ? void 0 : ragCapability.knowledge_asset_summary) && typeof (ragCapability == null ? void 0 : ragCapability.knowledge_asset_summary) === "object" ? ragCapability.knowledge_asset_summary : null;
     const ragIndexSourceTypes = (ragIndexSummary == null ? void 0 : ragIndexSummary.source_type_counts) && typeof ragIndexSummary.source_type_counts === "object" ? Object.entries(ragIndexSummary.source_type_counts) : [];
-    const ragKnowledgeAssetTypeCounts = Object.entries(((_i = ragAssetWorkspace.summary) == null ? void 0 : _i.asset_type_counts) || (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_type_counts) || {});
+    const ragKnowledgeAssetTypeCounts = Object.entries(((_j = ragAssetWorkspace.summary) == null ? void 0 : _j.asset_type_counts) || (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_type_counts) || {});
     const ragDisplayedAssets = Array.isArray(ragAssetWorkspace.assets) ? ragAssetWorkspace.assets : [];
-    const ragDisplayedAssetCount = (_l = (_k = (_j = ragAssetWorkspace.summary) == null ? void 0 : _j.asset_count) != null ? _k : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_count) != null ? _l : 0;
-    const ragDisplayedAssetDir = ((_m = ragAssetWorkspace.summary) == null ? void 0 : _m.asset_dir) || (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_dir) || "output/rag/assets";
+    const ragDisplayedAssetCount = (_m = (_l = (_k = ragAssetWorkspace.summary) == null ? void 0 : _k.asset_count) != null ? _l : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_count) != null ? _m : 0;
+    const ragDisplayedAssetDir = ((_n = ragAssetWorkspace.summary) == null ? void 0 : _n.asset_dir) || (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.asset_dir) || "output/rag/assets";
     const ragSplLibraryAssetCount = ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.asset_type) || "").toLowerCase() === SPL_LIBRARY_ASSET_TYPE).length;
-    const m2614AdvisorCapability = ((_n = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _n.m26_14_advisor) || null;
+    const m2614AdvisorCapability = ((_o = capabilitiesData == null ? void 0 : capabilitiesData.capabilities) == null ? void 0 : _o.m26_14_advisor) || null;
     const showM2614WorkspaceTab = !!((m2614AdvisorCapability == null ? void 0 : m2614AdvisorCapability.installed) && (m2614AdvisorCapability == null ? void 0 : m2614AdvisorCapability.enabled));
     const m2614PriorityObjectives = Object.values((m2614Profile == null ? void 0 : m2614Profile.priority_objectives) || {}).filter((item) => item && typeof item === "object");
     const m2614MaturityElements = Array.isArray(m2614Profile == null ? void 0 : m2614Profile.maturity_elements) ? m2614Profile.maturity_elements.filter((item) => item && typeof item === "object") : [];
     const m2614ValidationPacks = Array.isArray(m2614ValidationCatalog == null ? void 0 : m2614ValidationCatalog.packs) && m2614ValidationCatalog.packs.length > 0 ? m2614ValidationCatalog.packs : Array.isArray(m2614Profile == null ? void 0 : m2614Profile.validation_packs) ? m2614Profile.validation_packs : [];
     const selectedM2614ValidationPack = m2614ValidationPacks.find((pack) => (pack == null ? void 0 : pack.id) === m2614ValidationSelection.packId) || m2614ValidationPacks[0] || null;
-    const m2614RecommendedPackIds = Array.isArray((_o = m2614Profile == null ? void 0 : m2614Profile.live_validation) == null ? void 0 : _o.recommended_pack_ids) ? m2614Profile.live_validation.recommended_pack_ids : [];
+    const m2614RecommendedPackIds = Array.isArray((_p = m2614Profile == null ? void 0 : m2614Profile.live_validation) == null ? void 0 : _p.recommended_pack_ids) ? m2614Profile.live_validation.recommended_pack_ids : [];
     const m2614RecommendedPacks = m2614ValidationPacks.filter((pack) => m2614RecommendedPackIds.includes(pack == null ? void 0 : pack.id));
     const canRunM2614Validation = !authAccountsEnabled || ["admin", "analyst"].includes(String((currentAuthUser == null ? void 0 : currentAuthUser.role) || "").trim().toLowerCase());
-    const m2614ValidationSummary = ((_p = m2614ValidationResult == null ? void 0 : m2614ValidationResult.result) == null ? void 0 : _p.summary) && typeof m2614ValidationResult.result.summary === "object" ? m2614ValidationResult.result.summary : null;
-    const m2614ValidationRows = Array.isArray((_q = m2614ValidationResult == null ? void 0 : m2614ValidationResult.result) == null ? void 0 : _q.rows) ? m2614ValidationResult.result.rows : [];
+    const m2614ValidationSummary = ((_q = m2614ValidationResult == null ? void 0 : m2614ValidationResult.result) == null ? void 0 : _q.summary) && typeof m2614ValidationResult.result.summary === "object" ? m2614ValidationResult.result.summary : null;
+    const m2614ValidationRows = Array.isArray((_r = m2614ValidationResult == null ? void 0 : m2614ValidationResult.result) == null ? void 0 : _r.rows) ? m2614ValidationResult.result.rows : [];
     const m2614ValidationAdvisory = (m2614ValidationResult == null ? void 0 : m2614ValidationResult.advisory) && typeof m2614ValidationResult.advisory === "object" ? m2614ValidationResult.advisory : null;
     const m2614ValidationProfileSnapshot = (m2614ValidationAdvisory == null ? void 0 : m2614ValidationAdvisory.profile_snapshot) && typeof m2614ValidationAdvisory.profile_snapshot === "object" ? m2614ValidationAdvisory.profile_snapshot : null;
     const m2614ValidationRagContext = (m2614ValidationAdvisory == null ? void 0 : m2614ValidationAdvisory.rag_context) && typeof m2614ValidationAdvisory.rag_context === "object" ? m2614ValidationAdvisory.rag_context : null;
     const m2614ValidationReusableQueries = Array.isArray(m2614ValidationRagContext == null ? void 0 : m2614ValidationRagContext.reusable_spl_queries) ? m2614ValidationRagContext.reusable_spl_queries.filter((candidate) => typeof (candidate == null ? void 0 : candidate.query) === "string" && candidate.query.trim()).slice(0, 3) : [];
     const m2614ValidationLlmAnalysis = (m2614ValidationAdvisory == null ? void 0 : m2614ValidationAdvisory.llm_analysis) && typeof m2614ValidationAdvisory.llm_analysis === "object" ? m2614ValidationAdvisory.llm_analysis : null;
-    const ragLibraryStatusCounts = ((_r = ragAssetWorkspace.summary) == null ? void 0 : _r.library_status_counts) && typeof ragAssetWorkspace.summary.library_status_counts === "object" ? ragAssetWorkspace.summary.library_status_counts : (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.library_status_counts) && typeof ragKnowledgeAssetSummary.library_status_counts === "object" ? ragKnowledgeAssetSummary.library_status_counts : { checked_in: 0, checked_out: 0 };
-    const ragCheckedInAssetCount = (_u = (_t = (_s = ragAssetWorkspace.summary) == null ? void 0 : _s.checked_in_asset_count) != null ? _t : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.checked_in_asset_count) != null ? _u : ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.library_status) || "checked_in").toLowerCase() !== "checked_out").length;
-    const ragCheckedOutAssetCount = (_x = (_w = (_v = ragAssetWorkspace.summary) == null ? void 0 : _v.checked_out_asset_count) != null ? _w : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.checked_out_asset_count) != null ? _x : ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.library_status) || "").toLowerCase() === "checked_out").length;
+    const ragLibraryStatusCounts = ((_s = ragAssetWorkspace.summary) == null ? void 0 : _s.library_status_counts) && typeof ragAssetWorkspace.summary.library_status_counts === "object" ? ragAssetWorkspace.summary.library_status_counts : (ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.library_status_counts) && typeof ragKnowledgeAssetSummary.library_status_counts === "object" ? ragKnowledgeAssetSummary.library_status_counts : { checked_in: 0, checked_out: 0 };
+    const ragCheckedInAssetCount = (_v = (_u = (_t = ragAssetWorkspace.summary) == null ? void 0 : _t.checked_in_asset_count) != null ? _u : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.checked_in_asset_count) != null ? _v : ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.library_status) || "checked_in").toLowerCase() !== "checked_out").length;
+    const ragCheckedOutAssetCount = (_y = (_x = (_w = ragAssetWorkspace.summary) == null ? void 0 : _w.checked_out_asset_count) != null ? _x : ragKnowledgeAssetSummary == null ? void 0 : ragKnowledgeAssetSummary.checked_out_asset_count) != null ? _y : ragDisplayedAssets.filter((asset) => String((asset == null ? void 0 : asset.library_status) || "").toLowerCase() === "checked_out").length;
     const ragLibraryAssets = ragDisplayedAssets.filter((asset) => {
       const libraryStatus = String((asset == null ? void 0 : asset.library_status) || "checked_in").toLowerCase();
       if (ragLibraryFilter === "spl_library") {
@@ -1733,8 +2309,8 @@
     const ragInstallPackageIndexes = Array.isArray(ragInstallGuidance == null ? void 0 : ragInstallGuidance.package_indexes) ? ragInstallGuidance.package_indexes : [];
     const ragInstallStartedAt = (capabilityActionStartedAt == null ? void 0 : capabilityActionStartedAt.rag_chromadb) || 0;
     const ragInstallElapsedSeconds = ragActionInProgress === "install" && ragInstallStartedAt ? Math.max(0, Math.floor((capabilityActionTick - ragInstallStartedAt) / 1e3)) : 0;
-    const headerMcpConnected = !!((_y = connectionInfo == null ? void 0 : connectionInfo.mcp) == null ? void 0 : _y.configured);
-    const headerLlmDisplayLabel = String(((_z = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _z.display_label) || "").trim() || "Not configured";
+    const headerMcpConnected = !!((_z = connectionInfo == null ? void 0 : connectionInfo.mcp) == null ? void 0 : _z.configured);
+    const headerLlmDisplayLabel = String(((_A = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _A.display_label) || "").trim() || "Not configured";
     const connectionInfoStatus = String((connectionInfo == null ? void 0 : connectionInfo.status) || "disconnected").toLowerCase();
     const canUseSplunkDeeplinks = !!(deeplinkCapability == null ? void 0 : deeplinkCapability.installed) && !!(deeplinkCapability == null ? void 0 : deeplinkCapability.enabled) && !(deeplinkCapability == null ? void 0 : deeplinkCapability.restart_required) && String((deeplinkCapability == null ? void 0 : deeplinkCapability.health_status) || "").toLowerCase() === "ready";
     const canUseExportTools = !!(exportCapability == null ? void 0 : exportCapability.installed) && !!(exportCapability == null ? void 0 : exportCapability.enabled) && !(exportCapability == null ? void 0 : exportCapability.restart_required) && String((exportCapability == null ? void 0 : exportCapability.health_status) || "").toLowerCase() === "ready";
@@ -2059,7 +2635,7 @@
     const packagePersonaLabel = workflowTab ? `${workflowTab.charAt(0).toUpperCase()}${workflowTab.slice(1)}` : "Persona";
     const packageTargetLabel = `${selectedPackageSessionLabel} reports, ${packagePersonaLabel} runbook, ${operatorVoiceDefinition.label} style`;
     const isRagContextPreviewReady = !!(ragCapability == null ? void 0 : ragCapability.installed) && !!(ragCapability == null ? void 0 : ragCapability.enabled) && !(ragCapability == null ? void 0 : ragCapability.restart_required) && String((ragCapability == null ? void 0 : ragCapability.health_status) || "").toLowerCase() === "ready" && ragIndexedDocumentCount > 0;
-    const libraryDocsAvailable = !!((_C = (_B = (_A = knowledgeLibrary.data) == null ? void 0 : _A.docs) == null ? void 0 : _B.summary) == null ? void 0 : _C.available);
+    const libraryDocsAvailable = !!((_D = (_C = (_B = knowledgeLibrary.data) == null ? void 0 : _B.docs) == null ? void 0 : _C.summary) == null ? void 0 : _D.available);
     const canUseRagContextPreview = isRagContextPreviewReady || libraryDocsAvailable;
     const activeDetailPreviewTrace = (() => {
       var _a2, _b2, _c2;
@@ -2196,7 +2772,7 @@
     const missionStats = (latestMissionSession == null ? void 0 : latestMissionSession.stats) || {};
     const missionFreshness = getMissionFreshnessMeta((latestMissionSession == null ? void 0 : latestMissionSession.created_at) || (latestMissionSession == null ? void 0 : latestMissionSession.timestamp));
     const missionHasPreviousSession = !!(discoveryDashboard == null ? void 0 : discoveryDashboard.previous);
-    const missionExecutiveHeadline = ((_E = (_D = latestMissionSession == null ? void 0 : latestMissionSession.personas) == null ? void 0 : _D.executive) == null ? void 0 : _E.headline) || `Readiness score is ${formatMissionMetricValue((_F = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _F.readiness_score)} out of 100, with ${countLabel((_G = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _G.recommendation_count, "recommendation")} to follow up.`;
+    const missionExecutiveHeadline = ((_F = (_E = latestMissionSession == null ? void 0 : latestMissionSession.personas) == null ? void 0 : _E.executive) == null ? void 0 : _F.headline) || `Readiness score is ${formatMissionMetricValue((_G = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _G.readiness_score)} out of 100, with ${countLabel((_H = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _H.recommendation_count, "recommendation")} to follow up.`;
     const workspaceMetricTone = {
       shellClass: isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200",
       labelClass: mutedTextClass,
@@ -2206,8 +2782,8 @@
     const missionStatCards = [
       {
         label: "Readiness",
-        value: `${formatMissionMetricValue((_H = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _H.readiness_score)}/100`,
-        detail: describeMissionChange((_I = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _I.readiness_delta),
+        value: `${formatMissionMetricValue((_I = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _I.readiness_score)}/100`,
+        detail: describeMissionChange((_J = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _J.readiness_delta),
         ...workspaceMetricTone
       },
       {
@@ -2218,14 +2794,14 @@
       },
       {
         label: "Indexes",
-        value: formatMissionMetricValue((_J = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _J.total_indexes),
-        detail: describeMissionChange((_K = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _K.indexes_delta),
+        value: formatMissionMetricValue((_K = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _K.total_indexes),
+        detail: describeMissionChange((_L = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _L.indexes_delta),
         ...workspaceMetricTone
       },
       {
         label: "Sourcetypes",
-        value: formatMissionMetricValue((_L = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _L.total_sourcetypes),
-        detail: describeMissionChange((_M = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _M.sourcetypes_delta),
+        value: formatMissionMetricValue((_M = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _M.total_sourcetypes),
+        detail: describeMissionChange((_N = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _N.sourcetypes_delta),
         ...workspaceMetricTone
       },
       {
@@ -2236,8 +2812,8 @@
       },
       {
         label: "Recommendations",
-        value: formatMissionMetricValue(missionStats.recommendation_count || ((_N = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _N.recommendation_count)),
-        detail: describeMissionChange((_O = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _O.recommendations_delta),
+        value: formatMissionMetricValue(missionStats.recommendation_count || ((_O = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _O.recommendation_count)),
+        detail: describeMissionChange((_P = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _P.recommendations_delta),
         ...workspaceMetricTone
       }
     ];
@@ -2602,7 +3178,7 @@
       };
     }, [
       activeTab,
-      (_P = config == null ? void 0 : config.llm) == null ? void 0 : _P.provider,
+      (_Q = config == null ? void 0 : config.llm) == null ? void 0 : _Q.provider,
       currentSessionId,
       isSummaryModalOpen,
       summaryData
@@ -2984,8 +3560,18 @@
       }
       if (isCapabilitiesTab) {
         loadCapabilities();
+        loadDashboardStatus();
+        loadDashboardOperations();
       }
     }, [workspaceTab]);
+    useEffect(() => {
+      var _a2, _b2;
+      if (!isCapabilitiesTab || ((_b2 = (_a2 = dashboardStatus.data) == null ? void 0 : _a2.support) == null ? void 0 : _b2.state) !== "checking") {
+        return void 0;
+      }
+      const timer = setTimeout(() => loadDashboardStatus(), 4e3);
+      return () => clearTimeout(timer);
+    }, [isCapabilitiesTab, dashboardStatus.data]);
     useEffect(() => {
       if (isCapabilitiesRagView) {
         loadKnowledgeLibrary();
@@ -3596,6 +4182,74 @@
     };
     const refreshCapabilitiesWorkspace = () => {
       loadCapabilities();
+      loadDashboardStatus({ refresh: true });
+      loadDashboardOperations();
+    };
+    const loadDashboardStatus = async ({ refresh = false } = {}) => {
+      setDashboardStatus((prev) => ({ ...prev, status: "loading", error: "" }));
+      try {
+        const response = await fetch(`/api/dashboards/status${refresh ? "?refresh=true" : ""}`);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
+        }
+        setDashboardStatus({ status: "success", data, error: "" });
+      } catch (error) {
+        setDashboardStatus((prev) => ({ ...prev, status: "error", error: error.message || "Could not check Splunk Dashboards." }));
+      }
+    };
+    const loadDashboardOperations = async () => {
+      try {
+        const response = await fetch("/api/dashboards/operations?limit=5");
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
+        }
+        const items = (Array.isArray(data.operations) ? data.operations : []).map(sanitizeDashboardOperation).filter(Boolean);
+        setDashboardOperations({ status: "success", items, error: "" });
+      } catch (error) {
+        setDashboardOperations((prev) => ({ ...prev, status: "error", error: error.message || "Could not load recent dashboards." }));
+      }
+    };
+    const loadCapabilityConnections = async (name, { refresh = false } = {}) => {
+      setCapabilityConnections((prev) => ({ ...prev, [name]: { ...prev[name] || {}, status: "loading", error: "" } }));
+      try {
+        const response = await fetch(`/api/capabilities/${encodeURIComponent(name)}/connections${refresh ? "?refresh=true" : ""}`);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
+        }
+        const connections = Array.isArray(data.connections) ? data.connections : [];
+        setCapabilityConnections((prev) => ({ ...prev, [name]: { status: "success", connections, error: "" } }));
+        if (name === "splunk_dashboards") {
+          setDashboardWebUrlDrafts(Object.fromEntries(connections.map((entry) => [String(entry.name || ""), String(entry.splunk_web_url || "")])));
+        }
+      } catch (error) {
+        setCapabilityConnections((prev) => ({ ...prev, [name]: { ...prev[name] || {}, status: "error", error: error.message || "Could not check the Splunk connections." } }));
+      }
+    };
+    const saveDashboardWebUrls = async () => {
+      const addresses = Object.fromEntries(
+        Object.entries(dashboardWebUrlDrafts).map(([connectionName, address]) => [connectionName, String(address || "").trim()]).filter(([, address]) => address)
+      );
+      setDashboardWebUrlSave({ saving: true, error: "", notice: "" });
+      try {
+        const response = await fetch("/api/capabilities/splunk_dashboards/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config: { splunk_web_urls: addresses } })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(getCapabilityActionError(result, "Could not save the Splunk Web addresses.").message);
+        }
+        setDashboardWebUrlSave({ saving: false, error: "", notice: "Splunk Web addresses saved." });
+        loadCapabilities();
+        loadCapabilityConnections("splunk_dashboards");
+        loadDashboardStatus();
+      } catch (error) {
+        setDashboardWebUrlSave({ saving: false, error: error.message || "Could not save the Splunk Web addresses.", notice: "" });
+      }
     };
     const loadRagAssetWorkspace = async (options = {}) => {
       if (!options.suppressLoading) {
@@ -4040,6 +4694,9 @@
         });
         if (action !== "install") {
           setTimeout(() => setCapabilityNotice(null), 3500);
+        }
+        if (name === "splunk_dashboards") {
+          loadDashboardStatus();
         }
       }
     };
@@ -5325,7 +5982,7 @@ The names and the change log are removed. Discovery runs you already have are no
             /* @__PURE__ */ React.createElement("i", { className: "fa-solid fa-xmark", "aria-hidden": "true" }),
             /* @__PURE__ */ React.createElement("span", null, "Close")
           )),
-          /* @__PURE__ */ React.createElement("div", { className: "min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.15fr),minmax(280px,0.85fr)]" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-4 lg:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "What It Does"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, capability.purpose || capability.description || "Optional add-on for Splunk Discovery Tool.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Why Use It"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, capability.intent || "Turn it on when you need it."))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Features"), capabilitySet.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: `mt-3 space-y-2 text-sm ${subtextClass}` }, capabilitySet.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${capability.name}-capability-set-${itemIndex}`, className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? "bg-sky-300" : "bg-sky-600"}` }), /* @__PURE__ */ React.createElement("span", null, item)))) : /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-sm ${mutedTextClass}` }, "No feature list yet.")), renderCapabilityRuntimeSnapshot(capability)), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Status"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-3 gap-3 mt-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Setup"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, formatCapabilityInstallMethodLabel(capability.install_method || "unknown"))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Installed"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, capability.installed ? "Yes" : "No")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Enabled"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, capability.enabled ? "Yes" : "No")))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Health"), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getCapabilityStatusClasses(capability.health_status || "unknown")}` }, formatCapabilityStatusLabel(capability.health_status || "unknown")), capability.version && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, "Version ", capability.version)), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-sm leading-6 ${subtextClass}` }, capability.health_message || "Not tested yet."), capability.last_tested_at && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Last checked: ", formatMissionDateTime(capability.last_tested_at)), capability.last_error && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, capability.last_error)), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Dependencies"), dependencyPackages.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-3 text-xs" }, dependencyPackages.map((pkg) => /* @__PURE__ */ React.createElement("span", { key: pkg, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-white text-gray-700 border-gray-300"}` }, pkg))) : /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-sm ${mutedTextClass}` }, "No extra packages needed.")), restartNote && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-3 text-sm ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800"}` }, restartNote))))
+          /* @__PURE__ */ React.createElement("div", { className: "min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.15fr),minmax(280px,0.85fr)]" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 gap-4 lg:grid-cols-2" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "What It Does"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, capability.purpose || capability.description || "Optional add-on for Splunk Discovery Tool.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Why Use It"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, capability.intent || "Turn it on when you need it."))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Features"), capabilitySet.length > 0 ? /* @__PURE__ */ React.createElement("ul", { className: `mt-3 space-y-2 text-sm ${subtextClass}` }, capabilitySet.map((item, itemIndex) => /* @__PURE__ */ React.createElement("li", { key: `${capability.name}-capability-set-${itemIndex}`, className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `mt-1 h-1.5 w-1.5 rounded-full ${isDarkTheme ? "bg-sky-300" : "bg-sky-600"}` }), /* @__PURE__ */ React.createElement("span", null, item)))) : /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-sm ${mutedTextClass}` }, "No feature list yet.")), renderCapabilityRuntimeSnapshot(capability)), /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Status"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-3 gap-3 mt-3" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Setup"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, formatCapabilityInstallMethodLabel(capability.install_method || "unknown"))), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Installed"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, capability.installed ? "Yes" : "No")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-300"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${mutedTextClass}` }, "Enabled"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-sm font-semibold ${headingClass}` }, capability.enabled ? "Yes" : "No")))), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Health"), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getCapabilityStatusClasses(capability.health_status || "unknown")}` }, formatCapabilityStatusLabel(capability.health_status || "unknown")), capability.version && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${isDarkTheme ? "bg-gray-800 text-gray-200 border border-gray-600" : "bg-white text-gray-700 border border-gray-300"}` }, "Version ", capability.version)), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-sm leading-6 ${subtextClass}` }, capability.health_message || "Not tested yet."), capability.last_tested_at && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Last checked: ", formatMissionDateTime(capability.last_tested_at)), capability.last_error && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, capability.last_error)), /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Dependencies"), dependencyPackages.length > 0 ? /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-3 text-xs" }, dependencyPackages.map((pkg) => /* @__PURE__ */ React.createElement("span", { key: pkg, className: `rounded-full px-2 py-0.5 border ${isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-white text-gray-700 border-gray-300"}` }, pkg))) : /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-sm ${mutedTextClass}` }, "No extra packages needed.")), renderCapabilitySplunkRequirements(capability), restartNote && /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border px-4 py-3 text-sm ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-800"}` }, restartNote))))
         ))
       );
     };
@@ -5990,7 +6647,7 @@ The names and the change log are removed. Discovery runs you already have are no
         uninstall: `Turn off ${title} and mark it not installed. Its settings and data are kept.`,
         test: `Check that ${title} is working.`
       };
-      return /* @__PURE__ */ React.createElement("div", { "data-testid": `capability-actions-${name}`, className: "flex flex-wrap items-center gap-2" }, lifecycle === "planned" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Coming in a later release."), lifecycle === "restart_required" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Restart Splunk Discovery Tool to finish installing."), actions.map(({ action, primary }) => {
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": `capability-actions-${name}`, className: "flex flex-wrap items-center gap-2" }, lifecycle === "planned" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Coming in a later release."), lifecycle === "restart_required" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Restart Splunk Discovery Tool to finish installing."), !isCapabilityAdmin && lifecycle !== "planned" && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}`, "data-testid": `capability-admin-only-${name}` }, "Only an administrator can install, turn on, or change capabilities."), isCapabilityAdmin && actions.map(({ action, primary }) => {
         const labels = CAPABILITY_ACTION_LABELS[action];
         const busyLabel = action === "install" && name === "rag_chromadb" ? `Installing... ${formatCapabilityActionElapsed(ragInstallElapsedSeconds)}` : labels.busy;
         return /* @__PURE__ */ React.createElement(
@@ -6007,7 +6664,118 @@ The names and the change log are removed. Discovery runs you already have are no
           actionInProgress === action ? busyLabel : labels.idle,
           /* @__PURE__ */ React.createElement("span", { className: "sr-only" }, " ", title)
         );
-      }), extraButtons);
+      }), isCapabilityAdmin && extraButtons);
+    };
+    const DASHBOARD_SUPPORT_META = {
+      loading: { label: "Checking", tone: "info" },
+      checking: { label: "Checking", tone: "info" },
+      available: { label: "Dashboard tools found", tone: "success" },
+      potential: { label: "Potential capability", tone: "warning" },
+      incompatible: { label: "Unsupported version", tone: "error" },
+      unknown: { label: "Not checked", tone: "neutral" }
+    };
+    const getDashboardToneClasses = (tone) => {
+      switch (tone) {
+        case "success":
+          return isDarkTheme ? "bg-emerald-950 text-emerald-100 border-emerald-800" : "bg-emerald-50 text-emerald-800 border-emerald-200";
+        case "warning":
+          return isDarkTheme ? "bg-amber-950 text-amber-100 border-amber-800" : "bg-amber-50 text-amber-900 border-amber-200";
+        case "error":
+          return isDarkTheme ? "bg-red-950 text-red-100 border-red-800" : "bg-red-50 text-red-800 border-red-200";
+        case "info":
+          return isDarkTheme ? "bg-sky-950 text-sky-100 border-sky-800" : "bg-sky-50 text-sky-900 border-sky-200";
+        default:
+          return isDarkTheme ? "bg-gray-800 text-gray-200 border-gray-600" : "bg-gray-100 text-gray-700 border-gray-300";
+      }
+    };
+    const renderDashboardSupportChip = (state, testId) => {
+      const meta = DASHBOARD_SUPPORT_META[state] || DASHBOARD_SUPPORT_META.unknown;
+      return /* @__PURE__ */ React.createElement("span", { "data-testid": testId, "data-state": state, className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${getDashboardToneClasses(meta.tone)}` }, meta.label);
+    };
+    const renderSplunkRequirementLinks = (requirements, testId = "capability-splunk-requirements") => {
+      const items = (Array.isArray(requirements) ? requirements : []).filter((item) => item && typeof item.name === "string" && item.name.trim());
+      if (items.length === 0) {
+        return null;
+      }
+      return /* @__PURE__ */ React.createElement("ul", { "data-testid": testId, className: `mt-2 space-y-2 text-sm ${subtextClass}` }, items.map((item) => /* @__PURE__ */ React.createElement("li", { key: item.name, className: "flex flex-col gap-0.5" }, /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: `font-semibold ${headingClass}` }, item.name), item.description ? `: ${item.description}` : ""), typeof item.url === "string" && item.url.startsWith("https://") && /* @__PURE__ */ React.createElement("a", { href: item.url, target: "_blank", rel: "noopener noreferrer", className: "ui-link inline-flex items-center gap-1 text-xs" }, item.link_label || item.url, /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt", "aria-hidden": "true" })))));
+    };
+    const describeDashboardSupport = (support, connectionLabel = "") => {
+      const state = (support == null ? void 0 : support.state) || "unknown";
+      if (state === "available") {
+        return `${connectionLabel || "This Splunk connection"} offers the Constellation dashboard tools. Ask for a dashboard in chat, or use Create Dashboard on a report.`;
+      }
+      if (state === "potential") {
+        return "This Splunk environment does not offer the dashboard tools yet. To create dashboards here, install these apps in that Splunk environment:";
+      }
+      if (state === "incompatible") {
+        const problems = Array.isArray(support == null ? void 0 : support.problems) ? support.problems.join(" ") : "";
+        return ["This Splunk environment lists the dashboard tools, but not in the version this app supports.", problems, "Update Constellation in that Splunk environment:"].filter(Boolean).join(" ");
+      }
+      return (support == null ? void 0 : support.message) || "Not checked yet.";
+    };
+    const renderDashboardConnectionSettings = (capability) => {
+      const entry = capabilityConnections.splunk_dashboards || { status: "idle", connections: [] };
+      const connections = Array.isArray(entry.connections) ? entry.connections : [];
+      const isBusy = !!(capabilityActionState == null ? void 0 : capabilityActionState[capability.name]);
+      return /* @__PURE__ */ React.createElement(
+        "details",
+        {
+          "data-testid": "dashboard-connection-settings",
+          className: `mt-3 rounded-lg border ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-white"}`,
+          onToggle: (event) => {
+            if (event.currentTarget.open && entry.status === "idle") {
+              loadCapabilityConnections("splunk_dashboards");
+            }
+          }
+        },
+        /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}` }, "Splunk connections and Splunk Web addresses"),
+        /* @__PURE__ */ React.createElement("div", { className: "space-y-3 px-3 pb-3" }, /* @__PURE__ */ React.createElement("p", { className: `text-xs ${mutedTextClass}` }, "Dashboards work on each connection whose Splunk MCP Server offers the Constellation tools. Dashboard links must match the connection's Splunk Web address. If the address guessed from the connection is wrong, enter the right one."), entry.status === "loading" && connections.length === 0 && /* @__PURE__ */ React.createElement("p", { role: "status", className: `text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-1", "aria-hidden": "true" }), "Checking each Splunk connection..."), entry.status === "error" && /* @__PURE__ */ React.createElement("p", { role: "alert", className: `text-xs ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, entry.error), entry.status !== "loading" && entry.status !== "error" && entry.status !== "idle" && connections.length === 0 && /* @__PURE__ */ React.createElement("p", { className: `text-xs ${mutedTextClass}` }, "No Splunk connections are saved yet. Add one in Settings."), connections.map((connection) => {
+          var _a2;
+          const connectionName = String(connection.name || "");
+          const inputId = `dashboard-web-url-${connectionName || "active"}`.replace(/[^A-Za-z0-9_-]/g, "-");
+          const support = connection.support || {};
+          return /* @__PURE__ */ React.createElement("div", { key: connectionName || "__active__", "data-testid": "dashboard-connection-row", "data-connection": connectionName, className: `rounded-md border px-3 py-2 ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, connection.label || connectionName || "Active connection"), connection.active && /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${getDashboardToneClasses("neutral")}` }, "In use"), renderDashboardSupportChip(support.state || "unknown", "dashboard-connection-support")), /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs ${mutedTextClass}` }, [support.message, ...Array.isArray(support.problems) ? support.problems : []].filter(Boolean).join(" ")), /* @__PURE__ */ React.createElement("label", { htmlFor: inputId, className: `mt-2 block text-xs font-medium ${headingClass}` }, "Splunk Web address"), /* @__PURE__ */ React.createElement(
+            "input",
+            {
+              id: inputId,
+              type: "url",
+              value: (_a2 = dashboardWebUrlDrafts[connectionName]) != null ? _a2 : "",
+              onChange: (event) => {
+                const value = event.target.value;
+                setDashboardWebUrlDrafts((prev) => ({ ...prev, [connectionName]: value }));
+                setDashboardWebUrlSave((prev) => prev.error || prev.notice ? { ...prev, error: "", notice: "" } : prev);
+              },
+              placeholder: connection.derived_splunk_web_url || "https://splunk.example.com:8000",
+              className: `mt-1 w-full rounded-md border px-3 py-1.5 text-xs font-mono ${isDarkTheme ? "bg-gray-950 border-gray-700 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`
+            }
+          ), !dashboardWebUrlDrafts[connectionName] && connection.derived_splunk_web_url && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs ${mutedTextClass}` }, "Leave empty to use ", connection.derived_splunk_web_url, "."));
+        }), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: saveDashboardWebUrls, disabled: isBusy || dashboardWebUrlSave.saving || connections.length === 0, className: getCapabilityActionButtonClass(true, isBusy || dashboardWebUrlSave.saving), "data-testid": "dashboard-save-web-urls" }, dashboardWebUrlSave.saving ? "Saving..." : "Save Addresses"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => loadCapabilityConnections("splunk_dashboards", { refresh: true }), disabled: entry.status === "loading", className: getCapabilityActionButtonClass(false, entry.status === "loading") }, entry.status === "loading" ? "Checking..." : "Check Again")), dashboardWebUrlSave.error && /* @__PURE__ */ React.createElement("p", { role: "alert", "data-testid": "dashboard-web-url-error", className: `text-xs ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, dashboardWebUrlSave.error), dashboardWebUrlSave.notice && /* @__PURE__ */ React.createElement("p", { role: "status", "data-testid": "dashboard-web-url-notice", className: `text-xs ${isDarkTheme ? "text-emerald-300" : "text-emerald-700"}` }, dashboardWebUrlSave.notice))
+      );
+    };
+    const renderDashboardCapabilityPanel = (capability) => {
+      var _a2;
+      const view = dashboardStatus.data;
+      const support = (view == null ? void 0 : view.support) || null;
+      const supportState = !support && dashboardStatus.status !== "error" ? "loading" : (support == null ? void 0 : support.state) || "unknown";
+      const connectionLabel = ((_a2 = view == null ? void 0 : view.connection) == null ? void 0 : _a2.connection_label) || "";
+      const requirements = Array.isArray(view == null ? void 0 : view.requirements) && view.requirements.length > 0 ? view.requirements : capability.splunk_requirements;
+      const message = supportState === "loading" ? "Checking this Splunk connection for the dashboard tools..." : support ? describeDashboardSupport(support, connectionLabel) : dashboardStatus.error || "Not checked yet.";
+      const showBlockedReason = !!((view == null ? void 0 : view.enabled) && !(view == null ? void 0 : view.can_create) && supportState === "available" && (view == null ? void 0 : view.blocked_reason));
+      const operations = capability.installed ? (dashboardOperations.items || []).slice(0, 5) : [];
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": "dashboard-capability-panel", className: `mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, connectionLabel ? `Splunk connection: ${connectionLabel}` : "This Splunk connection"), renderDashboardSupportChip(supportState, "dashboard-support-state")), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => loadDashboardStatus({ refresh: true }), disabled: dashboardStatus.status === "loading", className: "ui-link text-xs disabled:opacity-60" }, dashboardStatus.status === "loading" ? "Checking..." : "Check Again")), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, "data-testid": "dashboard-support-message" }, message), (supportState === "potential" || supportState === "incompatible") && renderSplunkRequirementLinks(requirements, "dashboard-requirements"), showBlockedReason && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, "data-testid": "dashboard-blocked-reason" }, view.blocked_reason), operations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3", "data-testid": "dashboard-recent" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, "Your recent dashboards"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-2" }, operations.map((operation) => {
+        var _a3, _b2;
+        return /* @__PURE__ */ React.createElement("li", { key: operation.request_id, className: "flex flex-wrap items-center justify-between gap-2 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: "min-w-0 break-words" }, /* @__PURE__ */ React.createElement("span", { className: `font-medium ${headingClass}` }, operation.title || "Untitled dashboard"), /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, " · ", DASHBOARD_STATUS_LABELS[operation.status] || operation.status, operation.created_at ? ` · ${formatDashboardTime(operation.created_at)}` : "")), /* @__PURE__ */ React.createElement("span", { className: "flex flex-wrap gap-3" }, ((_a3 = operation.receipt) == null ? void 0 : _a3.view_url) && /* @__PURE__ */ React.createElement("a", { href: operation.receipt.view_url, target: "_blank", rel: "noopener noreferrer", className: "ui-link" }, "Open Dashboard"), ((_b2 = operation.receipt) == null ? void 0 : _b2.edit_url) && /* @__PURE__ */ React.createElement("a", { href: operation.receipt.edit_url, target: "_blank", rel: "noopener noreferrer", className: "ui-link" }, "Edit in Constellation")));
+      }))), isCapabilityAdmin && capability.installed && renderDashboardConnectionSettings(capability));
+    };
+    const renderCapabilitySplunkRequirements = (capability) => {
+      var _a2;
+      const requirements = Array.isArray(capability == null ? void 0 : capability.splunk_requirements) ? capability.splunk_requirements : [];
+      const requiredTools = Array.isArray(capability == null ? void 0 : capability.required_mcp_tools) ? capability.required_mcp_tools : [];
+      if (requirements.length === 0 && requiredTools.length === 0) {
+        return null;
+      }
+      const support = capability.name === "splunk_dashboards" ? (_a2 = dashboardStatus.data) == null ? void 0 : _a2.support : null;
+      return /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-4 ${panelMutedClass}`, "data-testid": "capability-detail-splunk-requirements" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Needs in Splunk"), requiredTools.length > 0 && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm ${subtextClass}` }, "Works only on Splunk connections whose Splunk MCP Server offers ", requiredTools.map((tool, index) => /* @__PURE__ */ React.createElement(React.Fragment, { key: tool }, index > 0 ? index === requiredTools.length - 1 ? " and " : ", " : "", /* @__PURE__ */ React.createElement("code", null, tool))), ". Install these in each Splunk environment where you want to use it:"), renderSplunkRequirementLinks(requirements, "capability-detail-requirement-links"), support && /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-2 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, "Your Splunk connection:"), renderDashboardSupportChip(support.state || "unknown", "capability-detail-support-state")));
     };
     const renderCapabilityNotice = () => {
       var _a2;
@@ -9794,6 +10562,7 @@ What should we check first? Run the first search that helps.`);
                     visualization_spec: result.visualization_spec,
                     spl_in_text: result.spl_in_text,
                     capability_usage: Array.isArray(result.capability_usage) ? result.capability_usage : [],
+                    dashboard_proposal: sanitizeDashboardProposal(result.dashboard_proposal) || void 0,
                     has_follow_on: mergedFollowOnActions.length > 0,
                     follow_on_actions: mergedFollowOnActions,
                     status_timeline: result.status_timeline,
@@ -9989,6 +10758,59 @@ What should we check first? Run the first search that helps.`);
     };
     const toggleChatReplyPanel = (messageId, panelKey) => {
       setChatReplyPanels((prev) => ({ ...prev, [messageId]: prev[messageId] === panelKey ? null : panelKey }));
+    };
+    const updateChatMessageFields = (messageId, patch) => {
+      setChatMessages((prev) => prev.map((message) => message.id === messageId ? { ...message, ...patch } : message));
+    };
+    const updateReportDashboardPlan = (reportName, patch) => {
+      setReportDashboardPlans((prev) => {
+        if (patch == null ? void 0 : patch.dashboard_dismissed) {
+          const next = { ...prev };
+          delete next[reportName];
+          return next;
+        }
+        return { ...prev, [reportName]: { ...prev[reportName] || {}, ...patch } };
+      });
+    };
+    const proposeDashboardFromReport = async (reportName) => {
+      var _a2;
+      if (!reportName || ((_a2 = reportDashboardPlans[reportName]) == null ? void 0 : _a2.status) === "loading") {
+        return;
+      }
+      setReportDashboardPlans((prev) => ({ ...prev, [reportName]: { status: "loading" } }));
+      try {
+        const response = await fetch("/api/dashboards/propose", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ report_name: reportName })
+        });
+        const data = await response.json().catch(() => ({}));
+        const proposal = response.ok ? sanitizeDashboardProposal(data.proposal) : null;
+        if (!proposal) {
+          setReportDashboardPlans((prev) => {
+            var _a3;
+            return {
+              ...prev,
+              [reportName]: {
+                status: "error",
+                error: dashboardApiError(data, "Could not draft a dashboard plan from this report. Try again."),
+                supportState: typeof ((_a3 = data == null ? void 0 : data.support) == null ? void 0 : _a3.state) === "string" ? data.support.state : "",
+                requirements: Array.isArray(data == null ? void 0 : data.requirements) ? data.requirements : []
+              }
+            };
+          });
+          return;
+        }
+        setReportDashboardPlans((prev) => ({
+          ...prev,
+          [reportName]: { status: "ready", dashboard_proposal: proposal, dashboard_operation: null }
+        }));
+      } catch (error) {
+        setReportDashboardPlans((prev) => ({
+          ...prev,
+          [reportName]: { status: "error", error: "Could not reach Splunk Discovery Tool. Check your connection and try again.", requirements: [] }
+        }));
+      }
     };
     const loadReport = async (filename) => {
       try {
@@ -10998,9 +11820,9 @@ What should we check first? Run the first search that helps.`);
     const riskAreasSection = getSummarySection(summarySections, "Risk Areas");
     const trendStorySection = getSummarySection(summarySections, "Trend Story");
     const nextLoopSection = getSummarySection(summarySections, "Next Check") || getSummarySection(summarySections, "Recursive Next Loop");
-    const readinessScore = typeof ((_R = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _R : (_Q = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _Q.readiness_score) === "number" ? (_T = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _T : (_S = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _S.readiness_score : null;
+    const readinessScore = typeof ((_S = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _S : (_R = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _R.readiness_score) === "number" ? (_U = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _U : (_T = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _T.readiness_score : null;
     const coverageGapItems = Array.isArray(summaryData == null ? void 0 : summaryData.coverage_gaps) ? summaryData.coverage_gaps.filter((gap) => gap && typeof gap === "object" && gap.gap).slice(0, 3) : [];
-    const trendDomainEntries = ((_U = summaryData == null ? void 0 : summaryData.trend_signals) == null ? void 0 : _U.recommendation_by_domain) ? Object.entries(summaryData.trend_signals.recommendation_by_domain).filter(([, count]) => Number(count) > 0) : [];
+    const trendDomainEntries = ((_V = summaryData == null ? void 0 : summaryData.trend_signals) == null ? void 0 : _V.recommendation_by_domain) ? Object.entries(summaryData.trend_signals.recommendation_by_domain).filter(([, count]) => Number(count) > 0) : [];
     const contextExplorer = (summaryData == null ? void 0 : summaryData.context_explorer) && typeof summaryData.context_explorer === "object" ? summaryData.context_explorer : {};
     const contextOverview = (contextExplorer == null ? void 0 : contextExplorer.overview) && typeof contextExplorer.overview === "object" ? contextExplorer.overview : {};
     const contextAnchors = (contextExplorer == null ? void 0 : contextExplorer.anchors) && typeof contextExplorer.anchors === "object" ? contextExplorer.anchors : {};
@@ -11113,7 +11935,7 @@ What should we check first? Run the first search that helps.`);
       }))
     ].filter((option) => option.key === "all" || option.count > 0);
     const activeTaskFilterKey = taskFilterOptions.some((option) => option.key === taskFilter) ? taskFilter : "all";
-    const activeTaskFilterLabel = ((_V = taskFilterOptions.find((option) => option.key === activeTaskFilterKey)) == null ? void 0 : _V.label) || "All";
+    const activeTaskFilterLabel = ((_W = taskFilterOptions.find((option) => option.key === activeTaskFilterKey)) == null ? void 0 : _W.label) || "All";
     const filteredTaskSnapshots = sortedTaskProgressSnapshots.filter(({ task, progress: progress2 }) => {
       if (activeTaskFilterKey === "all") {
         return true;
@@ -11687,7 +12509,8 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       const selectedReportModifiedAt = (selectedWorkspaceReportRecord == null ? void 0 : selectedWorkspaceReportRecord.modified_at) || (selectedWorkspaceReportRecord == null ? void 0 : selectedWorkspaceReportRecord.modified) || null;
       const reportSplQueries = Array.isArray(reportContent == null ? void 0 : reportContent.spl_queries) ? reportContent.spl_queries : [];
       const reportContextExcerpt = (reportContent == null ? void 0 : reportContent.type) === "text" ? String((reportContent == null ? void 0 : reportContent.content) || "").slice(0, 900) : "";
-      return /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { "data-testid": "report-viewer-title", className: `text-lg font-semibold ${headingClass}` }, getReportDisplayName(selectedReport)), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs break-all ${mutedTextClass}` }, selectedReport), /* @__PURE__ */ React.createElement("div", { className: `mt-2 flex flex-wrap items-center gap-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 border ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, selectedReportType), selectedReportSize != null && /* @__PURE__ */ React.createElement("span", null, (selectedReportSize / 1024).toFixed(1), " KB"), selectedReportModifiedAt && /* @__PURE__ */ React.createElement("span", null, formatMissionDateTime(selectedReportModifiedAt)))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, reportContent.type === "image" && /* @__PURE__ */ React.createElement(
+      const reportDashboardEntry = reportDashboardPlans[selectedReport] || null;
+      return /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { "data-testid": "report-viewer-title", className: `text-lg font-semibold ${headingClass}` }, getReportDisplayName(selectedReport)), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs break-all ${mutedTextClass}` }, selectedReport), /* @__PURE__ */ React.createElement("div", { className: `mt-2 flex flex-wrap items-center gap-2 text-xs ${mutedTextClass}` }, /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full px-2.5 py-1 border ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-200" : "bg-gray-50 border-gray-200 text-gray-700"}` }, selectedReportType), selectedReportSize != null && /* @__PURE__ */ React.createElement("span", null, (selectedReportSize / 1024).toFixed(1), " KB"), selectedReportModifiedAt && /* @__PURE__ */ React.createElement("span", null, formatMissionDateTime(selectedReportModifiedAt)))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-3" }, reportContent.type === "image" && /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
@@ -11717,7 +12540,33 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         },
         /* @__PURE__ */ React.createElement("i", { className: `fas ${reportShareExportLoading ? "fa-spinner fa-spin" : "fa-user-secret"} mr-1`, "aria-hidden": "true" }),
         "Export with Stand-ins"
-      )))), /* @__PURE__ */ React.createElement(
+      ), dashboardsCapabilityOn && reportContent.type !== "image" && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => proposeDashboardFromReport(selectedReport),
+          disabled: (reportDashboardEntry == null ? void 0 : reportDashboardEntry.status) === "loading",
+          className: "ui-link disabled:opacity-60 disabled:cursor-wait",
+          title: "Draft a Splunk dashboard plan from this report to review before anything is sent",
+          "data-testid": "report-create-dashboard"
+        },
+        /* @__PURE__ */ React.createElement("i", { className: `fas ${(reportDashboardEntry == null ? void 0 : reportDashboardEntry.status) === "loading" ? "fa-spinner fa-spin" : "fa-chart-pie"} mr-1`, "aria-hidden": "true" }),
+        "Create Dashboard"
+      )))), reportDashboardEntry && /* @__PURE__ */ React.createElement("div", { className: `px-6 pt-4 pb-2 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}`, "data-testid": "report-dashboard-area" }, reportDashboardEntry.status === "loading" && /* @__PURE__ */ React.createElement("p", { role: "status", className: `text-sm ${subtextClass}` }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-spinner fa-spin mr-2", "aria-hidden": "true" }), "Drafting a dashboard plan from this report..."), reportDashboardEntry.status === "error" && /* @__PURE__ */ React.createElement("div", { role: "alert", className: `rounded-lg border px-4 py-3 text-sm ${isDarkTheme ? "bg-amber-950 border-amber-800 text-amber-100" : "bg-amber-50 border-amber-200 text-amber-900"}`, "data-testid": "report-dashboard-error" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("p", { className: "whitespace-pre-wrap break-words" }, reportDashboardEntry.error), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => updateReportDashboardPlan(selectedReport, { dashboard_dismissed: true }), className: "ui-link text-xs flex-shrink-0" }, "Close")), ["potential", "incompatible"].includes(reportDashboardEntry.supportState) && renderSplunkRequirementLinks(reportDashboardEntry.requirements, "report-dashboard-requirements")), reportDashboardEntry.status === "ready" && reportDashboardEntry.dashboard_proposal && /* @__PURE__ */ React.createElement(
+        DashboardPlanCard,
+        {
+          key: reportDashboardEntry.dashboard_proposal.proposal_id,
+          proposal: reportDashboardEntry.dashboard_proposal,
+          operation: reportDashboardEntry.dashboard_operation || null,
+          isDarkTheme,
+          headingClass,
+          subtextClass,
+          mutedTextClass,
+          incognitoActive,
+          testIdPrefix: "report-dashboard",
+          onChange: (patch) => updateReportDashboardPlan(selectedReport, patch)
+        }
+      )), /* @__PURE__ */ React.createElement(
         "div",
         {
           className: "p-6 overflow-y-auto scroll-container",
@@ -11866,7 +12715,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       },
       /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `h-2.5 w-2.5 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}` }),
       /* @__PURE__ */ React.createElement("span", { className: "hidden sm:inline font-medium" }, headerConnectionMeta.label),
-      ((_W = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _W.configured) && /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `hidden xl:inline max-w-[16rem] truncate ${mutedTextClass}` }, headerLlmDisplayLabel)
+      ((_X = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _X.configured) && /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `hidden xl:inline max-w-[16rem] truncate ${mutedTextClass}` }, headerLlmDisplayLabel)
     ), /* @__PURE__ */ React.createElement(
       "button",
       {
@@ -12134,11 +12983,11 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           var _a2, _b2;
           return downloadCapabilityExport(((_a2 = exportBuildState.bundle) == null ? void 0 : _a2.download_name) || ((_b2 = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _b2.name));
         },
-        disabled: !(((_X = exportBuildState.bundle) == null ? void 0 : _X.download_name) || ((_Y = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _Y.name)),
-        className: `px-3 py-1 whitespace-nowrap rounded ${((_Z = exportBuildState.bundle) == null ? void 0 : _Z.download_name) || ((__ = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : __.name) ? "bg-slate-700 hover:bg-slate-800 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
+        disabled: !(((_Y = exportBuildState.bundle) == null ? void 0 : _Y.download_name) || ((_Z = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _Z.name)),
+        className: `px-3 py-1 whitespace-nowrap rounded ${((__ = exportBuildState.bundle) == null ? void 0 : __.download_name) || ((_$ = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _$.name) ? "bg-slate-700 hover:bg-slate-800 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
       },
       downloadPackageLabel
-    ))), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Contents: ", packageTargetLabel, "."), !canUseExportTools && /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "To build a package, install Report Packages on the Capabilities tab and turn it on."), exportBuildState.status === "error" && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "border-red-800 bg-red-950 text-red-200" : "border-red-200 bg-red-50 text-red-700"}` }, exportBuildState.error), activePackageBundle ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${subtextClass}` }, /* @__PURE__ */ React.createElement("div", { className: "font-medium mb-1" }, packageCardTitle), /* @__PURE__ */ React.createElement("div", null, "Contents: ", packageTargetLabel), /* @__PURE__ */ React.createElement("div", null, "Package: ", formatPackageFileLabel(((_$ = exportBuildState.bundle) == null ? void 0 : _$.bundle_name) || ((_aa = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _aa.name))), ((_ba = exportBuildState.bundle) == null ? void 0 : _ba.session_timestamp) && /* @__PURE__ */ React.createElement("div", null, "Run: ", formatMissionSessionSelectionLabel(exportBuildState.bundle.session_timestamp)), ((_ca = exportBuildState.bundle) == null ? void 0 : _ca.artifact_count) != null && /* @__PURE__ */ React.createElement("div", null, "Files included: ", exportBuildState.bundle.artifact_count), ((_da = exportBuildState.bundle) == null ? void 0 : _da.operator_voice_label) && /* @__PURE__ */ React.createElement("div", null, "Style: ", exportBuildState.bundle.operator_voice_label), (((_ea = exportBuildState.bundle) == null ? void 0 : _ea.bundle_size_bytes) || ((_fa = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _fa.size_bytes)) && /* @__PURE__ */ React.createElement("div", null, "Size: ", formatByteSize(((_ga = exportBuildState.bundle) == null ? void 0 : _ga.bundle_size_bytes) || ((_ha = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ha.size_bytes))), !hasFreshPackageBuild && /* @__PURE__ */ React.createElement("div", { className: `mt-2 ${mutedTextClass}` }, "Built earlier. Select Build Report Package to make a new one.")) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${mutedTextClass}` }, "No package built yet.")))))), isIntelligenceTab && /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-3 mb-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-semibold ${headingClass}` }, "Findings"), /* @__PURE__ */ React.createElement("p", { className: `text-sm ${subtextClass}` }, "Coverage gaps, investigations, and evidence from the latest discovery run.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, renderOperatorVoiceSelect(), renderWorkspaceRefreshButton(refreshIntelligenceWorkspace, "Refresh findings"))), !v2Intelligence || !v2Intelligence.has_data ? /* @__PURE__ */ React.createElement("div", { className: `text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}` }, "No findings yet. Run discovery from the Discovery tab to see findings here.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-hero rounded-xl border p-5 mb-4 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Latest run"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}` }, missionFreshness.label), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Last run: ", formatMissionDateTime((latestMissionSession == null ? void 0 : latestMissionSession.created_at) || (latestMissionSession == null ? void 0 : latestMissionSession.timestamp), (latestMissionSession == null ? void 0 : latestMissionSession.timestamp) || "Unavailable"))), /* @__PURE__ */ React.createElement("h3", { className: `mt-3 text-xl font-semibold ${headingClass}` }, intelligenceHeadline), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, intelligenceWhyNow)), /* @__PURE__ */ React.createElement("div", { "data-testid": "findings-stats", className: "mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3" }, intelligenceSummaryCards.map(renderWorkspaceMetricCard))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4" }, renderFindingsList({
+    ))), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Contents: ", packageTargetLabel, "."), !canUseExportTools && /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "To build a package, install Report Packages on the Capabilities tab and turn it on."), exportBuildState.status === "error" && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "border-red-800 bg-red-950 text-red-200" : "border-red-200 bg-red-50 text-red-700"}` }, exportBuildState.error), activePackageBundle ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${subtextClass}` }, /* @__PURE__ */ React.createElement("div", { className: "font-medium mb-1" }, packageCardTitle), /* @__PURE__ */ React.createElement("div", null, "Contents: ", packageTargetLabel), /* @__PURE__ */ React.createElement("div", null, "Package: ", formatPackageFileLabel(((_aa = exportBuildState.bundle) == null ? void 0 : _aa.bundle_name) || ((_ba = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ba.name))), ((_ca = exportBuildState.bundle) == null ? void 0 : _ca.session_timestamp) && /* @__PURE__ */ React.createElement("div", null, "Run: ", formatMissionSessionSelectionLabel(exportBuildState.bundle.session_timestamp)), ((_da = exportBuildState.bundle) == null ? void 0 : _da.artifact_count) != null && /* @__PURE__ */ React.createElement("div", null, "Files included: ", exportBuildState.bundle.artifact_count), ((_ea = exportBuildState.bundle) == null ? void 0 : _ea.operator_voice_label) && /* @__PURE__ */ React.createElement("div", null, "Style: ", exportBuildState.bundle.operator_voice_label), (((_fa = exportBuildState.bundle) == null ? void 0 : _fa.bundle_size_bytes) || ((_ga = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ga.size_bytes)) && /* @__PURE__ */ React.createElement("div", null, "Size: ", formatByteSize(((_ha = exportBuildState.bundle) == null ? void 0 : _ha.bundle_size_bytes) || ((_ia = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ia.size_bytes))), !hasFreshPackageBuild && /* @__PURE__ */ React.createElement("div", { className: `mt-2 ${mutedTextClass}` }, "Built earlier. Select Build Report Package to make a new one.")) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${mutedTextClass}` }, "No package built yet.")))))), isIntelligenceTab && /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-3 mb-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-semibold ${headingClass}` }, "Findings"), /* @__PURE__ */ React.createElement("p", { className: `text-sm ${subtextClass}` }, "Coverage gaps, investigations, and evidence from the latest discovery run.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, renderOperatorVoiceSelect(), renderWorkspaceRefreshButton(refreshIntelligenceWorkspace, "Refresh findings"))), !v2Intelligence || !v2Intelligence.has_data ? /* @__PURE__ */ React.createElement("div", { className: `text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}` }, "No findings yet. Run discovery from the Discovery tab to see findings here.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-hero rounded-xl border p-5 mb-4 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Latest run"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}` }, missionFreshness.label), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Last run: ", formatMissionDateTime((latestMissionSession == null ? void 0 : latestMissionSession.created_at) || (latestMissionSession == null ? void 0 : latestMissionSession.timestamp), (latestMissionSession == null ? void 0 : latestMissionSession.timestamp) || "Unavailable"))), /* @__PURE__ */ React.createElement("h3", { className: `mt-3 text-xl font-semibold ${headingClass}` }, intelligenceHeadline), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, intelligenceWhyNow)), /* @__PURE__ */ React.createElement("div", { "data-testid": "findings-stats", className: "mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3" }, intelligenceSummaryCards.map(renderWorkspaceMetricCard))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4" }, renderFindingsList({
       key: "admin",
       icon: "fa-shield-alt",
       iconClass: "text-rose-600",
@@ -12162,7 +13011,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       audience: "For leadership.",
       items: findingsExecutiveItems,
       emptyText: "No executive summary was generated."
-    })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Environment Profile")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs mb-3" }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Splunk"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, v2Overview.splunk_version || "Unknown"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, "License: ", v2Overview.license_state || "Unknown")), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Data"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_ia = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ia.indexes) || v2Overview.total_indexes), " indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_ja = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ja.sourcetypes) || v2Overview.total_sourcetypes), " sourcetypes • ", formatMissionMetricValue(((_ka = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ka.sources) || v2Overview.total_sources), " sources")), /* @__PURE__ */ React.createElement("div", { className: `col-span-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Users and objects"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_la = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _la.users) || v2Overview.total_users), " users"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_ma = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _ma.knowledge_objects) || v2Overview.total_knowledge_objects), " knowledge objects • ", formatMissionMetricValue(((_na = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _na.kv_collections) || v2Overview.total_kv_collections), " KV collections")))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stream text-emerald-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Key evidence")), v2FindingLedger.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "No evidence recorded.") : /* @__PURE__ */ React.createElement("ul", { className: "space-y-2 text-xs" }, v2FindingLedger.slice(0, 6).map((entry, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `font-medium ${headingClass}` }, "Step ", entry.step || 0, ": ", entry.title || "Discovery step"), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, formatMissionDateTime(entry.timestamp, "Time not recorded"))), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, summarizeFindingEntry(entry))))))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-fingerprint text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Patterns")), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, "Themes that came up repeatedly in the latest run.")), intelligenceNotablePatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-end gap-2" }, hasExpandableIntelligencePatterns && /* @__PURE__ */ React.createElement(
+    })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Environment Profile")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs mb-3" }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Splunk"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, v2Overview.splunk_version || "Unknown"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, "License: ", v2Overview.license_state || "Unknown")), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Data"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_ja = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ja.indexes) || v2Overview.total_indexes), " indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_ka = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ka.sourcetypes) || v2Overview.total_sourcetypes), " sourcetypes • ", formatMissionMetricValue(((_la = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _la.sources) || v2Overview.total_sources), " sources")), /* @__PURE__ */ React.createElement("div", { className: `col-span-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Users and objects"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_ma = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _ma.users) || v2Overview.total_users), " users"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_na = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _na.knowledge_objects) || v2Overview.total_knowledge_objects), " knowledge objects • ", formatMissionMetricValue(((_oa = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _oa.kv_collections) || v2Overview.total_kv_collections), " KV collections")))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stream text-emerald-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Key evidence")), v2FindingLedger.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "No evidence recorded.") : /* @__PURE__ */ React.createElement("ul", { className: "space-y-2 text-xs" }, v2FindingLedger.slice(0, 6).map((entry, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `font-medium ${headingClass}` }, "Step ", entry.step || 0, ": ", entry.title || "Discovery step"), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, formatMissionDateTime(entry.timestamp, "Time not recorded"))), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, summarizeFindingEntry(entry))))))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-fingerprint text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Patterns")), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, "Themes that came up repeatedly in the latest run.")), intelligenceNotablePatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-end gap-2" }, hasExpandableIntelligencePatterns && /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
@@ -12217,7 +13066,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: `inline-flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full border ${isDarkTheme ? "border-gray-600 bg-gray-800 text-sky-200 hover:bg-gray-700" : "border-gray-300 bg-white text-sky-700 hover:bg-sky-50"}`
         },
         /* @__PURE__ */ React.createElement("i", { className: "fa-solid fa-circle-info text-sm", "aria-hidden": "true" })
-      )), (showHealthMessage || capabilityFacts.length > 0) && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-xs ${mutedTextClass}` }, showHealthMessage ? capability.health_message : "", showHealthMessage && capabilityFacts.length > 0 ? " " : "", capabilityFacts.join(" · ")), lifecycle === "not_installed" && capability.install_method === "pip" && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-xs ${mutedTextClass}` }, "Installing downloads extra Python packages, which can take a few minutes."), canBuildDeeplink && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("label", { htmlFor: `deeplink-query-${capability.name}`, className: `block text-sm font-medium mb-2 ${headingClass}` }, "Build a Splunk search link"), /* @__PURE__ */ React.createElement(
+      )), (showHealthMessage || capabilityFacts.length > 0) && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-xs ${mutedTextClass}` }, showHealthMessage ? capability.health_message : "", showHealthMessage && capabilityFacts.length > 0 ? " " : "", capabilityFacts.join(" · ")), lifecycle === "not_installed" && capability.install_method === "pip" && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-xs ${mutedTextClass}` }, "Installing downloads extra Python packages, which can take a few minutes."), capability.name === "splunk_dashboards" && renderDashboardCapabilityPanel(capability), canBuildDeeplink && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("label", { htmlFor: `deeplink-query-${capability.name}`, className: `block text-sm font-medium mb-2 ${headingClass}` }, "Build a Splunk search link"), /* @__PURE__ */ React.createElement(
         "textarea",
         {
           id: `deeplink-query-${capability.name}`,
@@ -12292,7 +13141,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-external-link-alt mr-1.5", "aria-hidden": "true" }),
         "Open in Splunk"
-      ))), /* @__PURE__ */ React.createElement("div", { className: "mt-4" }, renderCapabilityLifecycleActions(capability)), capability.installed && /* @__PURE__ */ React.createElement("details", { className: `mt-3 rounded-lg border ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}` }, "Advanced settings"), /* @__PURE__ */ React.createElement("div", { className: "px-3 pb-3" }, /* @__PURE__ */ React.createElement(
+      ))), /* @__PURE__ */ React.createElement("div", { className: "mt-4" }, renderCapabilityLifecycleActions(capability)), capability.installed && isCapabilityAdmin && /* @__PURE__ */ React.createElement("details", { className: `mt-3 rounded-lg border ${isDarkTheme ? "border-gray-700 bg-gray-900" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("summary", { className: `cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}` }, "Advanced settings"), /* @__PURE__ */ React.createElement("div", { className: "px-3 pb-3" }, /* @__PURE__ */ React.createElement(
         "textarea",
         {
           "aria-label": `Settings for ${capability.title || capability.name} (JSON)`,
@@ -12301,7 +13150,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           rows: 8,
           className: `w-full rounded-lg border px-3 py-2 text-xs font-mono ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-100" : "bg-white border-gray-300 text-gray-900"}`
         }
-      ), capability.name === "rag_local" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "To use this in chat, turn it on here, then turn on Quick Report Search in Chat Settings."), capability.name === "splunk_deeplink_tools" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Set web_base_url to your Splunk Web address, including http:// or https://, if the guessed address is wrong. Select Test to confirm the address works."), capability.name === "visualization_tools" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Keep preview_enabled on to show charts for search results in chat."), capability.name === "export_tools" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Change source_dir and export_dir only if your reports are not in the default output folder. Once it is on, Build Report Package creates a zip with the reports, a summary note, and the runbook."), /* @__PURE__ */ React.createElement(
+      ), capability.name === "rag_local" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "To use this in chat, turn it on here, then turn on Quick Report Search in Chat Settings."), capability.name === "splunk_deeplink_tools" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Set web_base_url to your Splunk Web address, including http:// or https://, if the guessed address is wrong. Select Test to confirm the address works."), capability.name === "splunk_dashboards" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "create_timeout_seconds, status_timeout_seconds, and max_wait_seconds set how long the app waits for Splunk. Set Splunk Web addresses in Splunk connections and Splunk Web addresses above."), capability.name === "visualization_tools" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Keep preview_enabled on to show charts for search results in chat."), capability.name === "export_tools" && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${mutedTextClass}` }, "Change source_dir and export_dir only if your reports are not in the default output folder. Once it is on, Build Report Package creates a zip with the reports, a summary note, and the runbook."), /* @__PURE__ */ React.createElement(
         "button",
         {
           type: "button",
@@ -12840,7 +13689,21 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           const openReplyPanel = replyPanels.some((panel) => panel.key === chatReplyPanels[msg.id]) ? chatReplyPanels[msg.id] : null;
           const replyPanelId = (key) => `chat-reply-${msg.id}-${key}`;
           const nextActions = msg.has_follow_on ? visibleFollowOnActions(msg) : [];
-          return /* @__PURE__ */ React.createElement("div", { key: msg.id, "data-chat-message-id": msg.id, className: "flex min-w-0 items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${assistantAvatarClass}`, "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-xs" })), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("div", { "data-testid": "chat-reply-markdown", className: "space-y-3 text-[15px] leading-7 break-words" }, renderMarkdownDocument(msg.content, { compact: true })), replyPanels.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap gap-2", "data-testid": "chat-reply-toggles" }, replyPanels.map((panel) => {
+          return /* @__PURE__ */ React.createElement("div", { key: msg.id, "data-chat-message-id": msg.id, className: "flex min-w-0 items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full ${assistantAvatarClass}`, "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-robot text-xs" })), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("div", { "data-testid": "chat-reply-markdown", className: "space-y-3 text-[15px] leading-7 break-words" }, renderMarkdownDocument(msg.content, { compact: true })), msg.dashboard_proposal && /* @__PURE__ */ React.createElement(
+            DashboardPlanCard,
+            {
+              proposal: msg.dashboard_proposal,
+              operation: msg.dashboard_operation || null,
+              dismissed: !!msg.dashboard_dismissed,
+              isDarkTheme,
+              headingClass,
+              subtextClass,
+              mutedTextClass,
+              incognitoActive,
+              testIdPrefix: "chat-dashboard",
+              onChange: (patch) => updateChatMessageFields(msg.id, patch)
+            }
+          ), replyPanels.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap gap-2", "data-testid": "chat-reply-toggles" }, replyPanels.map((panel) => {
             const isOpen = openReplyPanel === panel.key;
             return /* @__PURE__ */ React.createElement(
               "button",
@@ -13702,7 +14565,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }),
         "SPL Queries ",
-        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_oa = summaryData.spl_queries) == null ? void 0 : _oa.length) || 0, ")")
+        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_pa = summaryData.spl_queries) == null ? void 0 : _pa.length) || 0, ")")
       ), /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -13717,7 +14580,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2", "aria-hidden": "true" }),
         "Admin Tasks ",
-        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_pa = summaryData.admin_tasks) == null ? void 0 : _pa.length) || 0, ")")
+        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_qa = summaryData.admin_tasks) == null ? void 0 : _qa.length) || 0, ")")
       ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto p-6" }, isLoadingSummary ? /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-center h-full" }, /* @__PURE__ */ React.createElement("div", { className: "text-center max-w-md" }, /* @__PURE__ */ React.createElement("div", { className: "relative mb-8" }, /* @__PURE__ */ React.createElement("div", { className: `inline-block animate-spin rounded-full h-20 w-20 border-4 ${isDarkTheme ? "border-indigo-900 border-t-indigo-400" : "border-indigo-200 border-t-indigo-600"}` }), /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-3xl animate-pulse ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}` })), /* @__PURE__ */ React.createElement("h3", { className: `text-xl font-semibold mb-4 ${headingClass}` }, "Building Your Summary"), /* @__PURE__ */ React.createElement("div", { className: `space-y-3 text-left rounded-lg shadow-sm border p-4 mb-4 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(1) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(1) ? "bg-green-600" : isSummaryStepActive(1) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(1) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(1) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(1) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-300" : "text-gray-700" }, "Loading discovery reports...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(2) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(2) ? "bg-green-600" : isSummaryStepActive(2) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(2) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(2) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(2) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Generating SPL queries...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(3) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(3) ? "bg-green-600" : isSummaryStepActive(3) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(3) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(3) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(3) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Building executive summary...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(4) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(4) ? "bg-green-600" : isSummaryStepActive(4) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(4) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(4) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(4) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Creating admin tasks..."))), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center mb-1" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, summaryProgress.message), /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, summaryProgress.progress, "%")), /* @__PURE__ */ React.createElement("div", { className: `w-full rounded-full h-2 ${isDarkTheme ? "bg-gray-700" : "bg-gray-200"}` }, /* @__PURE__ */ React.createElement(
         "div",
         {
@@ -13743,7 +14606,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: `text-xs tracking-[0.35em] lowercase focus:outline-none ${isDarkTheme ? "text-gray-900" : "text-white"} ${isGeneratingSummaryInfographic ? "cursor-wait" : "cursor-pointer"}`
         },
         "magic"
-      ))), activeTab === "context" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-context", role: "tabpanel", "aria-labelledby": "summary-tab-context", className: "space-y-6" }, !hasContextExplorer ? /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-6 ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-700"}` }, "This summary has no environment details for this run.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Context Explorer"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "The indexes, sourcetypes, and hosts this run found. Use them to start a chat, find related searches, or follow up on risks.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ra = (_qa = contextOverview.readiness_score) != null ? _qa : readinessScore) != null ? _ra : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Out of 100")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_sa = contextOverview.total_indexes) != null ? _sa : contextIndexAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Sourcetypes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ta = contextOverview.total_sourcetypes) != null ? _ta : contextSourcetypeAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Hosts"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ua = contextOverview.total_hosts) != null ? _ua : contextHostAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, contextOverview.data_volume_24h ? `${contextOverview.data_volume_24h} in 24 hours` : "Found by discovery"))))), /* @__PURE__ */ React.createElement("div", { className: "p-6 space-y-6" }, contextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-indigo-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Patterns"))), /* @__PURE__ */ React.createElement("div", { className: `inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${summaryInsetClass} ${headingClass}` }, countLabel(contextPatterns.length, "pattern"))), leadContextPattern && /* @__PURE__ */ React.createElement("div", { className: `mt-4 grid gap-4 ${supportingContextPatterns.length > 0 ? "xl:grid-cols-[minmax(0,1.15fr),minmax(0,0.85fr)]" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Lead pattern"), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, leadContextPattern.title || "Pattern 1"), leadContextPattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, leadContextPattern.description), leadContextPattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-4 py-3 ${summaryCardClass} ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Signal"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm leading-6 break-words" }, leadContextPattern.signal))), supportingContextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, supportingContextPatterns.map((pattern, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-pattern-${idx + 1}`, className: `rounded-lg border px-4 py-4 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-indigo-900 text-indigo-100" : "bg-indigo-100 text-indigo-700"}` }, idx + 2), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, pattern.title || `Pattern ${idx + 2}`), pattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, pattern.description), pattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs leading-5 ${summaryLabelClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Signal:"), " ", pattern.signal))))))), hiddenContextPatternCount > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Showing the top ", visibleContextPatterns.length, " of ", contextPatterns.length, " patterns.")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-3" }, [
+      ))), activeTab === "context" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-context", role: "tabpanel", "aria-labelledby": "summary-tab-context", className: "space-y-6" }, !hasContextExplorer ? /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-6 ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-700"}` }, "This summary has no environment details for this run.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Context Explorer"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "The indexes, sourcetypes, and hosts this run found. Use them to start a chat, find related searches, or follow up on risks.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_sa = (_ra = contextOverview.readiness_score) != null ? _ra : readinessScore) != null ? _sa : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Out of 100")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ta = contextOverview.total_indexes) != null ? _ta : contextIndexAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Sourcetypes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ua = contextOverview.total_sourcetypes) != null ? _ua : contextSourcetypeAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Hosts"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_va = contextOverview.total_hosts) != null ? _va : contextHostAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, contextOverview.data_volume_24h ? `${contextOverview.data_volume_24h} in 24 hours` : "Found by discovery"))))), /* @__PURE__ */ React.createElement("div", { className: "p-6 space-y-6" }, contextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-indigo-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Patterns"))), /* @__PURE__ */ React.createElement("div", { className: `inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${summaryInsetClass} ${headingClass}` }, countLabel(contextPatterns.length, "pattern"))), leadContextPattern && /* @__PURE__ */ React.createElement("div", { className: `mt-4 grid gap-4 ${supportingContextPatterns.length > 0 ? "xl:grid-cols-[minmax(0,1.15fr),minmax(0,0.85fr)]" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Lead pattern"), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, leadContextPattern.title || "Pattern 1"), leadContextPattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, leadContextPattern.description), leadContextPattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-4 py-3 ${summaryCardClass} ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Signal"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm leading-6 break-words" }, leadContextPattern.signal))), supportingContextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, supportingContextPatterns.map((pattern, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-pattern-${idx + 1}`, className: `rounded-lg border px-4 py-4 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-indigo-900 text-indigo-100" : "bg-indigo-100 text-indigo-700"}` }, idx + 2), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, pattern.title || `Pattern ${idx + 2}`), pattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, pattern.description), pattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs leading-5 ${summaryLabelClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Signal:"), " ", pattern.signal))))))), hiddenContextPatternCount > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Showing the top ", visibleContextPatterns.length, " of ", contextPatterns.length, " patterns.")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-3" }, [
         {
           key: "index",
           title: "Indexes",
@@ -14809,7 +15672,7 @@ ${querySpl}`,
           disabled: isUpdateMode,
           autoFocus: !isUpdateMode
         }
-      ), isUpdateMode && /* @__PURE__ */ React.createElement("p", { id: "credential-save-name-hint", className: `text-xs mt-1 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "You cannot rename a connection while you update it.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Provider:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, formatProviderName(selectedProvider))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Model:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_va = document.getElementById("llm-model")) == null ? void 0 : _va.value) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Max response length:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_wa = document.getElementById("llm-max-tokens")) == null ? void 0 : _wa.value) ? `${document.getElementById("llm-max-tokens").value} tokens` : "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Temperature:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_xa = document.getElementById("llm-temperature")) == null ? void 0 : _xa.value) || "Not set")))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
+      ), isUpdateMode && /* @__PURE__ */ React.createElement("p", { id: "credential-save-name-hint", className: `text-xs mt-1 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "You cannot rename a connection while you update it.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Provider:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, formatProviderName(selectedProvider))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Model:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_wa = document.getElementById("llm-model")) == null ? void 0 : _wa.value) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Max response length:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_xa = document.getElementById("llm-max-tokens")) == null ? void 0 : _xa.value) ? `${document.getElementById("llm-max-tokens").value} tokens` : "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Temperature:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_ya = document.getElementById("llm-temperature")) == null ? void 0 : _ya.value) || "Not set")))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           onClick: () => {

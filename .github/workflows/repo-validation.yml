@@ -94,6 +94,9 @@ jobs:
       - name: Run environment memory browser regression
         run: npm run test:environment-memory-browser
 
+      - name: Run dashboards browser regression
+        run: npm run test:dashboards-browser
+
       - name: Run UI contrast browser check
         run: npm run test:ui-contrast-browser
 

@@ -22,10 +22,11 @@ Shipped capability registry (`src/capabilities/registry.py`). Every capability i
 | Quick Report Search | `rag_local` | rag | internal |
 | Knowledge Base | `rag_chromadb` | rag | pip (`chromadb>=1.0,<2`), restart required after install |
 | Splunk Search Links | `splunk_deeplink_tools` | tool_pack | internal |
+| Splunk Dashboards | `splunk_dashboards` | tool_pack | internal; needs Constellation and Splunk MCP Server in each Splunk environment |
 | Charts | `visualization_tools` | tool_pack | internal |
 | Report Packages | `export_tools` | tool_pack | internal |
 
-Capabilities can be installed, turned on, turned off, removed, tested, reindexed (Knowledge Base), and configured from the Capabilities workspace tab. Shipped features that the original proposal did not cover are described in [Shipped Additions](#shipped-additions).
+Capabilities can be installed, turned on, turned off, removed, tested, reindexed (Knowledge Base), and configured from the Capabilities workspace tab, by admins when sign-in is on. Shipped features that the original proposal did not cover are described in [Shipped Additions](#shipped-additions).
 
 ## Current State
 
@@ -328,7 +329,7 @@ Implementation approach:
 
 Recommendation:
 
-Treat this as an app-native tool pack first, not as an external MCP dependency. The current app can surface it through the same tool reasoning model without waiting for external MCP changes.
+Treat this as an app-native tool pack first, not as an external MCP dependency. (Splunk Dashboards later added real Dashboard Studio dashboards through Constellation, a Splunk-side MCP dependency; see [Shipped Additions](#shipped-additions).) The current app can surface it through the same tool reasoning model without waiting for external MCP changes.
 
 ### 2. Export Tools
 
@@ -387,7 +388,7 @@ Recommendation:
 
 Start with option 2.
 
-**Shipped as option 2.** All tool packs are built into the app. A `tool provider` abstraction for other MCP servers is still a proposal.
+**Shipped as option 2, plus Splunk-side tools.** The built-in tool packs run in the app. Splunk Dashboards uses tools that Constellation adds to the same Splunk MCP Server the app already connects to, and shows as a potential capability on connections without them (see [Shipped Additions](#shipped-additions)). A `tool provider` abstraction for other MCP servers is still a proposal.
 
 Reason:
 
@@ -646,3 +647,13 @@ The Knowledge Base health details include `index_freshness`. Its `state` is `cur
 ### The knowledge library is separate from the Knowledge Base index
 
 The knowledge library (`src/knowledge_library/`) downloads Splunk documentation that matches the environment and stores it in its own SQLite index, `output/knowledge_library/docs/library_docs.sqlite3`. The Knowledge Base indexer skips that folder, so the documentation never needs a reindex. Chat adds documentation passages only when Search the Knowledge Base is on. Online library sources are off by default (`library.allow_online_sources`), and only admins can turn them on, refresh them, or import a library pack (`POST /api/knowledge-library/settings`, `POST /api/knowledge-library/refresh`, `POST /api/knowledge-library/pack/import`). The external RAG API and inbound MCP tools read the Knowledge Base only, not the knowledge library.
+
+### Capabilities that need Splunk-side apps
+
+A capability can depend on tools that another Splunk app adds to Splunk MCP Server. Its `CapabilityDefinition` lists those tools in `required_mcp_tools` and the Splunk apps to install in `splunk_requirements` (`CapabilityRequirement` with a `name`, `description`, `url`, and `link_label`). `GET /api/capabilities` returns both. The app checks each connection's MCP tool list (`src/capabilities/connection_support.py`) and reports `available`, `potential` (the tools are missing), `incompatible` (the tools do not take the expected arguments), `checking`, or `unknown`. A capability in the `potential` state still installs and turns on; its card explains what to install in that Splunk environment, with links, and the feature stays unavailable on that connection. Admins see the state of every saved connection through `GET /api/capabilities/{name}/connections`.
+
+Splunk Dashboards (`splunk_dashboards`) is the first such capability. It needs Constellation and Splunk MCP Server in the Splunk environment, drafts a dashboard plan from a chat or a report for the user to review, and sends it to Constellation only when the user selects Create Dashboard. With sign-in on, it uses only the user's own assigned connection, and it is blocked while incognito mode is on. See [SPLUNK_DASHBOARDS.md](SPLUNK_DASHBOARDS.md).
+
+### Admin-only capability changes
+
+With sign-in on, only admins can install, turn on, turn off, remove, test, reindex, or configure a capability (`require_admin_user` on each `POST /api/capabilities/{name}/...` route). Everyone signed in can read capability status, and the Capabilities tab hides the actions from other roles. With sign-in off, anyone can make these changes, as before.

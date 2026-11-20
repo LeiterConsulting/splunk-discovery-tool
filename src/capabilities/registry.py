@@ -2,7 +2,8 @@
 
 from typing import Dict, List, Optional
 
-from capabilities.models import CapabilityDefinition, CapabilityWorkspace
+from capabilities.models import CapabilityDefinition, CapabilityRequirement, CapabilityWorkspace
+from capabilities.tools.dashboards import CREATE_TOOL, STATUS_TOOL
 
 
 KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
@@ -131,6 +132,46 @@ KNOWN_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         enabled_by_default=False,
         priority=30,
         maturity="phase5",
+    ),
+    "splunk_dashboards": CapabilityDefinition(
+        name="splunk_dashboards",
+        title="Splunk Dashboards",
+        category="tool_pack",
+        description="Creates Dashboard Studio dashboards in Splunk from a chat or a report, through Constellation.",
+        purpose="Turns a finding into a private Splunk dashboard and a Constellation draft you can keep editing.",
+        intent="Ask for a dashboard in chat or from a report, review the plan, and open the result in Splunk.",
+        capability_set=[
+            "Drafts a dashboard plan from the conversation or a report for you to review and edit.",
+            "Sends the plan to Splunk only when you click Create, as your own Splunk user.",
+            "Shows Open dashboard and Edit in Constellation links once Splunk confirms the dashboard.",
+        ],
+        install_method="internal",
+        default_config={
+            "create_timeout_seconds": 180,
+            "status_timeout_seconds": 20,
+            "max_wait_seconds": 600,
+            "splunk_web_urls": {},
+        },
+        runtime_available=True,
+        requires_restart_on_install=False,
+        enabled_by_default=False,
+        priority=35,
+        maturity="pilot",
+        required_mcp_tools=[CREATE_TOOL, STATUS_TOOL],
+        splunk_requirements=[
+            CapabilityRequirement(
+                name="Constellation",
+                description="Splunk app that builds the dashboard and adds the two dashboard tools to Splunk MCP Server.",
+                url="https://github.com/LeiterConsulting/constellation/releases",
+                link_label="Constellation releases",
+            ),
+            CapabilityRequirement(
+                name="Splunk MCP Server",
+                description="Splunk app that serves Splunk tools to this app. Constellation registers its tools here.",
+                url="https://splunkbase.splunk.com/app/7931",
+                link_label="Splunk MCP Server on Splunkbase",
+            ),
+        ],
     ),
     "visualization_tools": CapabilityDefinition(
         name="visualization_tools",

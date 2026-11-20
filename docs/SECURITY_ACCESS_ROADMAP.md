@@ -104,8 +104,10 @@ Admin-only endpoints when sign-in is on:
 - `/api/security/tokens`, `/api/security/tokens/{token_id}`, and `POST /api/security/tokens/{token_id}/revoke`
 - `/api/credentials` and `/api/mcp-configs` routes, including load and test
 - knowledge library admin routes: `POST /api/knowledge-library/settings`, `POST /api/knowledge-library/refresh`, and `POST /api/knowledge-library/pack/import`
+- environment memory admin routes: `POST /api/environment-memory/check`, `POST /api/environment-memory/clear`, and `GET` and `POST /api/environment-memory/settings`
+- capability changes: `POST /api/capabilities/{name}/install`, `/enable`, `/disable`, `/uninstall`, `/test`, `/reindex`, and `/config`, plus `GET /api/capabilities/{name}/connections`. Everyone signed in can still read capability status (`GET /api/capabilities`)
 
-`POST /api/discovery/m26-14/validate` (run an M-26-14 check) requires the analyst or admin role. Other app routes, including the capability lifecycle routes under `/api/capabilities/{name}/...` and `POST /api/chat/settings`, require a signed-in user but do not check the role.
+`POST /api/discovery/m26-14/validate` (run an M-26-14 check) requires the analyst or admin role. Splunk dashboards (`POST /api/dashboards/propose` and `/create`) can be created only by admins and analysts, and only through their own assigned MCP connection, with no fallback to the install-wide connection, because Splunk creates each dashboard as the connection's Splunk user. Other app routes, including `POST /api/chat/settings`, require a signed-in user but do not check the role.
 
 Keep authorization simple and explicit. Avoid adding fine-grained scopes inside the core app before the access patterns are real.
 

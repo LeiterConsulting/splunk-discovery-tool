@@ -17,6 +17,24 @@ class CapabilityWorkspace:
 
 
 @dataclass
+class CapabilityRequirement:
+    """Software a capability needs inside the Splunk environment, with where to get it."""
+
+    name: str
+    description: str
+    url: str
+    link_label: str = ""
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "url": self.url,
+            "link_label": self.link_label or self.name,
+        }
+
+
+@dataclass
 class CapabilityDefinition:
     """Static definition for a known capability pack."""
 
@@ -39,6 +57,9 @@ class CapabilityDefinition:
     priority: int = 100
     maturity: str = "foundation"
     workspace: Optional[CapabilityWorkspace] = None
+    # MCP tools every connection must list before the capability works on that connection.
+    required_mcp_tools: List[str] = field(default_factory=list)
+    splunk_requirements: List[CapabilityRequirement] = field(default_factory=list)
 
 
 @dataclass

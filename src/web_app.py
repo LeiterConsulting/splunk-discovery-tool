@@ -46,6 +46,22 @@ from app_version import APP_VERSION
 from config_manager import MASKED_SECRET, ConfigManager, clean_secret, is_unset_secret
 from troubleshooting import capture_startup_state, run_llm_diagnostics, run_mcp_diagnostics, server_code_status
 from capabilities import CapabilityManager, CapabilityRegistry
+from capabilities.connection_support import evaluate_connection_support
+from capabilities.tools.dashboard_service import (
+    DashboardBinding,
+    DashboardBindingChanged,
+    DashboardConflict,
+    DashboardService,
+    build_plan_messages,
+    coerce_brief_draft,
+    detect_dashboard_create_intent,
+    fallback_brief_draft,
+    identity_digest,
+    new_proposal_id,
+    plan_problems,
+)
+from capabilities.tools.dashboard_store import DashboardOperationStore
+from capabilities.tools.dashboards import DASHBOARD_TOOLS, BriefError, check_tool_schema, derive_web_base
 from discovery.engine import DiscoveryEngine
 from discovery.m26_14_advisor import (
     build_profile_from_blueprint as build_m26_14_profile_from_blueprint,
@@ -3525,6 +3541,81 @@ _cached_mcp_tools = {
     "schemas": {},
     "timestamp": 0.0
 }
+
+# Each connection's last tools/list result, keyed by _build_mcp_runtime_identity, so features that need
+# specific tools can check the connection they will use rather than whichever one was listed last.
+_mcp_tool_catalogs: Dict[str, Dict[str, Any]] = {}
+_mcp_tool_catalog_refreshes: Dict[str, "asyncio.Task"] = {}
+MCP_TOOL_CATALOG_LIMIT = 32
+MCP_TOOL_CATALOG_TTL_SECONDS = 60.0
+MCP_TOOL_CATALOG_FAILURE_TTL_SECONDS = 30.0
+
+
+def _record_mcp_tool_catalog(identity: Optional[str], ok: bool, tools: Any = None, schemas: Any = None, error: str = "") -> None:
+    if not identity:
+        return
+    now = time.time()
+    previous = _mcp_tool_catalogs.get(identity)
+    if ok:
+        entry = {"ok": True, "tools": sorted(tools or []), "schemas": dict(schemas or {}), "fetched_at": now, "error": ""}
+    elif previous and previous.get("ok"):
+        # Keep the last good list; a failed refresh does not prove the tools went away.
+        entry = dict(previous, fetched_at=now, error=error)
+    else:
+        entry = {"ok": False, "tools": [], "schemas": {}, "fetched_at": now, "error": error}
+    entry["checked_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    _mcp_tool_catalogs[identity] = entry
+    if len(_mcp_tool_catalogs) > MCP_TOOL_CATALOG_LIMIT:
+        oldest = min(_mcp_tool_catalogs, key=lambda key: _mcp_tool_catalogs[key].get("fetched_at", 0))
+        _mcp_tool_catalogs.pop(oldest, None)
+
+
+def cached_mcp_tool_catalog(config: Any) -> Optional[Dict[str, Any]]:
+    identity = _build_mcp_runtime_identity(config)
+    entry = _mcp_tool_catalogs.get(identity) if identity else None
+    return dict(entry) if entry else None
+
+
+def _mcp_tool_catalog_is_fresh(entry: Optional[Dict[str, Any]]) -> bool:
+    if not entry:
+        return False
+    ttl = MCP_TOOL_CATALOG_TTL_SECONDS if entry.get("ok") and not entry.get("error") else MCP_TOOL_CATALOG_FAILURE_TTL_SECONDS
+    return (time.time() - float(entry.get("fetched_at") or 0)) < ttl
+
+
+async def get_connection_tool_catalog(config: Any, force_refresh: bool = False, wait_seconds: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """The connection's tool list, refreshed when stale. None when the connection has no address.
+
+    With ``wait_seconds``, a slow refresh keeps running in the background and this returns the
+    previous entry, or {"checking": True} when there is none yet.
+    """
+    identity = _build_mcp_runtime_identity(config)
+    if not identity:
+        return None
+    entry = _mcp_tool_catalogs.get(identity)
+    if not force_refresh and _mcp_tool_catalog_is_fresh(entry):
+        return dict(entry)
+    task = _mcp_tool_catalog_refreshes.get(identity)
+    if task is None or task.done():
+        task = asyncio.create_task(discover_mcp_tools(config, force_refresh=True))
+        _mcp_tool_catalog_refreshes[identity] = task
+        task.add_done_callback(
+            lambda finished: _mcp_tool_catalog_refreshes.pop(identity, None)
+            if _mcp_tool_catalog_refreshes.get(identity) is finished
+            else None
+        )
+    try:
+        if wait_seconds is None:
+            await asyncio.shield(task)
+        else:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
+    except asyncio.TimeoutError:
+        return dict(entry) if entry else {"checking": True, "ok": False}
+    except Exception:  # noqa: BLE001 - discovery records its own failure
+        pass
+    entry = _mcp_tool_catalogs.get(identity)
+    return dict(entry) if entry else {"ok": False, "tools": [], "schemas": {}, "error": "no_reply"}
+
 
 MCP_QUERY_TIMEOUT_SECONDS = 120.0
 MCP_METADATA_TIMEOUT_SECONDS = 45.0
@@ -10726,6 +10817,7 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
         async with httpx.AsyncClient(verify=ssl_verify, timeout=15.0) as client:
             response = await client.post(current_url, json=payload, headers=headers)
             if response.status_code != 200:
+                _record_mcp_tool_catalog(cache_identity, False, error=f"HTTP {response.status_code}")
                 return cached_tools
 
             data = response.json()
@@ -10757,10 +10849,14 @@ async def discover_mcp_tools(config, force_refresh: bool = False) -> set:
             _cached_mcp_tools["descriptions"] = descriptions
             _cached_mcp_tools["schemas"] = schemas
             _cached_mcp_tools["timestamp"] = now
+            _record_mcp_tool_catalog(cache_identity, True, discovered, schemas)
+        else:
+            _record_mcp_tool_catalog(cache_identity, False, error="empty tool list")
 
         return discovered or cached_tools
     except Exception as e:
         debug_log(f"MCP tool discovery failed: {str(e)}", "warning")
+        _record_mcp_tool_catalog(cache_identity, False, error=type(e).__name__)
         return cached_tools
 
 def debug_log(message: str, category: str = "info", data: Any = None):
@@ -11355,7 +11451,7 @@ async def run_discovery(
         debug_log(f"API key present: {bool(config.llm.api_key)}, length: {len(config.llm.api_key) if config.llm.api_key else 0}", "info")
 
         discovered_mcp_tools = await discover_mcp_tools(config)
-        available_mcp_tools = set(discovered_mcp_tools or ()) or {
+        available_mcp_tools = set(discovered_mcp_tools or ()) - DASHBOARD_TOOLS or {
             "splunk_run_query",
             "splunk_get_info",
             "splunk_get_indexes",
@@ -13499,12 +13595,19 @@ def _raise_for_capability_result(result: Dict[str, Any]):
 
 
 @app.get("/api/capabilities")
-async def get_capabilities():
+async def get_capabilities(request: Request):
     """Get current capability registry state and persisted config."""
+    capabilities = capability_manager.list_capabilities()
+    auth_user = getattr(request.state, "auth_user", None)
+    if is_auth_enabled() and not _is_admin_or_open(auth_user if isinstance(auth_user, dict) else None):
+        # Connection names are admin-only, so other users do not see the per-connection addresses.
+        dashboards = capabilities.get(DASHBOARD_CAPABILITY)
+        if isinstance(dashboards, dict) and isinstance(dashboards.get("config"), dict):
+            dashboards["config"] = {key: value for key, value in dashboards["config"].items() if key != "splunk_web_urls"}
     return {
         "status": "success",
         "summary": capability_manager.get_summary(),
-        "capabilities": capability_manager.list_capabilities(),
+        "capabilities": capabilities,
     }
 
 
@@ -13763,8 +13866,9 @@ async def export_knowledge_library_pack():
 
 
 @app.post("/api/capabilities/{name}/install")
-async def install_capability(name: str, install_request: Optional[CapabilityInstallRequest] = None):
+async def install_capability(name: str, request: Request, install_request: Optional[CapabilityInstallRequest] = None):
     """Install or prepare an optional capability."""
+    require_admin_user(request)
     result = capability_manager.install_capability(name, strategy=install_request.strategy if install_request else None).to_dict()
     if not result.get("ok"):
         return JSONResponse(status_code=400, content=result)
@@ -13772,51 +13876,648 @@ async def install_capability(name: str, install_request: Optional[CapabilityInst
 
 
 @app.post("/api/capabilities/{name}/enable")
-async def enable_capability(name: str):
+async def enable_capability(name: str, request: Request):
     """Enable an installed optional capability."""
+    require_admin_user(request)
     result = capability_manager.enable_capability(name).to_dict()
     _raise_for_capability_result(result)
     return result
 
 
 @app.post("/api/capabilities/{name}/disable")
-async def disable_capability(name: str):
+async def disable_capability(name: str, request: Request):
     """Disable an optional capability without uninstalling it."""
+    require_admin_user(request)
     result = capability_manager.disable_capability(name).to_dict()
     _raise_for_capability_result(result)
     return result
 
 
 @app.post("/api/capabilities/{name}/uninstall")
-async def uninstall_capability(name: str):
+async def uninstall_capability(name: str, request: Request):
     """Turn off an optional capability and mark it not installed, keeping its settings and data."""
+    require_admin_user(request)
     result = capability_manager.uninstall_capability(name).to_dict()
     _raise_for_capability_result(result)
     return result
 
 
 @app.post("/api/capabilities/{name}/test")
-async def test_capability(name: str):
+async def test_capability(name: str, request: Request):
     """Run a health check for an optional capability."""
+    auth_user = require_admin_user(request)
     result = capability_manager.test_capability(name).to_dict()
     _raise_for_capability_result(result)
+    if name == DASHBOARD_CAPABILITY:
+        config = resolve_effective_runtime_config(request=request, auth_user=auth_user)
+        view, _binding = await dashboard_readiness(config, auth_user, refresh=True, wait_seconds=15.0)
+        details = result.get("details") if isinstance(result.get("details"), dict) else {}
+        result["details"] = dict(details, dashboards=view)
+        if view["enabled"]:
+            result["message"] = (
+                "Your Splunk connection offers the dashboard tools. Dashboards can be created."
+                if view["can_create"]
+                else view["blocked_reason"]
+            )
     return result
 
 
 @app.post("/api/capabilities/{name}/reindex")
-async def reindex_capability(name: str):
+async def reindex_capability(name: str, request: Request):
     """Run an index rebuild for capabilities that manage retrieval content."""
+    require_admin_user(request)
     result = capability_manager.reindex_capability(name).to_dict()
     _raise_for_capability_result(result)
     return result
 
 
 @app.post("/api/capabilities/{name}/config")
-async def update_capability_config(name: str, config_update: CapabilityConfigUpdate):
+async def update_capability_config(name: str, config_update: CapabilityConfigUpdate, request: Request):
     """Persist capability-specific configuration updates."""
+    require_admin_user(request)
     result = capability_manager.update_capability_config(name, config_update.config).to_dict()
     _raise_for_capability_result(result)
     return result
+
+
+# ==================== Splunk Dashboards (Constellation) ====================
+
+DASHBOARD_CAPABILITY = "splunk_dashboards"
+DASHBOARD_REPORT_EXCERPT_CHARS = 6000
+DASHBOARD_HISTORY_CHARS = 4000
+DASHBOARD_CATALOG_WAIT_SECONDS = 8.0
+
+
+class DashboardRequestError(ValueError):
+    """A dashboard plan or request cannot go ahead. The message says what to do."""
+
+    def __init__(self, message: str, status_code: int = 409):
+        self.status_code = status_code
+        super().__init__(message)
+
+
+def _dashboard_settings() -> Dict[str, Any]:
+    try:
+        state = capability_manager.get_capability_state(DASHBOARD_CAPABILITY)
+    except KeyError:
+        return {}
+    return dict(state.get("config") or {})
+
+
+def dashboard_owner(auth_user: Optional[Dict[str, Any]]) -> str:
+    """Whose dashboard requests these are: the signed-in user, or the shared list when sign-in is off."""
+    return owner_key(auth_user if is_auth_enabled() and isinstance(auth_user, dict) else None)
+
+
+def _capability_action_hint(auth_user: Optional[Dict[str, Any]], verb: str) -> str:
+    if is_auth_enabled() and not _is_admin_or_open(auth_user if isinstance(auth_user, dict) else None):
+        return f"Ask an administrator to {verb} it on the Capabilities tab."
+    return f"{verb[:1].upper()}{verb[1:]} it on the Capabilities tab."
+
+
+def _dashboard_web_base(connection_name: str, mcp: Any) -> Tuple[Optional[str], str]:
+    """The Splunk Web address dashboard links must match: the one saved for the connection, else the MCP host on port 8000."""
+    configured = (_dashboard_settings().get("splunk_web_urls") or {}).get(connection_name or "")
+    if configured:
+        return str(configured), "configured"
+    derived = derive_web_base(getattr(mcp, "url", ""))
+    return derived, ("derived" if derived else "none")
+
+
+def resolve_dashboard_binding(config: Any, auth_user: Optional[Dict[str, Any]]) -> Tuple[Optional[DashboardBinding], str]:
+    """The connection a dashboard request goes through, or why there is none.
+
+    With sign-in on, only the user's own assigned connection counts. There is no fallback to the
+    shared connection, because Splunk creates the dashboard as the connection's Splunk user.
+    """
+    connection_name = str(getattr(config, "active_mcp_config_name", "") or "").strip()
+    if is_auth_enabled():
+        if not isinstance(auth_user, dict):
+            return None, "Sign in to create dashboards."
+        assigned = str(auth_user.get("mcp_config_name") or "").strip()
+        role = str(auth_user.get("role") or "").strip().lower()
+        if not assigned or role not in {"admin", "analyst"}:
+            return None, (
+                "Dashboards are created only through your own Splunk connection, and none is assigned to you. "
+                "Ask an administrator to assign one to your user in Settings."
+            )
+        if connection_name != assigned:
+            return None, "Your assigned Splunk connection could not be loaded. Ask an administrator to check it in Settings."
+    mcp = getattr(config, "mcp", None)
+    runtime_identity = _build_mcp_runtime_identity(config)
+    if mcp is None or not runtime_identity:
+        return None, "No Splunk connection is set up. Add one in Settings to create dashboards."
+    web_base, web_base_source = _dashboard_web_base(connection_name, mcp)
+    binding = DashboardBinding(
+        connection_name=connection_name,
+        connection_label=connection_name or "Active connection",
+        mcp=mcp,
+        identity=identity_digest(runtime_identity),
+        web_base=web_base,
+        web_base_source=web_base_source,
+    )
+    return binding, ""
+
+
+def _current_dashboard_identity(connection_name: str) -> str:
+    if is_auth_enabled():
+        saved = config_manager.get_mcp_config(connection_name) if connection_name else None
+        return identity_digest(_build_mcp_runtime_identity(SimpleNamespace(mcp=saved))) if saved is not None else ""
+    return identity_digest(_build_mcp_runtime_identity(config_manager.get()))
+
+
+def _dashboard_binding_is_current(binding: DashboardBinding) -> bool:
+    """False once the connection a request went out on has changed, so polling stops instead of asking another server."""
+    return bool(binding.identity) and _current_dashboard_identity(binding.connection_name) == binding.identity
+
+
+def dashboard_binding_key(binding: DashboardBinding) -> str:
+    """Ties a plan to the connection and Splunk user shown on its card, so Create cannot send it anywhere else."""
+    material = f"{binding.identity}|{binding.connection_name}|{binding.splunk_user}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+dashboard_service = DashboardService(
+    DashboardOperationStore(CHAT_DATA_ROOT / "dashboards"),
+    settings=_dashboard_settings,
+    binding_is_current=_dashboard_binding_is_current,
+    log=print,
+)
+
+
+async def capability_connection_support(
+    state: Dict[str, Any],
+    config: Any,
+    *,
+    refresh: bool = False,
+    wait_seconds: Optional[float] = DASHBOARD_CATALOG_WAIT_SECONDS,
+) -> Dict[str, Any]:
+    """Whether a connection offers the MCP tools a capability needs, from its cached or refreshed tool list."""
+    required = [str(name) for name in state.get("required_mcp_tools") or []]
+    if not required:
+        return {"state": "not_required", "message": ""}
+    catalog = await get_connection_tool_catalog(config, force_refresh=refresh, wait_seconds=wait_seconds)
+    if isinstance(catalog, dict) and catalog.get("checking"):
+        return {
+            "state": "checking",
+            "message": "Still reading the tool list from this Splunk connection. Check again in a moment.",
+        }
+    return evaluate_connection_support(required, catalog, check_tool_schema)
+
+
+def _capability_requirements_text(requirements: Any) -> str:
+    """The Splunk-side apps a capability needs, as a Markdown list with their download links."""
+    lines = []
+    for requirement in requirements if isinstance(requirements, list) else []:
+        if not isinstance(requirement, dict) or not str(requirement.get("name") or "").strip():
+            continue
+        name = str(requirement["name"]).strip()
+        description = str(requirement.get("description") or "").strip()
+        url = str(requirement.get("url") or "").strip()
+        label = str(requirement.get("link_label") or name).strip()
+        link = f" [{label}]({url})" if url.startswith("https://") else ""
+        lines.append(f"- **{name}**: {description}{link}".rstrip())
+    return "\n".join(lines)
+
+
+def dashboard_incognito_block(owner: str, config: Any) -> str:
+    """Why incognito rules stop dashboard creation, or an empty string when they do not.
+
+    Constellation sends the plan to its own AI model, where incognito mode cannot replace names.
+    """
+    policy = incognito_store.load_policy()
+    state = incognito_store.resolve_state(owner, llm_provider_kind(config), policy)
+    if state.active:
+        return (
+            "Dashboards cannot be created while incognito mode is on, because Constellation sends the plan to its own "
+            "AI model with the real names. Turn incognito mode off to create a dashboard."
+        )
+    if policy.force_for_cloud:
+        return (
+            "Dashboards cannot be created because your administrator requires incognito mode for cloud AI models, "
+            "and Constellation sends the plan to its own AI model with the real names."
+        )
+    return ""
+
+
+def _dashboard_support_problem(support: Dict[str, Any]) -> str:
+    state = support.get("state")
+    if state == "potential":
+        return (
+            "This Splunk environment does not offer the dashboard tools yet. To create dashboards here, install "
+            "Constellation in that Splunk environment, alongside Splunk MCP Server."
+        )
+    if state == "incompatible":
+        problems = " ".join(str(item) for item in support.get("problems") or [])
+        return " ".join(
+            part
+            for part in (
+                "This Splunk environment lists the dashboard tools, but not in the version this app supports.",
+                problems,
+                "Update Constellation in that Splunk environment.",
+            )
+            if part
+        )
+    return str(support.get("message") or "Could not check this Splunk connection for the dashboard tools.")
+
+
+async def dashboard_readiness(
+    config: Any,
+    auth_user: Optional[Dict[str, Any]],
+    *,
+    refresh: bool = False,
+    wait_seconds: Optional[float] = DASHBOARD_CATALOG_WAIT_SECONDS,
+) -> Tuple[Dict[str, Any], Optional[DashboardBinding]]:
+    """Whether the caller can create a dashboard now, with the first reason they cannot."""
+    state = capability_manager.get_capability_state(DASHBOARD_CAPABILITY)
+    installed = bool(state.get("installed"))
+    enabled = installed and bool(state.get("enabled")) and not bool(state.get("restart_required"))
+    binding, binding_problem = resolve_dashboard_binding(config, auth_user)
+    if binding is None:
+        support: Dict[str, Any] = {"state": "unknown", "reason": "no_connection", "message": binding_problem}
+    else:
+        support = await capability_connection_support(state, config, refresh=refresh, wait_seconds=wait_seconds)
+    if not installed:
+        blocked = f"Splunk Dashboards is not installed. {_capability_action_hint(auth_user, 'install')}"
+    elif not enabled:
+        blocked = f"Splunk Dashboards is turned off. {_capability_action_hint(auth_user, 'enable')}"
+    elif binding is None:
+        blocked = binding_problem
+    else:
+        blocked = dashboard_incognito_block(dashboard_owner(auth_user), config)
+        if not blocked and support.get("state") != "available":
+            blocked = _dashboard_support_problem(support)
+    view = {
+        "installed": installed,
+        "enabled": enabled,
+        "support": support,
+        "connection": binding.describe() if binding else None,
+        "requirements": list(state.get("splunk_requirements") or []),
+        "can_create": not blocked,
+        "blocked_reason": blocked,
+    }
+    return view, binding
+
+
+def _dashboard_known_names(environment_record: Any, report_knowledge: Any) -> Dict[str, List[str]]:
+    """Index and sourcetype names this app has seen in the Splunk environment, for the plan and its checks."""
+    names: Dict[str, List[str]] = {"indexes": [], "sourcetypes": []}
+    record = environment_record if isinstance(environment_record, dict) else {}
+    for kind, key in (("index", "indexes"), ("sourcetype", "sourcetypes")):
+        for entity in environment_ranked_entities(record, kind):
+            name = str(entity.get("name") or "").strip()
+            if name and name not in names[key]:
+                names[key].append(name)
+    known = report_knowledge.get("known_entities") if isinstance(report_knowledge, dict) else None
+    if isinstance(known, dict):
+        for key in ("indexes", "sourcetypes"):
+            for name in known.get(key) or []:
+                cleaned = str(name or "").strip()
+                if cleaned and cleaned not in names[key]:
+                    names[key].append(cleaned)
+    return {key: values[:40] for key, values in names.items()}
+
+
+def _dashboard_plan_notes(draft: Dict[str, Any], known: Dict[str, List[str]]) -> List[str]:
+    """Things to check before Create that the plan format itself cannot catch."""
+    notes: List[str] = []
+    source = draft.get("source") if isinstance(draft.get("source"), dict) else {}
+    if source.get("kind") == "spl":
+        notes.append("Splunk runs this search as your Splunk user. Check it before you create the dashboard.")
+        return notes
+    for field_name, key, label in (("index", "indexes", "index"), ("sourcetype", "sourcetypes", "sourcetype")):
+        value = str(source.get(field_name) or "").strip()
+        seen = {name.casefold() for name in known.get(key) or []}
+        if value and seen and value.casefold() not in seen:
+            notes.append(
+                f"The {label} {value} is not among the names this app has seen in this Splunk environment. "
+                "Check it before you create the dashboard."
+            )
+    return notes
+
+
+async def draft_dashboard_plan(
+    request_text: str,
+    context_sections: List[Tuple[str, str]],
+    config: Any,
+    *,
+    known_index: str = "",
+    provenance: Optional[Dict[str, str]] = None,
+    starter_topic: str = "",
+) -> Tuple[Dict[str, Any], str]:
+    """A plan drafted by the AI model, or a starter plan when the model cannot draft one. Returns the plan and who drafted it."""
+    available, _reason = _is_llm_available_for_m26_14_advisory(config)
+    if available:
+        try:
+            llm_client = get_or_create_llm_client(config)
+            raw_response = await llm_client.generate_response(
+                messages=build_plan_messages(request_text, context_sections),
+                max_tokens=llm_call_budget(config, 0.3, floor=600, ceiling=1600),
+                temperature=0.2,
+            )
+            parsed = _extract_json_object_from_llm_text(raw_response)
+            if parsed:
+                return coerce_brief_draft(parsed, provenance), "ai"
+        except IncognitoBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the starter plan still lets the user continue
+            print(f"[DASHBOARDS] plan draft failed: {type(exc).__name__}")
+    return fallback_brief_draft(request_text, known_index, provenance, topic=starter_topic), "starter"
+
+
+async def build_dashboard_proposal(
+    request_text: str,
+    context_sections: List[Tuple[str, str]],
+    config: Any,
+    binding: DashboardBinding,
+    *,
+    known: Dict[str, List[str]],
+    known_index: str = "",
+    provenance: Dict[str, str],
+    starter_topic: str = "",
+) -> Dict[str, Any]:
+    """The editable plan card: a drafted plan, what to fix, and the connection and Splunk user it will be created with."""
+    username, problem = await dashboard_service.verify_splunk_user(binding)
+    if not username:
+        raise DashboardRequestError(problem, status_code=502)
+    binding.splunk_user = username
+    sections = list(context_sections)
+    if known.get("indexes") or known.get("sourcetypes"):
+        sections.append((
+            "Names seen in this Splunk environment",
+            f"Indexes: {', '.join(known.get('indexes') or []) or 'none'}\n"
+            f"Sourcetypes: {', '.join(known.get('sourcetypes') or []) or 'none'}",
+        ))
+    fallback_index = known_index or next((name for name in known.get("indexes") or [] if not name.startswith("_")), "")
+    draft, drafted_by = await draft_dashboard_plan(
+        request_text, sections, config, known_index=fallback_index, provenance=provenance, starter_topic=starter_topic
+    )
+    proposal = {
+        "proposal_id": new_proposal_id(),
+        "brief": draft,
+        "problems": plan_problems(draft),
+        "notes": _dashboard_plan_notes(draft, known),
+        "drafted_by": drafted_by,
+        "binding_key": dashboard_binding_key(binding),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    proposal.update(binding.describe())
+    return proposal
+
+
+def _dashboard_history_excerpt(history: Any) -> str:
+    lines = []
+    for entry in _compact_chat_role_history(history, limit=6, include_system=False):
+        content = re.sub(r"\s+", " ", entry["content"]).strip()[:700]
+        lines.append(f"{entry['role'].capitalize()}: {content}")
+    return "\n".join(lines)[-DASHBOARD_HISTORY_CHARS:]
+
+
+async def handle_dashboard_chat_request(
+    user_message: str,
+    history: Any,
+    report_knowledge: Optional[Dict[str, Any]],
+    environment_record: Any,
+    config: Any,
+    auth_user: Optional[Dict[str, Any]],
+    known_index: str = "",
+) -> Optional[Tuple[str, Optional[Dict[str, Any]]]]:
+    """Answer a chat request to create a dashboard with a plan card, or say why no dashboard can be created.
+
+    Returns None when the message does not ask for a dashboard or the capability is off, so chat answers as usual.
+    """
+    if not detect_dashboard_create_intent(user_message):
+        return None
+    view, binding = await dashboard_readiness(config, auth_user)
+    if not view["enabled"]:
+        return None
+    if not view["can_create"] or binding is None:
+        reply = view["blocked_reason"]
+        if view["support"].get("state") in {"potential", "incompatible"}:
+            requirements = _capability_requirements_text(view["requirements"])
+            if requirements:
+                reply = f"{reply}\n\n{requirements}"
+        return reply, None
+    sections = [("Conversation so far", _dashboard_history_excerpt(history))]
+    if isinstance(report_knowledge, dict):
+        sections.append((
+            "Discovery report summary",
+            str(report_knowledge.get("prompt_context_compact") or "")[:DASHBOARD_REPORT_EXCERPT_CHARS],
+        ))
+    try:
+        proposal = await build_dashboard_proposal(
+            user_message,
+            sections,
+            config,
+            binding,
+            known=_dashboard_known_names(environment_record, report_knowledge),
+            known_index=known_index,
+            provenance={"kind": "conversation", "label": "Chat conversation"},
+        )
+    except DashboardRequestError as exc:
+        return str(exc), None
+    return (
+        "Here is a dashboard plan. Review it, change anything that needs it, and click Create to send it to Splunk. "
+        "Nothing goes to Splunk until you click Create.",
+        proposal,
+    )
+
+
+def _dashboard_report_label(name: str) -> str:
+    """A readable report name for a starter plan, such as Operator Runbook for v2_operator_runbook_20260522_010203.md."""
+    stem = re.sub(r"^v2_", "", Path(name).stem, flags=re.IGNORECASE)
+    stem = re.sub(r"_\d{8}_\d{6}$", "", stem)
+    words = [word for word in re.split(r"[_\-\s]+", stem) if word]
+    label = " ".join(word.upper() if word.lower() in {"ai", "mcp", "spl"} else word.capitalize() for word in words)
+    return label[:80] or "discovery"
+
+
+def _dashboard_report_excerpt(path: Path) -> str:
+    try:
+        if path.suffix.lower() == ".json":
+            with open(path, "r", encoding="utf-8") as handle:
+                content = json.dumps(json.load(handle), ensure_ascii=False, separators=(",", ":"))
+        else:
+            content = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        raise DashboardRequestError("This report could not be read.", status_code=404) from None
+    return content[:DASHBOARD_REPORT_EXCERPT_CHARS]
+
+
+class DashboardProposeRequest(BaseModel):
+    report_name: str = Field(..., min_length=1, max_length=255)
+    focus: str = Field("", max_length=2000)
+
+
+class DashboardCreateRequest(BaseModel):
+    proposal_id: str = Field(..., min_length=1, max_length=64)
+    binding_key: str = Field(..., min_length=1, max_length=64)
+    brief: Dict[str, Any]
+
+
+async def _verified_dashboard_binding(binding: DashboardBinding) -> DashboardBinding:
+    username, problem = await dashboard_service.verify_splunk_user(binding)
+    if not username:
+        raise HTTPException(status_code=502, detail=problem)
+    binding.splunk_user = username
+    return binding
+
+
+@app.get("/api/dashboards/status")
+async def get_dashboard_status(request: Request, refresh: bool = False):
+    """Whether the caller can create dashboards on their Splunk connection, and if not, why."""
+    auth_user = require_authenticated_user(request)
+    config = resolve_effective_runtime_config(request=request, auth_user=auth_user)
+    view, _binding = await dashboard_readiness(config, auth_user, refresh=refresh)
+    return {"status": "success", **view}
+
+
+@app.post("/api/dashboards/propose")
+async def propose_dashboard_from_report(request: Request, propose_request: DashboardProposeRequest):
+    """Draft an editable dashboard plan from a discovery report. Nothing is sent to Splunk."""
+    auth_user = require_authenticated_user(request)
+    config = resolve_effective_runtime_config(request=request, auth_user=auth_user)
+    view, binding = await dashboard_readiness(config, auth_user)
+    if not view["can_create"] or binding is None:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": view["blocked_reason"], "support": view["support"], "requirements": view["requirements"]},
+        )
+    scope_key = _build_discovery_scope_metadata(request=request, auth_user=auth_user).get("scope_key")
+    report_path = _resolve_accessible_output_artifact_path(propose_request.report_name, scope_key)
+    if report_path.suffix.lower() in IMAGE_ARTIFACT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Pick a text report to build a dashboard from.")
+    report_dir = request_discovery_dir(request)
+    environment_record = load_environment_record(report_dir)
+    report_knowledge = load_latest_report_knowledge(7, report_dir)
+    focus = re.sub(r"\s+", " ", propose_request.focus or "").strip()
+    request_text = focus or f"Create a dashboard that tracks the main findings of the report {report_path.name}."
+    session = incognito_session_for_request(request, "dashboard plan", config)
+    try:
+        with incognito_session_scope(session):
+            proposal = await build_dashboard_proposal(
+                request_text,
+                [(f"Report {report_path.name}", _dashboard_report_excerpt(report_path))],
+                config,
+                binding,
+                known=_dashboard_known_names(environment_record, report_knowledge),
+                known_index=environment_busiest_index(environment_record),
+                provenance={"kind": "discovery_report", "label": report_path.name},
+                starter_topic="" if focus else f"findings from the {_dashboard_report_label(report_path.name)} report",
+            )
+    except DashboardRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+    return attach_incognito_result(session, {"status": "success", "proposal": proposal})
+
+
+@app.post("/api/dashboards/create")
+async def create_dashboard(request: Request, create_request: DashboardCreateRequest):
+    """Send a reviewed plan to Splunk. The request is saved first and followed in the background."""
+    auth_user = require_authenticated_user(request)
+    config = resolve_effective_runtime_config(request=request, auth_user=auth_user)
+    view, binding = await dashboard_readiness(config, auth_user)
+    if not view["can_create"] or binding is None:
+        raise HTTPException(status_code=409, detail=view["blocked_reason"])
+    binding = await _verified_dashboard_binding(binding)
+    if create_request.binding_key != dashboard_binding_key(binding):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The Splunk connection or Splunk user changed after this plan was made. "
+                "Ask for the dashboard again so the plan shows where it will be created."
+            ),
+        )
+    try:
+        operation = dashboard_service.start_create(
+            dashboard_owner(auth_user), create_request.proposal_id, create_request.brief, binding
+        )
+    except BriefError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc), "problems": exc.problems})
+    except DashboardConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return {"status": "success", "operation": operation}
+
+
+@app.get("/api/dashboards/operations")
+async def list_dashboard_operations(request: Request, limit: int = 20):
+    """The caller's recent dashboard requests, newest first."""
+    auth_user = require_authenticated_user(request)
+    return {
+        "status": "success",
+        "operations": dashboard_service.list_operations(dashboard_owner(auth_user), max(1, min(limit, 50))),
+    }
+
+
+@app.get("/api/dashboards/operations/{request_id}")
+async def get_dashboard_operation(request: Request, request_id: str):
+    auth_user = require_authenticated_user(request)
+    operation = dashboard_service.get_operation(dashboard_owner(auth_user), request_id[:80])
+    if operation is None:
+        raise HTTPException(status_code=404, detail="That dashboard request is not available.")
+    return {"status": "success", "operation": operation}
+
+
+@app.post("/api/dashboards/operations/{request_id}/check")
+async def check_dashboard_operation(request: Request, request_id: str):
+    """Ask Splunk for the request's current receipt, on the same connection and Splunk user it was sent with."""
+    auth_user = require_authenticated_user(request)
+    owner = dashboard_owner(auth_user)
+    if dashboard_service.get_operation(owner, request_id[:80]) is None:
+        raise HTTPException(status_code=404, detail="That dashboard request is not available.")
+    state = capability_manager.get_capability_state(DASHBOARD_CAPABILITY)
+    if not (state.get("installed") and state.get("enabled")):
+        raise HTTPException(status_code=409, detail="Splunk Dashboards is turned off, so the app cannot check Splunk.")
+    config = resolve_effective_runtime_config(request=request, auth_user=auth_user)
+    binding, problem = resolve_dashboard_binding(config, auth_user)
+    if binding is None:
+        raise HTTPException(status_code=409, detail=problem)
+    binding = await _verified_dashboard_binding(binding)
+    try:
+        operation = await dashboard_service.check_status(owner, request_id[:80], binding)
+    except DashboardBindingChanged as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    if operation is None:
+        raise HTTPException(status_code=404, detail="That dashboard request is not available.")
+    return {"status": "success", "operation": operation}
+
+
+@app.get("/api/capabilities/{name}/connections")
+async def get_capability_connection_support(name: str, request: Request, refresh: bool = False):
+    """Admin view: whether each saved Splunk connection offers the MCP tools a capability needs."""
+    require_admin_user(request)
+    try:
+        state = capability_manager.get_capability_state(name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown capability.") from None
+    active_config = config_manager.get()
+    active_name = str(getattr(active_config, "active_mcp_config_name", "") or "").strip()
+    targets: List[Tuple[str, Any]] = [
+        (connection_name, SimpleNamespace(mcp=saved))
+        for connection_name, saved in config_manager.list_mcp_configs().items()
+    ]
+    if not active_name and _build_mcp_runtime_identity(active_config):
+        targets.insert(0, ("", active_config))
+    web_urls = (state.get("config") or {}).get("splunk_web_urls") or {} if name == DASHBOARD_CAPABILITY else {}
+
+    async def describe(connection_name: str, target: Any) -> Dict[str, Any]:
+        entry: Dict[str, Any] = {
+            "name": connection_name,
+            "label": connection_name or "Active connection",
+            "active": connection_name == active_name,
+            "support": await capability_connection_support(state, target, refresh=refresh, wait_seconds=6.0),
+        }
+        if name == DASHBOARD_CAPABILITY:
+            entry["splunk_web_url"] = str(web_urls.get(connection_name) or "")
+            entry["derived_splunk_web_url"] = derive_web_base(getattr(target.mcp, "url", "")) or ""
+        return entry
+
+    connections = await asyncio.gather(*(describe(connection_name, target) for connection_name, target in targets[:MCP_TOOL_CATALOG_LIMIT]))
+    return {
+        "status": "success",
+        "capability": name,
+        "required_mcp_tools": list(state.get("required_mcp_tools") or []),
+        "connections": list(connections),
+    }
 
 
 @app.post("/api/capabilities/deeplinks/build")
@@ -14546,6 +15247,14 @@ def chat_goal_owner(request: Request) -> str:
     if not is_auth_enabled():
         return owner_key(None)
     return owner_key(require_authenticated_user(request))
+
+
+def chat_auth_user(request: Request) -> Optional[Dict[str, Any]]:
+    """The signed-in user making a chat request, or None when sign-in is off."""
+    if not is_auth_enabled():
+        return None
+    user = getattr(request.state, "auth_user", None)
+    return user if isinstance(user, dict) else None
 
 
 def load_active_chat_goal(goal_owner: Optional[str], goal_id: Any) -> Optional[Dict[str, Any]]:
@@ -17797,6 +18506,7 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
     status_queue = asyncio.Queue()
     runtime_config = resolve_effective_runtime_config(request=http_request)
     goal_owner = chat_goal_owner(http_request)
+    auth_user = chat_auth_user(http_request)
     discovery_dir = request_discovery_dir(http_request)
     
     async def generate_sse():
@@ -17806,7 +18516,12 @@ async def chat_with_splunk_stream(http_request: Request, request: dict):
             # Process chat in background task
             chat_task = asyncio.create_task(
                 process_chat_with_streaming(
-                    request, status_queue, runtime_config=runtime_config, goal_owner=goal_owner, discovery_dir=discovery_dir
+                    request,
+                    status_queue,
+                    runtime_config=runtime_config,
+                    goal_owner=goal_owner,
+                    discovery_dir=discovery_dir,
+                    auth_user=auth_user,
                 )
             )
             
@@ -19485,6 +20200,7 @@ async def process_chat_with_streaming(
     runtime_config: Any = None,
     goal_owner: Optional[str] = None,
     discovery_dir: Optional[Path] = None,
+    auth_user: Optional[Dict[str, Any]] = None,
 ):
     """Process chat request and push status updates to queue."""
     try:
@@ -19499,7 +20215,12 @@ async def process_chat_with_streaming(
         
         # Call chat logic with streaming callback
         result = await run_chat_turn(
-            request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner, discovery_dir=discovery_dir
+            request,
+            status_callback,
+            runtime_config=runtime_config,
+            goal_owner=goal_owner,
+            discovery_dir=discovery_dir,
+            auth_user=auth_user,
         )
         record_chat_goal_turn(goal_owner, request, result)
         await status_queue.put({'type': 'done', 'data': result})
@@ -19513,12 +20234,18 @@ async def run_chat_turn(
     runtime_config: Any = None,
     goal_owner: Optional[str] = None,
     discovery_dir: Optional[Path] = None,
+    auth_user: Optional[Dict[str, Any]] = None,
 ):
     """Answer one chat message under the asker's incognito state."""
     session = open_incognito_session(goal_owner, "chat", config=runtime_config)
     with incognito_session_scope(session):
         result = await chat_with_splunk_logic(
-            request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner, discovery_dir=discovery_dir
+            request,
+            status_callback,
+            runtime_config=runtime_config,
+            goal_owner=goal_owner,
+            discovery_dir=discovery_dir,
+            auth_user=auth_user,
         )
     remember_chat_environment(discovery_dir, result)
     return attach_incognito_result(session, result)
@@ -19530,6 +20257,7 @@ async def chat_with_splunk_logic(
     runtime_config: Any = None,
     goal_owner: Optional[str] = None,
     discovery_dir: Optional[Path] = None,
+    auth_user: Optional[Dict[str, Any]] = None,
 ):
     """Core chat logic that can optionally stream status updates.
     
@@ -19539,6 +20267,7 @@ async def chat_with_splunk_logic(
                         Signature: async def callback(action: str, iteration: int, time: float)
         goal_owner: Whose goal library and chat scratchpad to use (see chat_goals.owner_key)
         discovery_dir: Where the asker's discovery reports are (see request_discovery_dir); the global output folder by default
+        auth_user: The signed-in user, so a dashboard request goes through their own Splunk connection
     """
     report_dir = Path(discovery_dir) if discovery_dir is not None else Path("output")
     try:
@@ -19618,6 +20347,40 @@ async def chat_with_splunk_logic(
         else:
             discovery_age_warning = "⚠️ No discovery data found. Run a discovery first to get environment context."
 
+        dashboard_timeline: List[Dict[str, Any]] = []
+        dashboard_reply = None
+        if detect_dashboard_create_intent(user_message) and _capability_is_ready(DASHBOARD_CAPABILITY):
+            await push_status(dashboard_timeline, "📊 Preparing a dashboard plan", 0)
+            dashboard_reply = await handle_dashboard_chat_request(
+                user_message, history, report_knowledge, environment_record, config, auth_user, environment_known_index
+            )
+        if dashboard_reply is not None:
+            dashboard_text, dashboard_proposal = dashboard_reply
+            dashboard_memory = update_chat_memory(
+                chat_session_id,
+                user_message,
+                assistant_response=dashboard_text,
+                record_user_turn=False,
+                owner=goal_owner,
+            )
+            return {
+                "response": dashboard_text,
+                "initial_response": user_message,
+                "tool_calls": [],
+                "spl_query": None,
+                "iterations": 0,
+                "execution_time": f"{time.time() - request_started_at:.2f}s",
+                "status_timeline": dashboard_timeline,
+                "discovery_age_warning": discovery_age_warning,
+                "chat_session_id": chat_session_id,
+                "chat_memory": dashboard_memory,
+                "conversation_history": _build_follow_up_conversation_history(history, user_message, dashboard_text),
+                "capability_usage": [],
+                "has_follow_on": False,
+                "follow_on_actions": [],
+                "dashboard_proposal": dashboard_proposal,
+            }
+
         report_intent = detect_report_intent(user_message, report_knowledge) if bool(turn_settings.get("enable_splunk_augmentation", True)) else None
 
         query_plan_context = build_query_plan_brief(user_message, report_knowledge, chat_memory)
@@ -19672,7 +20435,8 @@ async def chat_with_splunk_logic(
                 "follow_on_actions": follow_on_actions,
             }
 
-        available_mcp_tools = await discover_mcp_tools(config)
+        # Dashboard tools write to Splunk, so they run only from the Create button, never from a model's tool call.
+        available_mcp_tools = set(await discover_mcp_tools(config) or ()) - DASHBOARD_TOOLS
         if not available_mcp_tools:
             available_mcp_tools = {
                 "splunk_run_query",
@@ -21135,6 +21899,7 @@ async def chat_with_splunk(http_request: Request, request: dict):
         runtime_config=runtime_config,
         goal_owner=goal_owner,
         discovery_dir=request_discovery_dir(http_request),
+        auth_user=chat_auth_user(http_request),
     )
     record_chat_goal_turn(goal_owner, request, result)
     return result
@@ -21182,7 +21947,15 @@ async def execute_mcp_tool_call(tool_call, config):
         params = tool_call.get("params", {}) if isinstance(tool_call, dict) else {}
         requested_tool_name = str(params.get("name") or "unknown")
         requested_args = params.get("arguments", {}) if isinstance(params.get("arguments"), dict) else {}
-        available_tools = await discover_mcp_tools(config)
+        available_tools = set(await discover_mcp_tools(config) or ()) - DASHBOARD_TOOLS
+        if requested_tool_name in DASHBOARD_TOOLS:
+            debug_log("Rejected a dashboard tool call outside the dashboard Create flow", "warning")
+            return {
+                "error": "Dashboard tools run only when you click Create on a dashboard plan.",
+                "detail": "Ask for a dashboard in chat to get a plan you can review.",
+                "status_code": 403,
+                "fatal": False,
+            }
         resolved_tool_name = resolve_tool_name(requested_tool_name, available_tools)
         default_query_tool_name = resolve_tool_name("splunk_run_query", available_tools)
 
@@ -21271,7 +22044,7 @@ async def execute_mcp_tool_call(tool_call, config):
 
         if unknown_tool_text:
             debug_log(f"Refreshing MCP tools after unknown-tool signal: {unknown_tool_text}", "warning")
-            refreshed_tools = await discover_mcp_tools(config, force_refresh=True)
+            refreshed_tools = set(await discover_mcp_tools(config, force_refresh=True) or ()) - DASHBOARD_TOOLS
             retried_tool_name = resolve_tool_name(requested_tool_name, refreshed_tools)
             if retried_tool_name != executed_tool_name and retried_tool_name in refreshed_tools:
                 executed_tool_name = retried_tool_name

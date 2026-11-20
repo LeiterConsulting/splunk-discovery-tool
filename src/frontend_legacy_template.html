@@ -923,6 +923,817 @@
             return dedupeAssistantFollowOnActions([...responseActions, ...normalizedExistingActions], 3);
         };
 
+        const DASHBOARD_TIME_RANGE_OPTIONS = [
+            { value: '-15m', label: 'Last 15 minutes' },
+            { value: '-1h', label: 'Last hour' },
+            { value: '-24h', label: 'Last 24 hours' },
+            { value: '-7d', label: 'Last 7 days' },
+        ];
+        // Mirrors the Constellation dashboard contract v1 limits checked again on the server.
+        const DASHBOARD_LIMITS = {
+            title: 120,
+            purpose: 500,
+            requirements: 1200,
+            query: 8000,
+            pageName: 60,
+            panel: 240,
+            finding: 300,
+            pages: 2,
+            panelsPerPage: 4,
+            panelsTotal: 6,
+            findings: 4,
+        };
+        const DASHBOARD_INDEX_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}$/;
+        const DASHBOARD_SOURCETYPE_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,199}$/;
+        const DASHBOARD_STAGE_LABELS = {
+            accepted: 'Splunk accepted the plan.',
+            authoring: 'Constellation is writing the dashboard.',
+            validating: 'Constellation is checking the dashboard.',
+            saving_draft: 'Constellation is saving the draft.',
+            saving_native: 'Constellation is saving the dashboard in Splunk.',
+        };
+        const DASHBOARD_STATUS_LABELS = {
+            sending: 'Sending',
+            running: 'Building',
+            created: 'Created',
+            draft_only: 'Draft saved',
+            needs_input: 'Needs more detail',
+            failed: 'Not created',
+            indeterminate: 'Not confirmed',
+            not_found: 'No record in Splunk',
+            unconfirmed: 'Waiting for Splunk',
+            error: 'Stopped',
+        };
+        const DASHBOARD_ACTIVE_STATUSES = ['sending', 'running', 'unconfirmed'];
+        const DASHBOARD_POLL_MS = 2500;
+
+        const dashboardString = (value, limit) => (typeof value === 'string' ? value.slice(0, limit) : '');
+        const dashboardHttpsUrl = (value) => (
+            typeof value === 'string' && value.length <= 2048 && /^https:\/\/\S+$/i.test(value) ? value : ''
+        );
+        const dashboardSingleLine = (value) => String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+        const dashboardApiError = (data, fallback) => (typeof data?.detail === 'string' && data.detail.trim() ? data.detail : fallback);
+
+        const sanitizeDashboardBrief = (brief) => {
+            if (!brief || typeof brief !== 'object') {
+                return null;
+            }
+            const source = brief.source && typeof brief.source === 'object' ? brief.source : {};
+            const cleanSource = source.kind === 'spl'
+                ? { kind: 'spl', query: dashboardString(source.query, DASHBOARD_LIMITS.query * 2) }
+                : { kind: 'index', index: dashboardString(source.index, 400), sourcetype: dashboardString(source.sourcetype, 400) };
+            const clean = {
+                title: dashboardString(brief.title, DASHBOARD_LIMITS.title * 2),
+                purpose: dashboardString(brief.purpose, DASHBOARD_LIMITS.purpose * 2),
+                requirements: dashboardString(brief.requirements, DASHBOARD_LIMITS.requirements * 2),
+                source: cleanSource,
+                time_range: { earliest: dashboardString(brief.time_range?.earliest, 8), latest: 'now' },
+                pages: (Array.isArray(brief.pages) ? brief.pages : []).slice(0, 4).map((page) => ({
+                    name: dashboardString(page?.name, DASHBOARD_LIMITS.pageName * 2),
+                    panels: (Array.isArray(page?.panels) ? page.panels : []).slice(0, 8).map((panel) => dashboardString(panel, DASHBOARD_LIMITS.panel * 2)),
+                })),
+                findings: (Array.isArray(brief.findings) ? brief.findings : []).slice(0, 8).map((item) => dashboardString(item, DASHBOARD_LIMITS.finding * 2)),
+            };
+            if (brief.provenance && typeof brief.provenance === 'object' && ['conversation', 'discovery_report'].includes(brief.provenance.kind)) {
+                clean.provenance = { kind: brief.provenance.kind, label: dashboardString(brief.provenance.label, 120) };
+            }
+            return clean;
+        };
+
+        // The plan in contract form: trimmed text, no empty optional fields.
+        const buildDashboardBriefPayload = (draft) => {
+            const brief = sanitizeDashboardBrief(draft) || sanitizeDashboardBrief({});
+            const source = brief.source.kind === 'spl'
+                ? { kind: 'spl', query: String(brief.source.query || '').trim() }
+                : { kind: 'index', index: dashboardSingleLine(brief.source.index) };
+            if (brief.source.kind !== 'spl' && dashboardSingleLine(brief.source.sourcetype)) {
+                source.sourcetype = dashboardSingleLine(brief.source.sourcetype);
+            }
+            const payload = {
+                title: dashboardSingleLine(brief.title),
+                purpose: dashboardSingleLine(brief.purpose),
+                source,
+                time_range: { earliest: brief.time_range.earliest, latest: 'now' },
+                pages: brief.pages.map((page) => ({
+                    name: dashboardSingleLine(page.name),
+                    panels: page.panels.map(dashboardSingleLine).filter(Boolean),
+                })),
+            };
+            const requirements = dashboardSingleLine(brief.requirements);
+            if (requirements) {
+                payload.requirements = requirements;
+            }
+            const findings = brief.findings.map(dashboardSingleLine).filter(Boolean);
+            if (findings.length > 0) {
+                payload.findings = findings;
+            }
+            if (brief.provenance?.label) {
+                payload.provenance = brief.provenance;
+            }
+            return payload;
+        };
+
+        const findDashboardBriefProblems = (draft) => {
+            const brief = buildDashboardBriefPayload(draft);
+            const limits = DASHBOARD_LIMITS;
+            const problems = [];
+            const add = (field, message) => problems.push({ field, message });
+            if (!brief.title) {
+                add('title', 'Add a title.');
+            } else if (brief.title.length > limits.title) {
+                add('title', `Shorten the title to ${limits.title} characters or fewer.`);
+            }
+            if (!brief.purpose) {
+                add('purpose', 'Describe the question the dashboard answers and who it is for.');
+            } else if (brief.purpose.length > limits.purpose) {
+                add('purpose', `Shorten the purpose to ${limits.purpose} characters or fewer.`);
+            }
+            if ((brief.requirements || '').length > limits.requirements) {
+                add('requirements', `Shorten the requirements to ${limits.requirements} characters or fewer.`);
+            }
+            if (brief.source.kind === 'spl') {
+                if (!brief.source.query) {
+                    add('source.query', 'Enter the search the dashboard should use.');
+                } else if (brief.source.query.length > limits.query) {
+                    add('source.query', `Shorten the search to ${limits.query} characters or fewer.`);
+                }
+            } else {
+                if (!brief.source.index) {
+                    add('source.index', 'Enter the index the dashboard should use.');
+                } else if (!DASHBOARD_INDEX_RE.test(brief.source.index)) {
+                    add('source.index', 'Enter a single index name using letters, numbers, dots, dashes, or underscores.');
+                }
+                if (brief.source.sourcetype && !DASHBOARD_SOURCETYPE_RE.test(brief.source.sourcetype)) {
+                    add('source.sourcetype', 'Enter a single sourcetype using letters, numbers, dots, colons, dashes, or underscores.');
+                }
+            }
+            if (!DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === brief.time_range.earliest)) {
+                add('time_range', 'Pick a time range: last 15 minutes, last hour, last 24 hours, or last 7 days.');
+            }
+            if (brief.pages.length === 0) {
+                add('pages', 'Add at least one page with one panel.');
+            }
+            if (brief.pages.length > limits.pages) {
+                add('pages', `Use ${limits.pages} pages or fewer.`);
+            }
+            const seenNames = new Set();
+            let totalPanels = 0;
+            brief.pages.forEach((page, position) => {
+                const label = `page ${position + 1}`;
+                const key = page.name.toLowerCase();
+                if (!page.name) {
+                    add(`pages.${position}.name`, `Name ${label}.`);
+                } else if (page.name.length > limits.pageName) {
+                    add(`pages.${position}.name`, `Shorten the name of ${label} to ${limits.pageName} characters or fewer.`);
+                } else if (seenNames.has(key)) {
+                    add(`pages.${position}.name`, 'Give each page a different name.');
+                }
+                seenNames.add(key);
+                if (page.panels.length === 0) {
+                    add(`pages.${position}.panels`, `Describe at least one panel on ${label}.`);
+                } else if (page.panels.length > limits.panelsPerPage) {
+                    add(`pages.${position}.panels`, `Use ${limits.panelsPerPage} panels or fewer on ${label}.`);
+                }
+                page.panels.forEach((panel, panelPosition) => {
+                    if (panel.length > limits.panel) {
+                        add(`pages.${position}.panels.${panelPosition}`, `Shorten panel ${panelPosition + 1} on ${label} to ${limits.panel} characters or fewer.`);
+                    }
+                });
+                totalPanels += page.panels.length;
+            });
+            if (totalPanels > limits.panelsTotal) {
+                add('pages', `Use ${limits.panelsTotal} panels or fewer across all pages.`);
+            }
+            const findings = brief.findings || [];
+            if (findings.length > limits.findings) {
+                add('findings', `Keep ${limits.findings} findings or fewer.`);
+            }
+            findings.forEach((finding, position) => {
+                if (finding.length > limits.finding) {
+                    add(`findings.${position}`, `Shorten finding ${position + 1} to ${limits.finding} characters or fewer.`);
+                }
+            });
+            return problems;
+        };
+
+        const sanitizeDashboardProblems = (problems) => (Array.isArray(problems) ? problems : [])
+            .filter((problem) => problem && typeof problem.message === 'string' && problem.message.trim())
+            .slice(0, 20)
+            .map((problem) => ({ field: dashboardString(problem.field, 80), message: problem.message.slice(0, 400) }));
+
+        const sanitizeDashboardProposal = (proposal) => {
+            if (!proposal || typeof proposal !== 'object' || typeof proposal.proposal_id !== 'string' || !proposal.proposal_id) {
+                return null;
+            }
+            const brief = sanitizeDashboardBrief(proposal.brief);
+            if (!brief) {
+                return null;
+            }
+            return {
+                proposal_id: proposal.proposal_id.slice(0, 64),
+                binding_key: dashboardString(proposal.binding_key, 64),
+                brief,
+                problems: sanitizeDashboardProblems(proposal.problems),
+                notes: (Array.isArray(proposal.notes) ? proposal.notes : [])
+                    .filter((note) => typeof note === 'string' && note.trim())
+                    .slice(0, 6)
+                    .map((note) => note.slice(0, 400)),
+                drafted_by: proposal.drafted_by === 'ai' ? 'ai' : 'starter',
+                created_at: dashboardString(proposal.created_at, 40),
+                connection_label: dashboardString(proposal.connection_label, 200),
+                splunk_user: dashboardString(proposal.splunk_user, 200),
+                splunk_web_url: dashboardHttpsUrl(proposal.splunk_web_url),
+                splunk_web_url_source: dashboardString(proposal.splunk_web_url_source, 20),
+            };
+        };
+
+        const sanitizeDashboardOperation = (operation) => {
+            if (!operation || typeof operation !== 'object' || typeof operation.request_id !== 'string' || !operation.request_id) {
+                return null;
+            }
+            const receipt = operation.receipt && typeof operation.receipt === 'object' ? operation.receipt : null;
+            const error = operation.error && typeof operation.error === 'object' ? operation.error : null;
+            return {
+                request_id: operation.request_id.slice(0, 80),
+                proposal_id: dashboardString(operation.proposal_id, 64),
+                status: dashboardString(operation.status, 32),
+                title: dashboardString(operation.title, 200),
+                receipt: receipt ? {
+                    status: dashboardString(receipt.status, 32),
+                    stage: dashboardString(receipt.stage, 32),
+                    message: dashboardString(receipt.message, 500),
+                    question: dashboardString(receipt.question, 1000),
+                    code: dashboardString(receipt.code, 64),
+                    title: dashboardString(receipt.title, 200),
+                    view_url: dashboardHttpsUrl(receipt.view_url),
+                    edit_url: dashboardHttpsUrl(receipt.edit_url),
+                    warnings: (Array.isArray(receipt.warnings) ? receipt.warnings : [])
+                        .slice(0, 9)
+                        .map((warning) => ({ code: dashboardString(warning?.code, 64), message: dashboardString(warning?.message, 300) }))
+                        .filter((warning) => warning.code),
+                } : null,
+                code_message: dashboardString(operation.code_message, 400),
+                error: error ? { code: dashboardString(error.code, 64), message: dashboardString(error.message, 400) } : null,
+                check_note: dashboardString(operation.check_note, 400),
+                brief: sanitizeDashboardBrief(operation.brief),
+                connection_label: dashboardString(operation.connection_label, 200),
+                splunk_user: dashboardString(operation.splunk_user, 200),
+                created_at: dashboardString(operation.created_at, 40),
+                updated_at: dashboardString(operation.updated_at, 40),
+                resent: !!operation.resent,
+                polling: !!operation.polling,
+                wait_stopped: !!operation.wait_stopped,
+                can_check: !!operation.can_check,
+                can_retry: !!operation.can_retry,
+                missing: !!operation.missing,
+            };
+        };
+
+        const fetchDashboardOperation = async (requestId) => {
+            try {
+                const response = await fetch(`/api/dashboards/operations/${encodeURIComponent(requestId)}`);
+                if (response.status === 404) {
+                    return { missing: true };
+                }
+                const data = await response.json().catch(() => ({}));
+                return response.ok ? { operation: sanitizeDashboardOperation(data.operation) } : null;
+            } catch (error) {
+                return null;
+            }
+        };
+
+        const formatDashboardTime = (value) => {
+            const parsed = value ? new Date(value) : null;
+            return parsed && !Number.isNaN(parsed.getTime())
+                ? parsed.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+                : '';
+        };
+
+        // A dashboard plan the user reviews before anything goes to Splunk, then the request's receipt.
+        function DashboardPlanCard({ proposal, operation = null, dismissed = false, isDarkTheme, headingClass, subtextClass, mutedTextClass, incognitoActive = false, testIdPrefix = 'dashboard-plan', onChange }) {
+            const [editing, setEditing] = useState(false);
+            const [retrying, setRetrying] = useState(false);
+            const [draft, setDraft] = useState(() => sanitizeDashboardBrief(operation?.brief || proposal?.brief) || sanitizeDashboardBrief({}));
+            const [busy, setBusy] = useState('');
+            const [requestError, setRequestError] = useState('');
+            const [serverProblems, setServerProblems] = useState([]);
+            const [pollTick, setPollTick] = useState(0);
+            const requestId = operation?.request_id || '';
+            const status = operation?.status || '';
+            const isPolling = !!operation?.polling && !dismissed;
+            const notify = (patch) => {
+                if (typeof onChange === 'function') {
+                    onChange(patch);
+                }
+            };
+
+            useEffect(() => {
+                if (!requestId || !isPolling) {
+                    return undefined;
+                }
+                let cancelled = false;
+                const timer = setTimeout(async () => {
+                    const latest = await fetchDashboardOperation(requestId);
+                    if (cancelled) {
+                        return;
+                    }
+                    if (latest?.operation) {
+                        notify({ dashboard_operation: latest.operation });
+                    } else if (latest?.missing) {
+                        notify({ dashboard_operation: { ...operation, polling: false, missing: true } });
+                    }
+                    setPollTick((tick) => tick + 1);
+                }, DASHBOARD_POLL_MS);
+                return () => {
+                    cancelled = true;
+                    clearTimeout(timer);
+                };
+            }, [requestId, isPolling, pollTick]);
+
+            useEffect(() => {
+                // A saved card can be out of date after a reload, so ask the app once for the latest state.
+                if (!requestId || operation?.polling || operation?.missing || !DASHBOARD_ACTIVE_STATUSES.includes(status)) {
+                    return undefined;
+                }
+                let cancelled = false;
+                fetchDashboardOperation(requestId).then((latest) => {
+                    if (!cancelled && latest?.operation) {
+                        notify({ dashboard_operation: latest.operation });
+                    }
+                });
+                return () => {
+                    cancelled = true;
+                };
+            }, [requestId]);
+
+            const cardClass = isDarkTheme ? 'border-indigo-800 bg-gray-900' : 'border-indigo-200 bg-white';
+            const inputClass = `w-full rounded-md border px-3 py-2 text-sm ${isDarkTheme ? 'bg-gray-950 border-gray-600 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`;
+            const labelClass = `block text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`;
+            const secondaryButton = `inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60 ${isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700' : 'border-gray-300 bg-white text-gray-800 hover:bg-gray-50'}`;
+            const primaryButton = 'inline-flex items-center gap-1.5 rounded-md border border-transparent bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60';
+            const toneClasses = {
+                info: isDarkTheme ? 'border-sky-800 bg-sky-950 text-sky-100' : 'border-sky-200 bg-sky-50 text-sky-900',
+                success: isDarkTheme ? 'border-emerald-800 bg-emerald-950 text-emerald-100' : 'border-emerald-200 bg-emerald-50 text-emerald-900',
+                warning: isDarkTheme ? 'border-amber-800 bg-amber-950 text-amber-100' : 'border-amber-200 bg-amber-50 text-amber-900',
+                error: isDarkTheme ? 'border-red-800 bg-red-950 text-red-100' : 'border-red-200 bg-red-50 text-red-800',
+            };
+            const fieldId = (name) => `${testIdPrefix}-${String(proposal?.proposal_id || 'plan').slice(0, 12)}-${name}`;
+
+            if (dismissed) {
+                return (
+                    <div data-testid={`${testIdPrefix}-cancelled`} className={`mt-3 rounded-lg border px-4 py-3 text-sm ${cardClass} ${mutedTextClass}`}>
+                        You cancelled this dashboard plan. Nothing was sent to Splunk.
+                    </div>
+                );
+            }
+
+            const splunkUser = operation?.splunk_user || proposal?.splunk_user || '';
+            const connectionLabel = operation?.connection_label || proposal?.connection_label || '';
+            const identityLine = (
+                <p className={`text-xs ${mutedTextClass}`} data-testid={`${testIdPrefix}-identity`}>
+                    {splunkUser ? <>Splunk user <span className="font-semibold">{splunkUser}</span></> : 'Splunk user not confirmed'}
+                    {connectionLabel ? <> through {connectionLabel}</> : null}
+                </p>
+            );
+
+            const updateDraft = (updater) => {
+                setDraft((current) => updater(sanitizeDashboardBrief(current) || sanitizeDashboardBrief({})));
+                setServerProblems([]);
+                setRequestError('');
+            };
+
+            const createDashboard = async () => {
+                const problems = findDashboardBriefProblems(draft);
+                if (problems.length > 0) {
+                    setEditing(true);
+                    return;
+                }
+                setBusy('create');
+                setRequestError('');
+                setServerProblems([]);
+                try {
+                    const response = await fetch('/api/dashboards/create', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            proposal_id: proposal.proposal_id,
+                            binding_key: proposal.binding_key,
+                            brief: buildDashboardBriefPayload(draft),
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        const returnedProblems = sanitizeDashboardProblems(data.problems);
+                        if (returnedProblems.length > 0) {
+                            setServerProblems(returnedProblems);
+                            setEditing(true);
+                        } else {
+                            setRequestError(dashboardApiError(data, 'The dashboard request could not start. Try again.'));
+                        }
+                        return;
+                    }
+                    const started = sanitizeDashboardOperation(data.operation);
+                    setEditing(false);
+                    setRetrying(false);
+                    notify({
+                        dashboard_proposal: { ...proposal, brief: sanitizeDashboardBrief(draft), problems: [] },
+                        dashboard_operation: started,
+                    });
+                } catch (error) {
+                    setRequestError('Could not reach Splunk Discovery Tool. Check your connection and try again.');
+                } finally {
+                    setBusy('');
+                }
+            };
+
+            const checkStatus = async () => {
+                if (!requestId) {
+                    return;
+                }
+                setBusy('check');
+                setRequestError('');
+                try {
+                    const response = await fetch(`/api/dashboards/operations/${encodeURIComponent(requestId)}/check`, { method: 'POST' });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        setRequestError(dashboardApiError(data, 'Could not check this request. Try again.'));
+                        return;
+                    }
+                    notify({ dashboard_operation: sanitizeDashboardOperation(data.operation) });
+                } catch (error) {
+                    setRequestError('Could not reach Splunk Discovery Tool. Check your connection and try again.');
+                } finally {
+                    setBusy('');
+                }
+            };
+
+            if (operation && !retrying) {
+                const receipt = operation.receipt || {};
+                const describe = () => {
+                    if (operation.missing) {
+                        return { tone: 'warning', icon: 'fa-circle-exclamation', heading: 'This request is no longer in the app', body: 'The app keeps dashboard requests for 7 days.' };
+                    }
+                    switch (status) {
+                        case 'sending':
+                            return { tone: 'info', icon: 'fa-spinner fa-spin', heading: 'Sending the plan to Splunk', body: splunkUser ? `Constellation builds the dashboard as ${splunkUser}.` : 'Constellation builds the dashboard as your Splunk user.' };
+                        case 'running':
+                            return { tone: 'info', icon: 'fa-spinner fa-spin', heading: 'Building the dashboard', body: DASHBOARD_STAGE_LABELS[receipt.stage] || receipt.message || 'Constellation is working on the dashboard.' };
+                        case 'created':
+                            return { tone: 'success', icon: 'fa-circle-check', heading: 'Dashboard created', body: receipt.message || 'Splunk saved the dashboard.' };
+                        case 'draft_only':
+                            return { tone: 'success', icon: 'fa-file-pen', heading: 'Saved as a Constellation draft', body: receipt.message || 'Constellation saved a draft but not a Splunk dashboard. Open the draft to finish it.' };
+                        case 'needs_input':
+                            return { tone: 'warning', icon: 'fa-circle-question', heading: 'Constellation needs more detail', body: receipt.question || 'Change the plan and try again.' };
+                        case 'failed':
+                            return { tone: 'error', icon: 'fa-circle-xmark', heading: 'The dashboard was not created', body: operation.error?.message || operation.code_message || 'Dashboard creation did not finish.', detail: receipt.message };
+                        case 'indeterminate':
+                            return { tone: 'warning', icon: 'fa-circle-exclamation', heading: 'Splunk could not confirm the result', body: [operation.code_message, 'Check status, or look in the Constellation app in Splunk Web.'].filter(Boolean).join(' '), detail: receipt.message };
+                        case 'not_found':
+                            return { tone: 'warning', icon: 'fa-circle-exclamation', heading: 'Splunk has no record of this request', body: 'Nothing was created through this connection. Change the plan and try again.' };
+                        case 'unconfirmed':
+                            return { tone: 'warning', icon: 'fa-hourglass-half', heading: 'Waiting for Splunk to confirm', body: operation.error?.message || 'Splunk has not confirmed the result yet. Check status.' };
+                        default:
+                            return { tone: 'error', icon: 'fa-circle-exclamation', heading: 'The dashboard request stopped', body: operation.error?.message || 'Check status, or start a new request.' };
+                    }
+                };
+                const view = describe();
+                const stoppedFollowing = !operation.missing && DASHBOARD_ACTIVE_STATUSES.includes(status) && !operation.polling;
+                const showCheck = !operation.missing && operation.can_check && !operation.polling && !['created', 'draft_only', 'failed', 'needs_input'].includes(status);
+                const warnings = Array.isArray(receipt.warnings) ? receipt.warnings : [];
+                const hasLinks = !!(receipt.view_url || receipt.edit_url);
+                return (
+                    <div data-testid={`${testIdPrefix}-receipt`} data-status={operation.missing ? 'missing' : status} className={`mt-3 rounded-lg border p-4 ${cardClass}`}>
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div className="min-w-0">
+                                <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Splunk dashboard</div>
+                                <div className={`mt-1 font-semibold break-words ${headingClass}`} data-testid={`${testIdPrefix}-receipt-title`}>
+                                    {operation.title || proposal?.brief?.title || 'Untitled dashboard'}
+                                </div>
+                                {identityLine}
+                            </div>
+                            {operation.created_at && <span className={`text-xs ${mutedTextClass}`}>{formatDashboardTime(operation.created_at)}</span>}
+                        </div>
+                        <div role="status" className={`mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses[view.tone]}`} data-testid={`${testIdPrefix}-receipt-status`}>
+                            <div className="flex items-start gap-2">
+                                <i className={`fas ${view.icon} mt-1`} aria-hidden="true"></i>
+                                <div className="min-w-0">
+                                    <p className="font-semibold">{view.heading}</p>
+                                    <p className="whitespace-pre-wrap break-words">{view.body}</p>
+                                    {view.detail && view.detail !== view.body && <p className="mt-1 break-words opacity-90">{view.detail}</p>}
+                                </div>
+                            </div>
+                        </div>
+                        {(status === 'created' || status === 'draft_only' || status === 'indeterminate') && !hasLinks && (
+                            <p className={`mt-2 text-xs ${mutedTextClass}`}>No link came back that matches this connection's Splunk Web address. Open the Constellation app in Splunk Web to find it.</p>
+                        )}
+                        {warnings.length > 0 && (
+                            <ul className={`mt-2 list-disc space-y-1 pl-5 text-xs ${subtextClass}`} data-testid={`${testIdPrefix}-receipt-warnings`}>
+                                {warnings.map((warning, index) => <li key={`${warning.code}-${index}`}>{warning.message || `Constellation noted ${warning.code}.`}</li>)}
+                            </ul>
+                        )}
+                        {operation.check_note && <p className={`mt-2 text-xs ${subtextClass}`}>{operation.check_note}</p>}
+                        {stoppedFollowing && (
+                            <p className={`mt-2 text-xs ${subtextClass}`}>The app is not checking this request right now. Click Check Status to ask Splunk.</p>
+                        )}
+                        {requestError && <p role="alert" className={`mt-2 text-sm ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{requestError}</p>}
+                        <div className="mt-3 flex flex-wrap items-center gap-2">
+                            {receipt.view_url && (
+                                <a href={receipt.view_url} target="_blank" rel="noopener noreferrer" className={primaryButton} data-testid={`${testIdPrefix}-open-dashboard`}>
+                                    <i className="fas fa-external-link-alt" aria-hidden="true"></i>
+                                    Open Dashboard
+                                </a>
+                            )}
+                            {receipt.edit_url && (
+                                <a href={receipt.edit_url} target="_blank" rel="noopener noreferrer" className={receipt.view_url ? secondaryButton : primaryButton} data-testid={`${testIdPrefix}-edit-constellation`}>
+                                    <i className="fas fa-pen-to-square" aria-hidden="true"></i>
+                                    Edit in Constellation
+                                </a>
+                            )}
+                            {showCheck && (
+                                <button type="button" onClick={checkStatus} disabled={busy === 'check'} className={secondaryButton} data-testid={`${testIdPrefix}-check-status`}>
+                                    <i className={`fas ${busy === 'check' ? 'fa-spinner fa-spin' : 'fa-rotate'}`} aria-hidden="true"></i>
+                                    {busy === 'check' ? 'Checking...' : 'Check Status'}
+                                </button>
+                            )}
+                            {operation.can_retry && !operation.missing && (
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setDraft(sanitizeDashboardBrief(operation.brief || proposal?.brief) || sanitizeDashboardBrief({}));
+                                        setRequestError('');
+                                        setRetrying(true);
+                                        setEditing(true);
+                                    }}
+                                    className={secondaryButton}
+                                    data-testid={`${testIdPrefix}-retry`}
+                                >
+                                    <i className="fas fa-pen" aria-hidden="true"></i>
+                                    Change the Plan
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                );
+            }
+
+            const payload = buildDashboardBriefPayload(draft);
+            const liveProblems = findDashboardBriefProblems(draft);
+            const shownProblems = [...liveProblems, ...serverProblems.filter((problem) => !liveProblems.some((live) => live.message === problem.message))];
+            const notes = Array.isArray(proposal?.notes) ? proposal.notes : [];
+            const createBlocked = shownProblems.length > 0 || incognitoActive || !proposal?.binding_key || !!busy;
+            const timeRangeLabel = (DASHBOARD_TIME_RANGE_OPTIONS.find((option) => option.value === payload.time_range.earliest) || {}).label || 'Not set';
+            const totalPanels = draft.pages.reduce((sum, page) => sum + page.panels.length, 0);
+
+            const setPage = (pageIndex, updater) => updateDraft((current) => ({
+                ...current,
+                pages: current.pages.map((page, index) => (index === pageIndex ? updater(page) : page)),
+            }));
+
+            return (
+                <div data-testid={testIdPrefix} className={`mt-3 rounded-lg border p-4 ${cardClass}`}>
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                                <span className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>{retrying ? 'Change the dashboard plan' : 'Dashboard plan'}</span>
+                                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${isDarkTheme ? 'border-gray-600 text-gray-200' : 'border-gray-300 text-gray-700'}`}>
+                                    {proposal?.drafted_by === 'ai' ? 'Drafted by the AI model' : 'Starter plan'}
+                                </span>
+                            </div>
+                            {identityLine}
+                            {proposal?.splunk_web_url && (
+                                <p className={`text-xs break-all ${mutedTextClass}`}>
+                                    Links open at {proposal.splunk_web_url}{proposal.splunk_web_url_source === 'derived' ? ' (guessed from the connection)' : ''}
+                                </p>
+                            )}
+                        </div>
+                        {payload.provenance?.label && (
+                            <span className={`text-xs ${mutedTextClass}`}>{payload.provenance.kind === 'conversation' ? 'Based on this chat' : `Based on ${payload.provenance.label}`}</span>
+                        )}
+                    </div>
+
+                    {editing ? (
+                        <div className="mt-3 space-y-3" data-testid={`${testIdPrefix}-editor`}>
+                            <div>
+                                <label htmlFor={fieldId('title')} className={labelClass}>Title</label>
+                                <input id={fieldId('title')} type="text" maxLength={DASHBOARD_LIMITS.title} value={draft.title} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, title: value })); }} className={`mt-1 ${inputClass}`} />
+                            </div>
+                            <div>
+                                <label htmlFor={fieldId('purpose')} className={labelClass}>Purpose</label>
+                                <textarea id={fieldId('purpose')} rows={2} maxLength={DASHBOARD_LIMITS.purpose} value={draft.purpose} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, purpose: value })); }} className={`mt-1 ${inputClass}`} placeholder="The question the dashboard answers and who it is for" />
+                            </div>
+                            <div className="grid gap-3 sm:grid-cols-2">
+                                <div>
+                                    <label htmlFor={fieldId('source-kind')} className={labelClass}>Data</label>
+                                    <select
+                                        id={fieldId('source-kind')}
+                                        value={draft.source.kind}
+                                        onChange={(event) => {
+                                            const kind = event.target.value === 'spl' ? 'spl' : 'index';
+                                            updateDraft((current) => ({ ...current, source: kind === 'spl' ? { kind: 'spl', query: '' } : { kind: 'index', index: '', sourcetype: '' } }));
+                                        }}
+                                        className={`mt-1 ${inputClass}`}
+                                    >
+                                        <option value="index">An index</option>
+                                        <option value="spl">A search</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label htmlFor={fieldId('time-range')} className={labelClass}>Time range</label>
+                                    <select id={fieldId('time-range')} value={draft.time_range.earliest} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, time_range: { earliest: value, latest: 'now' } })); }} className={`mt-1 ${inputClass}`}>
+                                        {!DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === draft.time_range.earliest) && <option value={draft.time_range.earliest}>Pick a time range</option>}
+                                        {DASHBOARD_TIME_RANGE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                                    </select>
+                                </div>
+                            </div>
+                            {draft.source.kind === 'spl' ? (
+                                <div>
+                                    <label htmlFor={fieldId('query')} className={labelClass}>Search</label>
+                                    <textarea id={fieldId('query')} rows={3} maxLength={DASHBOARD_LIMITS.query} value={draft.source.query} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, source: { kind: 'spl', query: value } })); }} className={`mt-1 font-mono ${inputClass}`} placeholder="index=web sourcetype=access_combined | stats count by status" />
+                                    <p className={`mt-1 text-xs ${mutedTextClass}`}>Splunk runs this search as your Splunk user.</p>
+                                </div>
+                            ) : (
+                                <div className="grid gap-3 sm:grid-cols-2">
+                                    <div>
+                                        <label htmlFor={fieldId('index')} className={labelClass}>Index</label>
+                                        <input id={fieldId('index')} type="text" maxLength={120} value={draft.source.index} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, source: { ...current.source, kind: 'index', index: value } })); }} className={`mt-1 font-mono ${inputClass}`} placeholder="main" />
+                                    </div>
+                                    <div>
+                                        <label htmlFor={fieldId('sourcetype')} className={labelClass}>Sourcetype (optional)</label>
+                                        <input id={fieldId('sourcetype')} type="text" maxLength={200} value={draft.source.sourcetype || ''} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, source: { ...current.source, kind: 'index', sourcetype: value } })); }} className={`mt-1 font-mono ${inputClass}`} />
+                                    </div>
+                                </div>
+                            )}
+                            {draft.pages.map((page, pageIndex) => (
+                                <fieldset key={`page-${pageIndex}`} className={`rounded-md border p-3 ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`} data-testid={`${testIdPrefix}-page`}>
+                                    <legend className={`px-1 text-xs font-semibold ${headingClass}`}>Page {pageIndex + 1}</legend>
+                                    <label htmlFor={fieldId(`page-${pageIndex}-name`)} className={labelClass}>Page name</label>
+                                    <input id={fieldId(`page-${pageIndex}-name`)} type="text" maxLength={DASHBOARD_LIMITS.pageName} value={page.name} onChange={(event) => { const value = event.target.value; setPage(pageIndex, (current) => ({ ...current, name: value })); }} className={`mt-1 ${inputClass}`} />
+                                    <div className={`mt-2 ${labelClass}`}>Panels</div>
+                                    <div className="mt-1 space-y-2">
+                                        {page.panels.map((panel, panelIndex) => (
+                                            <div key={`panel-${panelIndex}`} className="flex items-center gap-2">
+                                                <input
+                                                    type="text"
+                                                    aria-label={`Panel ${panelIndex + 1} on page ${pageIndex + 1}`}
+                                                    maxLength={DASHBOARD_LIMITS.panel}
+                                                    value={panel}
+                                                    onChange={(event) => {
+                                                        const value = event.target.value;
+                                                        setPage(pageIndex, (current) => ({ ...current, panels: current.panels.map((item, index) => (index === panelIndex ? value : item)) }));
+                                                    }}
+                                                    className={inputClass}
+                                                    placeholder="Event arrivals over time"
+                                                />
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setPage(pageIndex, (current) => ({ ...current, panels: current.panels.filter((_, index) => index !== panelIndex) }))}
+                                                    className={secondaryButton}
+                                                    aria-label={`Remove panel ${panelIndex + 1} on page ${pageIndex + 1}`}
+                                                >
+                                                    <i className="fas fa-xmark" aria-hidden="true"></i>
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => setPage(pageIndex, (current) => ({ ...current, panels: [...current.panels, ''] }))}
+                                            disabled={page.panels.length >= DASHBOARD_LIMITS.panelsPerPage || totalPanels >= DASHBOARD_LIMITS.panelsTotal}
+                                            className={secondaryButton}
+                                        >
+                                            <i className="fas fa-plus" aria-hidden="true"></i>
+                                            Add Panel
+                                        </button>
+                                        {draft.pages.length > 1 && (
+                                            <button type="button" onClick={() => updateDraft((current) => ({ ...current, pages: current.pages.filter((_, index) => index !== pageIndex) }))} className={secondaryButton}>
+                                                Remove Page
+                                            </button>
+                                        )}
+                                    </div>
+                                </fieldset>
+                            ))}
+                            {draft.pages.length < DASHBOARD_LIMITS.pages && (
+                                <button
+                                    type="button"
+                                    onClick={() => updateDraft((current) => ({ ...current, pages: [...current.pages, { name: `Page ${current.pages.length + 1}`, panels: [''] }] }))}
+                                    disabled={totalPanels >= DASHBOARD_LIMITS.panelsTotal}
+                                    className={secondaryButton}
+                                >
+                                    <i className="fas fa-plus" aria-hidden="true"></i>
+                                    Add Page
+                                </button>
+                            )}
+                            <div>
+                                <label htmlFor={fieldId('findings')} className={labelClass}>Findings to show (optional, one per line)</label>
+                                <textarea id={fieldId('findings')} rows={3} value={draft.findings.join('\n')} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, findings: value.split('\n') })); }} className={`mt-1 ${inputClass}`} />
+                            </div>
+                            <div>
+                                <label htmlFor={fieldId('requirements')} className={labelClass}>Requirements (optional)</label>
+                                <textarea id={fieldId('requirements')} rows={2} maxLength={DASHBOARD_LIMITS.requirements} value={draft.requirements} onChange={(event) => { const value = event.target.value; updateDraft((current) => ({ ...current, requirements: value })); }} className={`mt-1 ${inputClass}`} placeholder="Units, metric definitions, exclusions, and how to treat missing data" />
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="mt-3 space-y-3 text-sm" data-testid={`${testIdPrefix}-summary`}>
+                            <div>
+                                <div className={`font-semibold break-words ${headingClass}`} data-testid={`${testIdPrefix}-title`}>{payload.title || 'Untitled dashboard'}</div>
+                                {payload.purpose && <p className={`mt-1 break-words ${subtextClass}`}>{payload.purpose}</p>}
+                            </div>
+                            <div className={`grid gap-2 sm:grid-cols-2 ${subtextClass}`}>
+                                <div className="min-w-0">
+                                    <span className={labelClass}>Data</span>
+                                    {payload.source.kind === 'spl' ? (
+                                        <pre className={`mt-1 whitespace-pre-wrap break-all rounded border px-2 py-1 text-xs ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>{payload.source.query || 'No search yet'}</pre>
+                                    ) : (
+                                        <span className="mt-1 block break-words">
+                                            {payload.source.index ? <>Index <code>{payload.source.index}</code></> : 'No index yet'}
+                                            {payload.source.sourcetype ? <>, sourcetype <code>{payload.source.sourcetype}</code></> : null}
+                                        </span>
+                                    )}
+                                </div>
+                                <div>
+                                    <span className={labelClass}>Time range</span>
+                                    <span className="mt-1 block">{timeRangeLabel}</span>
+                                </div>
+                            </div>
+                            {payload.pages.map((page, pageIndex) => (
+                                <div key={`summary-page-${pageIndex}`} className={subtextClass}>
+                                    <span className={labelClass}>{payload.pages.length > 1 ? `Page ${pageIndex + 1}: ${page.name || 'Unnamed'}` : `Panels on ${page.name || 'the page'}`}</span>
+                                    <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                                        {page.panels.map((panel, panelIndex) => <li key={`summary-panel-${panelIndex}`} className="break-words">{panel}</li>)}
+                                    </ul>
+                                </div>
+                            ))}
+                            {Array.isArray(payload.findings) && payload.findings.length > 0 && (
+                                <div className={subtextClass}>
+                                    <span className={labelClass}>Findings</span>
+                                    <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                                        {payload.findings.map((finding, index) => <li key={`finding-${index}`} className="break-words">{finding}</li>)}
+                                    </ul>
+                                </div>
+                            )}
+                            {payload.requirements && (
+                                <div className={subtextClass}>
+                                    <span className={labelClass}>Requirements</span>
+                                    <p className="mt-1 break-words">{payload.requirements}</p>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {shownProblems.length > 0 && (
+                        <div role="alert" className={`mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.error}`} data-testid={`${testIdPrefix}-problems`}>
+                            <p className="font-semibold">Fix these before you create the dashboard:</p>
+                            <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                                {shownProblems.map((problem, index) => <li key={`${problem.field}-${index}`}>{problem.message}</li>)}
+                            </ul>
+                        </div>
+                    )}
+                    {notes.length > 0 && (
+                        <div className={`mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`} data-testid={`${testIdPrefix}-notes`}>
+                            <ul className="list-disc space-y-0.5 pl-5">
+                                {notes.map((note, index) => <li key={`note-${index}`}>{note}</li>)}
+                            </ul>
+                        </div>
+                    )}
+                    {incognitoActive && (
+                        <p className={`mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`} data-testid={`${testIdPrefix}-incognito`}>
+                            Turn incognito mode off to create this dashboard. Constellation sends the plan to its own AI model with the real names.
+                        </p>
+                    )}
+                    {requestError && <p role="alert" className={`mt-3 text-sm ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{requestError}</p>}
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={createDashboard} disabled={createBlocked} className={primaryButton} data-testid={`${testIdPrefix}-create`}>
+                            <i className={`fas ${busy === 'create' ? 'fa-spinner fa-spin' : 'fa-chart-pie'}`} aria-hidden="true"></i>
+                            {busy === 'create' ? 'Sending...' : 'Create Dashboard'}
+                        </button>
+                        <button type="button" onClick={() => setEditing((current) => !current)} disabled={!!busy} className={secondaryButton} data-testid={`${testIdPrefix}-edit`}>
+                            <i className={`fas ${editing ? 'fa-check' : 'fa-pen'}`} aria-hidden="true"></i>
+                            {editing ? 'Done Editing' : 'Edit Plan'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                if (retrying) {
+                                    setRetrying(false);
+                                    setEditing(false);
+                                    setRequestError('');
+                                    return;
+                                }
+                                notify({ dashboard_dismissed: true });
+                            }}
+                            disabled={!!busy}
+                            className={secondaryButton}
+                            data-testid={`${testIdPrefix}-cancel`}
+                        >
+                            Cancel
+                        </button>
+                        <span className={`text-xs ${mutedTextClass}`}>Nothing goes to Splunk until you click Create Dashboard.</span>
+                    </div>
+                </div>
+            );
+        }
+
         const compactPersistedChatMessages = (items, limit = 24) => {
             if (!Array.isArray(items)) return [];
             return items.slice(-limit).map((msg, idx) => {
@@ -991,6 +1802,9 @@
                                 : [],
                         }))
                         : [],
+                    dashboard_proposal: sanitizeDashboardProposal(msg?.dashboard_proposal) || undefined,
+                    dashboard_operation: sanitizeDashboardOperation(msg?.dashboard_operation) || undefined,
+                    dashboard_dismissed: msg?.dashboard_dismissed ? true : undefined,
                     has_follow_on: followOnActions.length > 0,
                     follow_on_actions: followOnActions,
                     status_timeline: Array.isArray(msg?.status_timeline) ? msg.status_timeline.slice(-8) : [],
@@ -2428,6 +3242,12 @@
             const [capabilityActionTick, setCapabilityActionTick] = useState(() => Date.now());
             const [capabilityNotice, setCapabilityNotice] = useState(null);
             const [selectedCapabilityDetailName, setSelectedCapabilityDetailName] = useState(null);
+            const [dashboardStatus, setDashboardStatus] = useState({ status: 'idle', data: null, error: '' });
+            const [dashboardOperations, setDashboardOperations] = useState({ status: 'idle', items: [], error: '' });
+            const [capabilityConnections, setCapabilityConnections] = useState({});
+            const [dashboardWebUrlDrafts, setDashboardWebUrlDrafts] = useState({});
+            const [dashboardWebUrlSave, setDashboardWebUrlSave] = useState({ saving: false, error: '', notice: '' });
+            const [reportDashboardPlans, setReportDashboardPlans] = useState({});
             const [deeplinkDrafts, setDeeplinkDrafts] = useState({
                 splunk_deeplink_tools: {
                     query: 'search index=_internal | head 20',
@@ -2530,6 +3350,7 @@
             const authEnableGateActive = !securityConfig.auth_enabled && !hasReviewedAuthEnableInfo;
             const currentAuthUser = authStatus?.user || null;
             const authAccountsEnabled = !!authStatus?.auth_enabled;
+            const isCapabilityAdmin = !authAccountsEnabled || String(currentAuthUser?.role || '').toLowerCase() === 'admin';
             const headerAuthVisible = authAccountsEnabled && !!currentAuthUser && !!authStatus?.authenticated;
             const headerAuthProviderLabel = authStatus?.auth_provider === 'oidc' ? 'OpenID Connect' : 'Local account';
             const headerAuthRoleLabel = currentAuthUser?.role ? `${currentAuthUser.role} access` : 'Authenticated';
@@ -2623,6 +3444,8 @@
             const deeplinkCapability = capabilitiesData?.capabilities?.splunk_deeplink_tools || null;
             const exportCapability = capabilitiesData?.capabilities?.export_tools || null;
             const ragCapability = capabilitiesData?.capabilities?.rag_chromadb || null;
+            const dashboardCapability = capabilitiesData?.capabilities?.splunk_dashboards || null;
+            const dashboardsCapabilityOn = !!(dashboardCapability?.installed && dashboardCapability?.enabled && !dashboardCapability?.restart_required);
             const selectedCapabilityDetail = selectedCapabilityDetailName
                 ? capabilitiesData?.capabilities?.[selectedCapabilityDetailName] || null
                 : null;
@@ -4248,8 +5071,18 @@
                 }
                 if (isCapabilitiesTab) {
                     loadCapabilities();
+                    loadDashboardStatus();
+                    loadDashboardOperations();
                 }
             }, [workspaceTab]);
+
+            useEffect(() => {
+                if (!isCapabilitiesTab || dashboardStatus.data?.support?.state !== 'checking') {
+                    return undefined;
+                }
+                const timer = setTimeout(() => loadDashboardStatus(), 4000);
+                return () => clearTimeout(timer);
+            }, [isCapabilitiesTab, dashboardStatus.data]);
 
             useEffect(() => {
                 if (isCapabilitiesRagView) {
@@ -4973,6 +5806,80 @@
 
             const refreshCapabilitiesWorkspace = () => {
                 loadCapabilities();
+                loadDashboardStatus({ refresh: true });
+                loadDashboardOperations();
+            };
+
+            const loadDashboardStatus = async ({ refresh = false } = {}) => {
+                setDashboardStatus((prev) => ({ ...prev, status: 'loading', error: '' }));
+                try {
+                    const response = await fetch(`/api/dashboards/status${refresh ? '?refresh=true' : ''}`);
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
+                    }
+                    setDashboardStatus({ status: 'success', data, error: '' });
+                } catch (error) {
+                    setDashboardStatus((prev) => ({ ...prev, status: 'error', error: error.message || 'Could not check Splunk Dashboards.' }));
+                }
+            };
+
+            const loadDashboardOperations = async () => {
+                try {
+                    const response = await fetch('/api/dashboards/operations?limit=5');
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
+                    }
+                    const items = (Array.isArray(data.operations) ? data.operations : []).map(sanitizeDashboardOperation).filter(Boolean);
+                    setDashboardOperations({ status: 'success', items, error: '' });
+                } catch (error) {
+                    setDashboardOperations((prev) => ({ ...prev, status: 'error', error: error.message || 'Could not load recent dashboards.' }));
+                }
+            };
+
+            const loadCapabilityConnections = async (name, { refresh = false } = {}) => {
+                setCapabilityConnections((prev) => ({ ...prev, [name]: { ...(prev[name] || {}), status: 'loading', error: '' } }));
+                try {
+                    const response = await fetch(`/api/capabilities/${encodeURIComponent(name)}/connections${refresh ? '?refresh=true' : ''}`);
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
+                    }
+                    const connections = Array.isArray(data.connections) ? data.connections : [];
+                    setCapabilityConnections((prev) => ({ ...prev, [name]: { status: 'success', connections, error: '' } }));
+                    if (name === 'splunk_dashboards') {
+                        setDashboardWebUrlDrafts(Object.fromEntries(connections.map((entry) => [String(entry.name || ''), String(entry.splunk_web_url || '')])));
+                    }
+                } catch (error) {
+                    setCapabilityConnections((prev) => ({ ...prev, [name]: { ...(prev[name] || {}), status: 'error', error: error.message || 'Could not check the Splunk connections.' } }));
+                }
+            };
+
+            const saveDashboardWebUrls = async () => {
+                const addresses = Object.fromEntries(
+                    Object.entries(dashboardWebUrlDrafts)
+                        .map(([connectionName, address]) => [connectionName, String(address || '').trim()])
+                        .filter(([, address]) => address)
+                );
+                setDashboardWebUrlSave({ saving: true, error: '', notice: '' });
+                try {
+                    const response = await fetch('/api/capabilities/splunk_dashboards/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ config: { splunk_web_urls: addresses } }),
+                    });
+                    const result = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(getCapabilityActionError(result, 'Could not save the Splunk Web addresses.').message);
+                    }
+                    setDashboardWebUrlSave({ saving: false, error: '', notice: 'Splunk Web addresses saved.' });
+                    loadCapabilities();
+                    loadCapabilityConnections('splunk_dashboards');
+                    loadDashboardStatus();
+                } catch (error) {
+                    setDashboardWebUrlSave({ saving: false, error: error.message || 'Could not save the Splunk Web addresses.', notice: '' });
+                }
             };
 
             const loadRagAssetWorkspace = async (options = {}) => {
@@ -5455,6 +6362,9 @@
                     });
                     if (action !== 'install') {
                         setTimeout(() => setCapabilityNotice(null), 3500);
+                    }
+                    if (name === 'splunk_dashboards') {
+                        loadDashboardStatus();
                     }
                 }
             };
@@ -7205,6 +8115,8 @@
                                                 )}
                                             </div>
 
+                                            {renderCapabilitySplunkRequirements(capability)}
+
                                             {restartNote && (
                                                 <div className={`rounded-xl border px-4 py-3 text-sm ${isDarkTheme ? 'bg-amber-950 border-amber-800 text-amber-100' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
                                                     {restartNote}
@@ -8380,7 +9292,10 @@
                         {lifecycle === 'restart_required' && (
                             <span className={`text-xs ${mutedTextClass}`}>Restart Splunk Discovery Tool to finish installing.</span>
                         )}
-                        {actions.map(({ action, primary }) => {
+                        {!isCapabilityAdmin && lifecycle !== 'planned' && (
+                            <span className={`text-xs ${mutedTextClass}`} data-testid={`capability-admin-only-${name}`}>Only an administrator can install, turn on, or change capabilities.</span>
+                        )}
+                        {isCapabilityAdmin && actions.map(({ action, primary }) => {
                             const labels = CAPABILITY_ACTION_LABELS[action];
                             const busyLabel = action === 'install' && name === 'rag_chromadb'
                                 ? `Installing... ${formatCapabilityActionElapsed(ragInstallElapsedSeconds)}`
@@ -8400,11 +9315,254 @@
                                 </button>
                             );
                         })}
-                        {extraButtons}
+                        {isCapabilityAdmin && extraButtons}
                     </div>
                 );
             };
 
+            const DASHBOARD_SUPPORT_META = {
+                loading: { label: 'Checking', tone: 'info' },
+                checking: { label: 'Checking', tone: 'info' },
+                available: { label: 'Dashboard tools found', tone: 'success' },
+                potential: { label: 'Potential capability', tone: 'warning' },
+                incompatible: { label: 'Unsupported version', tone: 'error' },
+                unknown: { label: 'Not checked', tone: 'neutral' },
+            };
+
+            const getDashboardToneClasses = (tone) => {
+                switch (tone) {
+                    case 'success':
+                        return isDarkTheme ? 'bg-emerald-950 text-emerald-100 border-emerald-800' : 'bg-emerald-50 text-emerald-800 border-emerald-200';
+                    case 'warning':
+                        return isDarkTheme ? 'bg-amber-950 text-amber-100 border-amber-800' : 'bg-amber-50 text-amber-900 border-amber-200';
+                    case 'error':
+                        return isDarkTheme ? 'bg-red-950 text-red-100 border-red-800' : 'bg-red-50 text-red-800 border-red-200';
+                    case 'info':
+                        return isDarkTheme ? 'bg-sky-950 text-sky-100 border-sky-800' : 'bg-sky-50 text-sky-900 border-sky-200';
+                    default:
+                        return isDarkTheme ? 'bg-gray-800 text-gray-200 border-gray-600' : 'bg-gray-100 text-gray-700 border-gray-300';
+                }
+            };
+
+            const renderDashboardSupportChip = (state, testId) => {
+                const meta = DASHBOARD_SUPPORT_META[state] || DASHBOARD_SUPPORT_META.unknown;
+                return (
+                    <span data-testid={testId} data-state={state} className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${getDashboardToneClasses(meta.tone)}`}>
+                        {meta.label}
+                    </span>
+                );
+            };
+
+            const renderSplunkRequirementLinks = (requirements, testId = 'capability-splunk-requirements') => {
+                const items = (Array.isArray(requirements) ? requirements : []).filter((item) => item && typeof item.name === 'string' && item.name.trim());
+                if (items.length === 0) {
+                    return null;
+                }
+                return (
+                    <ul data-testid={testId} className={`mt-2 space-y-2 text-sm ${subtextClass}`}>
+                        {items.map((item) => (
+                            <li key={item.name} className="flex flex-col gap-0.5">
+                                <span>
+                                    <span className={`font-semibold ${headingClass}`}>{item.name}</span>
+                                    {item.description ? `: ${item.description}` : ''}
+                                </span>
+                                {typeof item.url === 'string' && item.url.startsWith('https://') && (
+                                    <a href={item.url} target="_blank" rel="noopener noreferrer" className="ui-link inline-flex items-center gap-1 text-xs">
+                                        {item.link_label || item.url}
+                                        <i className="fas fa-external-link-alt" aria-hidden="true"></i>
+                                    </a>
+                                )}
+                            </li>
+                        ))}
+                    </ul>
+                );
+            };
+
+            const describeDashboardSupport = (support, connectionLabel = '') => {
+                const state = support?.state || 'unknown';
+                if (state === 'available') {
+                    return `${connectionLabel || 'This Splunk connection'} offers the Constellation dashboard tools. Ask for a dashboard in chat, or use Create Dashboard on a report.`;
+                }
+                if (state === 'potential') {
+                    return 'This Splunk environment does not offer the dashboard tools yet. To create dashboards here, install these apps in that Splunk environment:';
+                }
+                if (state === 'incompatible') {
+                    const problems = Array.isArray(support?.problems) ? support.problems.join(' ') : '';
+                    return ['This Splunk environment lists the dashboard tools, but not in the version this app supports.', problems, 'Update Constellation in that Splunk environment:'].filter(Boolean).join(' ');
+                }
+                return support?.message || 'Not checked yet.';
+            };
+
+            const renderDashboardConnectionSettings = (capability) => {
+                const entry = capabilityConnections.splunk_dashboards || { status: 'idle', connections: [] };
+                const connections = Array.isArray(entry.connections) ? entry.connections : [];
+                const isBusy = !!capabilityActionState?.[capability.name];
+                return (
+                    <details
+                        data-testid="dashboard-connection-settings"
+                        className={`mt-3 rounded-lg border ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-white'}`}
+                        onToggle={(event) => {
+                            if (event.currentTarget.open && entry.status === 'idle') {
+                                loadCapabilityConnections('splunk_dashboards');
+                            }
+                        }}
+                    >
+                        <summary className={`cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}`}>Splunk connections and Splunk Web addresses</summary>
+                        <div className="space-y-3 px-3 pb-3">
+                            <p className={`text-xs ${mutedTextClass}`}>
+                                Dashboards work on each connection whose Splunk MCP Server offers the Constellation tools. Dashboard links must match the connection's Splunk Web address. If the address guessed from the connection is wrong, enter the right one.
+                            </p>
+                            {entry.status === 'loading' && connections.length === 0 && (
+                                <p role="status" className={`text-xs ${mutedTextClass}`}>
+                                    <i className="fas fa-spinner fa-spin mr-1" aria-hidden="true"></i>
+                                    Checking each Splunk connection...
+                                </p>
+                            )}
+                            {entry.status === 'error' && (
+                                <p role="alert" className={`text-xs ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{entry.error}</p>
+                            )}
+                            {entry.status !== 'loading' && entry.status !== 'error' && entry.status !== 'idle' && connections.length === 0 && (
+                                <p className={`text-xs ${mutedTextClass}`}>No Splunk connections are saved yet. Add one in Settings.</p>
+                            )}
+                            {connections.map((connection) => {
+                                const connectionName = String(connection.name || '');
+                                const inputId = `dashboard-web-url-${connectionName || 'active'}`.replace(/[^A-Za-z0-9_-]/g, '-');
+                                const support = connection.support || {};
+                                return (
+                                    <div key={connectionName || '__active__'} data-testid="dashboard-connection-row" data-connection={connectionName} className={`rounded-md border px-3 py-2 ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <span className={`text-sm font-medium ${headingClass}`}>{connection.label || connectionName || 'Active connection'}</span>
+                                            {connection.active && (
+                                                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${getDashboardToneClasses('neutral')}`}>In use</span>
+                                            )}
+                                            {renderDashboardSupportChip(support.state || 'unknown', 'dashboard-connection-support')}
+                                        </div>
+                                        <p className={`mt-1 text-xs ${mutedTextClass}`}>
+                                            {[support.message, ...(Array.isArray(support.problems) ? support.problems : [])].filter(Boolean).join(' ')}
+                                        </p>
+                                        <label htmlFor={inputId} className={`mt-2 block text-xs font-medium ${headingClass}`}>Splunk Web address</label>
+                                        <input
+                                            id={inputId}
+                                            type="url"
+                                            value={dashboardWebUrlDrafts[connectionName] ?? ''}
+                                            onChange={(event) => {
+                                                const value = event.target.value;
+                                                setDashboardWebUrlDrafts((prev) => ({ ...prev, [connectionName]: value }));
+                                                setDashboardWebUrlSave((prev) => (prev.error || prev.notice ? { ...prev, error: '', notice: '' } : prev));
+                                            }}
+                                            placeholder={connection.derived_splunk_web_url || 'https://splunk.example.com:8000'}
+                                            className={`mt-1 w-full rounded-md border px-3 py-1.5 text-xs font-mono ${isDarkTheme ? 'bg-gray-950 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                                        />
+                                        {!dashboardWebUrlDrafts[connectionName] && connection.derived_splunk_web_url && (
+                                            <p className={`mt-1 text-xs ${mutedTextClass}`}>Leave empty to use {connection.derived_splunk_web_url}.</p>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                            <div className="flex flex-wrap gap-2">
+                                <button type="button" onClick={saveDashboardWebUrls} disabled={isBusy || dashboardWebUrlSave.saving || connections.length === 0} className={getCapabilityActionButtonClass(true, isBusy || dashboardWebUrlSave.saving)} data-testid="dashboard-save-web-urls">
+                                    {dashboardWebUrlSave.saving ? 'Saving...' : 'Save Addresses'}
+                                </button>
+                                <button type="button" onClick={() => loadCapabilityConnections('splunk_dashboards', { refresh: true })} disabled={entry.status === 'loading'} className={getCapabilityActionButtonClass(false, entry.status === 'loading')}>
+                                    {entry.status === 'loading' ? 'Checking...' : 'Check Again'}
+                                </button>
+                            </div>
+                            {dashboardWebUrlSave.error && (
+                                <p role="alert" data-testid="dashboard-web-url-error" className={`text-xs ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{dashboardWebUrlSave.error}</p>
+                            )}
+                            {dashboardWebUrlSave.notice && (
+                                <p role="status" data-testid="dashboard-web-url-notice" className={`text-xs ${isDarkTheme ? 'text-emerald-300' : 'text-emerald-700'}`}>{dashboardWebUrlSave.notice}</p>
+                            )}
+                        </div>
+                    </details>
+                );
+            };
+
+            const renderDashboardCapabilityPanel = (capability) => {
+                const view = dashboardStatus.data;
+                const support = view?.support || null;
+                const supportState = !support && dashboardStatus.status !== 'error' ? 'loading' : (support?.state || 'unknown');
+                const connectionLabel = view?.connection?.connection_label || '';
+                const requirements = Array.isArray(view?.requirements) && view.requirements.length > 0 ? view.requirements : capability.splunk_requirements;
+                const message = supportState === 'loading'
+                    ? 'Checking this Splunk connection for the dashboard tools...'
+                    : (support ? describeDashboardSupport(support, connectionLabel) : (dashboardStatus.error || 'Not checked yet.'));
+                const showBlockedReason = !!(view?.enabled && !view?.can_create && supportState === 'available' && view?.blocked_reason);
+                const operations = capability.installed ? (dashboardOperations.items || []).slice(0, 5) : [];
+                return (
+                    <div data-testid="dashboard-capability-panel" className={`mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                                <span className={`text-sm font-medium ${headingClass}`}>{connectionLabel ? `Splunk connection: ${connectionLabel}` : 'This Splunk connection'}</span>
+                                {renderDashboardSupportChip(supportState, 'dashboard-support-state')}
+                            </div>
+                            <button type="button" onClick={() => loadDashboardStatus({ refresh: true })} disabled={dashboardStatus.status === 'loading'} className="ui-link text-xs disabled:opacity-60">
+                                {dashboardStatus.status === 'loading' ? 'Checking...' : 'Check Again'}
+                            </button>
+                        </div>
+                        <p className={`mt-2 text-xs ${subtextClass}`} data-testid="dashboard-support-message">{message}</p>
+                        {(supportState === 'potential' || supportState === 'incompatible') && renderSplunkRequirementLinks(requirements, 'dashboard-requirements')}
+                        {showBlockedReason && (
+                            <p className={`mt-2 text-xs ${subtextClass}`} data-testid="dashboard-blocked-reason">{view.blocked_reason}</p>
+                        )}
+                        {operations.length > 0 && (
+                            <div className="mt-3" data-testid="dashboard-recent">
+                                <div className={`text-xs font-semibold uppercase tracking-wide ${mutedTextClass}`}>Your recent dashboards</div>
+                                <ul className="mt-2 space-y-2">
+                                    {operations.map((operation) => (
+                                        <li key={operation.request_id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                                            <span className="min-w-0 break-words">
+                                                <span className={`font-medium ${headingClass}`}>{operation.title || 'Untitled dashboard'}</span>
+                                                <span className={mutedTextClass}> · {DASHBOARD_STATUS_LABELS[operation.status] || operation.status}{operation.created_at ? ` · ${formatDashboardTime(operation.created_at)}` : ''}</span>
+                                            </span>
+                                            <span className="flex flex-wrap gap-3">
+                                                {operation.receipt?.view_url && (
+                                                    <a href={operation.receipt.view_url} target="_blank" rel="noopener noreferrer" className="ui-link">Open Dashboard</a>
+                                                )}
+                                                {operation.receipt?.edit_url && (
+                                                    <a href={operation.receipt.edit_url} target="_blank" rel="noopener noreferrer" className="ui-link">Edit in Constellation</a>
+                                                )}
+                                            </span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+                        {isCapabilityAdmin && capability.installed && renderDashboardConnectionSettings(capability)}
+                    </div>
+                );
+            };
+
+            const renderCapabilitySplunkRequirements = (capability) => {
+                const requirements = Array.isArray(capability?.splunk_requirements) ? capability.splunk_requirements : [];
+                const requiredTools = Array.isArray(capability?.required_mcp_tools) ? capability.required_mcp_tools : [];
+                if (requirements.length === 0 && requiredTools.length === 0) {
+                    return null;
+                }
+                const support = capability.name === 'splunk_dashboards' ? dashboardStatus.data?.support : null;
+                return (
+                    <div className={`rounded-xl border p-4 ${panelMutedClass}`} data-testid="capability-detail-splunk-requirements">
+                        <div className={`text-xs uppercase tracking-wider ${mutedTextClass}`}>Needs in Splunk</div>
+                        {requiredTools.length > 0 && (
+                            <p className={`mt-2 text-sm ${subtextClass}`}>
+                                Works only on Splunk connections whose Splunk MCP Server offers {requiredTools.map((tool, index) => (
+                                    <React.Fragment key={tool}>
+                                        {index > 0 ? (index === requiredTools.length - 1 ? ' and ' : ', ') : ''}
+                                        <code>{tool}</code>
+                                    </React.Fragment>
+                                ))}. Install these in each Splunk environment where you want to use it:
+                            </p>
+                        )}
+                        {renderSplunkRequirementLinks(requirements, 'capability-detail-requirement-links')}
+                        {support && (
+                            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                                <span className={mutedTextClass}>Your Splunk connection:</span>
+                                {renderDashboardSupportChip(support.state || 'unknown', 'capability-detail-support-state')}
+                            </div>
+                        )}
+                    </div>
+                );
+            };
             const renderCapabilityNotice = () => {
                 const showRagInstallProgress = ragActionInProgress === 'install';
                 const progressMeta = showRagInstallProgress ? getRagInstallProgressMeta(ragInstallElapsedSeconds, ragInstallGuidance) : null;
@@ -14540,6 +15698,7 @@
                                             visualization_spec: result.visualization_spec,
                                             spl_in_text: result.spl_in_text,
                                             capability_usage: Array.isArray(result.capability_usage) ? result.capability_usage : [],
+                                            dashboard_proposal: sanitizeDashboardProposal(result.dashboard_proposal) || undefined,
                                             has_follow_on: mergedFollowOnActions.length > 0,
                                             follow_on_actions: mergedFollowOnActions,
                                             status_timeline: result.status_timeline,
@@ -14756,6 +15915,58 @@
 
             const toggleChatReplyPanel = (messageId, panelKey) => {
                 setChatReplyPanels(prev => ({ ...prev, [messageId]: prev[messageId] === panelKey ? null : panelKey }));
+            };
+
+            const updateChatMessageFields = (messageId, patch) => {
+                setChatMessages(prev => prev.map((message) => (message.id === messageId ? { ...message, ...patch } : message)));
+            };
+
+            const updateReportDashboardPlan = (reportName, patch) => {
+                setReportDashboardPlans((prev) => {
+                    if (patch?.dashboard_dismissed) {
+                        const next = { ...prev };
+                        delete next[reportName];
+                        return next;
+                    }
+                    return { ...prev, [reportName]: { ...(prev[reportName] || {}), ...patch } };
+                });
+            };
+
+            const proposeDashboardFromReport = async (reportName) => {
+                if (!reportName || reportDashboardPlans[reportName]?.status === 'loading') {
+                    return;
+                }
+                setReportDashboardPlans((prev) => ({ ...prev, [reportName]: { status: 'loading' } }));
+                try {
+                    const response = await fetch('/api/dashboards/propose', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ report_name: reportName }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    const proposal = response.ok ? sanitizeDashboardProposal(data.proposal) : null;
+                    if (!proposal) {
+                        setReportDashboardPlans((prev) => ({
+                            ...prev,
+                            [reportName]: {
+                                status: 'error',
+                                error: dashboardApiError(data, 'Could not draft a dashboard plan from this report. Try again.'),
+                                supportState: typeof data?.support?.state === 'string' ? data.support.state : '',
+                                requirements: Array.isArray(data?.requirements) ? data.requirements : [],
+                            },
+                        }));
+                        return;
+                    }
+                    setReportDashboardPlans((prev) => ({
+                        ...prev,
+                        [reportName]: { status: 'ready', dashboard_proposal: proposal, dashboard_operation: null },
+                    }));
+                } catch (error) {
+                    setReportDashboardPlans((prev) => ({
+                        ...prev,
+                        [reportName]: { status: 'error', error: 'Could not reach Splunk Discovery Tool. Check your connection and try again.', requirements: [] },
+                    }));
+                }
             };
 
             const loadReport = async (filename) => {
@@ -17267,6 +18478,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                 const reportContextExcerpt = reportContent?.type === 'text'
                     ? String(reportContent?.content || '').slice(0, 900)
                     : '';
+                const reportDashboardEntry = reportDashboardPlans[selectedReport] || null;
 
                 return (
                     <div className={`rounded-lg shadow-sm border ${panelClass}`}>
@@ -17287,7 +18499,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         )}
                                     </div>
                                 </div>
-                                <div className="flex items-center gap-3">
+                                <div className="flex flex-wrap items-center gap-3">
                                     {reportContent.type === 'image' && (
                                         <button
                                             type="button"
@@ -17319,9 +18531,57 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             Export with Stand-ins
                                         </button>
                                     )}
+                                    {dashboardsCapabilityOn && reportContent.type !== 'image' && (
+                                        <button
+                                            type="button"
+                                            onClick={() => proposeDashboardFromReport(selectedReport)}
+                                            disabled={reportDashboardEntry?.status === 'loading'}
+                                            className="ui-link disabled:opacity-60 disabled:cursor-wait"
+                                            title="Draft a Splunk dashboard plan from this report to review before anything is sent"
+                                            data-testid="report-create-dashboard"
+                                        >
+                                            <i className={`fas ${reportDashboardEntry?.status === 'loading' ? 'fa-spinner fa-spin' : 'fa-chart-pie'} mr-1`} aria-hidden="true"></i>
+                                            Create Dashboard
+                                        </button>
+                                    )}
                                 </div>
                             </div>
                         </div>
+                        {reportDashboardEntry && (
+                            <div className={`px-6 pt-4 pb-2 border-b ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`} data-testid="report-dashboard-area">
+                                {reportDashboardEntry.status === 'loading' && (
+                                    <p role="status" className={`text-sm ${subtextClass}`}>
+                                        <i className="fas fa-spinner fa-spin mr-2" aria-hidden="true"></i>
+                                        Drafting a dashboard plan from this report...
+                                    </p>
+                                )}
+                                {reportDashboardEntry.status === 'error' && (
+                                    <div role="alert" className={`rounded-lg border px-4 py-3 text-sm ${isDarkTheme ? 'bg-amber-950 border-amber-800 text-amber-100' : 'bg-amber-50 border-amber-200 text-amber-900'}`} data-testid="report-dashboard-error">
+                                        <div className="flex items-start justify-between gap-3">
+                                            <p className="whitespace-pre-wrap break-words">{reportDashboardEntry.error}</p>
+                                            <button type="button" onClick={() => updateReportDashboardPlan(selectedReport, { dashboard_dismissed: true })} className="ui-link text-xs flex-shrink-0">
+                                                Close
+                                            </button>
+                                        </div>
+                                        {['potential', 'incompatible'].includes(reportDashboardEntry.supportState) && renderSplunkRequirementLinks(reportDashboardEntry.requirements, 'report-dashboard-requirements')}
+                                    </div>
+                                )}
+                                {reportDashboardEntry.status === 'ready' && reportDashboardEntry.dashboard_proposal && (
+                                    <DashboardPlanCard
+                                        key={reportDashboardEntry.dashboard_proposal.proposal_id}
+                                        proposal={reportDashboardEntry.dashboard_proposal}
+                                        operation={reportDashboardEntry.dashboard_operation || null}
+                                        isDarkTheme={isDarkTheme}
+                                        headingClass={headingClass}
+                                        subtextClass={subtextClass}
+                                        mutedTextClass={mutedTextClass}
+                                        incognitoActive={incognitoActive}
+                                        testIdPrefix="report-dashboard"
+                                        onChange={(patch) => updateReportDashboardPlan(selectedReport, patch)}
+                                    />
+                                )}
+                            </div>
+                        )}
                         <div
                             className="p-6 overflow-y-auto scroll-container"
                             style={{ height: `${reportViewerHeight}px` }}
@@ -18390,6 +19650,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                 {lifecycle === 'not_installed' && capability.install_method === 'pip' && (
                                                                     <p className={`mt-3 text-xs ${mutedTextClass}`}>Installing downloads extra Python packages, which can take a few minutes.</p>
                                                                 )}
+                                                                {capability.name === 'splunk_dashboards' && renderDashboardCapabilityPanel(capability)}
 
                                                                 {canBuildDeeplink && (
                                                                     <div className={`mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>
@@ -18474,7 +19735,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                     {renderCapabilityLifecycleActions(capability)}
                                                                 </div>
 
-                                                                {capability.installed && (
+                                                                {capability.installed && isCapabilityAdmin && (
                                                                     <details className={`mt-3 rounded-lg border ${isDarkTheme ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-gray-50'}`}>
                                                                         <summary className={`cursor-pointer px-3 py-2 text-sm font-medium ${headingClass}`}>Advanced settings</summary>
                                                                         <div className="px-3 pb-3">
@@ -18493,6 +19754,11 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                                             {capability.name === 'splunk_deeplink_tools' && (
                                                                                 <div className={`mt-2 text-xs ${mutedTextClass}`}>
                                                                                     Set web_base_url to your Splunk Web address, including http:// or https://, if the guessed address is wrong. Select Test to confirm the address works.
+                                                                                </div>
+                                                                            )}
+                                                                            {capability.name === 'splunk_dashboards' && (
+                                                                                <div className={`mt-2 text-xs ${mutedTextClass}`}>
+                                                                                    create_timeout_seconds, status_timeout_seconds, and max_wait_seconds set how long the app waits for Splunk. Set Splunk Web addresses in Splunk connections and Splunk Web addresses above.
                                                                                 </div>
                                                                             )}
                                                                             {capability.name === 'visualization_tools' && (
@@ -19412,6 +20678,21 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                     <div data-testid="chat-reply-markdown" className="space-y-3 text-[15px] leading-7 break-words">
                                                         {renderMarkdownDocument(msg.content, { compact: true })}
                                                     </div>
+
+                                                    {msg.dashboard_proposal && (
+                                                        <DashboardPlanCard
+                                                            proposal={msg.dashboard_proposal}
+                                                            operation={msg.dashboard_operation || null}
+                                                            dismissed={!!msg.dashboard_dismissed}
+                                                            isDarkTheme={isDarkTheme}
+                                                            headingClass={headingClass}
+                                                            subtextClass={subtextClass}
+                                                            mutedTextClass={mutedTextClass}
+                                                            incognitoActive={incognitoActive}
+                                                            testIdPrefix="chat-dashboard"
+                                                            onChange={(patch) => updateChatMessageFields(msg.id, patch)}
+                                                        />
+                                                    )}
 
                                                     {replyPanels.length > 0 && (
                                                         <div className="mt-3 flex flex-wrap gap-2" data-testid="chat-reply-toggles">

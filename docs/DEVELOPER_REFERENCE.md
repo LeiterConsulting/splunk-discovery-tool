@@ -18,7 +18,7 @@ This reference is for developers who extend Splunk Discovery Tool or reuse it in
 - Chat settings and chat goals: src/chat_settings.py, src/chat_goals.py
 - MCP argument adaptation to advertised tool schemas: src/mcp_tool_args.py
 - SPL safety, validation, and scoping helpers: src/spl/spl_utils.py
-- Optional capabilities (registry, install manager, Knowledge Base indexer): src/capabilities/
+- Optional capabilities (registry, install manager, Knowledge Base indexer, Splunk dashboards through Constellation): src/capabilities/
 - Knowledge library (reference sources, documentation index, ranking, scorecard): src/knowledge_library/
 - Settings troubleshooting: src/troubleshooting.py
 - Config and encrypted credentials: src/config_manager.py
@@ -178,7 +178,7 @@ Every button should communicate purpose:
 - `POST /api/capabilities/rag/assets/import/file` → Import a supported text-based file as a managed knowledge asset
 - `POST /api/capabilities/rag/assets/{asset_id}/delete` → Delete a managed knowledge asset
 - `POST /api/capabilities/rag/context/build` → Build an operator-facing context preview from indexed managed knowledge assets, including traceable chunk references for matched assets, plus matching downloaded documentation in `details.library_matches` (documentation alone when the Knowledge Base is not ready)
-- `POST /api/capabilities/{name}/install` → Install or prepare a capability
+- `POST /api/capabilities/{name}/install` → Install or prepare a capability (admin when sign-in is on, like the other capability actions below)
 - `POST /api/capabilities/{name}/enable` → Enable an installed capability
 - `POST /api/capabilities/{name}/disable` → Disable a capability
 - `POST /api/capabilities/{name}/uninstall` → Turn a capability off and mark it not installed (Python packages, settings, and indexed knowledge stay)
@@ -186,6 +186,12 @@ Every button should communicate purpose:
 - `POST /api/capabilities/{name}/reindex` → Rebuild indexed retrieval content for capabilities that support it
 - `POST /api/capabilities/{name}/config` → Persist capability-specific config
 - `POST /api/capabilities/deeplinks/build` → Build a Splunk Web search deeplink through the optional deeplink capability
+- `GET /api/capabilities/{name}/connections` → Whether each saved MCP connection lists the MCP tools the capability needs, with its Splunk Web address (admin)
+- `GET /api/dashboards/status` → Whether the caller can create Splunk dashboards on their connection, the connection support state, and the first reason they cannot
+- `POST /api/dashboards/propose` → Draft an editable dashboard plan from a discovery report (`report_name`, optional `focus`); 409 with `support` and `requirements` when dashboards cannot be created. Nothing is sent to Splunk
+- `POST /api/dashboards/create` → Save a reviewed plan as a request and send it to Constellation in the background (`proposal_id`, `brief`, `binding_key`); 409 when the connection or Splunk user changed after the plan was made
+- `GET /api/dashboards/operations` and `GET /api/dashboards/operations/{request_id}` → The caller's dashboard requests and their receipts
+- `POST /api/dashboards/operations/{request_id}/check` → Ask Constellation for the request's current receipt on the same connection and Splunk user
 - `GET /api/knowledge-library/status` → Environment profile, loaded library sources, refresh job, coverage scorecard, gaps, and the matched catalog for the latest discovery
 - `POST /api/knowledge-library/settings` → Turn online library sources on or off (admin)
 - `POST /api/knowledge-library/refresh` → Download the library sources again in the background, or only those named in an optional `{"sources": [...]}` body (admin; 400 when no named source is valid, 409 while online sources are off)
@@ -212,6 +218,9 @@ Every button should communicate purpose:
 - managed knowledge assets currently support pasted text plus `.md`, `.txt`, `.json`, `.log`, `.csv`, `.pdf`, and `.docx` uploads; richer document ingestion is intentionally deferred beyond staged PDF and DOCX extraction
 - Chroma indexing uses a deterministic local hash-based embedding function so optional retrieval works without downloading an external embedding model
 - `splunk_deeplink_tools` derives a Splunk Web base URL from `config.mcp.url` by default, supports a `web_base_url` override in capability config, and currently ships search deeplinks first
+- `splunk_dashboards` is the first capability with `required_mcp_tools` and `splunk_requirements` on its `CapabilityDefinition`. `evaluate_connection_support()` in `src/capabilities/connection_support.py` compares the required tools with a connection's MCP tool list (cached per connection by `get_connection_tool_catalog`, 60 seconds, 30 after a failure) and returns `available`, `potential` (tools missing), `incompatible` (arguments do not match `TOOL_ARGUMENTS`), `checking`, or `unknown`. The UI shows `potential` and `incompatible` with the `splunk_requirements` links
+- Dashboard requests go through `DashboardService` (`src/capabilities/tools/dashboard_service.py`). `resolve_dashboard_binding()` in `src/web_app.py` picks the connection: with sign-in on, only the admin's or analyst's assigned connection, with no fallback. `verify_splunk_user()` reads the Splunk user from `splunk_get_user_info`, and both Constellation calls send it as `expected_user`. The plan's `binding_key` ties it to that connection and user. The request is saved to `DashboardOperationStore` (`output/chat_data/dashboards/operations.json`) before it is sent, the identical request is resent once, only after a `not_found` and while Constellation still admits its ID (24 hours), and polling stops when the connection changes (`_dashboard_binding_is_current`)
+- `dashboard_readiness()` blocks creation while incognito mode is active for the caller or `force_for_cloud` is set, because Constellation sends the plan to its own AI model. Receipts, links, request IDs, and Splunk user names stay out of AI prompts and the server log, and `normalize_receipt()` drops links that do not match the connection's Splunk Web address and the created resource
 
 ### Knowledge library notes
 
@@ -243,6 +252,7 @@ Every button should communicate purpose:
    - `npm run test:settings-profiles-browser`
    - `npm run test:settings-troubleshoot-browser`
    - `npm run test:environment-memory-browser`
+   - `npm run test:dashboards-browser`
    - `npm run test:ui-contrast-browser`
    - `npm run test:auth-browser`
    - `npm run test:account-functions`
@@ -264,7 +274,7 @@ Every button should communicate purpose:
 
 ## 11) Optional Capabilities
 
-For the optional capability model (the Knowledge Base, exports, charts, Splunk search links, and capability tabs), see:
+For the optional capability model (the Knowledge Base, exports, charts, Splunk search links, Splunk dashboards, and capability tabs), see:
 
 - `docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md`
 

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Splunk Dashboards** (optional capability): creates Splunk Dashboard Studio dashboards through [Constellation](https://github.com/LeiterConsulting/constellation/releases), a Splunk app that adds two dashboard tools to [Splunk MCP Server](https://splunkbase.splunk.com/app/7931). Ask in chat ("Create a dashboard that tracks failed logins in index main") or select **Create Dashboard** on a report. The app's AI model drafts a plan with a data source, time range, pages, and panels, and a card shows it with the Splunk connection and Splunk user it will use. Select **Edit Plan**, **Cancel**, or **Create Dashboard**. Nothing goes to Splunk until you select **Create Dashboard**
+- After you create a dashboard, the card follows its progress and ends with **Open Dashboard** and **Edit in Constellation** links, a Constellation draft, a question from Constellation, or the reason it failed. When Splunk cannot confirm the result, **Check Status** asks again, and the app never sends a second request it cannot prove is the same one. The Capabilities tab lists your recent dashboards
+- **Potential capability**: the app reads each connection's MCP tool list. When the dashboard tools are missing, the Capabilities tab shows Splunk Dashboards as a potential capability, explains that Constellation must be installed in that Splunk environment, and links to Constellation and Splunk MCP Server. A connection whose tools take other arguments shows **Unsupported version**
+- Admins can see the state of every saved connection and enter each one's Splunk Web address under **Splunk connections and Splunk Web addresses**. Dashboard links are shown only when they point to that address and to the dashboard that was created
+- With sign-in on, admins and analysts create dashboards only through their own assigned MCP connection, with no fallback to the shared connection, because Splunk creates each dashboard as the connection's Splunk user. Dashboards cannot be created while incognito mode is on, because Constellation sends the plan to its own AI model with the real names. Receipts, links, and Splunk user names never go to the AI model or the server log
+- API: `GET /api/dashboards/status`, `POST /api/dashboards/propose`, `POST /api/dashboards/create`, `GET /api/dashboards/operations`, `GET /api/dashboards/operations/{request_id}`, `POST /api/dashboards/operations/{request_id}/check`, and the admin route `GET /api/capabilities/{name}/connections`. See [docs/SPLUNK_DASHBOARDS.md](docs/SPLUNK_DASHBOARDS.md)
+- Regression suites: `tests/test_dashboards.py`, `tests/test_dashboard_routes.py`, and `tools/test_dashboards_browser.mjs` (`npm run test:dashboards-browser`, also run in CI)
+
+### Changed
+- With sign-in on, only admins can install, turn on, turn off, remove, test, reindex, or configure capabilities. Other signed-in users still see each capability's status, and the Capabilities tab tells them to ask an administrator. With sign-in off, nothing changes
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

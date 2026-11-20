@@ -17,6 +17,7 @@
 - **Chat goals**: set a goal, and the AI model breaks it into questions, tracks which ones your answers settle, and suggests what to ask next. The Goal Library keeps goals, tracked questions, and saved chats
 - **Settings tuned to the model**: model profiles, ranking, and auto-tuning for hosted and local models. Chat Settings start from the model's tuning and show each value as Auto or Custom
 - **Knowledge library**: the environment profile from discovery, Splunk Security Content, Splunkbase records, and help.splunk.com documentation for your Splunk version and installed apps, downloaded for offline search, with a coverage scorecard and library packs for servers without internet access
+- **Splunk Dashboards** (optional capability): ask in chat or select Create Dashboard on a report, review the plan, and the app creates a Splunk Dashboard Studio dashboard through Constellation as your own Splunk user. Connections without Constellation show it as a potential capability with install links
 - **Knowledge Base** (optional capability): managed knowledge assets, the SPL Library, and context previews. Discovery and AI summaries update its index after saving, and a Reindex needed notice shows when other sources change
 - **Troubleshooting**: Settings > Troubleshoot explains why an MCP server or AI model connection or save fails, without saving anything
 - **Incognito mode**: the AI model sees stand-ins such as `host_0012` instead of your host names, IP addresses, users, custom indexes, apps, and saved searches, while you still see the real names. Admins can require it for cloud AI models, and you can download chats and reports with stand-ins to share
@@ -102,7 +103,7 @@ The header holds the connection status, Chat, sign-in, and Settings. Each tab ke
 - **Findings**: The full next-step lists for admins, analysts, and executives, the environment profile, key evidence, and patterns
 - **Discovery**: Run discovery, follow each stage, and open saved reports and summaries
 - **Knowledge Base**: Library health (how well public Splunk references, Splunkbase, and versioned docs cover your environment, with gaps to fix), searchable Splunk documentation for your versions and installed apps, managed knowledge assets, the SPL Library, reusable query evidence, and context previews
-- **Capabilities**: Optional add-ons for the knowledge base, exports, charts, and Splunk search links. Each can be installed, turned on or off, tested, and removed
+- **Capabilities**: Optional add-ons for the knowledge base, exports, charts, Splunk search links, and Splunk dashboards. Each can be installed, turned on or off, tested, and removed (by admins when sign-in is on)
 - **Capability tabs**: An enabled capability can add its own tab after the core tabs. The M-26-14 Readiness Advisor adds an M-26-14 tab
 - **Chat and Summary**: Investigation chat, which opens as a Chat tab or in a window, plus the runbook and summary views when you need more detail
 
@@ -152,6 +153,17 @@ Incognito mode keeps your own names away from the AI model. When it is on, host 
 - Chat, chat goals, discovery analysis, AI summaries, task verification, remediation, the M-26-14 AI Review, and infographics all use it. The stand-in mapping is encrypted and never leaves the server
 
 See [docs/INCOGNITO_MODE.md](docs/INCOGNITO_MODE.md) for what is replaced, how requests are protected, and the limits.
+
+## 📊 Splunk Dashboards
+
+Splunk Dashboards (an optional capability) creates Splunk Dashboard Studio dashboards from a chat or a discovery report, through [Constellation](https://github.com/LeiterConsulting/constellation/releases), a Splunk app that adds dashboard tools to [Splunk MCP Server](https://splunkbase.splunk.com/app/7931).
+
+- **Ask in chat** ("Create a dashboard that tracks failed logins in index main") or select **Create Dashboard** on a report. The app drafts a plan with the data source, time range, pages, and panels, and shows the Splunk connection and Splunk user it will use
+- **Review first**: edit or cancel the plan. Nothing goes to Splunk until you select **Create Dashboard**. When Splunk confirms the result, the card links to the dashboard and to its Constellation draft
+- **Each Splunk environment needs Constellation**: when a connection's MCP tool list lacks the dashboard tools, the Capabilities tab shows Splunk Dashboards as a potential capability and links to what to install
+- **Your own Splunk user**: with sign-in on, admins and analysts create dashboards only through their own assigned connection. Dashboards cannot be created while incognito mode is on, because Constellation sends the plan to its own AI model with the real names
+
+See [docs/SPLUNK_DASHBOARDS.md](docs/SPLUNK_DASHBOARDS.md) for setup, results, and troubleshooting.
 ## 📚 Knowledge Library and Splunk Documentation
 
 Library health on the Knowledge Base tab scores how well reference sources cover the environment from your latest discovery and lists gaps with a next action (missing or turned-off add-ons, outdated or archived apps, apps not marked Cloud compatible, and busy sourcetypes no public reference describes).
@@ -213,6 +225,7 @@ The SPL Library keeps reusable SPL in the managed context workspace so operators
 - Host/CORS protections available via server settings
 - Knowledge library downloads are off until an admin turns them on, and reach only four allowed HTTPS hosts
 - Incognito mode replaces your names with stand-ins before anything reaches the AI model; admins can require it while a cloud AI model is in use
+- With sign-in on, only admins install, turn on, turn off, remove, test, or configure capabilities, and Splunk dashboards are created only through the user's own assigned connection
 
 ## 📁 Key Paths
 
@@ -231,7 +244,7 @@ src/chat_goals.py               Chat goals, tracked questions, and saved chats
 src/incognito/                  Incognito mode: stand-ins, masking, and records of what the AI saw
 src/llm/                        AI provider clients, model profiles, and auto-tuning
 src/knowledge_library/          Library sources, documentation index, ranking, and scorecard
-src/capabilities/               Optional capabilities (Knowledge Base, exports, charts, links, M-26-14)
+src/capabilities/               Optional capabilities (Knowledge Base, exports, charts, links, dashboards, M-26-14)
 src/troubleshooting.py          Settings > Troubleshoot checks
 src/config_manager.py           Encrypted config manager
 src/security_manager.py         Local auth, OIDC, sessions, roles, and token management
@@ -253,6 +266,7 @@ output/                         Discovery reports, summaries, chat data, the kno
 - [docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md](docs/OPTIONAL_CAPABILITIES_ARCHITECTURE.md): the optional capability model (Knowledge Base, exports, charts, links, capability tabs)
 - [docs/SECURITY_ACCESS_ROADMAP.md](docs/SECURITY_ACCESS_ROADMAP.md): the shipped security model plus extension notes
 - [docs/INCOGNITO_MODE.md](docs/INCOGNITO_MODE.md): incognito mode, what it replaces, admin settings, and shareable copies
+- [docs/SPLUNK_DASHBOARDS.md](docs/SPLUNK_DASHBOARDS.md): Splunk Dashboards through Constellation, what each Splunk environment needs, and troubleshooting
 - [docs/AUTH_TESTING.md](docs/AUTH_TESTING.md): local-password, OIDC, and account-function test guidance
 - [docs/EXTERNAL_RAG_API_QUICKSTART.md](docs/EXTERNAL_RAG_API_QUICKSTART.md): read-only external RAG API setup and examples
 - [docs/EXTERNAL_MCP_QUICKSTART.md](docs/EXTERNAL_MCP_QUICKSTART.md): inbound MCP setup, helper client, and stdio bridge usage
@@ -269,6 +283,7 @@ npm run test:browser
 npm run test:settings-profiles-browser
 npm run test:settings-troubleshoot-browser
 npm run test:environment-memory-browser
+npm run test:dashboards-browser
 npm run test:ui-contrast-browser
 npm run test:auth-browser
 npm run test:account-functions
@@ -414,6 +429,12 @@ npm run test:settings-troubleshoot-browser
 
 ```bash
 npm run test:environment-memory-browser
+```
+
+- To check Splunk Dashboards (the potential capability, the plan card, Create, results, incognito mode, and the Splunk Web addresses) against a stand-in MCP server, run:
+
+```bash
+npm run test:dashboards-browser
 ```
 
 - To validate auth-enabled flows and the account-function matrix, run:

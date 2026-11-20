@@ -1626,7 +1626,7 @@ class ChatHelperTests(unittest.TestCase):
         original_process_chat = web_app.process_chat_with_streaming
         original_wait_for = web_app.asyncio.wait_for
 
-        async def immediate_chat(_request, status_queue, runtime_config=None, goal_owner=None, discovery_dir=None):
+        async def immediate_chat(_request, status_queue, runtime_config=None, goal_owner=None, discovery_dir=None, auth_user=None):
             await status_queue.put({"type": "status", "message": "Finishing"})
             await status_queue.put({"type": "done", "data": {"response": "Completed"}})
 
@@ -1662,7 +1662,7 @@ class ChatHelperTests(unittest.TestCase):
         original_process_chat = web_app.process_chat_with_streaming
         outcome = {"started": False, "cancelled": False}
 
-        async def slow_chat(_request, status_queue, runtime_config=None, goal_owner=None, discovery_dir=None):
+        async def slow_chat(_request, status_queue, runtime_config=None, goal_owner=None, discovery_dir=None, auth_user=None):
             outcome["started"] = True
             await status_queue.put({"type": "status", "message": "Searching"})
             try:

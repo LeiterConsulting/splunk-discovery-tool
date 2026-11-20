@@ -356,7 +356,7 @@ class ChatGoalApiTests(unittest.TestCase):
         goal = self._create()["goal"]
         first_item = goal["items"][0]["id"]
 
-        async def fake_chat(request, status_callback=None, runtime_config=None, goal_owner=None, discovery_dir=None):
+        async def fake_chat(request, status_callback=None, runtime_config=None, goal_owner=None, discovery_dir=None, auth_user=None):
             return {"response": "Sensors s1 and s2 stopped on Monday.", "chat_session_id": request.get("chat_session_id")}
 
         with mock.patch.object(web_app, "chat_with_splunk_logic", side_effect=fake_chat):

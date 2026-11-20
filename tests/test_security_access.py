@@ -3941,12 +3941,15 @@ Environment summary.
         original_chat_logic = web_app.chat_with_splunk_logic
         original_build_deeplink = web_app.capability_manager.build_deeplink
 
-        async def stub_chat_logic(request_payload: dict, status_callback=None, runtime_config=None, goal_owner=None, discovery_dir=None):
+        async def stub_chat_logic(
+            request_payload: dict, status_callback=None, runtime_config=None, goal_owner=None, discovery_dir=None, auth_user=None
+        ):
             return {
                 "message": request_payload.get("message"),
                 "mcp_url": runtime_config.mcp.url if runtime_config else None,
                 "active_mcp_config_name": getattr(runtime_config, "active_mcp_config_name", None),
                 "discovery_dir": str(discovery_dir),
+                "auth_username": (auth_user or {}).get("username"),
             }
 
         class StubDeeplinkResult:
@@ -3984,6 +3987,8 @@ Environment summary.
             self.assertEqual(analyst_chat.json()["active_mcp_config_name"], "tenant-b")
             # Chat describes tenant B from the reports discovery saved for tenant B.
             self.assertEqual(analyst_chat.json()["discovery_dir"], str(web_app._discovery_scope_output_dir("mcp:tenant-b", create=False)))
+            # A dashboard request from chat must go through the signed-in user's own connection.
+            self.assertEqual(analyst_chat.json()["auth_username"], "analyst1")
 
             analyst_deeplink = self.client.post(
                 "/api/capabilities/deeplinks/build",

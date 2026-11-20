@@ -17,7 +17,15 @@ from capabilities.rag.chromadb_provider import ChromaRAGProvider
 from capabilities.rag.lightweight import LightweightRAGProvider
 from capabilities.registry import CapabilityRegistry
 from capabilities.tools import DeterministicExportProvider, SplunkDeepLinkProvider, VisualizationPreviewProvider
+from capabilities.tools.dashboards import normalize_web_base
 from discovery.m26_14_advisor import build_capability_state_snapshot
+
+# (minimum, maximum) seconds for the dashboard capability's timing settings.
+DASHBOARD_TIMING_LIMITS = {
+    "create_timeout_seconds": (30, 900),
+    "status_timeout_seconds": (5, 60),
+    "max_wait_seconds": (60, 3600),
+}
 
 
 def _utc_now_iso() -> str:
@@ -162,6 +170,8 @@ class CapabilityManager:
                 "requires_restart_on_install": definition.requires_restart_on_install,
                 "maturity": definition.maturity,
                 "workspace": definition.workspace.to_dict() if definition.workspace else None,
+                "required_mcp_tools": list(definition.required_mcp_tools),
+                "splunk_requirements": [requirement.to_dict() for requirement in definition.splunk_requirements],
             }
         )
         payload.update(self._extra_capability_state(definition, config))
@@ -302,6 +312,10 @@ class CapabilityManager:
         if definition is None:
             return CapabilityActionResult(False, name, "update-config", "Unknown capability.")
         config = self._get_or_create_config(definition)
+        if definition.name == "splunk_dashboards" and "splunk_web_urls" in (updates or {}):
+            problem = self._splunk_web_urls_problem(updates.get("splunk_web_urls"))
+            if problem:
+                return self._result(definition.name, "update-config", False, problem)
         merged = dict(config.config)
         merged.update(updates or {})
         config.config = self._normalize_capability_config(definition, merged)
@@ -309,6 +323,19 @@ class CapabilityManager:
             config.runtime_state = {}
         self.config_manager.save_capability(config)
         return self._result(definition.name, "update-config", True, "Capability configuration updated.")
+
+    @staticmethod
+    def _splunk_web_urls_problem(value: Any) -> Optional[str]:
+        if not isinstance(value, dict):
+            return "Splunk Web addresses must map each connection name to an address."
+        for connection_name, address in value.items():
+            if str(address or "").strip() and normalize_web_base(address) is None:
+                label = str(connection_name or "").strip() or "the active connection"
+                return (
+                    f"Enter an HTTPS Splunk Web address for {label}, such as https://splunk.example.com:8000, "
+                    "with no user name, password, or query."
+                )
+        return None
 
     def reindex_capability(self, name: str) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
@@ -1565,6 +1592,23 @@ class CapabilityManager:
                     normalized[key] = parsed if parsed > 0 else int(definition.default_config.get(key, 1))
                 except (TypeError, ValueError):
                     normalized[key] = int(definition.default_config.get(key, 1))
+
+        if definition.name == "splunk_dashboards":
+            for key, (minimum, maximum) in DASHBOARD_TIMING_LIMITS.items():
+                default_value = int(definition.default_config.get(key, minimum))
+                try:
+                    parsed = int(normalized.get(key))
+                except (TypeError, ValueError):
+                    parsed = default_value
+                normalized[key] = max(minimum, min(parsed, maximum))
+            addresses = normalized.get("splunk_web_urls")
+            cleaned_addresses = {}
+            if isinstance(addresses, dict):
+                for connection_name, address in addresses.items():
+                    web_base = normalize_web_base(address)
+                    if web_base:
+                        cleaned_addresses[str(connection_name or "").strip()[:200]] = web_base
+            normalized["splunk_web_urls"] = cleaned_addresses
 
         if definition.name == "export_tools":
             supported_outputs = {"bundle_zip", "manifest_json", "summary_markdown"}

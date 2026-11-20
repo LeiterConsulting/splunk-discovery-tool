@@ -10,7 +10,7 @@ Splunk Discovery Tool finds what a Splunk environment contains through the Splun
 - Chat: `src/chat_agent.py` (grounded prompts and tool outcomes), `src/chat_settings.py` (Auto values from the model's tuning), `src/chat_goals.py` (goals, tracked questions, saved chats)
 - AI models: `src/llm/` (provider clients, model profiles, auto-tuning, health)
 - Incognito mode: `src/incognito/` (stand-ins in place of the deployment's own names in everything sent to the AI model, and records of what the AI saw)
-- Optional capabilities: `src/capabilities/` (Knowledge Base, exports, charts, Splunk search links, M-26-14)
+- Optional capabilities: `src/capabilities/` (Knowledge Base, exports, charts, Splunk search links, Splunk dashboards through Constellation, M-26-14)
 - Knowledge library: `src/knowledge_library/` (reference sources, documentation index, ranking, scorecard)
 - Settings: `src/config_manager.py` (Fernet-encrypted, no plaintext secrets), `src/security_manager.py` (local sign-in, OIDC, roles, tokens), `src/troubleshooting.py`
 - The release version is `APP_VERSION` in `src/app_version.py`
@@ -22,6 +22,7 @@ Splunk Discovery Tool finds what a Splunk environment contains through the Splun
 - Keep the settings API and saved-config format backward compatible; unknown config keys are ignored on load
 - AI provider requests get their TLS context from `create_llm_ssl_context()` in `src/llm/factory.py` (system CAs plus certifi, verification always on); new AI request paths must use it
 - Every AI call that sends Splunk data must run inside an incognito session (`incognito_session_scope`), and must never fall back to sending unmasked text when `IncognitoBlocked` is raised (see `docs/INCOGNITO_MODE.md`)
+- Splunk dashboard receipts, links, request IDs, and Splunk user names never go into AI model prompts or the server log, and dashboard creation never falls back to a shared or admin connection (see `docs/SPLUNK_DASHBOARDS.md`)
 - Record user-facing changes in `CHANGELOG.md` and keep the docs in `docs/` current
 
 ## Validation
@@ -32,6 +33,7 @@ npm run test:browser
 npm run test:settings-profiles-browser
 npm run test:settings-troubleshoot-browser
 npm run test:environment-memory-browser
+npm run test:dashboards-browser
 npm run test:ui-contrast-browser
 npm run test:auth-browser
 npm run test:account-functions

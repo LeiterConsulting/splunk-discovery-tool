@@ -359,12 +359,20 @@ troubleshoot_llm_endpoint = "/api/troubleshoot/llm"                      # POST
 # Capabilities
 capabilities_endpoint = "/api/capabilities"
 capabilities_health_endpoint = "/api/capabilities/health"
-capability_action_endpoints = "/api/capabilities/{name}/{install|enable|disable|uninstall|test|reindex|config}"
+capability_action_endpoints = "/api/capabilities/{name}/{install|enable|disable|uninstall|test|reindex|config}"  # POST (admin)
+capability_connections_endpoint = "/api/capabilities/{name}/connections"  # GET ?refresh=false (admin)
 rag_assets_endpoints = "/api/capabilities/rag/assets..."   # List, read, import, delete, check in, check out
 rag_context_build_endpoint = "/api/capabilities/rag/context/build"
 deeplinks_build_endpoint = "/api/capabilities/deeplinks/build"
 exports_build_endpoint = "/api/capabilities/exports/build"
 exports_download_endpoint = "/api/capabilities/exports/download/{filename}"
+
+# Splunk Dashboards
+dashboards_status_endpoint = "/api/dashboards/status"                  # GET ?refresh=false
+dashboards_propose_endpoint = "/api/dashboards/propose"                # POST report_name, focus
+dashboards_create_endpoint = "/api/dashboards/create"                  # POST proposal_id, brief, binding_key
+dashboards_operations_endpoint = "/api/dashboards/operations"          # GET ?limit=20 (1-50); /{request_id}
+dashboards_check_endpoint = "/api/dashboards/operations/{request_id}/check"  # POST
 ```
 
 ---
@@ -387,6 +395,7 @@ library_docs_database = "output/knowledge_library/docs/library_docs.sqlite3"
 incognito_directory = "output/incognito/"                          # src/incognito/store.py (encrypted)
 environment_record = "output/environment_memory/record.json"       # Global scope; output/scopes/<scope>/environment_memory/ otherwise
 environment_settings_file = "output/environment_memory/settings.json"  # src/environment_memory/settings.py
+dashboard_requests_file = "output/chat_data/dashboards/operations.json"  # src/capabilities/tools/dashboard_store.py
 
 # Current Artifact Naming
 v2_blueprint_pattern = "v2_intelligence_blueprint_<timestamp>.json"
@@ -673,6 +682,41 @@ MAX_LEDGER_TEXT = 60000                        # Characters kept per text in a r
 # "cloud": Azure OpenAI, Anthropic, Gemini, Cohere, Bedrock, Vertex, and anything not confirmed local
 ```
 
+---
+
+## 17. Splunk Dashboards (src/capabilities/tools/, src/web_app.py)
+```python
+# src/capabilities/registry.py: splunk_dashboards default_config (admin, POST /api/capabilities/splunk_dashboards/config)
+create_timeout_seconds = 180                   # 30-900: wait for the create reply
+status_timeout_seconds = 20                    # 5-60: wait for each status or user reply
+max_wait_seconds = 600                         # 60-3600: keep checking a running request
+splunk_web_urls = {}                           # Connection name -> Splunk Web address; empty uses the MCP host on port 8000
+
+# src/capabilities/tools/dashboards.py (contract with Constellation, schema_version "1")
+CREATE_TOOL = "constellation_create_dashboard"   # schema_version, request_id, expected_user, brief_json
+STATUS_TOOL = "constellation_get_creation_status" # schema_version, request_id, expected_user
+USER_INFO_TOOL = "splunk_get_user_info"          # Standard Splunk MCP tool that names the Splunk user
+REQUEST_ADMISSION = 24 hours                   # Constellation accepts a resend of the same request ID
+RECEIPT_RETENTION = 7 days                     # Requests kept in the app
+MAX_BRIEF_BYTES = 16384                        # Serialized plan
+TIME_RANGES = ("-15m", "-1h", "-24h", "-7d")   # latest is always "now"
+# Plan limits: title 120, purpose 500, requirements 1200, search 8000, page name 60, panel 240,
+# finding 300 characters; 1-2 pages, 1-4 panels per page, 6 panels, 4 findings
+
+# src/capabilities/tools/dashboard_service.py
+USER_CACHE_SECONDS = 600                       # How long a confirmed Splunk user is reused
+MAX_POLL_DELAY_SECONDS = 15.0                  # Longest wait between status checks
+MAX_STATUS_ERRORS = 3                          # Status errors in a row before the request shows as unconfirmed
+
+# src/capabilities/tools/dashboard_store.py
+MAX_OPERATIONS_PER_OWNER = 50                  # output/chat_data/dashboards/operations.json (owner-only file)
+
+# src/web_app.py
+MCP_TOOL_CATALOG_TTL_SECONDS = 60.0            # Cached MCP tool list per connection (30 after a failure)
+DASHBOARD_CATALOG_WAIT_SECONDS = 8.0           # Wait for a tool list before showing Checking
+DASHBOARD_REPORT_EXCERPT_CHARS = 6000          # Report text given to the AI model for a plan
+DASHBOARD_HISTORY_CHARS = 4000                 # Conversation text given to the AI model for a plan
+```
 ---
 ## Summary of Key Thresholds
 
