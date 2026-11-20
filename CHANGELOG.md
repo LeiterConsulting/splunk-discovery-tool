@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Ask a focused follow-up**, the suggestion shown when an answer had no other next step, sent its own instruction ("Ask a focused plain-language question about one index, host, or sourcetype for deeper analysis.") to chat as your question. It is gone. When chat has no other suggestion, it now offers **Investigate unusual events** for the index the chat last named or the busiest index the app knows, and otherwise offers nothing
+- **Chat said a search did not run without asking for it** when the model wrote "I'll compare event counts by hour" or "I wasn't able to run the Splunk search" instead of the search. Chat now asks the model for the search after replies that promise to compare, chart, or plot data, and after replies that say it could not, was unable to, or wasn't able to run a search
+
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

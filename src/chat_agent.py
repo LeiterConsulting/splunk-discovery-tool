@@ -95,13 +95,14 @@ _APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'", "\uff
 _ANNOUNCED_SEARCH_RE = re.compile(
     r"\b(?:let me|i(?:'ll| will| am going to|'m going to| am about to|'m about to))\s+"
     r"(?:(?:now|quickly|first|then|also|next|just|briefly|go ahead and)\s+){0,2}"
-    r"(?:run|execute|query|search|check|look\s+(?:up|in|at|into|through|for|over)|(?:take|have)\s+a\s+(?:quick\s+)?look"
+    r"(?:run|execute|query|search|check|compare|chart|plot|look\s+(?:up|in|at|into|through|for|over)|(?:take|have)\s+a\s+(?:quick\s+)?look"
     r"|pull|fetch|retrieve|inspect|examine|review|scan|list|find|count|gather|sample|analy[sz]e|investigate"
     r"|dig\s+(?:into|through)|grab|identify|verify|trace|correlate|(?:start|begin)\s+by)\b",
     re.IGNORECASE,
 )
 _DISCLAIMED_SEARCH_RE = re.compile(
-    r"\bi(?:\s+can(?:not|'t)|(?:\s+am|'m)\s+(?:unable|not able) to|\s+don't have (?:the ability|access) to)\s+"
+    r"\bi(?:\s+can(?:not|'t)|\s+could(?:n't|\s+not)|(?:\s+am|'m|\s+was)\s+(?:unable|not able) to|\s+wasn't able to"
+    r"|\s+don't have (?:the ability|access) to)\s+"
     r"(?:directly\s+)?(?:run|execute|perform|query|search|access)\b[^.\n]{0,80}?"
     r"\b(?:live|splunk|search|lookup|query|in this (?:reply|response|chat))\b",
     re.IGNORECASE,

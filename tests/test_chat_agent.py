@@ -124,6 +124,7 @@ class ChatAgentHelperTests(unittest.TestCase):
             "I\u2019ll look in recent ESP32 events for an IP-address field associated with the freezer monitor.",
             "First, I\u2019m going to review the hosts that sent data to index=ping today.",
             "I\u2019ll take a quick look at the newest events in index=ping.",
+            "I\u2019ll compare event counts by hour in index=web over the last 24 hours with the day before.",
         ]
         for text in promises:
             self.assertTrue(chat_agent.announces_unexecuted_search(text), text)
@@ -133,6 +134,11 @@ class ChatAgentHelperTests(unittest.TestCase):
             "I can\u2019t run a live Splunk search in this reply. To check the last 24 hours, try:\n\n```spl\nindex=ping | head 100\n```"
         ))
         self.assertTrue(chat_agent.announces_unexecuted_search("I'm unable to run the lookup in this response."))
+        self.assertTrue(chat_agent.announces_unexecuted_search(
+            "I wasn\u2019t able to run the Splunk search, so I can\u2019t confirm the cause of the drop yet."
+        ))
+        self.assertTrue(chat_agent.announces_unexecuted_search("I couldn't run the search for index=web."))
+        self.assertTrue(chat_agent.announces_unexecuted_search("I was unable to query Splunk for that index."))
 
     def test_offers_and_answers_are_not_promises(self):
         for text in [
@@ -140,6 +146,8 @@ class ChatAgentHelperTests(unittest.TestCase):
             "Would you like me to look up the hosts recorded in index=ping over the last 24 hours?",
             "The ping data is sent by host DESKTOP-BFF2PPI; its events list target_ip values such as 192.168.1.252.",
             "I can\u2019t find a sender IP in these results; the host field holds a hostname.",
+            "I couldn\u2019t find a sender IP in these results; the host field holds a hostname.",
+            "index=web dropped 66% since yesterday. If you want, I\u2019ll compare it hour by hour next.",
         ]:
             self.assertFalse(chat_agent.announces_unexecuted_search(text), text)
 
