@@ -7,15 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **Chat scratchpads in the Knowledge Base**: each chat's scratchpad (recent questions and answers, and the indexes and hosts they named) was saved where the Knowledge Base indexed it, so one user's questions could appear as passages in anyone's chat answers and pushed reports out of the index. Scratchpads are now saved privately for each user under `output/chat_data/memory/`, never indexed, and an index that still holds them is rebuilt before its next search
-- **Chat in the wrong environment**: with sign-in on and an MCP connection assigned, chat, goal planning, and the hints after each search described the global discovery reports instead of the reports of the connection the user searches. They now read the user's own discovery scope, and Knowledge Base passages from discovery reports come only from that scope
-- Each chat answer keeps one copy of the chat settings, so changing settings or another user's question while an answer runs no longer changes its limits halfway through
-
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
 - **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.2.2] - 2026-11-20
+
+Version 2.2.2 keeps each user's chat scratchpad private and has chat answer from the discovery reports of the environment the user searches.
+
+### ⬆️ Upgrading from 2.2.1
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+- The Knowledge Base rebuilds its index at its first search after the upgrade, to remove chat scratchpads that earlier versions indexed. That first search takes longer
+- Scratchpads from earlier versions in `output/chat_memory/` have no owner. With sign-in off, each chat picks its scratchpad up again the next time it is used. With sign-in on, they are no longer read, and you can delete the folder
+
+### Fixed
+- **Chat scratchpads in the Knowledge Base**: each chat's scratchpad (recent questions and answers, and the indexes and hosts they named) was saved where the Knowledge Base indexed it, so one user's questions could appear as passages in anyone's chat answers and pushed reports out of the index. Scratchpads are now saved privately for each user under `output/chat_data/memory/`, never indexed, and an index that still holds them is rebuilt before its next search
+- **Chat in the wrong environment**: with sign-in on and an MCP connection assigned, chat, goal planning, and the hints after each search described the global discovery reports instead of the reports of the connection the user searches. They now read the user's own discovery scope, and Knowledge Base passages from discovery reports come only from that scope
+- Each chat answer keeps one copy of the chat settings, so changing settings or another user's question while an answer runs no longer changes its limits halfway through
 
 ## [2.2.1] - 2026-11-19
 
@@ -661,7 +670,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.2...HEAD
+[2.2.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.2
 [2.2.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.1
 [2.2.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0
 [2.1.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.1

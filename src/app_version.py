@@ -4,4 +4,4 @@ The installers, the README badge, and the latest CHANGELOG release carry the sam
 number; tests/test_version_consistency.py fails when they drift apart.
 """
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
