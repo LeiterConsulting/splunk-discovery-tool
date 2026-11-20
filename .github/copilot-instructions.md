@@ -31,6 +31,7 @@ python tools/check_frontend_sync.py
 npm run test:browser
 npm run test:settings-profiles-browser
 npm run test:settings-troubleshoot-browser
+npm run test:environment-memory-browser
 npm run test:ui-contrast-browser
 npm run test:auth-browser
 npm run test:account-functions

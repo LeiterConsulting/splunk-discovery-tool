@@ -243,7 +243,7 @@ RAG should not only index free-form text files. It should have typed source cate
 
 This allows better filtering and better UX when showing evidence.
 
-**Shipped.** The indexer uses these source types and adds `knowledge_asset` for documents imported into the Knowledge Base. Chat scratchpads are private to each user and are not indexed; versions before 2.2.2 indexed them as `chat_memory_derived`, and such an index is rebuilt before its next search. Passages from discovery reports reach chat only for the scope that ran the discovery.
+**Shipped.** The indexer uses these source types and adds `knowledge_asset` for documents imported into the Knowledge Base. Chat scratchpads are private to each user and are not indexed; versions before 2.2.2 indexed them as `chat_memory_derived`, and such an index is rebuilt before its next search. Environment records (`environment_memory/` folders) are not indexed either; chat gets them as its Known environment section. Passages from discovery reports reach chat only for the scope that ran the discovery.
 
 ## Make RAG Value Obvious
 

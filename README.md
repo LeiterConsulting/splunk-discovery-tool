@@ -98,7 +98,7 @@ If a test or save fails, open **Settings > Troubleshoot** (see [Troubleshooting]
 
 The header holds the connection status, Chat, sign-in, and Settings. Each tab keeps its own actions, and the theme choice lives in Settings > Appearance.
 
-- **Overview**: Discovery status, key numbers, the top three next steps, run comparison, the runbook, and report packages
+- **Overview**: Discovery status, key numbers, the top three next steps, what changed in your Splunk data, the runbook, and report packages
 - **Findings**: The full next-step lists for admins, analysts, and executives, the environment profile, key evidence, and patterns
 - **Discovery**: Run discovery, follow each stage, and open saved reports and summaries
 - **Knowledge Base**: Library health (how well public Splunk references, Splunkbase, and versioned docs cover your environment, with gaps to fix), searchable Splunk documentation for your versions and installed apps, managed knowledge assets, the SPL Library, reusable query evidence, and context previews
@@ -129,6 +129,17 @@ Goals and saved chats are kept per user when sign-in is on and in one shared lib
 
 ![Chat Settings showing Auto values that come from the AI model's tuning](docs/screenshots/chat-settings-current.png)
 
+## 🔭 What Changed
+
+Overview lists what changed in your Splunk data. The app remembers the indexes, sourcetypes, and hosts it sees in each Splunk connection, from discovery runs, from the results of chat searches, and from an optional scheduled check, and notes each change:
+
+- **New**: seen for the first time
+- **Went quiet**: sent events before and has sent none for 24 hours (admins can change the threshold)
+- **Back**: sending events again after it went quiet
+- **Volume shift**: events in 24 hours rose or fell by more than half
+- **Gone**: an index that discovery no longer lists
+
+Select **Ask in Chat** on a change to start a focused question about it. Chat also knows what the app has seen, so it can suggest real indexes and mention what went quiet. Admins can select **Check Now**, and can turn on the scheduled check (off by default, every 6 hours when on), turn off learning from chat, change the quiet threshold, or clear the record under **Settings > Connections > Environment Memory**. Everyone who uses a connection shares its record. It keeps only names that Splunk returned, never your questions, and it is not added to the Knowledge Base.
 ## 🕶️ Incognito Mode
 
 Incognito mode keeps your own names away from the AI model. When it is on, host names, IP addresses, users, custom indexes, apps, saved searches, and similar values are replaced with stand-ins such as `host_0012` before anything is sent, and the real names are put back in the reply. Splunk's own indexes, sourcetypes, fields, and apps stay visible.
@@ -257,6 +268,7 @@ python tools/check_frontend_sync.py
 npm run test:browser
 npm run test:settings-profiles-browser
 npm run test:settings-troubleshoot-browser
+npm run test:environment-memory-browser
 npm run test:ui-contrast-browser
 npm run test:auth-browser
 npm run test:account-functions
@@ -396,6 +408,12 @@ npm run test:browser
 ```bash
 npm run test:settings-profiles-browser
 npm run test:settings-troubleshoot-browser
+```
+
+- To check the What changed panel on Overview and the Environment Memory settings, run:
+
+```bash
+npm run test:environment-memory-browser
 ```
 
 - To validate auth-enabled flows and the account-function matrix, run:

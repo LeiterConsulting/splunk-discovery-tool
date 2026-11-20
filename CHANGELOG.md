@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **What changed** on Overview: the app keeps a record of the indexes, sourcetypes, and hosts it has seen in each Splunk environment and lists what changed. **New** is something seen for the first time, **Went quiet** has sent no events for 24 hours (by default), **Back** sends events again, **Volume shift** has 24-hour event counts up or down by more than half, and **Gone** is an index that discovery no longer lists. Filter by type, select **Ask in Chat** to start a focused question about a change, and, as an admin, select **Check Now** to look for changes between discovery runs. The count comparison of two runs is still there under **Compare two runs by counts**
+- The record learns from each discovery run, from the rows that chat searches return, and from an optional scheduled check (two light `tstats` searches over the last 24 hours). A new record starts from the last two discovery runs, so changes show at once. Chat keeps only names that are in Splunk's results, never the question, and it can add New items but never mark anything quiet. A kind reports changes only after a discovery run or check has covered it in full, so the first run records what exists without calling all of it new
+- Chat instructions get a **Known environment** section: the busiest indexes, sourcetypes, and hosts, what is quiet now, and changes in the last 7 days, with a note to run a search before relying on the counts. In incognito mode, its names are replaced with stand-ins like the rest of the request, and the section is left out when they cannot be
+- **Settings > Connections > Environment Memory** (admins): **Learn from Chat Searches** (on), **Run Scheduled Checks** (off; every 6 hours when on), **Quiet After** (24 hours), and **Clear Record**. These settings save on their own
+- Everyone who uses a connection shares its record. With sign-in on, each MCP connection scope keeps its own record in its discovery folder, signed-in users read the record of the scope they search, and only admins can check now, clear the record, or change the settings. The record is never added to the Knowledge Base
+- API: `GET /api/environment-memory` and `GET /api/environment-memory/changes`, plus the admin routes `POST /api/environment-memory/check`, `POST /api/environment-memory/clear`, and `GET` and `POST /api/environment-memory/settings`
+- Regression suites: `tests/test_environment_memory.py` and `tools/test_environment_memory_browser.mjs` (`npm run test:environment-memory-browser`, also run in CI)
+
+### Fixed
+- **Ask a focused follow-up**, the suggestion shown when an answer had no other next step, sent its own instruction ("Ask a focused plain-language question about one index, host, or sourcetype for deeper analysis.") to chat as your question. It is gone. When chat has no other suggestion, it now offers **Investigate unusual events** for the index the chat last named or the busiest index the app knows, and otherwise offers nothing
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment

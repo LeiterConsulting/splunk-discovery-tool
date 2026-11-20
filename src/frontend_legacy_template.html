@@ -2230,6 +2230,12 @@
             const [workflowTab, setWorkflowTab] = useState('admin');
             const [compareSelection, setCompareSelection] = useState({ current: 'latest', baseline: 'previous' });
             const [discoveryCompare, setDiscoveryCompare] = useState(null);
+            const [environmentMemory, setEnvironmentMemory] = useState(null);
+            const [environmentMemoryState, setEnvironmentMemoryState] = useState({ loading: false, checking: false, error: '', notice: '' });
+            const [environmentChangeFilter, setEnvironmentChangeFilter] = useState('all');
+            const [environmentChangesShown, setEnvironmentChangesShown] = useState(12);
+            const [environmentSettingsDraft, setEnvironmentSettingsDraft] = useState(null);
+            const [environmentSettingsState, setEnvironmentSettingsState] = useState({ saving: false, clearing: false, error: '', notice: '' });
             const [m2614Profile, setM2614Profile] = useState({ has_data: false, message: 'Loading M-26-14 readiness...' });
             const [m2614Compare, setM2614Compare] = useState({ has_data: false, message: 'Choose two runs, then select Compare.' });
             const [m2614ValidationCatalog, setM2614ValidationCatalog] = useState({
@@ -4209,6 +4215,7 @@
                 loadV2Artifacts();
                 loadCapabilities();
                 loadDiscoveryCompare('latest', 'previous');
+                loadEnvironmentMemory();
                 loadRunbookPayload('latest', 'admin');
                 loadConfig();
                 loadAuthStatus();
@@ -4427,6 +4434,7 @@
                         loadV2Intelligence();
                         loadV2Artifacts();
                         loadDiscoveryCompare('latest', 'previous');
+                        loadEnvironmentMemory();
                         loadRunbookPayload('latest', workflowTab);
                         break;
                     case 'rate_limit':
@@ -6144,6 +6152,147 @@
                 }
             };
 
+            const loadEnvironmentMemory = async () => {
+                setEnvironmentMemoryState((current) => ({ ...current, loading: true, error: '' }));
+                try {
+                    const response = await fetch('/api/environment-memory?change_limit=200');
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data.detail || `Could not load what changed (HTTP ${response.status}).`);
+                    }
+                    setEnvironmentMemory(data);
+                    setEnvironmentMemoryState((current) => ({ ...current, loading: false }));
+                    return data;
+                } catch (error) {
+                    setEnvironmentMemoryState((current) => ({ ...current, loading: false, error: error.message }));
+                    return null;
+                }
+            };
+
+            const runEnvironmentCheck = async () => {
+                setEnvironmentMemoryState((current) => ({ ...current, checking: true, error: '', notice: '' }));
+                try {
+                    const response = await fetch('/api/environment-memory/check', { method: 'POST' });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'The check could not run.');
+                    }
+                    setEnvironmentMemory(data);
+                    const check = data.check || {};
+                    if (check.status === 'error') {
+                        throw new Error(`The check failed: ${check.error || 'Splunk returned an error.'}`);
+                    }
+                    const count = Number(check.changes || 0);
+                    setEnvironmentMemoryState((current) => ({
+                        ...current,
+                        checking: false,
+                        notice: count === 0 ? 'Check finished. Nothing changed.' : `Check finished with ${count} ${count === 1 ? 'change' : 'changes'}.`,
+                    }));
+                } catch (error) {
+                    setEnvironmentMemoryState((current) => ({ ...current, checking: false, error: error.message }));
+                }
+            };
+
+            const buildEnvironmentSettingsDraft = (settings) => ({
+                learn_from_chat: settings?.learn_from_chat !== false,
+                scheduled_check: !!settings?.scheduled_check,
+                check_interval_hours: String(settings?.check_interval_hours ?? 6),
+                quiet_hours: String(settings?.quiet_hours ?? 24),
+            });
+
+            const updateEnvironmentSettingsDraft = (field, value) => {
+                setEnvironmentSettingsDraft((current) => ({ ...(current || buildEnvironmentSettingsDraft(environmentMemory?.settings)), [field]: value }));
+                setEnvironmentSettingsState((current) => ({ ...current, error: '', notice: '' }));
+            };
+
+            const saveEnvironmentSettings = async () => {
+                const draft = environmentSettingsDraft || buildEnvironmentSettingsDraft(environmentMemory?.settings);
+                const interval = Number(draft.check_interval_hours);
+                const quiet = Number(draft.quiet_hours);
+                if (!Number.isInteger(interval) || interval < 1 || interval > 168) {
+                    setEnvironmentSettingsState((current) => ({ ...current, error: 'Check every must be a whole number of hours from 1 to 168.', notice: '' }));
+                    return;
+                }
+                if (!Number.isInteger(quiet) || quiet < 1 || quiet > 720) {
+                    setEnvironmentSettingsState((current) => ({ ...current, error: 'Quiet after must be a whole number of hours from 1 to 720.', notice: '' }));
+                    return;
+                }
+                setEnvironmentSettingsState((current) => ({ ...current, saving: true, error: '', notice: '' }));
+                try {
+                    const response = await fetch('/api/environment-memory/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            learn_from_chat: !!draft.learn_from_chat,
+                            scheduled_check: !!draft.scheduled_check,
+                            check_interval_hours: interval,
+                            quiet_hours: quiet,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Could not save the environment memory settings.');
+                    }
+                    setEnvironmentMemory((current) => (current ? { ...current, settings: data.settings || current.settings } : current));
+                    setEnvironmentSettingsDraft(null);
+                    setEnvironmentSettingsState((current) => ({ ...current, saving: false, notice: 'Environment memory settings saved.' }));
+                } catch (error) {
+                    setEnvironmentSettingsState((current) => ({ ...current, saving: false, error: error.message }));
+                }
+            };
+
+            const clearEnvironmentMemory = async () => {
+                const label = environmentMemory?.scope?.scope_label || 'this connection';
+                const confirmed = window.confirm(`Forget what the app learned about ${label}?\n\nThe names and the change log are removed. Discovery runs you already have are not read again, so the record starts over with the next discovery run, check, or chat search.`);
+                if (!confirmed) {
+                    return;
+                }
+                setEnvironmentSettingsState((current) => ({ ...current, clearing: true, error: '', notice: '' }));
+                try {
+                    const response = await fetch('/api/environment-memory/clear', { method: 'POST' });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Could not clear the environment record.');
+                    }
+                    setEnvironmentMemory(data);
+                    setEnvironmentChangeFilter('all');
+                    setEnvironmentSettingsState((current) => ({ ...current, clearing: false, notice: `Cleared what the app learned about ${label}.` }));
+                } catch (error) {
+                    setEnvironmentSettingsState((current) => ({ ...current, clearing: false, error: error.message }));
+                }
+            };
+
+            const environmentSearchTerm = (kind, name) => {
+                const value = String(name || '');
+                return /^[A-Za-z0-9_.:\/-]+$/.test(value) ? `${kind}=${value}` : `${kind}="${value.replace(/"/g, '\\"')}"`;
+            };
+
+            const buildEnvironmentChangePrompt = (change) => {
+                const term = environmentSearchTerm(change?.kind || 'index', change?.name);
+                const rawDetail = String(change?.detail || '').trim();
+                const detail = rawDetail ? `${rawDetail.charAt(0).toLowerCase()}${rawDetail.slice(1)}` : '';
+                switch (change?.change) {
+                    case 'new':
+                        return `${term} is new in this Splunk environment. What data does it hold, where does it come from, and does it look expected?`;
+                    case 'went_quiet':
+                        return `${term} went quiet${detail ? ` (${detail})` : ''}. When did it last receive events, and what might have stopped them?`;
+                    case 'back':
+                        return `${term} is sending events again after a quiet period. How much has it sent since it came back, and how long was the gap?`;
+                    case 'volume_shift':
+                        return `${term} changed volume${detail ? ` (${detail})` : ''}. Compare its hourly event volume over the last 7 days and explain what changed.`;
+                    case 'gone':
+                        return `${term} is no longer listed by discovery. Check whether the index still exists and whether anything still sends data to it or searches it.`;
+                    default:
+                        return `Tell me about ${term} in this Splunk environment.`;
+                }
+            };
+
+            const askAboutEnvironmentChange = (change) => {
+                openChatSurface();
+                setChatInput(buildEnvironmentChangePrompt(change));
+                setTimeout(() => chatInputRef.current?.focus(), 0);
+            };
+
             const loadM2614Profile = async (timestamp = compareSelection.current || 'latest') => {
                 try {
                     const params = new URLSearchParams();
@@ -7240,6 +7389,384 @@
                                 </div>
                             </div>
                         </div>
+                    </div>
+                );
+            };
+
+            const ENVIRONMENT_CHANGE_LABELS = { new: 'New', went_quiet: 'Went quiet', back: 'Back', volume_shift: 'Volume shift', gone: 'Gone' };
+            const ENVIRONMENT_KIND_LABELS = { index: 'Index', sourcetype: 'Sourcetype', host: 'Host', source: 'Source' };
+            const ENVIRONMENT_ORIGIN_LABELS = { discovery: 'from a discovery run', chat: 'from a chat search', check: 'from a check' };
+
+            const environmentChangeBadgeClass = (change) => {
+                if (isDarkTheme) {
+                    return {
+                        new: 'border-emerald-700 bg-emerald-950 text-emerald-200',
+                        back: 'border-sky-700 bg-sky-950 text-sky-200',
+                        went_quiet: 'border-amber-700 bg-amber-950 text-amber-200',
+                        volume_shift: 'border-indigo-700 bg-indigo-950 text-indigo-200',
+                        gone: 'border-rose-700 bg-rose-950 text-rose-200',
+                    }[change] || 'border-gray-700 bg-gray-900 text-gray-200';
+                }
+                return {
+                    new: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+                    back: 'border-sky-200 bg-sky-50 text-sky-800',
+                    went_quiet: 'border-amber-200 bg-amber-50 text-amber-900',
+                    volume_shift: 'border-indigo-200 bg-indigo-50 text-indigo-800',
+                    gone: 'border-rose-200 bg-rose-50 text-rose-800',
+                }[change] || 'border-gray-200 bg-gray-50 text-gray-800';
+            };
+
+            const formatEnvironmentMoment = (value) => {
+                const moment = value ? new Date(value) : null;
+                return moment && !Number.isNaN(moment.getTime()) ? moment.toLocaleString() : '';
+            };
+
+            const describeEnvironmentCounts = (counts) => {
+                const parts = [];
+                const indexCount = Math.max(0, Number(counts?.index?.total || 0) - Number(counts?.index?.gone || 0));
+                const sourcetypeCount = Number(counts?.sourcetype?.total || 0);
+                const hostCount = Number(counts?.host?.total || 0);
+                if (indexCount) parts.push(`${indexCount} ${indexCount === 1 ? 'index' : 'indexes'}`);
+                if (sourcetypeCount) parts.push(`${sourcetypeCount} ${sourcetypeCount === 1 ? 'sourcetype' : 'sourcetypes'}`);
+                if (hostCount) parts.push(`${hostCount} ${hostCount === 1 ? 'host' : 'hosts'}`);
+                return parts;
+            };
+
+            const renderEnvironmentChangesPanel = () => {
+                const memory = environmentMemory?.memory || null;
+                const changes = Array.isArray(memory?.changes) ? memory.changes : [];
+                const changeCounts = memory?.change_counts || {};
+                const filtered = environmentChangeFilter === 'all' ? changes : changes.filter((item) => item.change === environmentChangeFilter);
+                const shown = filtered.slice(0, environmentChangesShown);
+                const countParts = describeEnvironmentCounts(memory?.counts);
+                const quietCount = ['index', 'sourcetype', 'host'].reduce((total, kind) => total + Number(memory?.counts?.[kind]?.quiet || 0), 0);
+                const scopeLabel = environmentMemory?.scope?.scope_label || 'Global';
+                const canManage = !!environmentMemory?.can_manage;
+                const lastCheck = memory?.last_check || null;
+                const settings = environmentMemory?.settings || {};
+                const errorTextClass = isDarkTheme ? 'text-red-300' : 'text-red-700';
+                const filterButtonClass = (active) => `rounded-full border px-2.5 py-1 font-medium transition-colors ${active
+                    ? 'border-indigo-600 bg-indigo-600 text-white'
+                    : (isDarkTheme ? 'border-gray-600 bg-gray-800 text-gray-200 hover:bg-gray-700' : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-100')}`;
+                return (
+                    <div data-testid="environment-changes-panel" className={`border rounded p-3 mb-4 ${isDarkTheme ? 'border-gray-600' : 'border-gray-200'}`}>
+                        <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                            <div>
+                                <h3 className={`text-sm font-semibold ${headingClass}`}>What changed</h3>
+                                <p className={`text-xs ${mutedTextClass}`}>Changes the app noticed in your Splunk data across discovery runs, chat searches, and checks.</p>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                                {environmentMemory?.can_check && (
+                                    <button
+                                        type="button"
+                                        data-testid="environment-check-now"
+                                        onClick={runEnvironmentCheck}
+                                        disabled={environmentMemoryState.checking || environmentMemory?.check_running}
+                                        className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <i className={`fas ${environmentMemoryState.checking ? 'fa-spinner fa-spin' : 'fa-satellite-dish'} mr-1`} aria-hidden="true"></i>
+                                        {environmentMemoryState.checking ? 'Checking...' : 'Check Now'}
+                                    </button>
+                                )}
+                                <button
+                                    type="button"
+                                    data-testid="environment-refresh"
+                                    onClick={loadEnvironmentMemory}
+                                    disabled={environmentMemoryState.loading}
+                                    className={`px-3 py-1 rounded border disabled:opacity-50 ${secondaryButtonClass}`}
+                                >
+                                    <i className="fas fa-sync-alt mr-1" aria-hidden="true"></i>Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        {memory?.has_data && (
+                            <p data-testid="environment-known-summary" className={`mt-2 text-xs ${subtextClass}`}>
+                                {countParts.length > 0 ? `Known for ${scopeLabel}: ${joinWithAnd(countParts)}.` : `Known for ${scopeLabel}.`}
+                                {quietCount > 0 ? ` ${quietCount} ${quietCount === 1 ? 'is' : 'are'} quiet now.` : ''}
+                                {memory?.updated_at ? ` Updated ${formatEnvironmentMoment(memory.updated_at)}.` : ''}
+                            </p>
+                        )}
+                        {canManage && memory?.has_data && (
+                            <p className={`mt-1 text-xs ${mutedTextClass}`}>
+                                {lastCheck?.at
+                                    ? (lastCheck.status === 'error'
+                                        ? `Last check ${formatEnvironmentMoment(lastCheck.at)} failed${lastCheck.error ? `: ${lastCheck.error}` : '.'}`
+                                        : `Last check ${formatEnvironmentMoment(lastCheck.at)} found ${Number(lastCheck.changes || 0)} ${Number(lastCheck.changes || 0) === 1 ? 'change' : 'changes'}.`)
+                                    : 'No check has run yet.'}
+                                {settings.scheduled_check
+                                    ? ` Scheduled checks run every ${settings.check_interval_hours} ${Number(settings.check_interval_hours) === 1 ? 'hour' : 'hours'}.`
+                                    : ' Scheduled checks are off. Turn them on under Settings, Connections, Environment Memory.'}
+                            </p>
+                        )}
+                        {environmentMemoryState.error && (
+                            <div role="alert" className={`mt-2 flex flex-wrap items-center gap-2 text-xs ${errorTextClass}`}>
+                                <span>{environmentMemoryState.error}</span>
+                                {!environmentMemory && (
+                                    <button type="button" onClick={loadEnvironmentMemory} className="font-medium ui-link">Try again</button>
+                                )}
+                            </div>
+                        )}
+                        {environmentMemoryState.notice && (
+                            <p role="status" className={`mt-2 text-xs ${isDarkTheme ? 'text-emerald-300' : 'text-emerald-700'}`}>{environmentMemoryState.notice}</p>
+                        )}
+
+                        {!environmentMemory && environmentMemoryState.loading ? (
+                            <div role="status" className={`text-xs mt-3 ${mutedTextClass}`}>Loading what changed...</div>
+                        ) : !memory?.has_data ? (
+                            environmentMemory ? (
+                                <div data-testid="environment-changes-empty" className={`text-xs mt-3 ${mutedTextClass}`}>
+                                    Nothing learned yet. Run discovery or ask chat about your data, and the indexes, sourcetypes, and hosts it finds are remembered here.
+                                </div>
+                            ) : null
+                        ) : changes.length === 0 ? (
+                            <div data-testid="environment-changes-empty" className={`text-xs mt-3 ${mutedTextClass}`}>
+                                No changes yet. Changes show up when a later discovery run{environmentMemory?.can_check ? ', check,' : ''} or chat search finds something new, quiet, back, or much busier or quieter than before.
+                            </div>
+                        ) : (
+                            <>
+                                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs" role="group" aria-label="Show changes of one type">
+                                    <button type="button" aria-pressed={environmentChangeFilter === 'all'} onClick={() => { setEnvironmentChangeFilter('all'); setEnvironmentChangesShown(12); }} className={filterButtonClass(environmentChangeFilter === 'all')}>
+                                        All ({changes.length})
+                                    </button>
+                                    {Object.entries(ENVIRONMENT_CHANGE_LABELS).filter(([type]) => Number(changeCounts[type] || 0) > 0).map(([type, label]) => (
+                                        <button
+                                            key={`environment-filter-${type}`}
+                                            type="button"
+                                            data-testid={`environment-filter-${type}`}
+                                            aria-pressed={environmentChangeFilter === type}
+                                            onClick={() => { setEnvironmentChangeFilter(type); setEnvironmentChangesShown(12); }}
+                                            className={filterButtonClass(environmentChangeFilter === type)}
+                                        >
+                                            {label} ({changeCounts[type]})
+                                        </button>
+                                    ))}
+                                </div>
+                                {shown.length === 0 ? (
+                                    <div className={`text-xs mt-3 ${mutedTextClass}`}>No changes of this type in the latest {changes.length}.</div>
+                                ) : (
+                                    <ul className="mt-3 space-y-2">
+                                        {shown.map((item) => (
+                                            <li key={`environment-change-${item.id}`} data-testid="environment-change" className={`rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'}`}>
+                                                <div className="flex flex-wrap items-start justify-between gap-2">
+                                                    <div className="min-w-0 flex-1">
+                                                        <div className="flex flex-wrap items-center gap-2">
+                                                            <span className={`rounded-full border px-2 py-0.5 font-medium ${environmentChangeBadgeClass(item.change)}`}>{ENVIRONMENT_CHANGE_LABELS[item.change] || item.change}</span>
+                                                            <span className={mutedTextClass}>{ENVIRONMENT_KIND_LABELS[item.kind] || item.kind}</span>
+                                                            <span data-testid="environment-change-name" className={`font-mono text-sm break-all ${headingClass}`}>{item.name}</span>
+                                                        </div>
+                                                        {item.detail && <div className={`mt-1 ${subtextClass}`}>{item.detail}</div>}
+                                                        <div className={`mt-1 ${mutedTextClass}`}>
+                                                            {[formatEnvironmentMoment(item.at), ENVIRONMENT_ORIGIN_LABELS[item.origin] || ''].filter(Boolean).join(', ')}
+                                                        </div>
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        data-testid="environment-change-ask"
+                                                        onClick={() => askAboutEnvironmentChange(item)}
+                                                        className={`flex-shrink-0 px-2.5 py-1 rounded border ${secondaryButtonClass}`}
+                                                    >
+                                                        <i className="fas fa-comments mr-1" aria-hidden="true"></i>Ask in Chat
+                                                    </button>
+                                                </div>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                )}
+                                {filtered.length > shown.length && (
+                                    <button type="button" onClick={() => setEnvironmentChangesShown((current) => current + 12)} className="mt-2 text-xs font-medium ui-link">
+                                        Show more ({filtered.length - shown.length} more)
+                                    </button>
+                                )}
+                            </>
+                        )}
+
+                        {sessionCatalog.length >= 2 && (
+                            <details className={`mt-4 border-t pt-3 ${isDarkTheme ? 'border-gray-700' : 'border-gray-200'}`}>
+                                <summary className={`cursor-pointer text-xs font-medium ${headingClass}`}>Compare two runs by counts</summary>
+                                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                                    <select
+                                        aria-label="Run to compare"
+                                        value={compareSelection.current}
+                                        onChange={(e) => setCompareSelection(prev => ({ ...prev, current: e.target.value }))}
+                                        className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                    >
+                                        <option value="latest">Latest run</option>
+                                        {sessionCatalog.map((session) => (
+                                            <option key={`current-${session.timestamp}`} value={session.timestamp}>
+                                                {formatMissionSessionSelectionLabel(session.timestamp)}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <span className={mutedTextClass}>vs</span>
+                                    <select
+                                        aria-label="Run to compare against"
+                                        value={compareSelection.baseline}
+                                        onChange={(e) => setCompareSelection(prev => ({ ...prev, baseline: e.target.value }))}
+                                        className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
+                                    >
+                                        <option value="previous">Previous run</option>
+                                        {sessionCatalog.map((session) => (
+                                            <option key={`baseline-${session.timestamp}`} value={session.timestamp}>
+                                                {formatMissionSessionSelectionLabel(session.timestamp)}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <button
+                                        type="button"
+                                        onClick={refreshCompareSelection}
+                                        className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded"
+                                    >
+                                        Compare
+                                    </button>
+                                </div>
+                                {!discoveryCompare || !discoveryCompare.has_data ? (
+                                    <div className={`text-xs mt-3 ${mutedTextClass}`}>
+                                        {discoveryCompare?.message || 'Run discovery at least twice to compare runs.'}
+                                    </div>
+                                ) : (
+                                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-xs">
+                                        {[
+                                            ['Readiness change', discoveryCompare.metrics?.readiness?.delta],
+                                            ['Index change', discoveryCompare.metrics?.indexes?.delta],
+                                            ['Sourcetype change', discoveryCompare.metrics?.sourcetypes?.delta],
+                                            ['Recommendation change', discoveryCompare.metrics?.recommendations?.delta],
+                                            ['MCP tool change', discoveryCompare.metrics?.tools?.delta],
+                                        ].map(([label, delta]) => (
+                                            <div key={`compare-metric-${label}`} className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
+                                                <div className={mutedTextClass}>{label}</div>
+                                                <div className={`font-semibold ${headingClass}`}>{delta ?? 0}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </details>
+                        )}
+                    </div>
+                );
+            };
+
+            const renderEnvironmentMemorySettingsCard = () => {
+                if (!environmentMemory?.can_manage) {
+                    return null;
+                }
+                const saved = buildEnvironmentSettingsDraft(environmentMemory.settings);
+                const draft = environmentSettingsDraft || saved;
+                const isDirty = JSON.stringify(draft) !== JSON.stringify(saved);
+                const innerClass = isDarkTheme ? 'bg-gray-950 border-gray-700' : 'bg-gray-50 border-gray-200';
+                const inputClass = `mt-2 w-28 rounded-md border px-3 py-1.5 text-sm ${isDarkTheme ? 'border-gray-600 bg-gray-900 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`;
+                const errorTextClass = isDarkTheme ? 'text-red-300' : 'text-red-700';
+                const updatedAt = environmentMemory.settings?.updated_at ? new Date(environmentMemory.settings.updated_at) : null;
+                const scopeLabel = environmentMemory.scope?.scope_label || 'Global';
+                return (
+                    <div data-testid="settings-environment-memory-card" className={`rounded-lg p-6 border ${isDarkTheme ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+                        <div className="mb-4">
+                            <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                                <i className="fas fa-database mr-2 text-indigo-600" aria-hidden="true"></i>
+                                Environment Memory
+                            </h3>
+                            <p className="text-sm text-gray-600">The app remembers the indexes, sourcetypes, and hosts it sees in each Splunk connection, notes what changed, and tells chat what is known. Everyone who uses a connection shares its record. These settings save on their own, not with Save Settings.</p>
+                        </div>
+                        {environmentMemory.settings?.unreadable && (
+                            <div role="alert" className={`mb-4 rounded-lg border px-4 py-3 text-sm ${isDarkTheme ? 'border-amber-800 bg-amber-950 text-amber-100' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
+                                The saved environment memory settings could not be read, so the defaults apply. Save the settings again to replace them.
+                            </div>
+                        )}
+                        <div className="grid gap-4 xl:grid-cols-2">
+                            <label className={`flex items-start justify-between gap-4 rounded-lg border px-4 py-3 ${innerClass}`}>
+                                <div>
+                                    <div className="text-sm font-semibold text-gray-900">Learn from Chat Searches</div>
+                                    <div className="mt-1 text-xs text-gray-500">Remember the indexes, sourcetypes, hosts, and sources that chat searches return. Only names in Splunk's results are kept, never the question.</div>
+                                </div>
+                                <input
+                                    type="checkbox"
+                                    data-testid="environment-settings-learn-from-chat"
+                                    checked={!!draft.learn_from_chat}
+                                    onChange={(event) => updateEnvironmentSettingsDraft('learn_from_chat', event.target.checked)}
+                                    className="mt-1 h-4 w-4"
+                                />
+                            </label>
+                            <label className={`flex items-start justify-between gap-4 rounded-lg border px-4 py-3 ${innerClass}`}>
+                                <div>
+                                    <div className="text-sm font-semibold text-gray-900">Run Scheduled Checks</div>
+                                    <div className="mt-1 text-xs text-gray-500">A light tstats search over the last 24 hours, for each connection with discovery runs, spots new and quiet data between runs.</div>
+                                </div>
+                                <input
+                                    type="checkbox"
+                                    data-testid="environment-settings-scheduled-check"
+                                    checked={!!draft.scheduled_check}
+                                    onChange={(event) => updateEnvironmentSettingsDraft('scheduled_check', event.target.checked)}
+                                    className="mt-1 h-4 w-4"
+                                />
+                            </label>
+                            <div className={`rounded-lg border px-4 py-3 ${innerClass}`}>
+                                <label htmlFor="environment-check-interval" className="text-sm font-semibold text-gray-900">Check Every (Hours)</label>
+                                <p id="environment-check-interval-hint" className="mt-1 text-xs text-gray-500">From 1 to 168 hours. Used while scheduled checks are on.</p>
+                                <input
+                                    id="environment-check-interval"
+                                    data-testid="environment-settings-interval"
+                                    type="number"
+                                    min={1}
+                                    max={168}
+                                    step={1}
+                                    aria-describedby="environment-check-interval-hint"
+                                    value={draft.check_interval_hours}
+                                    onChange={(event) => updateEnvironmentSettingsDraft('check_interval_hours', event.target.value)}
+                                    className={inputClass}
+                                />
+                            </div>
+                            <div className={`rounded-lg border px-4 py-3 ${innerClass}`}>
+                                <label htmlFor="environment-quiet-hours" className="text-sm font-semibold text-gray-900">Quiet After (Hours)</label>
+                                <p id="environment-quiet-hours-hint" className="mt-1 text-xs text-gray-500">Something that sent events before is reported as gone quiet after this many hours without any. From 1 to 720.</p>
+                                <input
+                                    id="environment-quiet-hours"
+                                    data-testid="environment-settings-quiet-hours"
+                                    type="number"
+                                    min={1}
+                                    max={720}
+                                    step={1}
+                                    aria-describedby="environment-quiet-hours-hint"
+                                    value={draft.quiet_hours}
+                                    onChange={(event) => updateEnvironmentSettingsDraft('quiet_hours', event.target.value)}
+                                    className={inputClass}
+                                />
+                            </div>
+                        </div>
+                        <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                            <p className="text-xs text-gray-500">
+                                {updatedAt && !Number.isNaN(updatedAt.getTime())
+                                    ? `Last saved ${updatedAt.toLocaleString()}${environmentMemory.settings?.updated_by ? ` by ${environmentMemory.settings.updated_by}` : ''}.`
+                                    : 'Not saved yet, so the defaults apply.'}
+                            </p>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                    type="button"
+                                    data-testid="environment-settings-clear"
+                                    onClick={clearEnvironmentMemory}
+                                    disabled={environmentSettingsState.clearing}
+                                    className={`inline-flex items-center rounded-lg border px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed ${secondaryButtonClass}`}
+                                >
+                                    <i className="fas fa-eraser mr-2" aria-hidden="true"></i>
+                                    {environmentSettingsState.clearing ? 'Clearing...' : `Clear Record for ${scopeLabel}`}
+                                </button>
+                                <button
+                                    type="button"
+                                    data-testid="environment-settings-save"
+                                    onClick={saveEnvironmentSettings}
+                                    disabled={environmentSettingsState.saving || !isDirty}
+                                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    <i className="fas fa-save mr-2" aria-hidden="true"></i>
+                                    {environmentSettingsState.saving ? 'Saving...' : 'Save Environment Memory Settings'}
+                                </button>
+                            </div>
+                        </div>
+                        {environmentSettingsState.error && (
+                            <p role="alert" className={`mt-2 text-sm ${errorTextClass}`}>{environmentSettingsState.error}</p>
+                        )}
+                        {environmentSettingsState.notice && (
+                            <p role="status" className={`mt-2 text-sm ${isDarkTheme ? 'text-emerald-300' : 'text-emerald-700'}`}>{environmentSettingsState.notice}</p>
+                        )}
                     </div>
                 );
             };
@@ -10259,6 +10786,7 @@
                     loadCredentials();
                     loadMCPConfigs();
                     loadSecurityControlPlane();
+                    loadEnvironmentMemory();
                     checkServerCodeStatus();
                 }, 100);
             };
@@ -17396,78 +17924,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                 )}
                                             </div>
 
-                                            {sessionCatalog.length >= 2 && (
-                                                <div className={`border rounded p-3 mb-4 ${isDarkTheme ? 'border-gray-600' : 'border-gray-200'}`}>
-                                                    <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
-                                                        <div>
-                                                            <h3 className={`text-sm font-semibold ${headingClass}`}>Compare runs</h3>
-                                                            <p className={`text-xs ${mutedTextClass}`}>See what changed between two discovery runs.</p>
-                                                        </div>
-                                                        <div className="flex flex-wrap items-center gap-2 text-xs">
-                                                            <select
-                                                                value={compareSelection.current}
-                                                                onChange={(e) => setCompareSelection(prev => ({ ...prev, current: e.target.value }))}
-                                                                className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
-                                                            >
-                                                                <option value="latest">Latest run</option>
-                                                                {sessionCatalog.map((session) => (
-                                                                    <option key={`current-${session.timestamp}`} value={session.timestamp}>
-                                                                        {formatMissionSessionSelectionLabel(session.timestamp)}
-                                                                    </option>
-                                                                ))}
-                                                            </select>
-                                                            <span className={mutedTextClass}>vs</span>
-                                                            <select
-                                                                value={compareSelection.baseline}
-                                                                onChange={(e) => setCompareSelection(prev => ({ ...prev, baseline: e.target.value }))}
-                                                                className={`border rounded px-2 py-1 ${isDarkTheme ? 'border-gray-600 bg-gray-700 text-gray-100' : 'border-gray-300 bg-white text-gray-900'}`}
-                                                            >
-                                                                <option value="previous">Previous run</option>
-                                                                {sessionCatalog.map((session) => (
-                                                                    <option key={`baseline-${session.timestamp}`} value={session.timestamp}>
-                                                                        {formatMissionSessionSelectionLabel(session.timestamp)}
-                                                                    </option>
-                                                                ))}
-                                                            </select>
-                                                            <button
-                                                                onClick={refreshCompareSelection}
-                                                                className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded"
-                                                            >
-                                                                Compare
-                                                            </button>
-                                                        </div>
-                                                    </div>
-
-                                                    {!discoveryCompare || !discoveryCompare.has_data ? (
-                                                        <div className={`text-xs mt-3 ${mutedTextClass}`}>
-                                                            {discoveryCompare?.message || 'Run discovery at least twice to compare runs.'}
-                                                        </div>
-                                                    ) : (
-                                                        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-xs">
-                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                <div className={mutedTextClass}>Readiness change</div>
-                                                                <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.readiness?.delta ?? 0}</div>
-                                                            </div>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                <div className={mutedTextClass}>Index change</div>
-                                                                <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.indexes?.delta ?? 0}</div>
-                                                            </div>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                <div className={mutedTextClass}>Sourcetype change</div>
-                                                                <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.sourcetypes?.delta ?? 0}</div>
-                                                            </div>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                <div className={mutedTextClass}>Recommendation change</div>
-                                                                <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.recommendations?.delta ?? 0}</div>
-                                                            </div>
-                                                            <div className={`${isDarkTheme ? 'bg-gray-700' : 'bg-gray-50'} rounded p-2`}>
-                                                                <div className={mutedTextClass}>MCP tool change</div>
-                                                                <div className={`font-semibold ${headingClass}`}>{discoveryCompare.metrics?.tools?.delta ?? 0}</div>
-                                                            </div>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            )}
+                                            {renderEnvironmentChangesPanel()}
 
                                             <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
                                                 <div className={`dt4sms-neo-runbook xl:col-span-3 border rounded p-3 ${isDarkTheme ? 'border-gray-600 bg-gray-800/40' : 'border-gray-200 bg-white'}`}>
@@ -22690,6 +23147,8 @@ ${querySpl}`,
                                             </div>
                                         </div>
                                     )}
+
+                                    {renderEnvironmentMemorySettingsCard()}
                                     </div>
                                 </div>
 

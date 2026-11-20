@@ -86,6 +86,14 @@ Chat strategy combines deterministic and agentic logic:
 - `sync_chat_settings_for_request()` returns the settings for one answer, and `chat_with_splunk_logic` reads only that copy. `refresh_chat_session_settings()` swaps `chat_session_settings` for a new dict instead of clearing it
 - `request_discovery_dir(request)` is the folder with the discovery reports of the requester's scope (`_build_discovery_scope_metadata`: `output/` for the global scope, `output/scopes/<scope>/` otherwise). The chat endpoints pass it to `run_chat_turn(discovery_dir=...)`, and chat uses it for `load_latest_report_knowledge(..., output_dir)`, `get_context_manager(output_dir)` (one `DiscoveryContextManager` per folder), and `get_optional_rag_context(..., discovery_dir)`. Goal planning passes it to `_goal_environment_brief`
 
+### Environment memory
+
+- `src/environment_memory/` has no FastAPI dependency. `EnvironmentMemory(folder)` reads and updates `<folder>/environment_memory/record.json` under a file lock (`update()` is a locked read-modify-write, and `write_private_file` replaces the file atomically with mode 0600). `EnvironmentSettingsStore` keeps the install-wide admin settings in `output/environment_memory/settings.json`
+- Observations come from `observation_from_blueprint` (discovery runs), `observation_from_rows` (chat search rows from `HARVEST_TOOL_NAMES` tools, only values in result rows), and `observation_from_check` (the two `CHECK_QUERIES` searches). `merge_observation` returns the changes; a kind reports them only once its `baseline` is set by an observation that covered it in full, and chat observations never mark anything quiet
+- `load_environment_record(folder)` merges discovery runs the record has not seen (`sync_discovery`; a new record starts from the last `BACKFILL_RUNS` = 2) and returns the record. `register_discovery_session`, the API, and `chat_with_splunk_logic` call it. `remember_chat_environment(discovery_dir, result)` runs in `run_chat_turn` after each answer and never fails the answer. `clear()` empties the record and marks the existing runs as read, so it starts over from the next run, check, or chat search
+- `chat_with_splunk_logic` adds `environment_prompt_context(record, compact=...)` after the scratchpad context, and passes `environment_busiest_index(record)` to `build_follow_on_actions(known_index=...)` for the Investigate unusual events fallback. Under incognito mode, the record's index and host names are seeded into the masker first; if the masker is missing or fails, the block is left out
+- `run_environment_check(scope_key, folder)` runs the check through `execute_mcp_tool_call` with `environment_check_config(scope_key)`, which is `None` without an MCP URL and token (a fresh install's placeholder URL alone does not count). `_environment_check_loop` starts on app startup (not in runtime workers) and calls `run_due_environment_checks()` every 60 seconds; it does nothing while `scheduled_check` is off
+
 ## 4) MCP Integration
 
 Core contracts:
@@ -154,6 +162,11 @@ Every button should communicate purpose:
 - `POST /api/llm/list-models`, `POST /api/llm/test-connection`, `POST /api/llm/assess-max-tokens`, `GET /api/llm/health` → AI model listing, ranking, tuning, and health
 - `GET /api/discovery/dashboard` → Overview and Findings data
 - `GET /api/discovery/compare` → Session delta metrics
+- `GET /api/environment-memory` → The caller's scope, its environment record (counts, top entities, changes), the settings, and `can_manage`, `can_check`, and `check_running`
+- `GET /api/environment-memory/changes` → The change log, newest first, filtered by `change` and `kind` (400 for an unknown value)
+- `POST /api/environment-memory/check` → Run the 24-hour check for the caller's scope now (admin; 400 without a Splunk connection, 409 while one runs)
+- `POST /api/environment-memory/clear` → Empty the caller's scope's record (admin)
+- `GET` and `POST /api/environment-memory/settings` → Learn from chat, scheduled check, check interval, and quiet threshold (admin; 400 for a value out of range)
 - `GET /api/discovery/runbook` → Persona runbook payload
 - `GET /api/v2/intelligence` → Latest blueprint payload
 - `GET /api/v2/artifacts` → Artifact catalog
@@ -188,7 +201,7 @@ Every button should communicate purpose:
 ### Capability notes
 
 - `rag_chromadb` persists an `index_summary` alongside the local Chroma storage and surfaces that summary through `GET /api/capabilities`
-- The indexer never reads `output/chat_data/`, `output/knowledge_library/`, or the old `output/chat_memory/` folder. An index whose summary still counts a `RETIRED_SOURCE_TYPES` type (`chat_memory_derived`, from versions before 2.2.2) is rebuilt by `_ensure_asset_index_current` before the next search
+- The indexer never reads `output/chat_data/`, `output/knowledge_library/`, any `environment_memory/` folder, or the old `output/chat_memory/` folder. An index whose summary still counts a `RETIRED_SOURCE_TYPES` type (`chat_memory_derived`, from versions before 2.2.2) is rebuilt by `_ensure_asset_index_current` before the next search
 - `get_context(..., discovery_dir=...)` on both Knowledge Base providers limits discovery reports (`DISCOVERY_SOURCE_TYPES`) to the requester's scope: `_visible_in_scope` keeps a passage from `scopes/<scope>/` only for that scope and a passage from the top of `output/` only for the global scope. Imports and other documents are shared. `rag_local` reads the scope's folder instead of `output/`. Without `discovery_dir`, nothing is filtered
 - `rag_chromadb` also reports `index_freshness` (`ArtifactSourceIndexer.get_index_freshness`): `not_indexed`, `nothing_to_index`, `current`, or `outdated` with reason `index_format` or `changed_files` and a count per source type. It compares source-file modification times with `last_indexed_at`. Files the app rewrites as bookkeeping (`FRESHNESS_EXEMPT_FILENAMES`, `FRESHNESS_EXEMPT_DIRS`) and imports do not count. The UI shows a Reindex needed notice from it. Both discovery completion paths await `_refresh_discovery_knowledge_base` after saving reports and registering the session; `_save_summary_and_index` saves the summary and updates the report catalog before refreshing the index. The refresh uses the existing capability reindex operation in a worker thread and respects its configured source and indexing limits. Only an installed, enabled Knowledge Base is refreshed; runtime workers reload current settings first. Discovery logs that the update started, and a summary enters the `indexing` stage only while the update runs; the summary cache does not report a summary complete while its worker is still `saving` or `indexing`. Any error from the refresh becomes a warning, so it never fails a run whose results are saved. Failed updates leave saved results available and surface a warning in discovery activity/progress or summary progress, with details in the server log. Manual Reindex remains available for retries and other source-file changes
 - `rag_chromadb` now also supports managed knowledge assets stored under a capability-controlled asset directory, with catalog/list/delete behavior exposed through dedicated RAG endpoints
@@ -229,6 +242,7 @@ Every button should communicate purpose:
    - `npm run test:browser`
    - `npm run test:settings-profiles-browser`
    - `npm run test:settings-troubleshoot-browser`
+   - `npm run test:environment-memory-browser`
    - `npm run test:ui-contrast-browser`
    - `npm run test:auth-browser`
    - `npm run test:account-functions`

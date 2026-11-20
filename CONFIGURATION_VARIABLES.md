@@ -202,6 +202,41 @@ Goals are stored as one JSON file per library owner under `output/chat_data/goal
 
 Each chat's scratchpad is stored the same way, under `output/chat_data/memory/<owner>/chat_memory_<chat session>.json` (`CHAT_MEMORY_DIR_NAME = "memory"` in `src/web_app.py`).
 
+### 3.3 Environment Memory (src/environment_memory/, src/web_app.py)
+```python
+# src/environment_memory/settings.py: install-wide, saved in output/environment_memory/settings.json (admin)
+class EnvironmentMemorySettings:
+    learn_from_chat: bool = True       # Keep names that chat search results return
+    scheduled_check: bool = False      # Light tstats check for each scope with a record or discovery runs
+    check_interval_hours: int = 6      # CHECK_INTERVAL_RANGE = (1, 168)
+    quiet_hours: int = 24              # QUIET_HOURS_RANGE = (1, 720); no events for this long is Went quiet
+
+# src/environment_memory/record.py: one record per scope, <scope folder>/environment_memory/record.json
+CHANGE_KINDS = ("index", "sourcetype", "host")           # Sources are kept but report no changes
+CHANGE_TYPES = ("new", "went_quiet", "back", "volume_shift", "gone")
+ENTITY_CAPS = {"index": 2000, "sourcetype": 5000, "host": 5000, "source": 2000}  # Least recently seen dropped first
+MAX_CHANGES = 500                  # Newest changes kept
+MAX_OBSERVATIONS = 50              # Newest observation summaries kept
+MIN_SHIFT_EVENTS = 100             # Volume shift: tstats counts, more than 50% up or down, either count at least this
+BACKFILL_RUNS = 2                  # A new record starts from the last 2 discovery runs
+UNREADABLE_REPORT_GRACE_SECONDS = 120   # A report this young that cannot be read is tried again later
+
+# src/environment_memory/observations.py
+CHECK_WINDOW = "-24h"
+CHECK_ROW_LIMIT = 5000             # A result at this size or a round cap (100, 1000, ...) counts as cut short
+CHAT_ROW_LIMIT = 5000              # Rows read from one chat answer's searches
+
+# src/environment_memory/context.py
+RECENT_CHANGE_DAYS = 7             # Changes listed in the chat Known environment section
+# Known environment lists up to 12 names per kind (6 in compact mode), 6 quiet items (3), and 6 changes (3)
+
+# src/web_app.py
+ENVIRONMENT_CHECK_LOOP_SECONDS = 60             # How often the schedule looks for a check that is due
+ENVIRONMENT_CHECK_SEARCH_TIMEOUT_SECONDS = 300  # Per check search
+ENVIRONMENT_VIEW_LIMIT_MAX = 500                # Largest limit or change_limit the API returns
+```
+
+The record keeps only names that Splunk returned. Each scope shares one record for everyone who searches it, and the Knowledge Base indexer skips `environment_memory/` folders.
 ---
 
 ## 4. Discovery Data Management
@@ -300,6 +335,14 @@ incognito_preview_endpoint = "/api/incognito/preview"                  # POST (a
 incognito_ledger_endpoint = "/api/incognito/ledger/{ledger_id}"        # GET (the person who asked)
 incognito_export_endpoint = "/api/incognito/export"                    # POST {"text", "filename"}
 incognito_report_export_endpoint = "/api/incognito/export/report/{filename}"  # GET
+
+# Environment Memory
+environment_memory_endpoint = "/api/environment-memory"                  # GET ?limit=50&change_limit=100
+environment_changes_endpoint = "/api/environment-memory/changes"         # GET ?limit=100&change=&kind=
+environment_check_endpoint = "/api/environment-memory/check"             # POST (admin)
+environment_clear_endpoint = "/api/environment-memory/clear"             # POST (admin)
+environment_settings_endpoint = "/api/environment-memory/settings"       # GET, POST (admin)
+
 # Knowledge Library
 knowledge_library_status_endpoint = "/api/knowledge-library/status"
 knowledge_library_settings_endpoint = "/api/knowledge-library/settings"
@@ -342,6 +385,8 @@ chat_goals_directory = "output/chat_data/goals/"                   # src/chat_go
 knowledge_library_directory = "output/knowledge_library/"          # src/knowledge_library/
 library_docs_database = "output/knowledge_library/docs/library_docs.sqlite3"
 incognito_directory = "output/incognito/"                          # src/incognito/store.py (encrypted)
+environment_record = "output/environment_memory/record.json"       # Global scope; output/scopes/<scope>/environment_memory/ otherwise
+environment_settings_file = "output/environment_memory/settings.json"  # src/environment_memory/settings.py
 
 # Current Artifact Naming
 v2_blueprint_pattern = "v2_intelligence_blueprint_<timestamp>.json"
@@ -581,6 +626,7 @@ FRESHNESS_EXEMPT_DIRS = {"runtime_jobs"}
 RETIRED_SOURCE_TYPES = {"chat_memory_derived"}    # An index that still holds these is rebuilt before the next search
 LEGACY_CHAT_MEMORY_DIR_NAME = "chat_memory"       # Old scratchpad folder; never indexed
 SCOPES_DIR_NAME = "scopes"                        # output/scopes/<scope>/ holds each sign-in scope's reports
+ENVIRONMENT_MEMORY_DIR_NAME = "environment_memory"  # Environment records and settings; never indexed
 DISCOVERY_SOURCE_TYPES = {"discovery_artifact", "generated_summary", "handoff", "runbook", "tool_result_snapshot"}
 ```
 
@@ -642,6 +688,10 @@ MAX_LEDGER_TEXT = 60000                        # Characters kept per text in a r
 | **Chat Goals** | Tracked Questions | 10 | count | Per goal |
 | **Chat Goals** | Saved Chats | 50 | count | Per goal |
 | **Chat Goals** | Messages per Saved Chat | 200 | count | Newest kept |
+| **Environment Memory** | Quiet After | 24 | hours | Admin setting, 1-720 |
+| **Environment Memory** | Scheduled Check | Off, every 6 | hours | Admin setting, 1-168 |
+| **Environment Memory** | Volume Shift | 50 | percent | Up or down, tstats counts, at least 100 events |
+| **Environment Memory** | Changes Kept | 500 | changes | Per scope, newest kept |
 | **External REST** | Rate Limit Requests | 30 | requests | Per-token fixed-window budget |
 | **External REST** | Rate Limit Window | 60 | seconds | Per-token window size |
 | **Inbound MCP** | Rate Limit Requests | 30 | requests | Per-token fixed-window budget |

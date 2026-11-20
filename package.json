@@ -8,6 +8,7 @@
     "test:auth-browser": "node tools/test_auth_browser.mjs",
     "test:settings-profiles-browser": "node tools/test_settings_profiles_browser.mjs",
     "test:settings-troubleshoot-browser": "node tools/test_settings_troubleshoot_browser.mjs",
+    "test:environment-memory-browser": "node tools/test_environment_memory_browser.mjs",
     "test:ui-contrast-browser": "node tools/test_ui_contrast_browser.mjs",
     "test:account-functions": "node tools/run_account_function_tests.mjs"
   },

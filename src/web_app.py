@@ -30,7 +30,7 @@ import ssl
 import subprocess
 import threading
 from urllib.parse import quote, urlencode
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, List, Dict, Any, Optional, Tuple
@@ -136,6 +136,26 @@ from spl.spl_utils import (
     scope_spl_to_index,
 )
 from frontend_legacy import get_frontend_html
+from environment_memory import (
+    CHANGE_KINDS as ENVIRONMENT_CHANGE_KINDS,
+    CHANGE_TYPES as ENVIRONMENT_CHANGE_TYPES,
+    CHECK_QUERIES as ENVIRONMENT_CHECK_QUERIES,
+    CHECK_ROW_LIMIT as ENVIRONMENT_CHECK_ROW_LIMIT,
+    CHECK_WINDOW as ENVIRONMENT_CHECK_WINDOW,
+    HARVEST_TOOL_NAMES as ENVIRONMENT_HARVEST_TOOL_NAMES,
+    EnvironmentMemory,
+    EnvironmentSettingsStore,
+    apply_settings_updates as apply_environment_settings_updates,
+    busiest_index as environment_busiest_index,
+    changes_view as environment_changes_view,
+    check_rows_complete as environment_check_rows_complete,
+    known_environment_block,
+    memory_view as environment_memory_view,
+    observation_from_check as environment_observation_from_check,
+    observation_from_rows as environment_observation_from_rows,
+    ranked_entities as environment_ranked_entities,
+)
+from environment_memory.values import stored_moment as environment_moment
 from incognito import (
     IncognitoBlocked,
     IncognitoLLMClient,
@@ -5689,8 +5709,12 @@ def build_follow_on_actions(
     memory: Dict[str, Any],
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     assistant_response: str = "",
+    known_index: str = "",
 ) -> List[Dict[str, Any]]:
-    """Generate executable, context-aware follow-on action suggestions."""
+    """Generate executable, context-aware follow-on action suggestions.
+
+    ``known_index`` is a real index from the environment record, used when the conversation has not named one.
+    """
     actions: List[Dict[str, Any]] = []
     remembered_index = _remembered_entity(memory, "index")
     remembered_host = _remembered_entity(memory, "host")
@@ -5806,19 +5830,13 @@ def build_follow_on_actions(
             "advance_mission",
         ))
 
-    if not actions:
-        if remembered_index:
-            actions.append(_make_follow_on_action(
-                "Investigate unusual events",
-                f"Show me unusual events in index={remembered_index} over the last 24 hours.",
-                "unusual_events",
-            ))
-        else:
-            actions.append(_make_follow_on_action(
-                "Ask a focused follow-up",
-                "Ask a focused plain-language question about one index, host, or sourcetype for deeper analysis.",
-                "generic_follow_up",
-            ))
+    fallback_index = remembered_index or str(known_index or "").strip()
+    if not actions and fallback_index:
+        actions.append(_make_follow_on_action(
+            "Investigate unusual events",
+            f"Show me unusual events in index={fallback_index} over the last 24 hours.",
+            "unusual_events",
+        ))
 
     return _dedupe_follow_on_actions(actions, limit=3)
 
@@ -7845,6 +7863,239 @@ def request_discovery_dir(request: Optional[Request]) -> Path:
     return _discovery_scope_output_dir(scope_key, create=False)
 
 
+environment_settings_store = EnvironmentSettingsStore()
+
+
+def load_environment_record(folder: Path) -> Dict[str, Any]:
+    """A scope's environment record, after merging any discovery run it has not seen yet."""
+    memory = EnvironmentMemory(folder)
+    try:
+        memory.sync_discovery(quiet_hours=environment_settings_store.load().quiet_hours)
+    except Exception as exc:  # noqa: BLE001 - the record is a convenience; chat and views go on without new runs
+        print(f"⚠️ [ENVIRONMENT] Could not merge discovery runs into the environment record: {exc}")
+    return memory.load()
+
+
+def learn_environment_from_chat(folder: Optional[Path], result: Any) -> int:
+    """Add the indexes, sourcetypes, hosts, and sources a chat answer's searches returned; return the changes found."""
+    if not isinstance(result, dict) or result.get("error"):
+        return 0
+    settings = environment_settings_store.load()
+    if not settings.learn_from_chat:
+        return 0
+    row_sets: List[Tuple[str, List[Any]]] = []
+    for call in result.get("tool_calls") or []:
+        if not isinstance(call, dict) or "result" not in call:
+            continue
+        tool_name = str(call.get("tool") or "")
+        if tool_name.strip().lower() not in ENVIRONMENT_HARVEST_TOOL_NAMES:
+            continue
+        outcome = classify_tool_result(call.get("result"))
+        if outcome["status"] == "data" and not outcome.get("zero_counts"):
+            row_sets.append((tool_name, outcome["rows"]))
+    observation = environment_observation_from_rows(row_sets, datetime.now(timezone.utc))
+    if observation is None:
+        return 0
+    memory = EnvironmentMemory(Path(folder) if folder is not None else Path("output"))
+    memory.sync_discovery(quiet_hours=settings.quiet_hours)
+    return len(memory.apply(observation, quiet_hours=settings.quiet_hours))
+
+
+def remember_chat_environment(folder: Optional[Path], result: Any) -> None:
+    try:
+        learn_environment_from_chat(folder, result)
+    except Exception as exc:  # noqa: BLE001 - never fail an answer the user already has
+        print(f"⚠️ [ENVIRONMENT] Could not record what the chat searches found: {exc}")
+
+
+def environment_prompt_context(record: Dict[str, Any], *, compact: bool) -> str:
+    """The KNOWN ENVIRONMENT block for chat instructions, or nothing when incognito mode could not mask it."""
+    block = known_environment_block(record, now=datetime.now(timezone.utc), compact=compact)
+    if not block:
+        return ""
+    session = current_incognito_session()
+    if session is not None and session.active:
+        if session.masker is None:
+            return ""
+        try:
+            # Names learned from chat may not be in any discovery report, so register them before the block is masked.
+            session.masker.seed({
+                kind: [entity["name"] for entity in environment_ranked_entities(record, kind, include_gone=True)]
+                for kind in ("index", "host")
+            })
+        except Exception as exc:  # noqa: BLE001 - leave the block out rather than send names unmasked
+            print(f"⚠️ [INCOGNITO] Could not register the known environment names: {exc}")
+            return ""
+    return block
+
+
+ENVIRONMENT_CHECK_LOOP_SECONDS = 60
+ENVIRONMENT_CHECK_SEARCH_TIMEOUT_SECONDS = 300
+environment_check_task: Optional[asyncio.Task] = None
+environment_checks_running: set = set()
+
+
+def environment_scope_folders() -> List[Tuple[str, Path]]:
+    """Scopes with discovery runs or an environment record, as (scope key, folder)."""
+    output_dir = Path("output")
+    candidates: List[Tuple[str, Path]] = [(DISCOVERY_SCOPE_GLOBAL, output_dir)]
+    scopes_dir = output_dir / "scopes"
+    if scopes_dir.is_dir():
+        for folder in sorted(scopes_dir.iterdir()):
+            if not folder.is_dir():
+                continue
+            try:
+                scope_key = base64.urlsafe_b64decode(folder.name + "=" * (-len(folder.name) % 4)).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if _discovery_scope_output_dir(scope_key, create=False) == folder:
+                candidates.append((_normalize_discovery_scope_key(scope_key), folder))
+    return [
+        (scope_key, folder) for scope_key, folder in candidates
+        if EnvironmentMemory(folder).exists() or any(folder.glob("v2_intelligence_blueprint_*.json"))
+    ]
+
+
+def environment_check_config(scope_key: Optional[str]) -> Any:
+    """The runtime config whose MCP connection searches this scope, or None without the URL and token discovery needs."""
+    normalized = _normalize_discovery_scope_key(scope_key)
+    if normalized == DISCOVERY_SCOPE_NO_MCP:
+        return None
+    config = copy.deepcopy(config_manager.get())
+    if normalized.startswith("mcp:"):
+        name = normalized[len("mcp:"):]
+        saved = config_manager.get_mcp_config(name)
+        if saved is None:
+            return None
+        config.mcp.url = saved.url
+        config.mcp.token = saved.token
+        config.mcp.verify_ssl = saved.verify_ssl
+        config.mcp.ca_bundle_path = saved.ca_bundle_path
+        config.active_mcp_config_name = name
+    elif normalized != DISCOVERY_SCOPE_GLOBAL:
+        return None
+    # A fresh install already has a placeholder URL, so only a token shows a connection was set up.
+    if not str(getattr(config.mcp, "url", "") or "").strip() or is_unset_secret(config.mcp.token):
+        return None
+    return config
+
+
+async def run_environment_check(scope_key: Optional[str], folder: Path) -> Dict[str, Any]:
+    """Run the light 24-hour tstats check for one scope and merge what it found."""
+    normalized = _normalize_discovery_scope_key(scope_key)
+    config = environment_check_config(normalized)
+    if config is None:
+        return {"status": "skipped", "reason": "This scope has no Splunk connection to check."}
+    if normalized in environment_checks_running:
+        return {"status": "running"}
+    environment_checks_running.add(normalized)
+    memory = EnvironmentMemory(folder)
+    started = datetime.now(timezone.utc)
+    try:
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        for name, query in ENVIRONMENT_CHECK_QUERIES:
+            arguments = {
+                "query": query,
+                "earliest_time": ENVIRONMENT_CHECK_WINDOW,
+                "latest_time": "now",
+                "row_limit": ENVIRONMENT_CHECK_ROW_LIMIT,
+            }
+            raw = await asyncio.wait_for(
+                execute_mcp_tool_call({"method": "tools/call", "params": {"name": "splunk_run_query", "arguments": arguments}}, config),
+                timeout=ENVIRONMENT_CHECK_SEARCH_TIMEOUT_SECONDS,
+            )
+            outcome = classify_tool_result(raw)
+            if outcome["status"] == "error":
+                message = str(outcome.get("error") or "The search failed.")
+                memory.record_check(started, status="error", error=message)
+                return {"status": "error", "error": message}
+            outcomes[name] = outcome
+        settings = environment_settings_store.load()
+        memory.sync_discovery(quiet_hours=settings.quiet_hours)
+        by_sourcetype, by_host = outcomes["by_sourcetype"], outcomes["by_host"]
+        observation = environment_observation_from_check(
+            by_sourcetype["rows"],
+            by_host["rows"],
+            at=started,
+            sourcetype_complete=environment_check_rows_complete(
+                by_sourcetype["row_count"], total_rows=by_sourcetype.get("total_rows"), truncated=bool(by_sourcetype.get("truncated"))
+            ),
+            host_complete=environment_check_rows_complete(
+                by_host["row_count"], total_rows=by_host.get("total_rows"), truncated=bool(by_host.get("truncated"))
+            ),
+        )
+        changes = memory.apply(observation, quiet_hours=settings.quiet_hours)
+        memory.record_check(started, status="ok", changes=len(changes))
+        return {"status": "ok", "changes": len(changes)}
+    except asyncio.TimeoutError:
+        message = "The check search did not finish in time."
+        memory.record_check(started, status="error", error=message)
+        return {"status": "error", "error": message}
+    except Exception as exc:  # noqa: BLE001 - record the failure so the schedule waits a full interval before retrying
+        message = str(exc) or exc.__class__.__name__
+        try:
+            memory.record_check(started, status="error", error=message)
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "error", "error": message}
+    finally:
+        environment_checks_running.discard(normalized)
+
+
+async def run_due_environment_checks(now: Optional[datetime] = None) -> List[str]:
+    """Run the scheduled check for every scope whose last check is older than the interval; return those scopes."""
+    settings = environment_settings_store.load()
+    if not settings.scheduled_check:
+        return []
+    moment = now or datetime.now(timezone.utc)
+    interval = timedelta(hours=settings.check_interval_hours)
+    ran: List[str] = []
+    for scope_key, folder in environment_scope_folders():
+        last_check = EnvironmentMemory(folder).load().get("last_check") or {}
+        last_at = environment_moment(last_check.get("at"))
+        if last_at is not None and moment - last_at < interval:
+            continue
+        if environment_check_config(scope_key) is None:
+            continue
+        await run_environment_check(scope_key, folder)
+        ran.append(scope_key)
+    return ran
+
+
+async def _environment_check_loop() -> None:
+    while True:
+        try:
+            await run_due_environment_checks()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the schedule alive
+            print(f"⚠️ [ENVIRONMENT] Scheduled check error: {exc}")
+        await asyncio.sleep(ENVIRONMENT_CHECK_LOOP_SECONDS)
+
+
+@app.on_event("startup")
+async def start_environment_checks() -> None:
+    global environment_check_task
+
+    if _is_runtime_worker_process():
+        return
+    if environment_check_task is None or environment_check_task.done():
+        environment_check_task = asyncio.create_task(_environment_check_loop())
+
+
+@app.on_event("shutdown")
+async def stop_environment_checks() -> None:
+    global environment_check_task
+
+    task = environment_check_task
+    environment_check_task = None
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
 def _discovery_scope_output_dir(scope_key: Optional[str] = None, *, create: bool = True) -> Path:
     output_dir = Path("output")
     if create:
@@ -8330,6 +8581,7 @@ def register_discovery_session(
     sessions.insert(0, session_record)
     sessions = sorted(sessions, key=lambda x: x.get("timestamp", ""), reverse=True)
     save_discovery_sessions(sessions[:100])
+    load_environment_record(_discovery_scope_output_dir(scope_key, create=False))
     return session_record
 
 
@@ -11870,6 +12122,117 @@ async def get_discovery_compare(request: Request, current: Optional[str] = None,
     """Return comparative metrics between two discovery sessions."""
     scope_key = _build_discovery_scope_metadata(request=request).get("scope_key")
     return build_discovery_compare_payload(current, baseline, scope_key=scope_key)
+
+
+ENVIRONMENT_VIEW_LIMIT_MAX = 500
+
+
+def _environment_scope_for_request(request: Request) -> Tuple[Dict[str, Any], Path]:
+    scope = _build_discovery_scope_metadata(request=request)
+    scope_key = _normalize_discovery_scope_key(scope.get("scope_key"))
+    view = {"scope_key": scope_key, "scope_label": str(scope.get("scope_label") or "Global")}
+    return view, _discovery_scope_output_dir(scope_key, create=False)
+
+
+def _environment_view_limit(value: Any, default: int) -> int:
+    number = _safe_int(value) if value is not None else default
+    return max(0, min(number, ENVIRONMENT_VIEW_LIMIT_MAX))
+
+
+def _environment_memory_payload(request: Request, user: Optional[Dict[str, Any]], *, limit: Any = 50,
+                                change_limit: Any = 100) -> Dict[str, Any]:
+    scope, folder = _environment_scope_for_request(request)
+    can_manage = _is_admin_or_open(user)
+    record = load_environment_record(folder)
+    settings = environment_settings_store.load().to_dict()
+    if not can_manage:
+        settings.pop("updated_by", None)
+    return {
+        "scope": scope,
+        "memory": environment_memory_view(
+            record,
+            limit=_environment_view_limit(limit, 50),
+            change_limit=_environment_view_limit(change_limit, 100),
+            include_errors=can_manage,
+        ),
+        "settings": settings,
+        "can_manage": can_manage,
+        "can_check": can_manage and environment_check_config(scope["scope_key"]) is not None,
+        "check_running": scope["scope_key"] in environment_checks_running,
+    }
+
+
+@app.get("/api/environment-memory")
+async def get_environment_memory(request: Request, limit: int = 50, change_limit: int = 100):
+    """What the app has learned about the caller's Splunk environment, and what changed there."""
+    user = require_authenticated_user(request)
+    return _environment_memory_payload(request, user, limit=limit, change_limit=change_limit)
+
+
+@app.get("/api/environment-memory/changes")
+async def get_environment_changes(request: Request, limit: int = 100, change: Optional[str] = None,
+                                  kind: Optional[str] = None):
+    """The change log for the caller's scope, newest first, optionally of one change type or kind."""
+    require_authenticated_user(request)
+    if change and change not in ENVIRONMENT_CHANGE_TYPES:
+        raise HTTPException(status_code=400, detail=f"change must be one of: {', '.join(ENVIRONMENT_CHANGE_TYPES)}")
+    if kind and kind not in ENVIRONMENT_CHANGE_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind must be one of: {', '.join(ENVIRONMENT_CHANGE_KINDS)}")
+    scope, folder = _environment_scope_for_request(request)
+    record = load_environment_record(folder)
+    return {
+        "scope": scope,
+        "changes": environment_changes_view(record, limit=_environment_view_limit(limit, 100), change=change, kind=kind),
+    }
+
+
+@app.post("/api/environment-memory/check")
+async def check_environment_now(request: Request):
+    """Admin: run the light 24-hour check for the caller's scope now."""
+    user = require_admin_user(request)
+    scope, folder = _environment_scope_for_request(request)
+    if environment_check_config(scope["scope_key"]) is None:
+        raise HTTPException(status_code=400, detail="This scope has no Splunk connection to check.")
+    if scope["scope_key"] in environment_checks_running:
+        raise HTTPException(status_code=409, detail="A check is already running for this scope.")
+    result = await run_environment_check(scope["scope_key"], folder)
+    payload = _environment_memory_payload(request, user)
+    payload["check"] = result
+    return payload
+
+
+@app.post("/api/environment-memory/clear")
+async def clear_environment_memory(request: Request):
+    """Admin: forget what the app learned for the caller's scope and start over from the next run, check, or chat search."""
+    user = require_admin_user(request)
+    _scope, folder = _environment_scope_for_request(request)
+    try:
+        EnvironmentMemory(folder).clear()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not clear the environment record: {exc}") from None
+    return _environment_memory_payload(request, user)
+
+
+@app.get("/api/environment-memory/settings")
+async def get_environment_memory_settings(request: Request):
+    require_admin_user(request)
+    return {"settings": environment_settings_store.load().to_dict()}
+
+
+@app.post("/api/environment-memory/settings")
+async def update_environment_memory_settings(request: Request):
+    """Admin: learn from chat, the scheduled check and its interval, and the quiet threshold."""
+    user = require_admin_user(request)
+    payload = await _goal_payload(request)
+    try:
+        updated = apply_environment_settings_updates(environment_settings_store.load(), payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    try:
+        saved = environment_settings_store.save(updated, updated_by=str((user or {}).get("username") or "local"))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save the environment memory settings: {exc}") from None
+    return {"settings": saved.to_dict()}
 
 
 @app.get("/api/discovery/m26-14/profile")
@@ -19157,6 +19520,7 @@ async def run_chat_turn(
         result = await chat_with_splunk_logic(
             request, status_callback, runtime_config=runtime_config, goal_owner=goal_owner, discovery_dir=discovery_dir
         )
+    remember_chat_environment(discovery_dir, result)
     return attach_incognito_result(session, result)
 
 
@@ -19224,6 +19588,8 @@ async def chat_with_splunk_logic(
                 save_chat_memory(chat_session_id, chat_memory, goal_owner)
         mission = normalize_mission(chat_memory.get("mission"))
         memory_context = build_chat_memory_context(chat_memory)
+        environment_record = load_environment_record(report_dir)
+        environment_known_index = environment_busiest_index(environment_record)
 
         query_lower = user_message.lower()
         small_talk = is_small_talk(user_message)
@@ -19417,6 +19783,7 @@ async def chat_with_splunk_logic(
                     updated_memory,
                     latest_tool_calls,
                     assistant_response=response_text,
+                    known_index=environment_known_index,
                 )
                 return {
                     "response": response_text,
@@ -19520,6 +19887,7 @@ async def chat_with_splunk_logic(
                 updated_memory,
                 latest_tool_calls,
                 assistant_response=response_text,
+                known_index=environment_known_index,
             )
             return {
                 "response": response_text,
@@ -19679,6 +20047,7 @@ async def chat_with_splunk_logic(
                 updated_memory,
                 skill_tool_calls,
                 assistant_response=response_text,
+                known_index=environment_known_index,
             )
             return {
                 "response": response_text,
@@ -19824,6 +20193,7 @@ async def chat_with_splunk_logic(
                 updated_memory,
                 offline_tool_calls,
                 assistant_response=response_text,
+                known_index=environment_known_index,
             )
             return {
                 "response": response_text,
@@ -20204,6 +20574,7 @@ async def chat_with_splunk_logic(
                 updated_memory,
                 basic_tool_calls,
                 assistant_response=response_text,
+                known_index=environment_known_index,
             )
             return {
                 "response": response_text,
@@ -20248,12 +20619,16 @@ async def chat_with_splunk_logic(
         evidence_chars = int(chat_runtime_profile.get("evidence_chars") or 6000)
         followup_max_tokens = chat_runtime_profile["followup_max_tokens"]
 
+        environment_context = environment_prompt_context(
+            environment_record, compact=bool(chat_runtime_profile["use_compact_prompt"])
+        )
+        prompt_memory_context = "\n\n".join(part for part in (memory_context, environment_context) if part)
         if chat_runtime_profile["use_compact_prompt"]:
             system_prompt = build_compact_chat_prompt(
                 query_tool_name=query_tool_name,
                 discovery_context=discovery_context,
                 rag_context=rag_context,
-                memory_context=memory_context,
+                memory_context=prompt_memory_context,
                 available_tools_text=available_tools_text,
                 discovery_age_warning=discovery_age_warning,
                 mission=mission,
@@ -20265,7 +20640,7 @@ async def chat_with_splunk_logic(
                 available_tools_text=available_tools_text,
                 discovery_context=discovery_context,
                 rag_context=rag_context,
-                memory_context=memory_context,
+                memory_context=prompt_memory_context,
                 discovery_age_warning=discovery_age_warning,
                 mission=mission,
                 goal_progress=goal_progress,
@@ -20672,6 +21047,7 @@ async def chat_with_splunk_logic(
                 updated_memory,
                 all_tool_calls,
                 assistant_response=user_facing_final_answer,
+                known_index=environment_known_index,
             )
             status_labels = {"error": "error", "data": "success", "no_data": "no_data"}
             return {
@@ -20721,6 +21097,7 @@ async def chat_with_splunk_logic(
             user_message,
             updated_memory,
             assistant_response=direct_response,
+            known_index=environment_known_index,
         )
         return {
             "response": direct_response,

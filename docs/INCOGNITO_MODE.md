@@ -64,7 +64,7 @@ Kept visible: Splunk's built-in indexes (such as `_internal`, `main`, and `notab
 
 Names come from three places:
 
-1. **Discovery**: hosts, indexes, users, apps, saved searches, knowledge objects, KV store collections, and roles from the latest discovery reports, plus field values found inside saved-search SPL
+1. **Discovery**: hosts, indexes, users, apps, saved searches, knowledge objects, KV store collections, and roles from the latest discovery reports, plus field values found inside saved-search SPL. The indexes and hosts in the environment record (What changed on Overview), including names learned from chat searches, are added before each chat request. If they cannot be added, chat leaves its Known environment section out of the request
 2. **Patterns**: IP addresses, MAC addresses, email addresses, domain names, GUIDs, SIDs, home folder paths, and secrets, wherever they appear
 3. **Admin terms**: the Always replace list
 

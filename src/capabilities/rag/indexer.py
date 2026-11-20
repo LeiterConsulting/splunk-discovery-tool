@@ -14,6 +14,7 @@ from capabilities.rag.asset_manager import KnowledgeAssetManager, normalize_know
 from capabilities.rag.base import RetrievalChunk
 from knowledge_library import LIBRARY_DIR_NAME
 from chat_settings import CHAT_DATA_DIR_NAME
+from environment_memory.values import ENVIRONMENT_MEMORY_DIR_NAME
 from knowledge_library.ranking import (
     BM25,
     best_possible_fusion,
@@ -584,6 +585,9 @@ class ArtifactSourceIndexer:
             relative_parts = path.relative_to(source_dir).parts
             # The library and saved chat data have their own stores, and chat data is private to each user.
             if LIBRARY_DIR_NAME in relative_parts or CHAT_DATA_DIR_NAME in relative_parts:
+                continue
+            # The environment record is chat context of its own and changes after every chat search.
+            if ENVIRONMENT_MEMORY_DIR_NAME in relative_parts:
                 continue
             if relative_parts[0] == LEGACY_CHAT_MEMORY_DIR_NAME:
                 continue

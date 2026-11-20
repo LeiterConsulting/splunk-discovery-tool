@@ -2388,7 +2388,7 @@ class KnowledgeBasePrivacyAndScopeTests(unittest.TestCase):
         )
         return scoped_dir
 
-    def test_chat_scratchpads_are_never_indexed(self):
+    def test_chat_scratchpads_and_environment_records_are_never_indexed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "output"
             runbook = output_dir / "v2_operator_runbook_20260101_000000.md"
@@ -2396,6 +2396,8 @@ class KnowledgeBasePrivacyAndScopeTests(unittest.TestCase):
                 runbook,
                 output_dir / "chat_memory" / "chat_memory_chat_1.json",
                 output_dir / "chat_data" / "memory" / "local" / "chat_memory_chat_1.json",
+                output_dir / "environment_memory" / "record.json",
+                output_dir / "scopes" / "bWNwOmNvbnRvc28" / "environment_memory" / "record.json",
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('{"last_user_message": "a private question about the contoso payroll hosts"}', encoding="utf-8")

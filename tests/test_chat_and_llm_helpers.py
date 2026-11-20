@@ -33,7 +33,25 @@ from llm.model_profiles import build_model_profile, clear_model_metadata_cache, 
 from capabilities.models import CapabilityActionResult, CapabilityConfig
 from discovery.context_manager import DiscoveryContextManager
 from discovery.engine import DiscoveryEngine
+from environment_memory.record import empty_record
 import web_app
+
+
+# Chat runs here use the default "output" folder, so keep the environment record out of the real one and out of the prompts.
+_NO_ENVIRONMENT_MEMORY = (
+    patch.object(web_app, "load_environment_record", lambda _folder: empty_record()),
+    patch.object(web_app, "remember_chat_environment", lambda _folder, _result: None),
+)
+
+
+def setUpModule():
+    for patcher in _NO_ENVIRONMENT_MEMORY:
+        patcher.start()
+
+
+def tearDownModule():
+    for patcher in _NO_ENVIRONMENT_MEMORY:
+        patcher.stop()
 
 
 class OpenAIModelHelperTests(unittest.TestCase):

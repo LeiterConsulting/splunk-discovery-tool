@@ -49,7 +49,7 @@ The web app reads discovery data through dedicated endpoints:
 
 The UI has five core tabs, followed by any tabs that enabled capabilities add:
 
-1. **Overview**: discovery status, key numbers, top next steps, run comparison, runbook, and report packages
+1. **Overview**: discovery status, key numbers, top next steps, what changed (from environment memory), runbook, and report packages
 2. **Findings**: next steps for each audience, the environment profile, key evidence, and patterns
 3. **Discovery**: discovery runs, stage progress, saved reports, and summaries
 4. **Knowledge Base**: library health and the coverage scorecard, downloaded Splunk documentation, managed knowledge assets, the SPL Library, and context previews
@@ -68,6 +68,7 @@ Chat combines:
 5. Chat goals (`src/chat_goals.py`): a request with `goal_id` uses the goal as the mission; after each answer the browser asks `POST /api/chat/goals/{goal_id}/progress` which tracked questions the answer settled
 6. Chat settings (`src/chat_settings.py`): Auto values from the AI model's tuning, with Custom values saved per model. Each answer keeps its own copy for the whole answer
 7. A scratchpad per chat with the indexes, hosts, and recent turns it mentioned, saved privately for each user under `output/chat_data/memory/<owner>/` and never indexed
+8. Known environment: the busiest indexes, sourcetypes, and hosts in the asker's scope, what is quiet now, and changes in the last 7 days, from environment memory (below)
 
 Chat describes the environment the asker can search. With sign-in on, discovery saves each scope's reports under `output/scopes/<scope>/` (an assigned MCP connection is its own scope), and chat, context requests, hints after a search, Knowledge Base passages from discovery reports, and goal planning read the asker's scope (`request_discovery_dir`). With sign-in off, everything uses the global scope in `output/`.
 
@@ -77,6 +78,17 @@ When adding new intents:
 2. Add a handler branch in `chat_with_splunk_logic`
 3. Return structured tool call summaries for the step list and follow-on actions
 
+## Environment Memory (Developer Notes)
+
+`src/environment_memory/` keeps one record per discovery scope at `<scope folder>/environment_memory/record.json` (`output/` for the global scope, `output/scopes/<scope>/` otherwise). It lists the indexes, sourcetypes, hosts, and sources the app has seen, with first and last seen times, last event time, 24-hour counts, and status, plus a change log.
+
+1. **Observations**: `observation_from_blueprint` reads each discovery run, `observation_from_rows` reads the rows of chat searches (`learn_environment_from_chat`, after each answer), and `observation_from_check` reads the scheduled check's two `tstats` searches (`CHECK_QUERIES`, last 24 hours)
+2. **Merging**: `merge_observation` updates the entities and returns the changes: `new`, `went_quiet`, `back`, `volume_shift` (tstats counts only, more than 50 percent, at least 100 events), and `gone`. A kind reports changes only after an observation covered it in full (its baseline). Chat observations are never complete, so chat can add New items but never mark anything quiet
+3. **Discovery sync**: `load_environment_record` merges discovery runs the record has not seen (a new record starts from the last 2). `register_discovery_session` calls it after each run, and Overview and chat call it before they read the record
+4. **Chat**: `known_environment_block` adds a KNOWN ENVIRONMENT section to the chat instructions. Under incognito mode, `environment_prompt_context` registers the record's index and host names with the masker first, and drops the section if it cannot
+5. **Scheduled check**: off by default. `_environment_check_loop` runs every minute and checks each scope with a record or discovery runs whose last check is older than the interval, when the scope has an MCP URL and token
+
+Every update holds a file lock and writes the file atomically. The change log keeps the newest 500 changes.
 ## MCP + AI Model Settings (Preserved)
 
 Settings behavior is intentionally stable:

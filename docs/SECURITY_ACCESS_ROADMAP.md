@@ -124,6 +124,8 @@ When sign-in is on, chat goals and the saved chats under each goal are stored pe
 
 Incognito choices and records of what the AI saw follow the same rule: per user when sign-in is on, shared when it is off. The incognito policy and the stand-in mapping are install-wide, so a name gets the same stand-in for everyone.
 
+Environment memory (the What changed record) belongs to a discovery scope, not a user: everyone who searches a scope shares its record, including names learned from their chat searches. A signed-in user reads only the record of the scope they search (`GET /api/environment-memory`). Check Now, Clear Record, and the Environment Memory settings require an admin. The record holds only names that Splunk returned, never questions, and the Knowledge Base does not index it.
+
 ### 7. Incognito mode for the AI model
 
 Incognito mode (release 2.2.0) limits what the app sends to its AI model. When it is on, `src/incognito/` replaces the deployment's own names (hosts, IP addresses, users, custom indexes, non-Splunk apps, saved searches, knowledge objects, KV store collections, roles, emails, domains, and secrets) with stand-ins before each request and restores them in the reply. See [INCOGNITO_MODE.md](INCOGNITO_MODE.md).

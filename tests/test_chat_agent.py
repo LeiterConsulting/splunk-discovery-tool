@@ -18,8 +18,26 @@ if str(SRC_DIR) not in sys.path:
 
 import chat_agent  # noqa: E402
 import web_app  # noqa: E402
+from environment_memory.record import empty_record  # noqa: E402
 from llm.factory import PreambleReply  # noqa: E402
 from mcp_tool_args import adapt_tool_arguments, parse_jsonrpc_error  # noqa: E402
+
+
+# Chat runs here use the default "output" folder, so keep the environment record out of the real one and out of the prompts.
+_NO_ENVIRONMENT_MEMORY = (
+    patch.object(web_app, "load_environment_record", lambda _folder: empty_record()),
+    patch.object(web_app, "remember_chat_environment", lambda _folder, _result: None),
+)
+
+
+def setUpModule():
+    for patcher in _NO_ENVIRONMENT_MEMORY:
+        patcher.start()
+
+
+def tearDownModule():
+    for patcher in _NO_ENVIRONMENT_MEMORY:
+        patcher.stop()
 
 
 def _rows_result(rows, **extra):
