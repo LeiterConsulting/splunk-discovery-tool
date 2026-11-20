@@ -7,15 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **Test Connection & Auto-Configure** for OpenAI failed with "Unknown error" after the form was switched from another provider, such as Ollama. The test sent the OpenAI key to the other provider's endpoint. It now goes to OpenAI, and a failed test always shows its reason
-- Save Settings kept the old provider's endpoint after a provider change, so the app kept calling the old server and Fetch Models listed its models. Changing the provider now clears the old endpoint, and the old key unless you enter a new one
-- Test Connection and the max response length check use a saved key for a blank key field only when the provider and endpoint match, like Fetch Models. Fetch Models and Test Connection also remove a pasted `Bearer ` prefix and spaces from a typed key
-
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
 - **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.2.1] - 2026-11-19
+
+Version 2.2.1 fixes the AI model settings after a switch from another provider, such as Ollama, to OpenAI.
+
+### ⬆️ Upgrading from 2.2.0
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+- Settings saved with 2.2.0 right after a switch to OpenAI can still point at the old provider's server. If Test Connection for OpenAI still fails after the upgrade, select **Load** on your saved OpenAI credential, or pick another provider and save, then pick OpenAI and save again
+
+### Fixed
+- **Test Connection & Auto-Configure** for OpenAI failed with "Unknown error" after the form was switched from another provider, such as Ollama. The test sent the OpenAI key to the other provider's endpoint. It now goes to OpenAI, and a failed test always shows its reason
+- Save Settings kept the old provider's endpoint after a provider change, so the app kept calling the old server and Fetch Models listed its models. Changing the provider now clears the old endpoint, and the old key unless you enter a new one
+- Test Connection and the max response length check use a saved key for a blank key field only when the provider and endpoint match, like Fetch Models. Fetch Models and Test Connection also remove a pasted `Bearer ` prefix and spaces from a typed key
 
 ## [2.2.0] - 2026-11-19
 
@@ -648,7 +656,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.1
 [2.2.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0
 [2.1.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.1
 [2.1.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.1.0

@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-2.2.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0)
+[![Version](https://img.shields.io/badge/version-2.2.1-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.1)
 
 > Finds what a Splunk environment contains, explains what to do next, and answers questions with live Splunk searches through the Splunk MCP server.
 
-**Current release: [2.2.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0)** (November 19, 2026). Incognito mode shows the AI model stand-ins such as `host_0012` instead of your own names, admins can require it for cloud AI models, and chats and reports can be downloaded with stand-ins to share. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
+**Current release: [2.2.1](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.1)** (November 19, 2026). Test Connection & Auto-Configure for OpenAI works again after the AI model settings are switched from another provider, such as Ollama, and Save Settings no longer keeps the old provider's endpoint. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
 
 ## ✨ What's Included
 
