@@ -7,14 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **Chat said "The search described above did not run"** about one time in four when an OpenAI model such as `gpt-6-luna` answered with only a short note like "I'll check event counts by index." The app asked again for the search but sent the note back labeled as `commentary`, and the model then returned an empty reply. The note now goes back without the label, and the search runs
-- **What the AI saw** left out requests that failed, such as those empty replies, even though their masked text had been sent. Failed requests are now listed with their error, with anything shaped like a key or token hidden
-
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
 - **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
 - **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+
+## [2.2.3] - 2026-11-20
+
+Version 2.2.3 has chat run the search after an OpenAI model answers with only a short note about it, and lists failed requests in What the AI saw.
+
+### ⬆️ Upgrading from 2.2.2
+- Run the installer again from the install folder (`./install.sh --restart` or `.\install.ps1 -Restart`). Settings, keys, and `output/` in the install folder are kept
+
+### Fixed
+- **Chat said "The search described above did not run"** after an OpenAI model such as `gpt-6-luna` answered with only a short note like "I'll check event counts by index." The app asked again for the search, but it sent the note back labeled as `commentary`, which made the model return an empty reply about one time in four. The note now goes back without the label, and the search runs
+- **What the AI saw** left out requests that failed, such as those empty replies, even though their masked text had been sent. Failed requests are now listed with their error, with anything shaped like a key or token hidden
 
 ## [2.2.2] - 2026-11-20
 
@@ -674,7 +681,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.2...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.2.3...HEAD
+[2.2.3]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.3
 [2.2.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.2
 [2.2.1]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.1
 [2.2.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.0
