@@ -23,6 +23,7 @@ The v3 development baseline is Factory's dashboard integration commit on top of 
 
 ### Fixed
 - The Splunk Dashboards card distinguishes a missing Splunk connection from an unchecked tool list. Users see guidance based on their role and whether they have an assigned connection.
+- Dashboard plans use the current chat's visible turns before server-side conversation history is available. Discovery retries an incomplete plan once with the original chat or report context.
 
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives

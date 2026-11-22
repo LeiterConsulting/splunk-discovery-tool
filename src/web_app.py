@@ -52,7 +52,7 @@ from capabilities.tools.dashboard_service import (
     DashboardBindingChanged,
     DashboardConflict,
     DashboardService,
-    build_plan_messages,
+    build_plan_messages as build_dashboard_plan_messages,
     coerce_brief_draft,
     detect_dashboard_create_intent,
     fallback_brief_draft,
@@ -14214,14 +14214,28 @@ async def draft_dashboard_plan(
     if available:
         try:
             llm_client = get_or_create_llm_client(config)
-            raw_response = await llm_client.generate_response(
-                messages=build_plan_messages(request_text, context_sections),
-                max_tokens=llm_call_budget(config, 0.3, floor=600, ceiling=1600),
-                temperature=0.2,
-            )
-            parsed = _extract_json_object_from_llm_text(raw_response)
-            if parsed:
-                return coerce_brief_draft(parsed, provenance), "ai"
+            messages = build_dashboard_plan_messages(request_text, context_sections)
+            budget = llm_call_budget(config, 0.3, floor=600, ceiling=1600)
+            for attempt in range(2):
+                raw_response = await llm_client.generate_response(
+                    messages=messages,
+                    max_tokens=budget,
+                    temperature=0.2,
+                )
+                parsed = _extract_json_object_from_llm_text(raw_response)
+                if (
+                    parsed
+                    and isinstance(parsed.get("purpose"), str)
+                    and parsed["purpose"].strip()
+                    and isinstance(parsed.get("pages"), list)
+                    and parsed["pages"]
+                ):
+                    return coerce_brief_draft(parsed, provenance), "ai"
+                if attempt == 0:
+                    messages = [*messages, {"role": "user", "content": (
+                        "Draft the dashboard for the requested subject in the context above. "
+                        "Return the complete JSON plan, including its purpose and requested panels."
+                    )}]
         except IncognitoBlocked:
             raise
         except Exception as exc:  # noqa: BLE001 - the starter plan still lets the user continue
@@ -14270,6 +14284,14 @@ async def build_dashboard_proposal(
 
 
 def _dashboard_history_excerpt(history: Any) -> str:
+    # The browser sends visible chat messages with "type" until it has a
+    # server conversation history. Both forms carry the same user context.
+    if isinstance(history, list):
+        history = [
+            dict(entry, role=entry.get("role") or entry.get("type"))
+            for entry in history
+            if isinstance(entry, dict)
+        ]
     lines = []
     for entry in _compact_chat_role_history(history, limit=6, include_system=False):
         content = re.sub(r"\s+", " ", entry["content"]).strip()[:700]

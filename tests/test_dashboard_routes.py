@@ -304,6 +304,37 @@ class DashboardRouteTests(DashboardRouteCase):
         self.assertEqual(web_app._dashboard_report_label("v2_ai_summary_20260522_010203.md"), "AI Summary")
         self.assertEqual(web_app._dashboard_report_label("notes.txt"), "Notes")
 
+    def test_dashboard_plan_keeps_visible_chat_history_before_server_history_exists(self):
+        history = [
+            {"role": "system", "content": "Internal guidance"},
+            {"type": "user", "content": "Show the deployment signal count."},
+            {"type": "error", "content": "An internal error"},
+            {"role": "assistant", "content": "There are six synthetic events."},
+        ]
+        self.assertEqual(
+            web_app._dashboard_history_excerpt(history),
+            "User: Show the deployment signal count.\nAssistant: There are six synthetic events.",
+        )
+
+    def test_dashboard_plan_retries_an_incomplete_model_reply_with_the_same_context(self):
+        model = mock.Mock()
+        model.generate_response = mock.AsyncMock(side_effect=[
+            '{"title":"Dashboard Creation"}',
+            '{"title":"Deployment signals","purpose":"Count deployment events",'
+            '"pages":[{"name":"Overview","panels":["Overall event count"]}]}',
+        ])
+        with mock.patch.object(web_app, "_is_llm_available_for_m26_14_advisory", return_value=(True, "")), \
+                mock.patch.object(web_app, "get_or_create_llm_client", return_value=model):
+            draft, author = asyncio.run(web_app.draft_dashboard_plan(
+                "Turn this into a dashboard",
+                [("Conversation so far", "User: Count deployment events")],
+                self.config_manager.get(),
+            ))
+        self.assertEqual((draft["title"], author), ("Deployment signals", "ai"))
+        first, second = [call.kwargs["messages"] for call in model.generate_response.call_args_list]
+        self.assertEqual(second[:len(first)], first)
+        self.assertIn("Count deployment events", second[1]["content"])
+
 
 class DashboardSignInTests(DashboardRouteCase):
     def sign_in_admin(self):

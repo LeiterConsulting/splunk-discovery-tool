@@ -118,6 +118,9 @@ def detect_dashboard_create_intent(message: Any) -> bool:
 # ---------------------------------------------------------------- plan drafting
 
 PLAN_SYSTEM_PROMPT = """You draft a dashboard plan for Constellation, which builds Splunk Dashboard Studio dashboards.
+Use the latest request to decide what to draft. Resolve references such as "this" from the preceding conversation.
+Keep any explicit title, source, measurements, and panels the user has already chosen unless the latest request changes them.
+Use the discovery summary as supporting evidence only. Earlier requests in the context describe prior turns.
 Reply with one JSON object and nothing else, in this form:
 {"title": "...", "purpose": "...", "requirements": "...", "source": {"kind": "index", "index": "...", "sourcetype": "..."}, "time_range": {"earliest": "-24h", "latest": "now"}, "pages": [{"name": "Overview", "panels": ["...", "..."]}], "findings": ["..."]}
 Rules:
