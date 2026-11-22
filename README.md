@@ -8,6 +8,8 @@
 
 **Current release: [2.3.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.3.0)** (November 20, 2026). Overview shows what changed in each Splunk environment since the app last looked, and chat starts from what the app already knows about the environment. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
 
+**v3 in development.** The next major release builds on 2.3.0 and adds optional dashboard creation from Discovery chat or a report. See the [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md) for the supported workflow and Constellation pilot status.
+
 ## ✨ What's Included
 
 - **Discovery**: a worker-backed pipeline that surveys the environment through MCP, keeps its progress across restarts, and saves an intelligence blueprint, an insights brief, an operator runbook, and a developer handoff (`v2_*` files in `output/`)
@@ -156,11 +158,11 @@ See [docs/INCOGNITO_MODE.md](docs/INCOGNITO_MODE.md) for what is replaced, how r
 
 ## 📊 Splunk Dashboards
 
-Splunk Dashboards (an optional capability) creates Splunk Dashboard Studio dashboards from a chat or a discovery report, through [Constellation](https://github.com/LeiterConsulting/constellation/releases), a Splunk app that adds dashboard tools to [Splunk MCP Server](https://splunkbase.splunk.com/app/7931).
+Discovery Tool and Constellation each run independently. Together, they can turn the investigation in your current chat or an open discovery report into a Splunk Dashboard Studio dashboard. The optional integration uses a Constellation build with dashboard tools registered in the Splunk environment's MCP Server. [Constellation repository](https://github.com/LeiterConsulting/constellation) · [Splunk MCP Server](https://splunkbase.splunk.com/app/7931)
 
 - **Ask in chat** ("Create a dashboard that tracks failed logins in index main") or select **Create Dashboard** on a report. The app drafts a plan with the data source, time range, pages, and panels, and shows the Splunk connection and Splunk user it will use
-- **Review first**: edit or cancel the plan. Nothing goes to Splunk until you select **Create Dashboard**. When Splunk confirms the result, the card links to the dashboard and to its Constellation draft
-- **Each Splunk environment needs Constellation**: when a connection's MCP tool list lacks the dashboard tools, the Capabilities tab shows Splunk Dashboards as a potential capability and links to what to install
+- **Review first**. Edit or cancel the plan, or select **Create Dashboard** to submit it. When Splunk confirms the result, the card links to the dashboard and to its Constellation draft
+- **Check each Splunk connection** to see whether it offers the Constellation dashboard tools. When the tools are missing, the Capabilities tab shows Splunk Dashboards as a potential capability and links to setup resources
 - **Your own Splunk user**: with sign-in on, admins and analysts create dashboards only through their own assigned connection. Dashboards cannot be created while incognito mode is on, because Constellation sends the plan to its own AI model with the real names
 
 See [docs/SPLUNK_DASHBOARDS.md](docs/SPLUNK_DASHBOARDS.md) for setup, results, and troubleshooting.

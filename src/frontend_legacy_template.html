@@ -9327,6 +9327,7 @@
                 potential: { label: 'Potential capability', tone: 'warning' },
                 incompatible: { label: 'Unsupported version', tone: 'error' },
                 unknown: { label: 'Not checked', tone: 'neutral' },
+                no_connection: { label: 'No connection', tone: 'warning' },
             };
 
             const getDashboardToneClasses = (tone) => {
@@ -9481,7 +9482,9 @@
             const renderDashboardCapabilityPanel = (capability) => {
                 const view = dashboardStatus.data;
                 const support = view?.support || null;
-                const supportState = !support && dashboardStatus.status !== 'error' ? 'loading' : (support?.state || 'unknown');
+                const supportState = !support && dashboardStatus.status !== 'error'
+                    ? 'loading'
+                    : (support?.reason === 'no_connection' ? 'no_connection' : (support?.state || 'unknown'));
                 const connectionLabel = view?.connection?.connection_label || '';
                 const requirements = Array.isArray(view?.requirements) && view.requirements.length > 0 ? view.requirements : capability.splunk_requirements;
                 const message = supportState === 'loading'

@@ -13996,11 +13996,15 @@ def resolve_dashboard_binding(config: Any, auth_user: Optional[Dict[str, Any]]) 
             return None, "Sign in to create dashboards."
         assigned = str(auth_user.get("mcp_config_name") or "").strip()
         role = str(auth_user.get("role") or "").strip().lower()
-        if not assigned or role not in {"admin", "analyst"}:
-            return None, (
-                "Dashboards are created only through your own Splunk connection, and none is assigned to you. "
-                "Ask an administrator to assign one to your user in Settings."
+        if role not in {"admin", "analyst"}:
+            return None, "Your role cannot create dashboards. Ask an administrator for the analyst role."
+        if not assigned:
+            next_step = (
+                "Assign one to your user in Settings > Users."
+                if role == "admin"
+                else "Ask an administrator to assign one to your user in Settings."
             )
+            return None, f"Dashboards are created only through your own Splunk connection, and none is assigned to you. {next_step}"
         if connection_name != assigned:
             return None, "Your assigned Splunk connection could not be loaded. Ask an administrator to check it in Settings."
     mcp = getattr(config, "mcp", None)

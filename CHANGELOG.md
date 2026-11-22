@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The v3 development baseline is Factory's dashboard integration commit on top of the 2.3.0 release. The Discovery client has local regression coverage. Live dashboard creation depends on the Constellation MCP pilot and its joint qualification. [Factory commit](https://github.com/LeiterConsulting/splunk-discovery-tool/commit/aff54a8c0cec88185ac6f24415afa804ddd1fb5e) · [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md)
+
 ### Added
 - **Splunk Dashboards** (optional capability): creates Splunk Dashboard Studio dashboards through [Constellation](https://github.com/LeiterConsulting/constellation/releases), a Splunk app that adds two dashboard tools to [Splunk MCP Server](https://splunkbase.splunk.com/app/7931). Ask in chat ("Create a dashboard that tracks failed logins in index main") or select **Create Dashboard** on a report. The app's AI model drafts a plan with a data source, time range, pages, and panels, and a card shows it with the Splunk connection and Splunk user it will use. Select **Edit Plan**, **Cancel**, or **Create Dashboard**. Nothing goes to Splunk until you select **Create Dashboard**
 - After you create a dashboard, the card follows its progress and ends with **Open Dashboard** and **Edit in Constellation** links, a Constellation draft, a question from Constellation, or the reason it failed. When Splunk cannot confirm the result, **Check Status** asks again, and the app never sends a second request it cannot prove is the same one. The Capabilities tab lists your recent dashboards
@@ -18,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - With sign-in on, only admins can install, turn on, turn off, remove, test, reindex, or configure capabilities. Other signed-in users still see each capability's status, and the Capabilities tab tells them to ask an administrator. With sign-in off, nothing changes
+
+### Fixed
+- The Splunk Dashboards card distinguishes a missing Splunk connection from an unchecked tool list. Users see guidance based on their role and whether they have an assigned connection.
 
 ### Planned
 - **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives

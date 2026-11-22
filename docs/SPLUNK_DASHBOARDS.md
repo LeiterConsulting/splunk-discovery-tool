@@ -1,20 +1,29 @@
 # Splunk Dashboards
 
-Splunk Dashboards is an optional capability that creates Splunk Dashboard Studio dashboards from a chat or a discovery report. The app does not build the dashboard itself. It drafts a plan for you to review, and when you select **Create Dashboard** it sends the plan to Constellation, a Splunk app that builds the dashboard in Splunk as your Splunk user. Each result is a private Splunk dashboard plus a Constellation draft you can keep editing.
+Discovery Tool and Constellation each support standalone use. With the optional Splunk Dashboards capability, Discovery drafts a plan from your current chat or an open discovery report. When you select **Create Dashboard**, Discovery sends the reviewed plan to Constellation through Splunk MCP Server as your Splunk user. A successful creation returns a private Dashboard Studio dashboard and a Constellation draft you can keep editing. [Constellation repository](https://github.com/LeiterConsulting/constellation)
+
+## v3 development status
+
+Factory implemented the Discovery client immediately after the 2.3.0 release. Its client tests cover the plan, confirmation, and receipt flows with a stand-in MCP server. The 2.3.0 tag predates this integration. [Discovery 2.3.0 source](https://github.com/LeiterConsulting/splunk-discovery-tool/tree/v2.3.0) · [Factory integration commit](https://github.com/LeiterConsulting/splunk-discovery-tool/commit/aff54a8c0cec88185ac6f24415afa804ddd1fb5e)
+
+Constellation's published 1.0.2 package predates the dashboard MCP tools. The separate Constellation 1.1.0-preview build 64 exercises the two tools in a lab pilot. Probe mode checks identity and argument mapping with writes disabled. Fixture mode can create a restricted test dashboard and draft. General dashboard authoring from Discovery context still requires a Constellation implementation and live validation through an ordinary user's Discovery connection. [Constellation 1.0.2 package metadata](https://github.com/LeiterConsulting/constellation/blob/v1.0.2/splunk/constellation/default/app.conf)
+
+Joint validation starts with both tool calls in probe mode through an ordinary user's Discovery connection. The fixture test then checks that the creator can open the private Studio dashboard, edit the Constellation draft, and recover the same result after retrying the same request. A second ordinary user checks that both artifacts stay private.
 
 ## What each Splunk environment needs
 
 The app talks to Constellation only through the Splunk MCP server of each connection. Each Splunk environment where you want dashboards needs:
 
 - **Splunk MCP Server**: [Splunk MCP Server on Splunkbase](https://splunkbase.splunk.com/app/7931)
-- **Constellation**: [Constellation releases](https://github.com/LeiterConsulting/constellation/releases). It adds two tools to Splunk MCP Server: `constellation_create_dashboard` and `constellation_get_creation_status`
+- **Constellation** with both v1 tools registered and enabled in Splunk MCP Server, `constellation_create_dashboard` and `constellation_get_creation_status`. [Constellation releases](https://github.com/LeiterConsulting/constellation/releases)
 
 The app reads each connection's MCP tool list and shows one of these states:
 
-- **Dashboard tools found**: both tools are listed with the arguments this app supports (contract schema version 1)
-- **Potential capability**: the tools are not listed. The Capabilities tab explains that Constellation must be installed in that Splunk environment and links to both apps. Nothing else in the app changes
+- **Dashboard tools found** means both tools are visible with contract schema version 1. The result of a request depends on the server's mode and the caller's permissions
+- **Potential capability** means the connection does not list both tools. The Capabilities tab links to Constellation and Splunk MCP Server
 - **Unsupported version**: the tools are listed, but their arguments do not match. Update Constellation in that Splunk environment
 - **Checking** or **Not checked**: the tool list is still loading, or the connection could not be read
+- **No connection**: you have no Splunk connection to create dashboards with, such as when sign-in is on and no connection is assigned to you
 
 The app also calls `splunk_get_user_info`, one of the standard Splunk MCP tools, to confirm which Splunk user the connection signs in as.
 
@@ -34,10 +43,10 @@ Admins can also change three timing settings in the capability's configuration:
 
 ## Create a dashboard
 
-- **From chat**: ask in your own words, such as "Create a dashboard that tracks failed logins in index main" or "Turn this into a dashboard". Questions about how to build a dashboard get a normal answer
+- **From chat**: ask in your own words, such as "Create a dashboard that tracks failed logins in index main" or "Turn this into a dashboard". You can also start with **Ask in Chat** on an Overview change and continue the investigation there. Questions about how to build a dashboard get a normal answer
 - **From a report**: open a discovery report and select **Create Dashboard**. The plan starts from the report's findings
 
-Either way, the app's AI model drafts a plan from the conversation or the report, using index and sourcetype names the app has seen in the environment. When no AI model is available, you get a starter plan to fill in. The plan appears as a card with:
+For a chat request, the app's AI model uses an excerpt from the current conversation, a discovery summary from your scope, and the known indexes and sourcetypes for that Splunk environment. From a report, it uses an excerpt of the selected report. When no AI model is available, you get a starter plan to fill in. The plan card includes the following fields.
 
 - a title, a purpose, and optional requirements (units, definitions, exclusions)
 - one data source: an index with an optional sourcetype, or one read-only search
@@ -45,7 +54,7 @@ Either way, the app's AI model drafts a plan from the conversation or the report
 - one or two pages with up to six panels in total, and up to four findings
 - the Splunk connection and Splunk user the dashboard will be created with
 
-Select **Edit Plan** to change the plan, **Cancel** to drop it, or **Create Dashboard** to send it. The card lists anything to fix before it can be sent, such as a missing index. Nothing goes to Splunk until you select **Create Dashboard**.
+Select **Edit Plan** to change the plan, **Cancel** to drop it, or **Create Dashboard** to send it. The card lists anything to fix before you submit it, such as a missing index.
 
 After you create it, the app saves the request first, sends it, and follows its progress. The card ends in one of these results:
 
@@ -79,9 +88,10 @@ Dashboards cannot be created while incognito mode is on for you, or while an adm
 
 | Message | What to do |
 | --- | --- |
-| This Splunk environment does not offer the dashboard tools yet | Install Constellation in that Splunk environment, then select **Check Again** |
+| This Splunk environment does not offer the dashboard tools yet | Check that an MCP-enabled Constellation build is installed and both tools are registered and enabled for your connection. Then select **Check Again** |
 | This Splunk environment lists the dashboard tools, but not in the version this app supports | Update Constellation in that Splunk environment |
-| None is assigned to you | Ask an admin to assign an MCP connection to your user in Settings |
+| None is assigned to you | Ask an admin to assign an MCP connection to your user in Settings. Admins assign one to their own user in **Settings > Users** |
+| Your role cannot create dashboards | Ask an admin for the analyst role |
 | Could not confirm which Splunk user this connection signs in as | Check the connection's token in Settings, and that Splunk MCP Server offers `splunk_get_user_info` |
 | Dashboards cannot be created while incognito mode is on | Turn incognito mode off, or ask an admin about the cloud AI model rule |
 | The dashboard is created but has no links | Enter the connection's Splunk Web address under **Splunk connections and Splunk Web addresses** |

@@ -6672,7 +6672,8 @@ The names and the change log are removed. Discovery runs you already have are no
       available: { label: "Dashboard tools found", tone: "success" },
       potential: { label: "Potential capability", tone: "warning" },
       incompatible: { label: "Unsupported version", tone: "error" },
-      unknown: { label: "Not checked", tone: "neutral" }
+      unknown: { label: "Not checked", tone: "neutral" },
+      no_connection: { label: "No connection", tone: "warning" }
     };
     const getDashboardToneClasses = (tone) => {
       switch (tone) {
@@ -6756,7 +6757,7 @@ The names and the change log are removed. Discovery runs you already have are no
       var _a2;
       const view = dashboardStatus.data;
       const support = (view == null ? void 0 : view.support) || null;
-      const supportState = !support && dashboardStatus.status !== "error" ? "loading" : (support == null ? void 0 : support.state) || "unknown";
+      const supportState = !support && dashboardStatus.status !== "error" ? "loading" : (support == null ? void 0 : support.reason) === "no_connection" ? "no_connection" : (support == null ? void 0 : support.state) || "unknown";
       const connectionLabel = ((_a2 = view == null ? void 0 : view.connection) == null ? void 0 : _a2.connection_label) || "";
       const requirements = Array.isArray(view == null ? void 0 : view.requirements) && view.requirements.length > 0 ? view.requirements : capability.splunk_requirements;
       const message = supportState === "loading" ? "Checking this Splunk connection for the dashboard tools..." : support ? describeDashboardSupport(support, connectionLabel) : dashboardStatus.error || "Not checked yet.";

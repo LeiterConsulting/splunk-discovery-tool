@@ -313,10 +313,10 @@ class DashboardSignInTests(DashboardRouteCase):
         reset = self.client.post("/api/auth/reset-password", json={"current_password": "password", "new_password": password, "confirm_password": password})
         self.assertEqual(reset.status_code, 200)
 
-    def add_analyst(self, username, connection_name=None):
+    def add_analyst(self, username, connection_name=None, role="analyst"):
         password = "".join(["Dash", "Analyst", "Pass", "123!"])
         created = self.client.post("/api/security/users", json={
-            "username": username, "password": password, "role": "analyst", "require_password_reset": False, "mcp_config_name": connection_name,
+            "username": username, "password": password, "role": role, "require_password_reset": False, "mcp_config_name": connection_name,
         })
         self.assertEqual(created.status_code, 200, created.text)
         return password
@@ -354,9 +354,16 @@ class DashboardSignInTests(DashboardRouteCase):
         assigned_password = self.add_analyst("analyst1", "contoso-analyst")
         unassigned_password = self.add_analyst("analyst2")
 
+        viewer_password = self.add_analyst("viewer1", "contoso-analyst", role="viewer")
+
         admin_status = self.client.get("/api/dashboards/status").json()
         self.assertFalse(admin_status["can_create"])
         self.assertIn("none is assigned to you", admin_status["blocked_reason"])
+        self.assertIn("Assign one to your user in Settings > Users.", admin_status["blocked_reason"])
+
+        viewer_status = self.signed_in("viewer1", viewer_password).get("/api/dashboards/status").json()
+        self.assertFalse(viewer_status["can_create"])
+        self.assertIn("Your role cannot create dashboards", viewer_status["blocked_reason"])
 
         analyst = self.signed_in("analyst1", assigned_password)
         for action in ("install", "enable", "disable", "uninstall", "test", "reindex"):
@@ -383,6 +390,8 @@ class DashboardSignInTests(DashboardRouteCase):
         status = other.get("/api/dashboards/status").json()
         self.assertFalse(status["can_create"])
         self.assertIn("none is assigned to you", status["blocked_reason"])
+        self.assertIn("Ask an administrator to assign one", status["blocked_reason"])
+        self.assertEqual(status["support"]["reason"], "no_connection")
         self.assertEqual(other.get("/api/dashboards/operations").json()["operations"], [])
 
 
