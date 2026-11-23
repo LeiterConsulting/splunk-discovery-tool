@@ -685,7 +685,8 @@ class ConfigManager:
     # MCP Configuration Vault Management
     def save_mcp_config(self, name: str, url: str, token: str, 
                        verify_ssl: bool = False, ca_bundle_path: Optional[str] = None,
-                       description: Optional[str] = None, activate: bool = False) -> bool:
+                       description: Optional[str] = None, activate: bool = False,
+                       *, fallback_profile: Optional[str] = None) -> bool:
         """Save a named MCP configuration.
 
         A blank or masked token keeps the token already stored under this name, or the
@@ -696,7 +697,7 @@ class ConfigManager:
             self.last_save_error = "MCP configuration name is required"
             return False
         if is_unset_secret(token):
-            token = self.resolve_mcp_token(name, url)
+            token = self.resolve_mcp_token(name, url, fallback_profile=fallback_profile)
         token = clean_secret(token)
         mcp_config = MCPCredential(
             name=name,
@@ -706,30 +707,37 @@ class ConfigManager:
             ca_bundle_path=ca_bundle_path,
             description=description
         )
-        self._config.saved_mcp_configs[name] = mcp_config
+        candidate = copy.deepcopy(self._config)
+        candidate.saved_mcp_configs[name] = mcp_config
         if activate:
-            self._apply_mcp_profile(name, mcp_config)
-        return self.save(self._config)
+            self._apply_mcp_profile(candidate, name, mcp_config)
+        return self.save(candidate)
 
-    def resolve_mcp_token(self, name: Optional[str], url: Any) -> str:
-        return self.resolve_mcp_token_with_source(name, url)[0]
+    def resolve_mcp_token(self, name: Optional[str], url: Any, *, fallback_profile: Optional[str] = None) -> str:
+        return self.resolve_mcp_token_with_source(name, url, fallback_profile=fallback_profile)[0]
 
-    def resolve_mcp_token_with_source(self, name: Optional[str], url: Any) -> Tuple[str, str]:
+    def resolve_mcp_token_with_source(
+        self, name: Optional[str], url: Any, *, fallback_profile: Optional[str] = None
+    ) -> Tuple[str, str]:
         """Return the token to use for a blank/masked entry and where it came from ("saved", "active", or "")."""
         existing = self._config.saved_mcp_configs.get(str(name or "").strip())
         if existing is not None and not is_unset_secret(existing.token):
             return existing.token, "saved"
+        assigned = self._config.saved_mcp_configs.get(fallback_profile)
+        if assigned is not None and _same_endpoint(url, assigned.url) and not is_unset_secret(assigned.token):
+            return assigned.token, "active"
         active = self._config.mcp
         if _same_endpoint(url, active.url) and not is_unset_secret(active.token):
             return active.token, "active"
         return "", ""
 
-    def _apply_mcp_profile(self, name: str, mcp_config: MCPCredential) -> None:
-        self._config.mcp.url = mcp_config.url
-        self._config.mcp.token = "" if is_unset_secret(mcp_config.token) else mcp_config.token
-        self._config.mcp.verify_ssl = mcp_config.verify_ssl
-        self._config.mcp.ca_bundle_path = mcp_config.ca_bundle_path
-        self._config.active_mcp_config_name = name
+    @staticmethod
+    def _apply_mcp_profile(config: AppConfig, name: str, mcp_config: MCPCredential) -> None:
+        config.mcp.url = mcp_config.url
+        config.mcp.token = "" if is_unset_secret(mcp_config.token) else mcp_config.token
+        config.mcp.verify_ssl = mcp_config.verify_ssl
+        config.mcp.ca_bundle_path = mcp_config.ca_bundle_path
+        config.active_mcp_config_name = name
     
     def get_mcp_config(self, name: str) -> Optional[MCPCredential]:
         """Get a saved MCP configuration by name"""
@@ -753,6 +761,7 @@ class ConfigManager:
         """Load a saved MCP configuration into active MCP config"""
         mcp_config = self.get_mcp_config(name)
         if mcp_config:
-            self._apply_mcp_profile(name, mcp_config)
-            return self.save(self._config)
+            candidate = copy.deepcopy(self._config)
+            self._apply_mcp_profile(candidate, name, mcp_config)
+            return self.save(candidate)
         return False

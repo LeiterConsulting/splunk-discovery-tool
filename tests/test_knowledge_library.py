@@ -947,6 +947,15 @@ class KnowledgeLibraryApiTests(unittest.TestCase):
             discovery_step_count=0,
         )
 
+    def test_document_ranking_cache_keeps_each_workspace_environment(self):
+        service = web_app.knowledge_library_service
+        alpha = make_blueprint()
+        first = service.environment_terms(lambda: alpha, scope_key="alpha")
+        second = service.environment_terms(lambda: None, scope_key="beta")
+        self.assertTrue(first.entities)
+        self.assertEqual(second.entities, [])
+        self.assertIs(service.environment_terms(lambda: None, scope_key="alpha"), first)
+
     def test_status_before_discovery_and_sources(self):
         response = self.client.get("/api/knowledge-library/status")
         self.assertEqual(response.status_code, 200, response.text)

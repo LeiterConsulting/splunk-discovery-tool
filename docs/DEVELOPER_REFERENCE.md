@@ -1,6 +1,6 @@
 # Splunk Discovery Tool Developer Reference
 
-This reference is for developers who extend Splunk Discovery Tool or reuse it in their own projects. It describes release 2.3.0.
+This reference is for developers who extend Splunk Discovery Tool or reuse it in their own projects. It describes release 3.0.0.
 
 ## 1) Runtime Topology
 
@@ -221,6 +221,8 @@ Every button should communicate purpose:
 - `splunk_dashboards` is the first capability with `required_mcp_tools` and `splunk_requirements` on its `CapabilityDefinition`. `evaluate_connection_support()` in `src/capabilities/connection_support.py` compares the required tools with a connection's MCP tool list (cached per connection by `get_connection_tool_catalog`, 60 seconds, 30 after a failure) and returns `available`, `potential` (tools missing), `incompatible` (arguments do not match `TOOL_ARGUMENTS`), `checking`, or `unknown`. The UI shows `potential` and `incompatible` with the `splunk_requirements` links
 - Dashboard requests go through `DashboardService` (`src/capabilities/tools/dashboard_service.py`). `resolve_dashboard_binding()` in `src/web_app.py` picks the connection: with sign-in on, only the admin's or analyst's assigned connection, with no fallback. `verify_splunk_user()` reads the Splunk user from `splunk_get_user_info`, and both Constellation calls send it as `expected_user`. The plan's `binding_key` ties it to that connection and user. The request is saved to `DashboardOperationStore` (`output/chat_data/dashboards/operations.json`) before it is sent, the identical request is resent once, only after a `not_found` and while Constellation still admits its ID (24 hours), and polling stops when the connection changes (`_dashboard_binding_is_current`)
 - `dashboard_readiness()` blocks creation while incognito mode is active for the caller or `force_for_cloud` is set, because Constellation sends the plan to its own AI model. Receipts, links, request IDs, and Splunk user names stay out of AI prompts and the server log, and `normalize_receipt()` drops links that do not match the connection's Splunk Web address and the created resource
+- `POST /api/dashboards/source-options` verifies the plan's binding and reads index names or up to 25 observed sourcetype names for a literal index and supported rolling range through the caller's Splunk MCP connection. The picker loads them on demand and discards outdated responses when the selected scope changes. Only names reach the browser.
+- `POST /api/dashboards/inspect-source` calls the optional `constellation_inspect_dashboard_source` tool for a verified plan binding and exact source and range. Discovery coalesces concurrent reads and keeps bounded, sanitized metadata in memory for 60 seconds, keyed by Discovery owner, Splunk connection, Splunk caller, and normalized scope. `POST /api/dashboards/suggest-panels` uses that fresh server-side evidence under the existing model and Incognito policy. The browser reviews proposed pages before applying them. Create sends the same v1 brief as before.
 
 ### Knowledge library notes
 
@@ -282,7 +284,7 @@ A capability can add its own workspace tab by setting `workspace` on its `Capabi
 
 ## 12) Releases and Versioning
 
-The release version lives in `src/app_version.py` (`APP_VERSION`). The startup banner, the FastAPI app, and the inbound MCP server's `serverInfo` report it. The `version` field in the settings file records the version that created the file and is not the running version.
+The release version lives in `src/app_version.py` (`APP_VERSION`). The startup banner, the FastAPI app, the external runtime summary, and the inbound MCP server's `serverInfo` report it. The `version` field in the settings file records the version that created the file.
 
 To cut a release:
 

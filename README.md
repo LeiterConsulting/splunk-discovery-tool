@@ -2,13 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-2.3.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.3.0)
+[![Version](https://img.shields.io/badge/version-3.0.0-green.svg)](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v3.0.0)
 
 > Finds what a Splunk environment contains, explains what to do next, and answers questions with live Splunk searches through the Splunk MCP server.
 
-**Current release: [2.3.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.3.0)** (November 20, 2026). Overview shows what changed in each Splunk environment since the app last looked, and chat starts from what the app already knows about the environment. See [CHANGELOG.md](CHANGELOG.md) for what changed and how to upgrade from 1.0.0.
-
-**v3 in development.** The next major release builds on 2.3.0 and adds optional dashboard creation from Discovery chat or a report. See the [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md) for the supported workflow and Constellation pilot status.
+**Current release [3.0.0](https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v3.0.0)** (November 23, 2026) uses the active Splunk MCP connection to select the reports, Knowledge Base, and chat workspace. It adds optional dashboard creation from chat and reports through Constellation. See the [release and upgrade notes](CHANGELOG.md#300---2026-11-23) and the [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md).
 
 ## ✨ What's Included
 
@@ -19,7 +17,7 @@
 - **Chat goals**: set a goal, and the AI model breaks it into questions, tracks which ones your answers settle, and suggests what to ask next. The Goal Library keeps goals, tracked questions, and saved chats
 - **Settings tuned to the model**: model profiles, ranking, and auto-tuning for hosted and local models. Chat Settings start from the model's tuning and show each value as Auto or Custom
 - **Knowledge library**: the environment profile from discovery, Splunk Security Content, Splunkbase records, and help.splunk.com documentation for your Splunk version and installed apps, downloaded for offline search, with a coverage scorecard and library packs for servers without internet access
-- **Splunk Dashboards** (optional capability): ask in chat or select Create Dashboard on a report, review the plan, and the app creates a Splunk Dashboard Studio dashboard through Constellation as your own Splunk user. Connections without Constellation show it as a potential capability with install links
+- **Splunk Dashboards** (optional capability): ask in chat or select Create Dashboard on a report, inspect the source, and review the panel outline. Constellation creates a private Splunk Dashboard Studio dashboard and an editable draft as your Splunk user. Connections without the dashboard tools show setup links. [Setup and verified compatibility](docs/SPLUNK_DASHBOARDS.md)
 - **Knowledge Base** (optional capability): managed knowledge assets, the SPL Library, and context previews. Discovery and AI summaries update its index after saving, and a Reindex needed notice shows when other sources change
 - **Troubleshooting**: Settings > Troubleshoot explains why an MCP server or AI model connection or save fails, without saving anything
 - **Incognito mode**: the AI model sees stand-ins such as `host_0012` instead of your host names, IP addresses, users, custom indexes, apps, and saved searches, while you still see the real names. Admins can require it for cloud AI models, and you can download chats and reports with stand-ins to share
@@ -161,11 +159,17 @@ See [docs/INCOGNITO_MODE.md](docs/INCOGNITO_MODE.md) for what is replaced, how r
 Discovery Tool and Constellation each run independently. Together, they can turn the investigation in your current chat or an open discovery report into a Splunk Dashboard Studio dashboard. The optional integration uses a Constellation build with dashboard tools registered in the Splunk environment's MCP Server. [Constellation repository](https://github.com/LeiterConsulting/constellation) · [Splunk MCP Server](https://splunkbase.splunk.com/app/7931)
 
 - **Ask in chat** ("Create a dashboard that tracks failed logins in index main") or select **Create Dashboard** on a report. The app drafts a plan with the data source, time range, pages, and panels, and shows the Splunk connection and Splunk user it will use
-- **Review first**. Edit or cancel the plan, or select **Create Dashboard** to submit it. When Splunk confirms the result, the card links to the dashboard and to its Constellation draft
+- **Review first**. Use **Browse Splunk data** to choose a live index and sourcetype with that connection, or select **Edit Plan** for manual edits. **Create Dashboard** submits the plan and returns links to the dashboard and its Constellation draft after Splunk confirms creation
 - **Check each Splunk connection** to see whether it offers the Constellation dashboard tools. When the tools are missing, the Capabilities tab shows Splunk Dashboards as a potential capability and links to setup resources
 - **Your own Splunk user**: with sign-in on, admins and analysts create dashboards only through their own assigned connection. Dashboards cannot be created while incognito mode is on, because Constellation sends the plan to its own AI model with the real names
 
 See [docs/SPLUNK_DASHBOARDS.md](docs/SPLUNK_DASHBOARDS.md) for setup, results, and troubleshooting.
+## Splunk workspaces
+
+The header, Report Library, and Knowledge Base show the effective MCP connection. With sign-in enabled, an assigned connection takes precedence for that user. In **Settings > Connections**, **Load** switches to a saved connection immediately. **Save Settings** applies MCP edits to the loaded profile. When saving a new profile, select **Use this connection for my account after saving** to switch immediately. Discovery reports, environment observations, imported knowledge, saved SPL, and the current chat follow the workspace. Profiles on the same host have separate workspaces because their Splunk permissions can differ.
+
+Rotating a profile's token retains its workspace. Editing the endpoint opens a separate workspace, and switching back restores its reports and imports. Existing reports and imports without a verified endpoint association remain on disk. Run Discovery on the selected endpoint to build its evidence, and import any documents or saved SPL that belong there. Downloaded public Splunk documentation is shared, with recommendations and search ranking based on the selected workspace's discovery.
+
 ## 📚 Knowledge Library and Splunk Documentation
 
 Library health on the Knowledge Base tab scores how well reference sources cover the environment from your latest discovery and lists gaps with a next action (missing or turned-off add-ons, outdated or archived apps, apps not marked Cloud compatible, and busy sourcetypes no public reference describes).

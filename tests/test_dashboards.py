@@ -19,6 +19,7 @@ from capabilities.tools.dashboard_service import (  # noqa: E402
     DashboardBindingChanged,
     DashboardConflict,
     DashboardService,
+    build_plan_messages,
     coerce_brief_draft,
     detect_dashboard_create_intent,
     fallback_brief_draft,
@@ -28,6 +29,7 @@ from capabilities.tools.dashboard_store import DashboardOperationStore  # noqa: 
 from capabilities.tools.dashboards import (  # noqa: E402
     CREATE_TOOL,
     ERROR_MESSAGES,
+    INSPECT_TOOL,
     STATUS_TOOL,
     USER_INFO_TOOL,
     BriefError,
@@ -124,7 +126,18 @@ def not_found(args):
     return wrapped_reply(receipt(args["request_id"], "not_found"))
 
 
+def probe_status(args):
+    return wrapped_reply(receipt(args["request_id"], "not_found", pilot={"mode": "probe", "identity_verified": True}))
+
+
 class DashboardContractTests(unittest.TestCase):
+    def test_dashboard_design_guidance_matches_the_planning_context(self):
+        messages = build_plan_messages("Build a dashboard for latency over time", [])
+        self.assertIn("Dashboard design guidance v1", messages[0]["content"])
+        self.assertIn("audience's decision", messages[0]["content"])
+        self.assertIn("Do not take percentiles of pre-aggregated averages", messages[0]["content"])
+        self.assertNotIn("Carry deliberate filters into detail views", messages[0]["content"])
+
     def test_valid_plan_keeps_its_fields_and_serializes_compactly(self):
         normalized = normalize_brief(VALID_BRIEF)
         self.assertEqual(normalized, VALID_BRIEF)
@@ -467,6 +480,45 @@ class DashboardServiceTests(unittest.IsolatedAsyncioTestCase):
         while service._tasks:
             await asyncio.gather(*list(service._tasks.values()))
 
+    async def test_source_inspection_distinguishes_empty_partial_and_transport_timeout(self):
+        scope = {key: VALID_BRIEF[key] for key in ("source", "time_range")}
+
+        def source_reply(rows, completion, status):
+            return lambda _args: wrapped_reply({
+                "schema_version": "1", "status": status,
+                "source": dict(scope["source"], language="spl"), "time_range": scope["time_range"],
+                "sample": {"rows": rows, "row_limit": 200, "grain": "indexed_observations", "completion": completion},
+                "fields": [],
+            })
+
+        fake = FakeSplunk({INSPECT_TOOL: [
+            source_reply(0, "complete", "empty"),
+            source_reply(0, "partial", "inconclusive"),
+            source_reply(3, "partial", "observed"),
+            lambda _args: TIMEOUT_REPLY,
+        ]})
+        service = self.service(fake)
+        binding = self.binding()
+        empty = await service.inspect_source("local", binding, scope)
+        self.assertEqual(empty["status"], "empty")
+        self.assertEqual(await service.inspect_source("local", binding, scope), empty)
+        self.assertEqual(len(fake.named(INSPECT_TOOL)), 1)
+        self.assertIsNone(service.cached_source_profile("other", binding, scope))
+        self.assertIsNone(service.cached_source_profile("local", self.binding(identity="other"), scope))
+        self.assertIsNone(service.cached_source_profile("local", self.binding(splunk_user="other"), scope))
+
+        self.now += 61
+        partial_empty = await service.inspect_source("local", binding, scope)
+        self.assertEqual(partial_empty["status"], "inconclusive")
+        self.assertEqual(partial_empty["sample"]["rows"], 0)
+        partial = await service.inspect_source("local", binding, scope, refresh=True)
+        self.assertEqual(partial["status"], "observed")
+        self.assertEqual(partial["sample"]["completion"], "partial")
+        timed_out = await service.inspect_source("local", binding, scope, refresh=True)
+        self.assertEqual(timed_out, {"status": "inconclusive", "sample": None, "fields": []})
+        self.assertIsNone(service.cached_source_profile("local", binding, scope))
+        self.assertEqual(service.list_operations("local"), [])
+
     async def test_create_then_status_until_created(self):
         fake = FakeSplunk({CREATE_TOOL: [running], STATUS_TOOL: [running, created]})
         service = self.service(fake)
@@ -511,6 +563,51 @@ class DashboardServiceTests(unittest.IsolatedAsyncioTestCase):
         operation = service.get_operation("local", started["request_id"])
         self.assertEqual(operation["status"], "not_found")
         self.assertTrue(operation["can_retry"])
+
+    async def test_probe_status_preserves_an_uncertain_create_until_authoring_recovers(self):
+        fake = FakeSplunk({CREATE_TOOL: [lambda _args: TIMEOUT_REPLY], STATUS_TOOL: [probe_status, created]})
+        service = self.service(fake)
+        started = service.start_create("local", "b" * 32, VALID_BRIEF, self.binding())
+        await self.settle(service)
+        uncertain = service.get_operation("local", started["request_id"])
+        self.assertEqual(uncertain["status"], "unconfirmed")
+        self.assertIn("probe mode", uncertain["check_note"])
+        self.assertTrue(uncertain["can_check"])
+        self.assertFalse(uncertain["can_retry"])
+        self.assertFalse(uncertain["resent"])
+        recovered = await service.check_status("local", started["request_id"], self.binding())
+        self.assertEqual(recovered["status"], "created")
+        self.assertEqual(recovered["check_note"], "")
+        self.assertEqual(len(fake.named(CREATE_TOOL)), 1)
+        self.assertEqual({args["request_id"] for args in fake.named(STATUS_TOOL)}, {started["request_id"]})
+
+    async def test_check_status_never_resends_an_unconfirmed_create(self):
+        fake = FakeSplunk({
+            CREATE_TOOL: [lambda _args: TIMEOUT_REPLY],
+            STATUS_TOOL: [lambda _args: TIMEOUT_REPLY, not_found],
+        })
+        service = self.service(fake)
+        started = service.start_create("local", "c" * 32, VALID_BRIEF, self.binding())
+        await self.settle(service)
+        checked = await service.check_status("local", started["request_id"], self.binding())
+        self.assertEqual(checked["status"], "not_found")
+        self.assertTrue(checked["can_retry"])
+        self.assertFalse(checked["resent"])
+        self.assertEqual(len(fake.named(CREATE_TOOL)), 1)
+
+    async def test_missing_receipt_after_acceptance_does_not_authorize_retry(self):
+        fake = FakeSplunk({CREATE_TOOL: [running], STATUS_TOOL: [not_found, created]})
+        service = self.service(fake)
+        started = service.start_create("local", "a" * 32, VALID_BRIEF, self.binding())
+        await self.settle(service)
+        waiting = service.get_operation("local", started["request_id"])
+        self.assertEqual(waiting["status"], "unconfirmed")
+        self.assertIn("previously accepted", waiting["check_note"])
+        self.assertTrue(waiting["can_check"])
+        self.assertFalse(waiting["can_retry"])
+        recovered = await service.check_status("local", started["request_id"], self.binding())
+        self.assertEqual(recovered["status"], "created")
+        self.assertEqual(len(fake.named(CREATE_TOOL)), 1)
 
     async def test_clear_refusal_fails_without_a_status_check(self):
         fake = FakeSplunk({CREATE_TOOL: [lambda _args: domain_error_reply("pilot_busy")]})
@@ -559,6 +656,18 @@ class DashboardServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checked["status"], "created")
         self.assertIn("did not answer in time", checked["check_note"])
         self.assertEqual(checked["receipt"]["dashboard_id"], "contoso_web_errors")
+
+    async def test_probe_status_preserves_a_created_dashboard_and_its_links(self):
+        fake = FakeSplunk({CREATE_TOOL: [created], STATUS_TOOL: [probe_status]})
+        service = self.service(fake)
+        started = service.start_create("local", "2" * 32, VALID_BRIEF, self.binding())
+        await self.settle(service)
+        original = service.get_operation("local", started["request_id"])
+        checked = await service.check_status("local", started["request_id"], self.binding())
+        self.assertEqual(checked["status"], "created")
+        self.assertEqual(checked["receipt"], original["receipt"])
+        self.assertIn("probe mode", checked["check_note"])
+        self.assertEqual(len(fake.named(CREATE_TOOL)), 1)
 
     async def test_check_status_refuses_another_connection_or_user(self):
         fake = FakeSplunk({CREATE_TOOL: [created]})

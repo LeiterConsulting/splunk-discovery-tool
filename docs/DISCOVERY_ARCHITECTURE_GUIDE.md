@@ -1,6 +1,6 @@
 # Splunk Discovery Tool: Discovery Architecture Guide
 
-This document describes how discovery, reports, the workspace, and chat fit together in release 2.3.0.
+This document describes how discovery, reports, the workspace, and chat fit together in release 3.0.0.
 
 ## Design Goals
 
@@ -13,7 +13,7 @@ This document describes how discovery, reports, the workspace, and chat fit toge
 
 `DiscoveryV2Pipeline` (`src/discovery/v2_pipeline.py`) orchestrates a run over `DiscoveryEngine` (`src/discovery/engine.py`), which makes the MCP calls and yields step-level findings. Runs execute in a detached worker (`src/runtime_job_worker.py`) whose progress is saved to disk, so a restart does not lose them. Progress reaches the browser over the `/ws` WebSocket.
 
-The pipeline writes timestamped artifacts to `output/` using stable compatibility filenames:
+The pipeline writes timestamped artifacts to `output/scopes/<scope>/` for an active MCP connection, or to `output/` for the standalone scope. The filenames remain compatible with earlier reports.
 
 - `v2_intelligence_blueprint_<timestamp>.json`: canonical machine-readable discovery payload
 - `v2_insights_brief_<timestamp>.md`: concise operator or executive summary
@@ -70,7 +70,7 @@ Chat combines:
 7. A scratchpad per chat with the indexes, hosts, and recent turns it mentioned, saved privately for each user under `output/chat_data/memory/<owner>/` and never indexed
 8. Known environment: the busiest indexes, sourcetypes, and hosts in the asker's scope, what is quiet now, and changes in the last 7 days, from environment memory (below)
 
-Chat describes the environment the asker can search. With sign-in on, discovery saves each scope's reports under `output/scopes/<scope>/` (an assigned MCP connection is its own scope), and chat, context requests, hints after a search, Knowledge Base passages from discovery reports, and goal planning read the asker's scope (`request_discovery_dir`). With sign-in off, everything uses the global scope in `output/`.
+Discovery resolves the active MCP connection from the user's assignment when one applies, or the selected shared connection in standalone operation. The endpoint and profile together identify the workspace. Chat, reports, environment memory, Knowledge Base passages from Discovery reports, and goal planning read its scope through `request_discovery_dir`. The browser reloads workspace data when the active connection switches. Requests that still carry the previous workspace are refused and the browser refreshes the connection information.
 
 When adding new intents:
 

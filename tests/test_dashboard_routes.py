@@ -21,7 +21,7 @@ import web_app  # noqa: E402
 from capabilities import CapabilityManager  # noqa: E402
 from capabilities.tools.dashboard_service import DashboardService  # noqa: E402
 from capabilities.tools.dashboard_store import DashboardOperationStore  # noqa: E402
-from capabilities.tools.dashboards import CREATE_TOOL, STATUS_TOOL, USER_INFO_TOOL  # noqa: E402
+from capabilities.tools.dashboards import CREATE_TOOL, INSPECT_TOOL, STATUS_TOOL, USER_INFO_TOOL  # noqa: E402
 from config_manager import ConfigManager  # noqa: E402
 from incognito import IncognitoStore  # noqa: E402
 from incognito.store import IncognitoPolicy  # noqa: E402
@@ -51,6 +51,14 @@ DASHBOARD_CATALOG = {
     },
     "checked_at": "2026-05-22T12:00:00+00:00",
 }
+INSPECTION_CATALOG = {
+    **DASHBOARD_CATALOG,
+    "tools": DASHBOARD_CATALOG["tools"] + [INSPECT_TOOL],
+    "schemas": {
+        **DASHBOARD_CATALOG["schemas"],
+        INSPECT_TOOL: tool_schema(["schema_version", "expected_user", "scope_json"]),
+    },
+}
 
 
 def wrapped_reply(payload):
@@ -67,14 +75,50 @@ class FakeSplunk:
 
     def __init__(self):
         self.calls = []
+        self.created_ids = set()
+        self.authoring_mode = "authoring"
+        self.before_inspection_reply = None
+        self.create_problem = None
+        self.failed_requests = {}
 
     async def __call__(self, mcp, tool_name, arguments, timeout_seconds):
         self.calls.append((tool_name, dict(arguments), str(getattr(mcp, "url", ""))))
         if tool_name == USER_INFO_TOOL:
             return wrapped_reply({"username": SPLUNK_USER})
+        if tool_name == INSPECT_TOOL:
+            scope = json.loads(arguments["scope_json"])
+            if self.before_inspection_reply:
+                self.before_inspection_reply()
+            return wrapped_reply({
+                "schema_version": "1", "status": "observed",
+                "source": {key: value for key, value in dict(scope["source"], language="spl").items() if key != "query"},
+                "time_range": scope["time_range"],
+                "sample": {
+                    "rows": 3, "row_limit": 200,
+                    "grain": "indexed_observations" if scope["source"]["kind"] == "index" else "existing_search_output",
+                    "completion": "partial", "reasons": ["resource_limit"],
+                },
+                "fields": [{"name": "latency_ms", "present": 2, "missing": 1, "numeric": 2, "multivalue": 0,
+                            "unit": "ms", "basis": "field_name", "value": "discard synthetic value"}],
+                "results": [{"_raw": "discard synthetic event"}],
+            })
         base = {"schema_version": "1", "request_id": arguments["request_id"], "warnings": []}
         if tool_name == CREATE_TOOL:
+            self.created_ids.add(arguments["request_id"])
+            if self.create_problem:
+                self.failed_requests[arguments["request_id"]] = dict(base, **self.create_problem)
             return wrapped_reply(dict(base, status="running", stage="authoring", poll_after_ms=500))
+        if arguments["request_id"] in self.failed_requests:
+            return wrapped_reply(self.failed_requests[arguments["request_id"]])
+        if arguments["request_id"] not in self.created_ids:
+            if self.authoring_mode in {"feature_disabled", "identity_unavailable"}:
+                return wrapped_reply({"error": "Fixture refusal", "code": self.authoring_mode})
+            if self.authoring_mode == "timeout":
+                return {"http_status": None, "timed_out": True}
+            status = dict(base, status="not_found")
+            if self.authoring_mode != "legacy":
+                status["pilot"] = {"mode": self.authoring_mode, "identity_verified": True}
+            return wrapped_reply(status)
         return wrapped_reply(dict(
             base,
             status="created",
@@ -88,9 +132,6 @@ class FakeSplunk:
     def named(self, tool_name):
         return [arguments for name, arguments, _url in self.calls if name == tool_name]
 
-    def dashboard_calls(self):
-        return [name for name, _arguments, _url in self.calls if name.startswith("constellation_")]
-
 
 class DashboardRouteCase(unittest.TestCase):
     def setUp(self):
@@ -102,10 +143,24 @@ class DashboardRouteCase(unittest.TestCase):
         self.addCleanup(os.chdir, original_cwd)
         output = Path("output")
         output.mkdir()
-        (output / REPORT_NAME).write_text("# Operator Runbook\n\n1. Track failed logins on the contoso web tier.\n", encoding="utf-8")
 
         self.config_manager = ConfigManager(str(self.temp_path / "config.encrypted"))
         self.config_manager.update_mcp(url=MCP_URL, token="contoso-fixture-token", verify_ssl=False)
+        scope_key = web_app._mcp_workspace(self.config_manager.get())["scope_key"]
+        report_dir = web_app._discovery_scope_output_dir(scope_key)
+        (report_dir / REPORT_NAME).write_text("# Operator Runbook\n\n1. Track failed logins on the contoso web tier.\n", encoding="utf-8")
+        web_app.register_discovery_session(
+            timestamp="20260522_010203",
+            overview=SimpleNamespace(total_indexes=0, total_sourcetypes=0, total_hosts=0, total_users=0,
+                                     data_volume_24h="unknown", splunk_version="unknown"),
+            report_paths=[REPORT_NAME],
+            mcp_capabilities={},
+            classifications={},
+            recommendations=[],
+            suggested_use_cases=[],
+            discovery_step_count=0,
+            discovery_scope=web_app._mcp_workspace(self.config_manager.get()),
+        )
         self.incognito = IncognitoStore(self.temp_path / "incognito", Fernet(Fernet.generate_key()))
         self.fake = FakeSplunk()
         self.logs = []
@@ -182,7 +237,8 @@ class DashboardRouteTests(DashboardRouteCase):
         status = self.client.get("/api/dashboards/status?refresh=true").json()
         self.assertEqual(status["support"]["state"], "potential")
         self.assertEqual(status["support"]["missing_tools"], [CREATE_TOOL, STATUS_TOOL])
-        self.assertIn("install Constellation in that Splunk environment", status["blocked_reason"])
+        self.assertIn("MCP-enabled Constellation build", status["blocked_reason"])
+        self.assertEqual(status["support"]["message"], status["blocked_reason"])
 
         refused = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME})
         self.assertEqual(refused.status_code, 409)
@@ -191,19 +247,120 @@ class DashboardRouteTests(DashboardRouteCase):
         self.assertEqual({item["url"] for item in payload["requirements"]}, {CONSTELLATION_RELEASES, SPLUNK_MCP_SERVER})
         self.assertEqual(self.fake.calls, [])
 
+    def test_authoring_check_distinguishes_modes_and_keeps_the_status_call_read_only(self):
+        self.turn_on()
+        self.catalog = DASHBOARD_CATALOG
+        for mode, expected, allowed in (
+            ("probe", "pilot_probe_only", False),
+            ("fixture", "fixture", False),
+            ("feature_disabled", "feature_disabled", False),
+            ("identity_unavailable", "identity_unavailable", False),
+            ("timeout", "unconfirmed", False),
+            ("legacy", "legacy", True),
+            ("authoring", "authoring", True),
+        ):
+            with self.subTest(mode=mode):
+                self.fake.authoring_mode = mode
+                status = self.client.get("/api/dashboards/status").json()
+                self.assertEqual(status["support"]["state"], "available")
+                self.assertEqual(status["authoring"]["state"], expected)
+                self.assertEqual(status["can_create"], allowed)
+                self.assertEqual(status["connection"]["splunk_user"], SPLUNK_USER)
+        checked = self.fake.named(STATUS_TOOL)
+        self.assertEqual(len(checked), 7)
+        self.assertEqual(len({item["request_id"] for item in checked}), 7)
+        for arguments in checked:
+            self.assertEqual(set(arguments), {"schema_version", "request_id", "expected_user"})
+            self.assertEqual(arguments["expected_user"], SPLUNK_USER)
+        self.assertFalse(self.fake.named(CREATE_TOOL))
+        self.assertEqual(self.client.get("/api/dashboards/operations").json()["operations"], [])
+
+    def test_probe_blocks_chat_and_report_planning_and_is_rechecked_on_create(self):
+        self.turn_on()
+        self.catalog = DASHBOARD_CATALOG
+        proposal = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME}).json()["proposal"]
+        self.fake.authoring_mode = "probe"
+        with mock.patch.object(web_app, "draft_dashboard_plan", new_callable=mock.AsyncMock) as draft:
+            refused = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME})
+            self.assertEqual(refused.status_code, 409)
+            self.assertIn("probe mode", refused.json()["detail"])
+            reply, chat_proposal = asyncio.run(web_app.handle_dashboard_chat_request(
+                "Create a dashboard of web errors", [], None, {}, self.config_manager.get(), None
+            ))
+            self.assertIn("probe mode", reply)
+            self.assertIsNone(chat_proposal)
+            draft.assert_not_awaited()
+        blocked = self.client.post("/api/dashboards/create", json={
+            "proposal_id": proposal["proposal_id"], "binding_key": proposal["binding_key"],
+            "brief": dict(proposal["brief"], source={"kind": "index", "index": "contoso_web"}),
+        })
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn("probe mode", blocked.json()["detail"])
+        self.assertFalse(self.fake.named(CREATE_TOOL))
+
+    def test_dashboard_source_options_are_bound_to_the_plan_and_return_only_names(self):
+        self.turn_on()
+        self.catalog = dict(DASHBOARD_CATALOG, tools=DASHBOARD_CATALOG["tools"] + ["splunk_get_indexes"])
+        proposal = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME}).json()["proposal"]
+        request = {"binding_key": proposal["binding_key"]}
+        with mock.patch.object(web_app, "call_dashboard_mcp_tool", new_callable=mock.AsyncMock) as call:
+            call.return_value = {"http_status": 200, "body": {"result": {"results": [
+                {"title": "contoso_web", "private": "omitted"},
+                {"name": "contoso_app"},
+                {"title": "contoso_web"},
+                {"name": "invalid index name"},
+            ]}}}
+            indexes = self.client.post("/api/dashboards/source-options", json=request)
+            self.assertEqual(indexes.json(), {"options": ["contoso_app", "contoso_web"]})
+            self.assertIn("no-store", indexes.headers["Cache-Control"])
+            connection, tool, arguments, _timeout = call.await_args.args
+            self.assertEqual((connection.url, connection.token), (MCP_URL, "contoso-fixture-token"))
+            self.assertEqual((tool, arguments), ("splunk_get_indexes", {"count": 100}))
+
+            call.return_value = {"http_status": 200, "body": {"result": {"results": [
+                {"sourcetype": "access:combined", "count": "17", "_raw": "omitted"},
+            ]}}}
+            types = self.client.post("/api/dashboards/source-options", json=dict(request, index="contoso_web", earliest="-1h"))
+            self.assertEqual(types.json(), {"options": ["access:combined"]})
+            _connection, tool, arguments, _timeout = call.await_args.args
+            self.assertEqual(tool, "splunk_run_query")
+            self.assertEqual(arguments["earliest_time"], "-1h")
+            self.assertEqual(arguments["latest_time"], "now")
+            self.assertIn('index="contoso_web" by sourcetype', arguments["query"])
+
+            invalid = self.client.post("/api/dashboards/source-options", json=dict(request, index="*", earliest="-1h"))
+            self.assertEqual(invalid.status_code, 400)
+            self.incognito.set_preference("local", True)
+            self.assertEqual(self.client.post("/api/dashboards/source-options", json=request).status_code, 409)
+            self.incognito.set_preference("local", False)
+            self.config_manager.update_mcp(url=MCP_URL, token="replacement-fixture-token", verify_ssl=False)
+            stale = self.client.post("/api/dashboards/source-options", json=request)
+            self.assertEqual(stale.status_code, 409)
+            self.assertIn("connection or user changed", stale.json()["detail"])
+            self.assertEqual(call.await_count, 2)
+        self.assertFalse(self.fake.named(CREATE_TOOL))
+
     def test_report_plan_then_create_through_the_connection(self):
         self.turn_on()
         self.catalog = DASHBOARD_CATALOG
         proposed = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME})
         self.assertEqual(proposed.status_code, 200, proposed.text)
         proposal = proposed.json()["proposal"]
+        self.assertFalse(proposal["source_inspection_available"])
+        absent = self.client.post("/api/dashboards/inspect-source", json={
+            "binding_key": proposal["binding_key"], "scope": {
+                "source": {"kind": "index", "index": "contoso_web"}, "time_range": proposal["brief"]["time_range"],
+            },
+        })
+        self.assertEqual(absent.json()["profile"]["status"], "unavailable")
+        self.assertFalse(self.fake.named(INSPECT_TOOL))
         self.assertEqual(proposal["splunk_user"], SPLUNK_USER)
         self.assertEqual(proposal["splunk_web_url"], WEB)
         self.assertEqual(proposal["splunk_web_url_source"], "derived")
         self.assertEqual(proposal["brief"]["title"], "Findings from the Operator Runbook report")
         self.assertEqual(proposal["brief"]["provenance"], {"kind": "discovery_report", "label": REPORT_NAME})
         self.assertEqual([item["field"] for item in proposal["problems"]], ["source.index"])
-        self.assertEqual(self.fake.dashboard_calls(), [], "Drafting a plan must not call Constellation.")
+        self.assertFalse(self.fake.named(CREATE_TOOL), "Drafting a plan may only check Constellation status.")
 
         brief = dict(proposal["brief"], source={"kind": "index", "index": "contoso_web"})
         changed = self.client.post("/api/dashboards/create", json={"proposal_id": proposal["proposal_id"], "binding_key": "0" * 32, "brief": brief})
@@ -213,7 +370,7 @@ class DashboardRouteTests(DashboardRouteCase):
         invalid = self.client.post("/api/dashboards/create", json={"proposal_id": proposal["proposal_id"], "binding_key": proposal["binding_key"], "brief": proposal["brief"]})
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual([item["field"] for item in invalid.json()["problems"]], ["source.index"])
-        self.assertEqual(self.fake.dashboard_calls(), [])
+        self.assertFalse(self.fake.named(CREATE_TOOL))
 
         created = self.client.post("/api/dashboards/create", json={"proposal_id": proposal["proposal_id"], "binding_key": proposal["binding_key"], "brief": brief})
         self.assertEqual(created.status_code, 200, created.text)
@@ -238,6 +395,134 @@ class DashboardRouteTests(DashboardRouteCase):
         joined = "\n".join(self.logs)
         self.assertNotIn("contoso", joined)
         self.assertNotIn("https://", joined)
+
+    def test_inspection_guides_panel_suggestions_for_the_exact_reviewed_scope(self):
+        self.turn_on()
+        self.catalog = INSPECTION_CATALOG
+        proposal = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME}).json()["proposal"]
+        self.assertTrue(proposal["source_inspection_available"])
+        key = proposal["binding_key"]
+        search = "search index=contoso_web  | stats avg(duration) AS latency_ms"
+        scope = {
+            "source": {"kind": "spl", "query": search},
+            "time_range": {"earliest": "-1h", "latest": "now"},
+        }
+        request = {"binding_key": key, "scope": scope}
+        not_reviewed = self.client.post("/api/dashboards/inspect-source", json=request)
+        self.assertEqual(not_reviewed.status_code, 400)
+        self.assertFalse(self.fake.named(INSPECT_TOOL))
+        self.incognito.set_preference("local", True)
+        blocked = self.client.post("/api/dashboards/inspect-source", json=dict(request, reviewed_search=True))
+        self.assertEqual(blocked.status_code, 409)
+        self.assertFalse(self.fake.named(INSPECT_TOOL))
+        self.incognito.set_preference("local", False)
+
+        response = self.client.post("/api/dashboards/inspect-source", json=dict(request, reviewed_search=True))
+        self.assertEqual(response.status_code, 200, response.text)
+        profile = response.json()["profile"]
+        self.assertEqual(profile["sample"]["completion"], "partial")
+        self.assertEqual(profile["sample"]["grain"], "existing_search_output")
+        self.assertEqual(profile["fields"][0]["name"], "latency_ms")
+        self.assertNotIn("discard", response.text)
+        self.assertNotIn(search, json.dumps(profile))
+        self.assertEqual(response.json()["scope"], scope)
+        self.assertEqual(self.fake.named(INSPECT_TOOL), [{
+            "schema_version": "1", "expected_user": SPLUNK_USER,
+            "scope_json": json.dumps(scope, separators=(",", ":")),
+        }])
+
+        brief = dict(proposal["brief"], **scope)
+        stale = dict(brief, time_range={"earliest": "-7d", "latest": "now"})
+        pages = [{"name": "Latency", "panels": ["Latency from the selected search"]}]
+        with mock.patch.object(web_app, "draft_dashboard_plan", new_callable=mock.AsyncMock) as draft:
+            draft.return_value = (dict(brief, pages=pages, source={"kind": "index", "index": "other"}), "ai")
+            wrong_scope = self.client.post("/api/dashboards/suggest-panels", json={"binding_key": key, "brief": stale})
+            self.assertEqual(wrong_scope.status_code, 409)
+            draft.assert_not_awaited()
+            suggestion = self.client.post("/api/dashboards/suggest-panels", json={"binding_key": key, "brief": brief})
+            self.assertEqual(suggestion.json(), {"pages": pages})
+            context = dict(draft.await_args.args[1])
+            self.assertEqual(json.loads(context["Advisory Splunk sample metadata"]), profile)
+            self.assertNotIn(search, json.dumps(context))
+        self.assertFalse(self.fake.named(CREATE_TOOL))
+
+        submission = {"proposal_id": proposal["proposal_id"], "binding_key": key, "inspected_scope": scope}
+        mismatch = self.client.post("/api/dashboards/create", json={**submission, "brief": stale})
+        self.assertEqual(mismatch.status_code, 409, mismatch.text)
+        self.assertFalse(self.fake.named(CREATE_TOOL))
+        updated_plan = {**brief, "pages": pages}
+        started = self.client.post("/api/dashboards/create", json={**submission, "brief": updated_plan})
+        self.assertEqual(started.status_code, 200, started.text)
+        self.wait_for_status(started.json()["operation"]["request_id"], "created")
+        sent = json.loads(self.fake.named(CREATE_TOOL)[0]["brief_json"])
+        self.assertEqual({key: sent[key] for key in scope}, scope)
+        self.assertEqual(sent["pages"], pages)
+
+    def test_dashboard_planner_keeps_an_explicit_selected_search(self):
+        self.turn_on()
+        self.catalog = DASHBOARD_CATALOG
+        search = '| makeresults count=4  | eval label="a  b" | stats count BY label'
+        block = f"```spl\n{search}\n```"
+        scope_key = web_app._build_discovery_scope_metadata()["scope_key"]
+        report = web_app._discovery_scope_output_dir(scope_key) / REPORT_NAME
+        report.write_text(f"# Synthetic report\n\n{block}\n", encoding="utf-8")
+        model_plan = web_app.fallback_brief_draft("Create a dashboard of tests", "contoso_web")
+        with mock.patch.object(web_app, "draft_dashboard_plan", return_value=(model_plan, "ai")):
+            chat = self.client.post("/chat", json={"message": "Create a dashboard from this search\n\n" + block})
+            report_plan = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME})
+        self.assertEqual(chat.status_code, 200, chat.text)
+        self.assertEqual(report_plan.status_code, 200, report_plan.text)
+        for proposal in (chat.json()["dashboard_proposal"], report_plan.json()["proposal"]):
+            self.assertEqual(proposal["brief"]["source"], {"kind": "spl", "query": search})
+        self.assertEqual(model_plan["source"]["kind"], "index")
+        self.assertIsNone(web_app._dashboard_selected_source([search, "index=other"]))
+
+    def test_inspection_discards_result_if_connection_changes_in_flight(self):
+        self.turn_on()
+        self.catalog = INSPECTION_CATALOG
+        proposal = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME}).json()["proposal"]
+        self.fake.before_inspection_reply = lambda: self.config_manager.update_mcp(
+            url=MCP_URL, token="replacement-fixture-token", verify_ssl=False,
+        )
+        response = self.client.post("/api/dashboards/inspect-source", json={
+            "binding_key": proposal["binding_key"],
+            "scope": {"source": {"kind": "index", "index": "contoso_web"}, "time_range": proposal["brief"]["time_range"]},
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertNotIn("latency_ms", response.text)
+        self.assertEqual(len(self.fake.named(INSPECT_TOOL)), 1)
+
+    def test_dashboard_repair_keeps_scope_and_requires_review_after_a_failed_request(self):
+        self.turn_on()
+        self.catalog = DASHBOARD_CATALOG
+        proposal = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME}).json()["proposal"]
+        brief = {**proposal["brief"], "source": {"kind": "index", "index": "contoso_web"}}
+        request = {"proposal_id": proposal["proposal_id"], "binding_key": proposal["binding_key"], "brief": brief}
+        self.fake.create_problem = {"status": "needs_input", "code": "panel_coverage", "question": "Review your panel list."}
+        started = self.client.post("/api/dashboards/create", json=request).json()["operation"]
+        failed = self.wait_for_status(started["request_id"], "needs_input")
+        self.assertEqual(failed["receipt"]["code"], "panel_coverage")
+        self.assertEqual(failed["recovery"]["heading"], "Revise the dashboard panels")
+        self.assertEqual(failed["brief"]["source"], brief["source"])
+        suggested = [{"name": "Overview", "panels": ["Event count"]}]
+        body = {"binding_key": proposal["binding_key"], "brief": brief, "repair_request_id": started["request_id"]}
+        with mock.patch.object(web_app, "draft_dashboard_plan", new_callable=mock.AsyncMock) as draft:
+            draft.return_value = (dict(brief, pages=suggested), "ai")
+            missing = self.client.post("/api/dashboards/suggest-panels", json={**body, "repair_request_id": "missing"})
+            self.assertEqual(missing.status_code, 409)
+            draft.assert_not_awaited()
+            fix = self.client.post("/api/dashboards/suggest-panels", json=body)
+            self.assertEqual(fix.json(), {"pages": suggested})
+            prompt, context, _ = draft.await_args.args
+            self.assertIn("introduce no new fields", prompt)
+            self.assertIn("could not verify every requested panel", dict(context)["Constellation recovery guidance"])
+            self.assertNotIn("Advisory Splunk sample metadata", dict(context))
+        self.assertEqual(len(self.fake.named(CREATE_TOOL)), 1)
+        self.fake.create_problem = None
+        retried = self.client.post("/api/dashboards/create", json=dict(request, brief=dict(brief, pages=suggested))).json()["operation"]
+        self.assertNotEqual(retried["request_id"], started["request_id"])
+        self.wait_for_status(retried["request_id"], "created")
+        self.assertEqual(len(self.fake.named(CREATE_TOOL)), 2)
 
     def test_saved_splunk_web_address_is_used_for_links(self):
         self.turn_on()
@@ -293,16 +578,41 @@ class DashboardRouteTests(DashboardRouteCase):
 
         self.catalog = DASHBOARD_CATALOG
         text, proposal = ask("Create a dashboard of web errors")
-        self.assertIn("Nothing goes to Splunk until you click Create.", text)
+        self.assertIn("sends the plan to Splunk only when you click Create", text)
         self.assertEqual(proposal["brief"]["title"], "Web errors")
         self.assertEqual(proposal["brief"]["provenance"]["kind"], "conversation")
         self.assertEqual(proposal["splunk_user"], SPLUNK_USER)
-        self.assertEqual(self.fake.dashboard_calls(), [])
+        self.assertFalse(self.fake.named(CREATE_TOOL))
 
     def test_report_label(self):
         self.assertEqual(web_app._dashboard_report_label(REPORT_NAME), "Operator Runbook")
         self.assertEqual(web_app._dashboard_report_label("v2_ai_summary_20260522_010203.md"), "AI Summary")
         self.assertEqual(web_app._dashboard_report_label("notes.txt"), "Notes")
+
+    def test_chat_and_report_plans_retrieve_from_their_splunk_workspace(self):
+        self.turn_on()
+        self.catalog = DASHBOARD_CATALOG
+        expected_dir = web_app._discovery_scope_output_dir(
+            web_app._mcp_workspace(self.config_manager.get())["scope_key"], create=False
+        )
+
+        async def draft(text, sections, config, **options):
+            self.assertIn(("Knowledge Base for this Splunk workspace", "Lab fixture passage"), sections)
+            return web_app.fallback_brief_draft(text, "contoso_web", options.get("provenance")), "ai"
+
+        with mock.patch.object(web_app, "sync_chat_settings_for_request", return_value=dict(web_app.chat_session_settings, enable_rag_context=True)), \
+                mock.patch.object(web_app, "draft_dashboard_plan", side_effect=draft), \
+                mock.patch.object(web_app, "get_optional_rag_context", return_value=(
+                    "Lab fixture passage", [{"chunks": [{"source": "Lab evidence"}]}],
+                )) as retrieve:
+            chat = self.client.post("/chat", json={"message": "Create a dashboard of failed logins"})
+            report = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME})
+        self.assertEqual(chat.status_code, 200, chat.text)
+        self.assertEqual(report.status_code, 200, report.text)
+        self.assertEqual([call.kwargs["discovery_dir"] for call in retrieve.call_args_list], [expected_dir, expected_dir])
+        self.assertIn("Track failed logins", retrieve.call_args_list[1].args[0])
+        for proposal in (chat.json()["dashboard_proposal"], report.json()["proposal"]):
+            self.assertIn("The plan used Knowledge Base evidence from this Splunk workspace.", proposal["notes"])
 
     def test_dashboard_plan_keeps_visible_chat_history_before_server_history_exists(self):
         history = [
@@ -319,9 +629,9 @@ class DashboardRouteTests(DashboardRouteCase):
     def test_dashboard_plan_retries_an_incomplete_model_reply_with_the_same_context(self):
         model = mock.Mock()
         model.generate_response = mock.AsyncMock(side_effect=[
-            '{"title":"Dashboard Creation"}',
+            '{"title":"Dashboard Creation","purpose":"Track deployment events","pages":[{"name":"Overview","panels":[]}]}',
             '{"title":"Deployment signals","purpose":"Count deployment events",'
-            '"pages":[{"name":"Overview","panels":["Overall event count"]}]}',
+            '"pages":[{"name":"Overview","panels":[{"name":"Overall event count","description":"Single value"}]}]}',
         ])
         with mock.patch.object(web_app, "_is_llm_available_for_m26_14_advisory", return_value=(True, "")), \
                 mock.patch.object(web_app, "get_or_create_llm_client", return_value=model):
@@ -331,9 +641,50 @@ class DashboardRouteTests(DashboardRouteCase):
                 self.config_manager.get(),
             ))
         self.assertEqual((draft["title"], author), ("Deployment signals", "ai"))
+        self.assertEqual(draft["pages"][0]["panels"], ["Overall event count. Single value"])
         first, second = [call.kwargs["messages"] for call in model.generate_response.call_args_list]
         self.assertEqual(second[:len(first)], first)
         self.assertIn("Count deployment events", second[1]["content"])
+
+    def test_chat_and_report_retry_a_valid_but_incomplete_requested_outline(self):
+        self.turn_on()
+        self.catalog = DASHBOARD_CATALOG
+        scope_key = web_app._build_discovery_scope_metadata()["scope_key"]
+        report = web_app._discovery_scope_output_dir(scope_key) / REPORT_NAME
+        report.write_text("# Deployment report\n\nUse one page with exactly 4 visualizations: volume, failures, trend, and region.\n", encoding="utf-8")
+        panels = ["Total deployments", "Failed deployments", "Failures over time", "Deployments by region"]
+
+        def answer(outline):
+            return json.dumps({
+                "title": "Deployment signals", "purpose": "Count deployments and failed deployments",
+                "source": {"kind": "index", "index": "contoso_web"},
+                "pages": [{"name": "Overview" if i == 0 else "Details", "panels": page} for i, page in enumerate(outline)],
+            })
+
+        model = mock.Mock()
+        model.generate_response = mock.AsyncMock(side_effect=[answer([panels[:2]]), answer([panels[:2], panels[2:]])] * 2)
+        with mock.patch.object(web_app, "_is_llm_available_for_m26_14_advisory", return_value=(True, "")), \
+                mock.patch.object(web_app, "get_or_create_llm_client", return_value=model):
+            chat = self.client.post("/chat", json={"message": "Create a four-panel dashboard for deployments on one Overview page"})
+            report_plan = self.client.post("/api/dashboards/propose", json={"report_name": REPORT_NAME})
+
+        self.assertEqual(chat.status_code, 200, chat.text)
+        self.assertEqual(report_plan.status_code, 200, report_plan.text)
+        for proposal in (chat.json()["dashboard_proposal"], report_plan.json()["proposal"]):
+            self.assertEqual(proposal["brief"]["pages"], [{"name": "Overview", "panels": panels}])
+        self.assertEqual(model.generate_response.await_count, 4)
+        for call in model.generate_response.call_args_list[1::2]:
+            self.assertIn("exactly 4 panels", call.kwargs["messages"][-1]["content"])
+        self.assertFalse(self.fake.named(CREATE_TOOL))
+
+    def test_explicit_panel_count_does_not_get_padded_with_generic_panels(self):
+        with mock.patch.object(web_app, "_is_llm_available_for_m26_14_advisory", return_value=(False, "")):
+            draft, author = asyncio.run(web_app.draft_dashboard_plan(
+                "Create a dashboard with four charts", [], self.config_manager.get(), panel_count=4,
+            ))
+        self.assertEqual((draft["pages"], author), ([], "starter"))
+        self.assertIsNone(web_app.requested_dashboard_panel_count("Use two to four panels. `exactly six panels`"))
+        self.assertIsNone(web_app.requested_dashboard_panel_count("Build two pages with two panels per page."))
 
 
 class DashboardSignInTests(DashboardRouteCase):
@@ -353,7 +704,9 @@ class DashboardSignInTests(DashboardRouteCase):
         return password
 
     def add_scoped_report(self, connection_name, timestamp):
-        scope_key = f"mcp:{connection_name}"
+        scope_key = web_app._build_discovery_scope_metadata(
+            auth_user={"role": "analyst", "mcp_config_name": connection_name}
+        )["scope_key"]
         report_name = f"v2_operator_runbook_{timestamp}.md"
         (web_app._discovery_scope_output_dir(scope_key) / report_name).write_text("# Operator Runbook\n", encoding="utf-8")
         overview = SimpleNamespace(total_indexes=0, total_sourcetypes=0, total_hosts=0, total_users=0, data_volume_24h="unknown", splunk_version="unknown")

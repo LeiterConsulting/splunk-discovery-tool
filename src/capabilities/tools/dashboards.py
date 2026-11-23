@@ -16,12 +16,14 @@ import httpx
 
 CREATE_TOOL = "constellation_create_dashboard"
 STATUS_TOOL = "constellation_get_creation_status"
-DASHBOARD_TOOLS = frozenset({CREATE_TOOL, STATUS_TOOL})
+INSPECT_TOOL = "constellation_inspect_dashboard_source"
+DASHBOARD_TOOLS = frozenset({CREATE_TOOL, STATUS_TOOL, INSPECT_TOOL})
 USER_INFO_TOOL = "splunk_get_user_info"
 SCHEMA_VERSION = "1"
 TOOL_ARGUMENTS = {
     CREATE_TOOL: ("schema_version", "request_id", "expected_user", "brief_json"),
     STATUS_TOOL: ("schema_version", "request_id", "expected_user"),
+    INSPECT_TOOL: ("schema_version", "expected_user", "scope_json"),
 }
 
 REQUEST_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}$")
@@ -74,7 +76,7 @@ ERROR_MESSAGES = {
     "pilot_capacity": "Constellation has reached its limit of saved requests for your Splunk user. Try again later.",
     "pilot_busy": "Constellation is already creating another dashboard for you. Wait for it to finish, then try again.",
     "pilot_configuration": "Constellation is not fully set up on this Splunk environment. Ask an administrator to check its settings.",
-    "pilot_probe_only": "Constellation is in test mode on this Splunk environment. It checked the request but did not create a dashboard.",
+    "pilot_probe_only": "Constellation is in read-only probe mode. Ask the Splunk administrator to enable authoring before trying again.",
     "pilot_request_failed": "The Splunk request failed. Check status, or try again later.",
     "pilot_unconfirmed": "Splunk could not confirm the result yet. Check status.",
     "ledger_unavailable": "Constellation could not read its request records. Check status later.",
@@ -84,6 +86,27 @@ ERROR_MESSAGES = {
     "write_unconfirmed": "Splunk could not confirm that the dashboard was saved. Check status later.",
     "method_not_allowed": "The Splunk MCP server called the dashboard tool the wrong way. Ask an administrator to check the Constellation tool registration.",
 }
+
+# Contract v1 can include a safe reason for a failed request or one that needs input.
+_DASHBOARD_RECOVERY = {
+    "source_unavailable": ("source", "Review the dashboard source", "Constellation could not use the selected source. Choose an accessible index or review the search and time range."),
+    "no_data": ("source", "Review the dashboard source", "The selected source and time range returned no usable rows for a requested panel. Choose a source or range with data."),
+    "panel_coverage": ("panels", "Revise the dashboard panels", "Constellation could not verify every requested panel. Start with the key measure and a breakdown supported by the selected data."),
+    "validation_failed": ("panels", "Review the dashboard plan", "Constellation stopped during validation and gave no specific reason. Verify the source and try a smaller set of panels focused on the main question."),
+    "recovery_budget": ("panels", "Simplify the dashboard plan", "Constellation could not finish validating all the requested panels in one run. Start with a smaller overview."),
+    "model_token_limit": ("panels", "Shorten the dashboard plan", "The Constellation model reached its context limit. Shorten the brief or choose a model with more room in Constellation Settings."),
+    "model_output_limit": ("panels", "Simplify the dashboard plan", "The Constellation model ran out of room to finish its response. Start with fewer panels or adjust the model in Constellation Settings."),
+    "authoring_settings": ("settings", "Check Constellation settings", "Select the approved authoring connection and model in Constellation Settings. You can then return to your plan."),
+    "provider_timeout": ("retry", "The Constellation model timed out", "Check the model connection in Constellation Settings, then review and resubmit your plan."),
+    "provider_connection": ("settings", "Check the Constellation model connection", "Constellation could not reach its model. Check the configured connection in Constellation Settings, then return to your plan."),
+}
+
+
+def dashboard_recovery(status: str, code: str) -> Optional[Dict[str, str]]:
+    if status not in {"needs_input", "failed"} or code not in _DASHBOARD_RECOVERY:
+        return None
+    focus, heading, message = _DASHBOARD_RECOVERY[code]
+    return {"focus": focus, "heading": heading, "message": message}
 
 
 class BriefError(ValueError):
@@ -165,14 +188,7 @@ def normalize_brief(raw: Any) -> Dict[str, Any]:
 
     brief["source"] = _normalize_source(raw.get("source"), problem)
 
-    time_range = raw.get("time_range")
-    earliest = time_range.get("earliest") if isinstance(time_range, dict) else None
-    latest = time_range.get("latest", "now") if isinstance(time_range, dict) else None
-    if isinstance(time_range, dict) and set(time_range) - {"earliest", "latest"}:
-        problem("time_range", "The time range takes only earliest and latest.")
-    if earliest not in TIME_RANGES or latest != "now":
-        problem("time_range", "Pick a time range: last 15 minutes, last hour, last 24 hours, or last 7 days.")
-    brief["time_range"] = {"earliest": earliest if earliest in TIME_RANGES else "", "latest": "now"}
+    brief["time_range"] = _normalize_time_range(raw.get("time_range"), problem)
 
     brief["pages"] = _normalize_pages(raw.get("pages"), problem)
 
@@ -209,6 +225,32 @@ def normalize_brief(raw: Any) -> Dict[str, Any]:
     if problems:
         raise BriefError(problems)
     return brief
+
+
+def _normalize_time_range(time_range: Any, problem) -> Dict[str, str]:
+    earliest = time_range.get("earliest") if isinstance(time_range, dict) else None
+    latest = time_range.get("latest", "now") if isinstance(time_range, dict) else None
+    if isinstance(time_range, dict) and set(time_range) - {"earliest", "latest"}:
+        problem("time_range", "The time range takes only earliest and latest.")
+    if earliest not in TIME_RANGES or latest != "now":
+        problem("time_range", "Pick a time range: last 15 minutes, last hour, last 24 hours, or last 7 days.")
+    return {"earliest": earliest if earliest in TIME_RANGES else "", "latest": "now"}
+
+
+def normalize_inspection_scope(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Reuse Create's source and time contract without accepting any plan details."""
+    problems: List[Dict[str, str]] = []
+
+    def problem(field_name: str, message: str) -> None:
+        problems.append({"field": field_name, "message": message})
+
+    if set(raw) != {"source", "time_range"}:
+        problem("", "Provide a source and time range for inspection.")
+    source = _normalize_source(raw.get("source"), problem)
+    time_range = _normalize_time_range(raw.get("time_range"), problem)
+    if problems:
+        raise BriefError(problems)
+    return {"source": source, "time_range": time_range}
 
 
 def _normalize_source(source: Any, problem) -> Dict[str, Any]:
@@ -356,6 +398,85 @@ def check_tool_schema(tool_name: str, schema: Any) -> Optional[str]:
     if isinstance(version, dict) and isinstance(version.get("enum"), list) and SCHEMA_VERSION not in version["enum"]:
         return f"does not accept contract version {SCHEMA_VERSION}"
     return None
+
+
+def supports_source_inspection(catalog: Any) -> bool:
+    if not isinstance(catalog, dict) or not catalog.get("ok") or INSPECT_TOOL not in (catalog.get("tools") or []):
+        return False
+    schema = (catalog.get("schemas") or {}).get(INSPECT_TOOL)
+    if check_tool_schema(INSPECT_TOOL, schema) is not None:
+        return False
+    return all(
+        isinstance(schema["properties"][name], dict) and schema["properties"][name].get("type") == "string"
+        for name in TOOL_ARGUMENTS[INSPECT_TOOL]
+    )
+
+
+_INSPECTION_REASONS = {
+    "resource_limit", "row_limit", "unverified_completion", "search_warning", "byte_limit",
+    "preview_timeout", "dynamic_field_names",
+}
+_FIELD_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.: -]{0,79}")
+_FIELD_HINT_RE = re.compile(r"[A-Za-z0-9_%./-]{1,24}")
+
+
+def normalize_source_profile(payload: Any, scope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Keep bounded sample metadata for the requested scope. Drop all other tool output."""
+    if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+        return None
+    source = payload.get("source")
+    expected = scope["source"]
+    if (
+        not isinstance(source, dict)
+        or source.get("kind") != expected["kind"]
+        or source.get("language") != "spl"
+        or (expected["kind"] == "index" and any(source.get(key) != expected.get(key) for key in ("index", "sourcetype")))
+        or payload.get("time_range") != scope["time_range"]
+    ):
+        return None
+    sample = payload.get("sample")
+    if not isinstance(sample, dict):
+        return None
+    rows, row_limit = sample.get("rows"), sample.get("row_limit")
+    if type(rows) is not int or type(row_limit) is not int or not 0 <= rows <= row_limit <= 200 or not row_limit:
+        return None
+    grain = "indexed_observations" if expected["kind"] == "index" else "existing_search_output"
+    completion = sample.get("completion")
+    status = "observed" if rows else ("empty" if completion == "complete" else "inconclusive")
+    if completion not in ("complete", "partial", "unknown") or sample.get("grain") != grain or payload.get("status") != status:
+        return None
+    raw_reasons = sample.get("reasons")
+    reasons = list(dict.fromkeys(
+        reason for reason in raw_reasons[:12] if isinstance(reason, str) and reason in _INSPECTION_REASONS
+    )) if isinstance(raw_reasons, list) else []
+    fields = []
+    names = set()
+    raw_fields = payload.get("fields")
+    if rows and isinstance(raw_fields, list) and "dynamic_field_names" not in reasons:
+        for field in raw_fields[:12]:
+            if not isinstance(field, dict):
+                continue
+            name = field.get("name")
+            if not isinstance(name, str) or not _FIELD_NAME_RE.fullmatch(name) or name in names:
+                continue
+            counts = {key: field.get(key) for key in ("present", "missing", "numeric", "multivalue")}
+            if any(type(count) is not int or not 0 <= count <= rows for count in counts.values()):
+                continue
+            if counts["present"] + counts["missing"] != rows or max(counts["numeric"], counts["multivalue"]) > counts["present"]:
+                continue
+            names.add(name)
+            hints = {
+                key: field[key] for key in ("role", "unit", "basis")
+                if isinstance(field.get(key), str) and _FIELD_HINT_RE.fullmatch(field[key])
+            }
+            if "basis" not in hints:
+                hints.pop("unit", None)
+            fields.append({"name": name, **counts, **hints})
+    return {
+        "status": status,
+        "sample": {"rows": rows, "row_limit": row_limit, "grain": grain, "completion": completion, "reasons": reasons},
+        "fields": fields,
+    }
 
 
 # ---------------------------------------------------------------- replies
@@ -627,6 +748,9 @@ def normalize_receipt(payload: Any, request_id: str, web_base: Any) -> Dict[str,
         if not question:
             raise ReceiptError("malformed_receipt", "The receipt asked for input without a question.")
         receipt["question"] = question
+        code = payload.get("code")
+        if isinstance(code, str) and code in _DASHBOARD_RECOVERY:
+            receipt["code"] = code
     elif status in {"failed", "indeterminate"}:
         code = str(payload.get("code") or "")
         receipt["code"] = code if SAFE_CODE_RE.match(code) else "unknown"

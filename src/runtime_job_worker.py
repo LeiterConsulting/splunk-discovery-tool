@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict
 
@@ -28,7 +29,7 @@ def _load_request_payload(path_text: str) -> Dict[str, Any]:
 
 
 def _build_discovery_runtime_config(binding: Dict[str, Any]) -> Any:
-    runtime_config = web_app.config_manager.get()
+    runtime_config = deepcopy(web_app.config_manager.get())
     active_name = str(binding.get("active_mcp_config_name") or "").strip()
     clear_runtime_mcp = bool(binding.get("clear_runtime_mcp"))
 
@@ -40,7 +41,7 @@ def _build_discovery_runtime_config(binding: Dict[str, Any]) -> Any:
         runtime_config.active_mcp_config_name = None
         return runtime_config
 
-    if active_name:
+    if active_name and runtime_config.active_mcp_config_name != active_name:
         assigned_config = web_app.config_manager.get_mcp_config(active_name)
         if assigned_config is None:
             runtime_config.mcp.url = ""
@@ -72,6 +73,10 @@ async def _run_discovery_job(payload: Dict[str, Any]) -> None:
         execution_mode="worker",
     )
     runtime_config = _build_discovery_runtime_config(payload.get("runtime_binding") or {})
+    if web_app._mcp_workspace(runtime_config).get("scope_key") != (
+        scope_key if str(scope_key or "").startswith("mcp-host:") else None
+    ):
+        raise RuntimeError("The Splunk connection changed before Discovery started. Start a new run.")
     incognito = web_app.open_incognito_session_for_job(payload, "discovery analysis", runtime_config)
     try:
         with web_app.incognito_session_scope(incognito):

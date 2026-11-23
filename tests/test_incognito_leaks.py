@@ -212,6 +212,8 @@ class IncognitoLeakSuite(unittest.TestCase):
         self.config_manager = ConfigManager(str(self.temp_path / "config.encrypted"))
         self.config_manager.update_llm(provider="openai", model="gpt-test", api_key="test-" + "key")
         self.config_manager.update_mcp(url="https://splunk.example.test:8089/services/mcp", token="test-token")
+        self.scope = web_app._mcp_workspace(self.config_manager.get())
+        self.report_dir = web_app._discovery_scope_output_dir(self.scope["scope_key"], create=False)
         originals = (web_app.config_manager, web_app.capability_manager, web_app.security_manager)
 
         def restore():
@@ -274,7 +276,7 @@ class IncognitoLeakSuite(unittest.TestCase):
         def engine(**kwargs):
             return make_engine(mcp, llm=kwargs["llm_client"])
 
-        payload = {"scope": {}, "runtime_binding": {}, "incognito": web_app.incognito_job_payload("local")}
+        payload = {"scope": self.scope, "runtime_binding": {}, "incognito": web_app.incognito_job_payload("local")}
         self.assertTrue(payload["incognito"]["active"])
         with mock.patch.object(web_app, "_is_runtime_worker_process", return_value=True), \
                 mock.patch.object(web_app, "DISCOVERY_PIPELINE_VERSION", "v2"), \
@@ -291,18 +293,18 @@ class IncognitoLeakSuite(unittest.TestCase):
         with mock.patch.object(web_app, "_is_runtime_worker_process", return_value=True), \
                 mock.patch.dict(web_app.summarization_progress, {}, clear=True):
             asyncio.run(runtime_job_worker._run_summary_job({
-                "timestamp": timestamp, "scope_key": None, "incognito": web_app.incognito_job_payload("local"),
+                "timestamp": timestamp, "scope_key": self.scope["scope_key"], "incognito": web_app.incognito_job_payload("local"),
             }))
-        return json.loads((Path("output") / f"v2_ai_summary_{timestamp}.json").read_text(encoding="utf-8"))
+        return json.loads((self.report_dir / f"v2_ai_summary_{timestamp}.json").read_text(encoding="utf-8"))
 
     def test_discovery_reports_keep_real_names_while_the_model_sees_stand_ins(self):
         timestamp = self.run_discovery()
         self.assert_nothing_identifying_sent()
         self.assertEqual(len(self.model.requests), 3)
-        blueprint = json.loads((Path("output") / f"v2_intelligence_blueprint_{timestamp}.json").read_text("utf-8"))
+        blueprint = json.loads((self.report_dir / f"v2_intelligence_blueprint_{timestamp}.json").read_text("utf-8"))
         self.assertEqual(blueprint["llm_status"]["recommendations"]["status"], "ok")
         self.assert_real_names_restored(blueprint["recommendations"][0]["description"], "recommendation")
-        for report in Path("output").glob(f"v2_*_{timestamp}.*"):
+        for report in self.report_dir.glob(f"v2_*_{timestamp}.*"):
             self.assertIsNone(STAND_IN.search(report.read_text("utf-8")), f"{report.name} shows a stand-in")
         self.assert_clean_afterwards()
 

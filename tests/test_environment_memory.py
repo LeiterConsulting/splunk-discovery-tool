@@ -519,14 +519,15 @@ class EnvironmentApiTests(EnvironmentAppCase):
         self.assertFalse(self.client.get("/api/environment-memory").json()["can_check"])
 
         self.assertTrue(self.config_manager.update_mcp(token="contoso-token"))
-        self.assertEqual(web_app.environment_check_config(global_scope).mcp.token, "contoso-token")
+        self.assertEqual(web_app.environment_check_config(web_app._mcp_workspace(self.config_manager.get())["scope_key"]).mcp.token, "contoso-token")
         self.assertTrue(self.client.get("/api/environment-memory").json()["can_check"])
         self.assertIsNone(web_app.environment_check_config(web_app.DISCOVERY_SCOPE_NO_MCP))
         self.assertIsNone(web_app.environment_check_config("mcp:contoso-missing"))
 
         lab_url = "https://splunk.example.test:8089/services/mcp"
-        self.assertTrue(self.config_manager.save_mcp_config("contoso-lab", lab_url, "lab-token"))
-        lab = web_app.environment_check_config("mcp:contoso-lab")
+        self.assertTrue(self.config_manager.save_mcp_config("contoso-lab", lab_url, "lab-token", activate=True))
+        lab_scope = self.client.get("/connection-info").json()["workspace"]["scope_key"]
+        lab = web_app.environment_check_config(lab_scope)
         self.assertEqual((lab.mcp.url, lab.mcp.token, lab.active_mcp_config_name), (lab_url, "lab-token", "contoso-lab"))
 
     def test_scheduled_checks_wait_for_the_setting_and_the_interval(self):

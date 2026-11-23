@@ -310,10 +310,12 @@ class DeterministicExportProvider:
             try:
                 payload = json.loads(manifest_path.read_text(encoding="utf-8"))
                 if isinstance(payload, list):
-                    normalized = self._normalize_sessions(payload, output_dir)
-                    if normalized != payload:
-                        manifest_path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
-                    return normalized
+                    # This manifest belongs to Discovery and can contain many workspaces.
+                    standalone = [
+                        session for session in payload
+                        if isinstance(session, dict) and session.get("scope_key") in (None, "__global__")
+                    ]
+                    return self._normalize_sessions(standalone, output_dir)
             except Exception:
                 pass
 

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "baseline": [
+    "Lead with the audience's decision. Put the smallest set of measures needed to answer it on the overview, then use a breakdown or detail table for investigation.",
+    "Use concise titles that name the measure. Keep related panels together, align comparable panels, and share the same time range and population for comparisons.",
+    "Specify the unit, aggregation, and denominator when known. A count of sampled rows is not an event total, and an identifier is not a measure."
+  ],
+  "patterns": [
+    {
+      "terms": ["trend", "time", "over time", "spike", "latency", "volume"],
+      "guidance": "Use a line chart for a measure over meaningful time buckets. For percentiles, use event-level measurements or a valid percentile source. Do not take percentiles of pre-aggregated averages."
+    },
+    {
+      "terms": ["breakdown", "compare", "top", "endpoint", "host", "service", "status"],
+      "guidance": "Use a sorted bar chart for a manageable categorical comparison and label the measure. Group or filter high-cardinality categories before charting, and use a detail table for long tails."
+    },
+    {
+      "terms": ["kpi", "threshold", "slo", "rate", "health", "overview"],
+      "guidance": "Use a single value for a clearly defined KPI with a relevant time range. Define the denominator for a rate and use a threshold only when supplied or documented."
+    },
+    {
+      "terms": ["drilldown", "detail", "incident", "investigate", "table"],
+      "guidance": "Use a detail table for exact values and investigation. Carry deliberate filters into detail views, and keep the overview's key metrics visible before deeper navigation."
+    }
+  ],
+  "references": [
+    "https://help.splunk.com/en/splunk-enterprise/create-dashboards-and-reports/dashboard-studio/10.4/create-a-dashboard-in-dashboard-studio/create-a-dashboard-in-dashboard-studio"
+  ]
+}

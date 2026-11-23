@@ -447,6 +447,17 @@ class WebAppLocalAuthTests(unittest.TestCase):
         self.assertFalse(reset.json()["password_reset_required"])
         return updated_password
 
+    def _mcp_scope(self, name):
+        scope = web_app._build_discovery_scope_metadata(auth_user={"role": "analyst", "mcp_config_name": name})
+        self.assertEqual(scope["active_mcp_config_name"], name)
+        return scope["scope_key"]
+
+    def _save_tenant_mcp_fixtures(self):
+        for name in ("tenant-a", "tenant-b"):
+            self.assertTrue(self.config_manager.save_mcp_config(
+                name, f"https://{name}.example.com/mcp", f"{name}-fixture-token", activate=False
+            ))
+
     def _register_discovery_session_fixture(self, timestamp, scope_key=None, active_mcp_config_name=None):
         report_name = f"v2_intelligence_blueprint_{timestamp}.json"
         output_dir = web_app._discovery_scope_output_dir(scope_key)
@@ -1285,7 +1296,6 @@ class WebAppLocalAuthTests(unittest.TestCase):
             web_app.current_discovery_session = None
 
             with patch.object(web_app, "_launch_runtime_job_worker", return_value=SimpleNamespace(pid=fake_worker_pid)), \
-                 patch.object(web_app, "_build_discovery_runtime_binding", return_value={}), \
                  patch.object(web_app, "_broadcast_discovery_runtime_state", new=AsyncMock()):
                 response = self.client.post("/start-discovery")
 
@@ -1315,6 +1325,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
 
         try:
             self._enable_auth_and_complete_admin_reset()
+            self._save_tenant_mcp_fixtures()
             self.security_manager.create_user(
                 username="analyst-a",
                 password="AnalystPassword123!",
@@ -1375,16 +1386,16 @@ class WebAppLocalAuthTests(unittest.TestCase):
                 other_scope_start = self.client.post("/start-discovery")
 
             self.assertEqual(first_start.status_code, 200)
-            self.assertEqual(first_start.json()["discovery"]["scope_key"], "mcp:tenant-a")
+            self.assertEqual(first_start.json()["discovery"]["scope_key"], self._mcp_scope("tenant-a"))
             self.assertEqual(first_start.json()["worker_pid"], 424242)
 
             self.assertEqual(shared_scope_start.status_code, 200)
             self.assertEqual(shared_scope_start.json()["error"], "Discovery already in progress")
-            self.assertEqual(shared_scope_start.json()["discovery"]["scope_key"], "mcp:tenant-a")
+            self.assertEqual(shared_scope_start.json()["discovery"]["scope_key"], self._mcp_scope("tenant-a"))
             self.assertEqual(shared_scope_start.json()["discovery"]["worker_pid"], 424242)
 
             self.assertEqual(other_scope_start.status_code, 200)
-            self.assertEqual(other_scope_start.json()["discovery"]["scope_key"], "mcp:tenant-b")
+            self.assertEqual(other_scope_start.json()["discovery"]["scope_key"], self._mcp_scope("tenant-b"))
             self.assertEqual(other_scope_start.json()["worker_pid"], 525252)
             self.assertEqual(launch_worker.call_count, 2)
         finally:
@@ -1400,6 +1411,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
 
         try:
             self._enable_auth_and_complete_admin_reset()
+            self._save_tenant_mcp_fixtures()
             self.security_manager.create_user(
                 username="analyst-a",
                 password="AnalystPassword123!",
@@ -1420,7 +1432,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
             web_app.discovery_runtime_state = web_app._build_discovery_runtime_state()
             web_app.discovery_runtime_states = {web_app.DISCOVERY_SCOPE_GLOBAL: web_app.discovery_runtime_state}
             web_app._update_discovery_runtime_state(
-                scope_key="mcp:tenant-a",
+                scope_key=self._mcp_scope("tenant-a"),
                 scope_label="tenant-a",
                 active_mcp_config_name="tenant-a",
                 status="running",
@@ -1429,7 +1441,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
                 execution_mode="worker",
             )
             web_app._update_discovery_runtime_state(
-                scope_key="mcp:tenant-b",
+                scope_key=self._mcp_scope("tenant-b"),
                 scope_label="tenant-b",
                 active_mcp_config_name="tenant-b",
                 status="running",
@@ -1457,19 +1469,91 @@ class WebAppLocalAuthTests(unittest.TestCase):
                 status_b = self.client.get("/api/discovery/status")
 
             self.assertEqual(status_a.status_code, 200)
-            self.assertEqual(status_a.json()["scope_key"], "mcp:tenant-a")
+            self.assertEqual(status_a.json()["scope_key"], self._mcp_scope("tenant-a"))
             self.assertEqual(status_a.json()["worker_pid"], 111)
 
             self.assertEqual(status_b.status_code, 200)
-            self.assertEqual(status_b.json()["scope_key"], "mcp:tenant-b")
+            self.assertEqual(status_b.json()["scope_key"], self._mcp_scope("tenant-b"))
             self.assertEqual(status_b.json()["worker_pid"], 222)
         finally:
             web_app.discovery_runtime_state = original_runtime_state
             web_app.discovery_runtime_states = original_runtime_states
             web_app._persist_runtime_state()
 
+    def test_repointed_profile_isolates_reports_rag_and_stale_requests(self):
+        self.assertTrue(self.config_manager.save_mcp_config(
+            "Lab", "https://alpha.example.test:8089/services/mcp", "alpha-token", activate=True
+        ))
+        workspace_a = self.client.get("/connection-info").json()["workspace"]
+        scope_a = workspace_a["scope_key"]
+        self.assertEqual(workspace_a["scope_label"], "Lab · alpha.example.test:8089")
+        self._register_discovery_session_fixture("20260622_120100", scope_a, "Lab")
+        self.assertTrue(self.client.get("/reports").json()["reports"])
+        self.assertEqual(self.client.get("/api/capabilities").status_code, 200)
+        self.assertEqual(self.client.get("/reports/v2_intelligence_blueprint_20260622_120100.json").status_code, 200)
+        created = self.client.post("/api/capabilities/rag/assets/import/text", json={
+            "title": "Alpha queue runbook",
+            "content": "Alpha handles queue pressure with a unique sentinel."
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        asset_id = created.json()["details"]["asset"]["asset_id"]
+
+        definition = web_app.capability_registry.get_definition("rag_chromadb")
+        indexed = definition.runtime_available
+        if indexed:
+            rag = web_app.capability_manager._get_or_create_config(definition)
+            rag.installed = rag.enabled = True
+            rag.restart_required = False
+            self.assertTrue(self.config_manager.save_capability(rag))
+            request_body = {"query": "alpha queue pressure"}
+            result = self.client.post("/api/capabilities/rag/context/build", json=request_body)
+            self.assertIn("Alpha handles queue pressure", result.json()["details"]["context_text"])
+
+        # Token renewal retains the evidence and imports for the endpoint.
+        self.assertTrue(self.config_manager.save_mcp_config(
+            "Lab", "https://alpha.example.test:8089/services/mcp", "rotated-token", activate=True
+        ))
+        self.assertEqual(self.client.get("/connection-info").json()["workspace"]["scope_key"], scope_a)
+
+        self.assertTrue(self.config_manager.save_mcp_config(
+            "Lab", "https://beta.example.test:8089/services/mcp", "beta-token", activate=True
+        ))
+        workspace_b = self.client.get("/connection-info").json()["workspace"]
+        self.assertNotEqual(workspace_b["scope_key"], scope_a)
+        self.assertEqual(self.client.get("/reports").json(), {"reports": [], "sessions": []})
+        self.assertEqual(self.client.get("/api/capabilities/rag/assets").json()["details"]["assets"], [])
+        self.assertEqual(self.client.get(f"/api/capabilities/rag/assets/{asset_id}").status_code, 400)
+        self.assertIsNone(web_app.environment_check_config(scope_a))
+        if indexed:
+            result = self.client.post("/api/capabilities/rag/context/build", json=request_body)
+            self.assertEqual(result.json()["details"]["context_text"], "")
+
+
+        for path in ("/reports", "/api/knowledge-library/status"):
+            stale = self.client.get(path, headers={"X-Discovery-Workspace": scope_a})
+            self.assertEqual(stale.status_code, 409)
+            self.assertEqual(stale.headers["X-Discovery-Workspace-Changed"], "1")
+        with patch.object(web_app, "run_chat_turn", new=AsyncMock()) as run_chat:
+            stale_chat = self.client.post("/chat", json={"message": "previous results", "workspace_key": scope_a})
+            self.assertEqual(stale_chat.status_code, 409)
+            run_chat.assert_not_awaited()
+
+        self.assertTrue(self.config_manager.save_mcp_config(
+            "Alternate", "https://alpha.example.test:8089/services/mcp", "another-user-token", activate=True
+        ))
+        self.assertNotEqual(self.client.get("/connection-info").json()["workspace"]["scope_key"], scope_a)
+        self.assertEqual(self.client.get("/reports").json()["reports"], [])
+
+        self.assertTrue(self.config_manager.save_mcp_config(
+            "Lab", "https://alpha.example.test:8089/services/mcp", "rotated-token", activate=True
+        ))
+        self.assertEqual(self.client.get("/connection-info").json()["workspace"]["scope_key"], scope_a)
+        self.assertTrue(self.client.get("/reports").json()["reports"])
+        self.assertEqual(self.client.get(f"/api/capabilities/rag/assets/{asset_id}").status_code, 200)
+
     def test_reports_and_latest_blueprint_are_filtered_by_mcp_scope(self):
         self._enable_auth_and_complete_admin_reset()
+        self._save_tenant_mcp_fixtures()
         self.security_manager.create_user(
             username="analyst-a",
             password="AnalystPassword123!",
@@ -1498,8 +1582,8 @@ class WebAppLocalAuthTests(unittest.TestCase):
             splunk_version="unknown",
         )
 
-        tenant_a_dir = web_app._discovery_scope_output_dir("mcp:tenant-a")
-        tenant_b_dir = web_app._discovery_scope_output_dir("mcp:tenant-b")
+        tenant_a_dir = web_app._discovery_scope_output_dir(self._mcp_scope("tenant-a"))
+        tenant_b_dir = web_app._discovery_scope_output_dir(self._mcp_scope("tenant-b"))
         (tenant_a_dir / report_name).write_text(json.dumps({"marker": "tenant-a"}), encoding="utf-8")
         (tenant_b_dir / report_name).write_text(json.dumps({"marker": "tenant-b"}), encoding="utf-8")
 
@@ -1513,7 +1597,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
             suggested_use_cases=[],
             discovery_step_count=1,
             discovery_scope={
-                "scope_key": "mcp:tenant-a",
+                "scope_key": self._mcp_scope("tenant-a"),
                 "scope_label": "tenant-a",
                 "active_mcp_config_name": "tenant-a",
             },
@@ -1528,7 +1612,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
             suggested_use_cases=[],
             discovery_step_count=1,
             discovery_scope={
-                "scope_key": "mcp:tenant-b",
+                "scope_key": self._mcp_scope("tenant-b"),
                 "scope_label": "tenant-b",
                 "active_mcp_config_name": "tenant-b",
             },
@@ -1556,7 +1640,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
 
         self.assertEqual(reports_a.status_code, 200)
         self.assertEqual(len(reports_a.json()["sessions"]), 1)
-        self.assertEqual(reports_a.json()["sessions"][0]["scope_key"], "mcp:tenant-a")
+        self.assertEqual(reports_a.json()["sessions"][0]["scope_key"], self._mcp_scope("tenant-a"))
         self.assertEqual(reports_a.json()["reports"][0]["name"], report_name)
         self.assertEqual(report_a.status_code, 200)
         self.assertEqual(report_a.json()["content"]["marker"], "tenant-a")
@@ -1565,7 +1649,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
 
         self.assertEqual(reports_b.status_code, 200)
         self.assertEqual(len(reports_b.json()["sessions"]), 1)
-        self.assertEqual(reports_b.json()["sessions"][0]["scope_key"], "mcp:tenant-b")
+        self.assertEqual(reports_b.json()["sessions"][0]["scope_key"], self._mcp_scope("tenant-b"))
         self.assertEqual(reports_b.json()["reports"][0]["name"], report_name)
         self.assertEqual(report_b.status_code, 200)
         self.assertEqual(report_b.json()["content"]["marker"], "tenant-b")
@@ -3986,7 +4070,7 @@ Environment summary.
             self.assertEqual(analyst_chat.json()["mcp_url"], "https://tenant-b.example.com/mcp")
             self.assertEqual(analyst_chat.json()["active_mcp_config_name"], "tenant-b")
             # Chat describes tenant B from the reports discovery saved for tenant B.
-            self.assertEqual(analyst_chat.json()["discovery_dir"], str(web_app._discovery_scope_output_dir("mcp:tenant-b", create=False)))
+            self.assertEqual(analyst_chat.json()["discovery_dir"], str(web_app._discovery_scope_output_dir(self._mcp_scope("tenant-b"), create=False)))
             # A dashboard request from chat must go through the signed-in user's own connection.
             self.assertEqual(analyst_chat.json()["auth_username"], "analyst1")
 
@@ -5123,6 +5207,7 @@ Environment summary.
             )
             self.assertEqual(runtime_call.status_code, 200)
             runtime_result = runtime_call.json()["result"]["structuredContent"]
+            self.assertEqual(runtime_result["version"], web_app.APP_VERSION)
             self.assertEqual(runtime_result["security"]["auth_provider"], "oidc")
             self.assertTrue(runtime_result["security"]["oidc"]["issuer_configured"])
             self.assertTrue(runtime_result["mcp"]["url_configured"])

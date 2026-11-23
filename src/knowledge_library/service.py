@@ -63,7 +63,7 @@ class KnowledgeLibraryService:
         self._job: Dict[str, Any] = {"state": "idle"}
         self._last_auto_attempt: Optional[datetime] = None
         self._pack_lock = threading.Lock()
-        self._environment: Tuple[float, Optional[EnvironmentTerms]] = (0.0, None)
+        self._environments: Dict[str, Tuple[float, EnvironmentTerms]] = {}
 
     # -- refresh -----------------------------------------------------------
 
@@ -243,9 +243,11 @@ class KnowledgeLibraryService:
 
     # -- documentation search ---------------------------------------------
 
-    def environment_terms(self, load_blueprint: Callable[[], Optional[Dict[str, Any]]]) -> EnvironmentTerms:
+    def environment_terms(
+        self, load_blueprint: Callable[[], Optional[Dict[str, Any]]], *, scope_key: str
+    ) -> EnvironmentTerms:
         """Names from the latest discovery, cached briefly because chat asks for them on every message."""
-        expires, terms = self._environment
+        expires, terms = self._environments.get(scope_key, (0.0, None))
         now = time.monotonic()
         if terms is not None and now < expires:
             return terms
@@ -254,7 +256,7 @@ class KnowledgeLibraryService:
         except Exception:  # noqa: BLE001 - ranking still works without environment names
             profile = {"available": False}
         terms = EnvironmentTerms.from_profile(profile)
-        self._environment = (now + ENVIRONMENT_CACHE_SECONDS, terms)
+        self._environments[scope_key] = (now + ENVIRONMENT_CACHE_SECONDS, terms)
         return terms
 
     def search_docs(

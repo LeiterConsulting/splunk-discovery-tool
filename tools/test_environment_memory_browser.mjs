@@ -252,7 +252,7 @@ async function main() {
         await page.getByTestId('environment-change').first().waitFor({ timeout: 30000 });
 
         const summary = await page.getByTestId('environment-known-summary').innerText();
-        assert(summary.includes('Known for Global: 4 indexes, 3 sourcetypes, and 2 hosts.'), `Unexpected known summary: ${summary}`);
+        assert(summary.includes('Known for Standalone: 4 indexes, 3 sourcetypes, and 2 hosts.'), `Unexpected known summary: ${summary}`);
         assert(summary.includes('3 are quiet now.'), `The summary should count quiet items, got: ${summary}`);
         assert(await page.getByTestId('environment-check-now').count() === 0, 'Check Now needs an MCP connection, so it should be hidden.');
         assert(await page.getByTestId('environment-change').count() === 6, 'All six changes from the second run should be listed.');
@@ -308,8 +308,8 @@ async function main() {
 
         const dialogCount = dialogs.length;
         await page.getByTestId('environment-settings-clear').click();
-        await card.getByText('Cleared what the app learned about Global.').waitFor({ timeout: 10000 });
-        assert(dialogs.slice(dialogCount).some((message) => message.startsWith('Forget what the app learned about Global?')), 'Clearing should ask first.');
+        await card.getByText('Cleared what the app learned about Standalone.').waitFor({ timeout: 10000 });
+        assert(dialogs.slice(dialogCount).some((message) => message.startsWith('Forget what the app learned about Standalone?')), 'Clearing should ask first.');
         const cleared = await getJson(baseUrl, '/api/environment-memory');
         assert(!cleared.memory.has_data, 'The record should be empty after clearing.');
 

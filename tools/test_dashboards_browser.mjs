@@ -147,9 +147,10 @@ async function waitForServer(baseUrl, timeoutMs = 30000) {
 }
 
 // A Splunk MCP Server stand-in. The Constellation tools are listed only once `offerConstellation` is set.
+const SOURCE_INSPECTION_TOOL = 'constellation_inspect_dashboard_source';
 function startFakeSplunkMcp(port) {
     const webBase = `https://127.0.0.1:${port}`;
-    const state = { offerConstellation: false, calls: [], authorizations: new Set(), requests: {} };
+    const state = { offerConstellation: false, authoringMode: 'authoring', statusProbeMode: false, calls: [], authorizations: new Set(), requests: {} };
     const schema = (names) => ({
         type: 'object',
         properties: Object.fromEntries(names.map((name) => [name, name === 'schema_version' ? { type: 'string', enum: ['1'] } : { type: 'string' }])),
@@ -157,10 +158,16 @@ function startFakeSplunkMcp(port) {
     });
     const listTools = () => {
         const tools = ['splunk_run_query', 'splunk_get_info', 'splunk_get_indexes', 'splunk_get_user_info']
-            .map((name) => ({ name, description: `${name} fixture`, inputSchema: { type: 'object', properties: {} } }));
+            .map((name) => ({
+                name, description: `${name} fixture`,
+                inputSchema: name === 'splunk_run_query' ? schema(['query', 'earliest_time', 'latest_time'])
+                    : name === 'splunk_get_indexes' ? { type: 'object', properties: { count: { type: 'integer' } } }
+                        : { type: 'object', properties: {} },
+            }));
         if (state.offerConstellation) {
             tools.push({ name: 'constellation_create_dashboard', description: 'Create a dashboard', inputSchema: schema(['schema_version', 'request_id', 'expected_user', 'brief_json']) });
             tools.push({ name: 'constellation_get_creation_status', description: 'Creation status', inputSchema: schema(['schema_version', 'request_id', 'expected_user']) });
+            tools.push({ name: SOURCE_INSPECTION_TOOL, description: 'Inspect a source', inputSchema: schema(['schema_version', 'expected_user', 'scope_json']) });
         }
         return tools;
     };
@@ -196,19 +203,58 @@ function startFakeSplunkMcp(port) {
                 reply(wrapped({ username: SPLUNK_USER, roles: ['user'] }));
                 return;
             }
+            if (name === 'splunk_get_indexes') {
+                reply({ structuredContent: { results: [{ title: 'contoso_app' }, { title: 'contoso_web' }] } });
+                return;
+            }
+            if (name === 'splunk_run_query' && args.query?.startsWith('| tstats count where index="contoso_web" by sourcetype')) {
+                const sourcetype = args.earliest_time === '-7d' ? 'access_combined' : 'access_recent';
+                reply({ structuredContent: { results: [{ sourcetype }] } });
+                return;
+            }
+            if (name === SOURCE_INSPECTION_TOOL) {
+                const { source, time_range } = JSON.parse(args.scope_json);
+                const isOlderScope = source.index === 'contoso_web' && time_range.earliest === '-24h';
+                const empty = source.index === 'contoso_app';
+                const field = isOlderScope ? 'previous_scope_field' : 'status_code';
+                const sendProfile = () => reply(wrapped({
+                    schema_version: '1',
+                    source: { ...source, language: 'spl', query: undefined },
+                    time_range,
+                    status: empty ? 'empty' : 'observed',
+                    sample: { rows: empty ? 0 : 3, row_limit: 200,
+                        grain: source.kind === 'spl' ? 'existing_search_output' : 'indexed_observations',
+                        completion: empty ? 'complete' : 'partial', reasons: empty ? [] : ['resource_limit'] },
+                    fields: empty ? [] : [{ name: field, present: 3, missing: 0, numeric: 3, multivalue: 0 }],
+                }));
+                if (isOlderScope) {
+                    setTimeout(sendProfile, 1800);
+                } else {
+                    sendProfile();
+                }
+                return;
+            }
             if (name === 'constellation_create_dashboard') {
                 const brief = JSON.parse(args.brief_json || '{}');
-                state.requests[args.request_id] = { brief, statusCalls: 0 };
+                state.requests[args.request_id] = { brief, statusCalls: 0, problem: state.nextCreateProblem };
+                state.nextCreateProblem = null;
                 reply(wrapped({ schema_version: '1', request_id: args.request_id, status: 'running', stage: 'authoring', poll_after_ms: 500 }));
                 return;
             }
             if (name === 'constellation_get_creation_status') {
                 const record = state.requests[args.request_id];
-                if (!record) {
-                    reply(wrapped({ schema_version: '1', request_id: args.request_id, status: 'not_found', warnings: [] }));
+                if (!record || state.statusProbeMode) {
+                    reply(wrapped({
+                        schema_version: '1', request_id: args.request_id, status: 'not_found',
+                        warnings: [], pilot: { mode: record ? 'probe' : state.authoringMode, identity_verified: true },
+                    }));
                     return;
                 }
                 record.statusCalls += 1;
+                if (record.problem) {
+                    reply(wrapped({ schema_version: '1', request_id: args.request_id, warnings: [], ...record.problem }));
+                    return;
+                }
                 if (record.statusCalls < 2) {
                     reply(wrapped({ schema_version: '1', request_id: args.request_id, status: 'running', stage: 'validating', poll_after_ms: 500 }));
                     return;
@@ -236,18 +282,20 @@ function startFakeSplunkMcp(port) {
     });
 }
 
-async function seedOutput(outputDir) {
-    await mkdir(outputDir, { recursive: true });
+async function seedOutput(outputDir, workspace) {
+    const reportDir = path.join(outputDir, 'scopes', Buffer.from(workspace.scope_key).toString('base64url'));
+    await mkdir(reportDir, { recursive: true });
     const blueprint = buildOperatorFixtureBlueprint(OPERATOR_FIXTURE_TIMESTAMP, OPERATOR_FIXTURE_CREATED_AT);
     const reports = {
         [`v2_intelligence_blueprint_${OPERATOR_FIXTURE_TIMESTAMP}.json`]: JSON.stringify(blueprint, null, 2),
         [REPORT_NAME]: '# Operator Runbook\n\n## Action Queue\n1. Validate authentication monitoring coverage (high)\n2. Track failed logins on the contoso web tier.\n',
     };
     for (const [name, content] of Object.entries(reports)) {
-        await writeFile(path.join(outputDir, name), content, 'utf8');
+        await writeFile(path.join(reportDir, name), content, 'utf8');
     }
     await writeFile(path.join(outputDir, 'discovery_sessions.json'), JSON.stringify([{
         timestamp: OPERATOR_FIXTURE_TIMESTAMP,
+        ...workspace,
         created_at: OPERATOR_FIXTURE_CREATED_AT,
         overview: blueprint.overview,
         report_paths: Object.keys(reports),
@@ -355,7 +403,6 @@ async function main() {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'dt4sms-dashboards-'));
     const baseUrl = `http://127.0.0.1:${appPort}/`;
     const mcpUrl = `http://127.0.0.1:${mcpPort}/services/mcp`;
-    await seedOutput(path.join(tempDir, 'output'));
     const fakeMcp = await startFakeSplunkMcp(mcpPort);
     const serverHandle = startServer(pythonCommand, appPort, tempDir);
     let browser = null;
@@ -366,6 +413,9 @@ async function main() {
         await waitForServer(baseUrl);
         const saved = await requestJson(baseUrl, '/api/config', { method: 'POST', body: { mcp: { url: mcpUrl, token: MCP_TOKEN, verify_ssl: false } } });
         assert(saved.status === 200, `Saving the MCP connection failed with HTTP ${saved.status}: ${JSON.stringify(saved.data)}`);
+
+        const connection = await requestJson(baseUrl, '/connection-info');
+        await seedOutput(path.join(tempDir, 'output'), connection.data.workspace);
 
         const initial = await requestJson(baseUrl, '/api/dashboards/status?refresh=true');
         assert(initial.status === 200, `Dashboard status returned HTTP ${initial.status}.`);
@@ -390,6 +440,8 @@ async function main() {
         assert(hrefs.includes('https://github.com/LeiterConsulting/constellation/releases') && hrefs.includes('https://splunkbase.splunk.com/app/7931'),
             `The potential card should link to Constellation releases and Splunk MCP Server, got ${hrefs.join(', ')}.`);
         assert((await card.getByTestId('dashboard-support-message').innerText()).includes('does not offer the dashboard tools yet'), 'The card should say the tools are missing.');
+        assert((await card.getByTestId('dashboard-support-message').innerText()).includes('MCP-enabled Constellation build'),
+            'The card should explain that an existing Constellation installation may need an MCP-enabled build.');
         await snap(page, 'capability-potential', card);
 
         await runCapabilityAction(page, card, 'install');
@@ -405,14 +457,23 @@ async function main() {
         assert(potentialReply.includes('does not offer the dashboard tools yet'), `The chat reply should explain the missing tools, got: ${potentialReply}`);
         assert(await reply.locator('a[href="https://github.com/LeiterConsulting/constellation/releases"]').count() === 1, 'The chat reply should link to Constellation releases.');
         assert(await page.getByTestId('chat-dashboard').count() === 0, 'No plan card should appear while the tools are missing.');
-        assert(!fakeMcp.state.calls.some((call) => call.name.startsWith('constellation_')), 'Nothing may be sent to Constellation before Create.');
+        assert(!fakeMcp.state.calls.some((call) => call.name.startsWith('constellation_')), 'Missing tools should prevent the authoring check.');
         await page.getByRole('button', { name: 'Close chat' }).first().click();
 
         // Constellation is installed in Splunk: Check Again finds the tools.
         fakeMcp.state.offerConstellation = true;
+        fakeMcp.state.authoringMode = 'probe';
         card = await openCapabilities(page);
         await card.locator('button.ui-link', { hasText: 'Check Again' }).first().click();
         await waitForSupport(card, 'available');
+        await card.getByTestId('dashboard-blocked-reason').filter({ hasText: 'Constellation is in read-only probe mode.' }).waitFor();
+        reply = await sendChat(page, 'Create a dashboard of web errors');
+        assert((await reply.innerText()).includes('read-only probe mode'), 'Chat should explain why the tools cannot author.');
+        assert(await page.getByTestId('chat-dashboard').count() === 0, 'Probe mode should stop before drafting a plan.');
+        await page.getByRole('button', { name: 'Close chat' }).first().click();
+        fakeMcp.state.authoringMode = 'authoring';
+        await card.locator('button.ui-link', { hasText: 'Check Again' }).first().click();
+        await card.getByTestId('dashboard-authoring-status').filter({ hasText: `Constellation authoring is enabled for Splunk user ${SPLUNK_USER}.` }).waitFor();
 
         // Admin view: each connection, with the guessed Splunk Web address and a check on what is typed.
         const settings = card.getByTestId('dashboard-connection-settings');
@@ -440,21 +501,51 @@ async function main() {
         await settings.getByTestId('dashboard-web-url-notice').waitFor({ timeout: 10000 });
         assert(await savedAddress() === '', 'Clearing the address should go back to the guessed one.');
 
-        // Chat: the plan card shows the Splunk user, needs an index, and sends nothing until Create.
+        // Chat: readiness can read status before the user approves the plan.
         reply = await sendChat(page, 'Create a dashboard of web errors');
-        assert((await reply.innerText()).includes('Nothing goes to Splunk until you click Create.'), 'The chat reply should introduce the plan.');
+        assert((await reply.innerText()).includes('sends the plan to Splunk only when you click Create'), 'The chat reply should introduce the plan.');
         const plan = page.getByTestId('chat-dashboard').last();
         await plan.waitFor({ state: 'visible', timeout: 15000 });
         assert((await plan.getByTestId('chat-dashboard-identity').innerText()).includes(`Splunk user ${SPLUNK_USER}`), 'The plan should name the Splunk user it is created as.');
         assert((await plan.getByTestId('chat-dashboard-title').innerText()) === 'Web errors', 'The starter plan title should come from the request.');
-        assert(!fakeMcp.state.calls.some((call) => call.name.startsWith('constellation_')), 'Drafting a plan must not call Constellation.');
+        assert(!fakeMcp.state.calls.some((call) => call.name === 'constellation_create_dashboard'), 'Drafting a plan may only check Constellation status.');
         const createButton = plan.getByTestId('chat-dashboard-create');
         if (await plan.getByTestId('chat-dashboard-problems').count()) {
             assert(await createButton.isDisabled(), 'Create should stay disabled while the plan has problems.');
         }
+        await plan.getByTestId('chat-dashboard-browse-data').click();
+        const picker = plan.locator('[data-testid$="-source-picker"]');
+        await picker.getByRole('option', { name: 'contoso_web', exact: true }).waitFor({ state: 'attached' });
+        const oldScopeRequest = page.waitForRequest((request) => request.url().endsWith('/api/dashboards/inspect-source'));
+        await picker.getByLabel('Index', { exact: true }).selectOption('contoso_web');
+        await oldScopeRequest;
+        await picker.getByRole('option', { name: 'access_recent', exact: true }).waitFor({ state: 'attached' });
+        await picker.getByLabel('Time range', { exact: true }).selectOption('-7d');
+        await picker.getByRole('option', { name: 'access_combined', exact: true }).waitFor({ state: 'attached' });
+        assert(await picker.getByRole('option', { name: 'access_recent', exact: true }).count() === 0, 'A range change must clear the prior options.');
+        await picker.getByLabel('Sourcetype', { exact: true }).selectOption('access_combined');
+        const coverage = plan.getByTestId('chat-dashboard-coverage');
+        await coverage.filter({ hasText: '3 sampled rows · indexed observations · Partial coverage' }).waitFor();
+        await delay(1800);
+        const inspectedFields = plan.getByTestId('chat-dashboard-sample-fields');
+        assert((await inspectedFields.textContent()).includes('status_code'), 'The latest scope should expose observed field metadata.');
+        assert(!(await inspectedFields.textContent()).includes('previous_scope_field'), 'The late response from the earlier time range must be ignored.');
+        const panelRoute = '**/api/dashboards/suggest-panels';
+        await page.route(panelRoute, (route) => route.fulfill({
+            json: { pages: [{ name: 'Overview', panels: ['Status code distribution'] }] },
+        }));
+        await plan.getByRole('button', { name: 'Suggest panels', exact: true }).click();
+        const suggested = plan.getByTestId('chat-dashboard-suggested-panels');
+        await suggested.getByText('Status code distribution').waitFor();
+        await suggested.getByRole('button', { name: 'Use suggested panels', exact: true }).click();
+        await page.unroute(panelRoute);
+        await plan.getByTestId('chat-dashboard-panel-outline').getByText('Status code distribution').waitFor();
+        assert(!fakeMcp.state.calls.some((call) => call.name === 'constellation_create_dashboard'), 'Browsing data must only read from Splunk.');
+        await snap(page, 'chat-plan-source-picker', plan);
         await plan.getByTestId('chat-dashboard-edit').click();
         const editor = plan.getByTestId('chat-dashboard-editor');
-        await editor.getByLabel('Index').fill('contoso_web');
+        assert(await editor.getByLabel('Index').inputValue() === 'contoso_web', 'The editor should keep the chosen index.');
+        assert(await editor.getByLabel('Sourcetype (optional)').inputValue() === 'access_combined', 'The editor should keep the chosen sourcetype.');
         await editor.getByLabel('Sourcetype (optional)').fill('bad sourcetype');
         await plan.getByTestId('chat-dashboard-problems').getByText('Enter a single sourcetype').waitFor({ timeout: 5000 });
         assert(await createButton.isDisabled(), 'A bad sourcetype should keep Create disabled.');
@@ -467,9 +558,16 @@ async function main() {
         await snap(page, 'chat-plan-summary', plan);
         assert((await plan.getByTestId('chat-dashboard-summary').innerText()).includes('Last 7 days'), 'The summary should show the edited time range.');
 
+        fakeMcp.state.statusProbeMode = true;
         await createButton.click();
         const receipt = page.getByTestId('chat-dashboard-receipt').last();
         await receipt.waitFor({ state: 'visible', timeout: 15000 });
+        await receipt.getByText('Constellation is in probe mode. Check Status again when authoring is available.', { exact: true })
+            .waitFor({ timeout: 15000 });
+        assert(await receipt.getAttribute('data-status') === 'unconfirmed', 'A probe reply should leave the request unconfirmed.');
+        assert(await receipt.getByTestId('chat-dashboard-retry').count() === 0, 'Probe mode should not offer a new create.');
+        fakeMcp.state.statusProbeMode = false;
+        await receipt.getByTestId('chat-dashboard-check-status').click();
         await page.waitForFunction(
             () => document.querySelector('[data-testid="chat-dashboard-receipt"]')?.getAttribute('data-status') === 'created',
             null,
@@ -489,13 +587,16 @@ async function main() {
         assert(createArgs.schema_version === '1' && createArgs.expected_user === SPLUNK_USER && REQUEST_ID_RE.test(createArgs.request_id),
             `Create arguments do not follow the contract: ${JSON.stringify({ ...createArgs, brief_json: '(omitted)' })}`);
         const sentBrief = JSON.parse(createArgs.brief_json);
+        assert(!Object.hasOwn(sentBrief, 'profile') && !Object.hasOwn(sentBrief, 'sample'), 'Advisory inspection must stay out of Create.');
         assert(sentBrief.title === 'Web errors' && sentBrief.source?.index === 'contoso_web' && sentBrief.source?.sourcetype === 'access_combined'
             && sentBrief.time_range?.earliest === '-7d' && sentBrief.pages?.[0]?.panels?.[0] === 'Server errors over time',
             `The sent plan should match the edited card: ${createArgs.brief_json}`);
         assert(sentBrief.provenance?.kind === 'conversation', 'A chat plan should say it came from the conversation.');
         const statusCalls = fakeMcp.state.calls.filter((call) => call.name === 'constellation_get_creation_status');
-        assert(statusCalls.length >= 2 && statusCalls.every((call) => call.args.expected_user === SPLUNK_USER && call.args.request_id === createArgs.request_id),
-            'Status checks should repeat the request ID and Splunk user.');
+        const receiptChecks = statusCalls.filter((call) => call.args.request_id === createArgs.request_id);
+        assert(receiptChecks.length >= 2 && statusCalls.length > receiptChecks.length && statusCalls.every((call) => call.args.expected_user === SPLUNK_USER),
+            'The same Splunk identity should be used for readiness and receipt checks.');
+        assert(statusCalls.every((call) => !Object.hasOwn(call.args, 'brief_json')), 'Status checks must not send the dashboard plan.');
         assert([...fakeMcp.state.authorizations].every((value) => value === `Bearer ${MCP_TOKEN}`), 'Every MCP call should use the saved connection token.');
 
         // The card keeps its receipt after a reload.
@@ -520,18 +621,29 @@ async function main() {
         const reportRow = page.getByTestId('discovery-report-row').filter({ hasText: REPORT_NAME }).first();
         await reportRow.waitFor({ state: 'visible', timeout: 30000 });
         await reportRow.click({ force: true });
+        fakeMcp.state.authoringMode = 'fixture';
+        await page.getByTestId('report-create-dashboard').click();
+        await page.getByTestId('report-dashboard-error').filter({ hasText: 'Constellation is in fixture mode' }).waitFor();
+        fakeMcp.state.authoringMode = 'authoring';
         await page.getByTestId('report-create-dashboard').click();
         const reportPlan = page.getByTestId('report-dashboard');
         await reportPlan.waitFor({ state: 'visible', timeout: 30000 });
         assert((await reportPlan.innerText()).includes(`Based on ${REPORT_NAME}`), 'A report plan should say which report it is based on.');
         const reportTitle = await reportPlan.getByTestId('report-dashboard-title').innerText();
         assert(reportTitle === 'Findings from the Operator Runbook report', `The starter plan title should name the report, got ${reportTitle}.`);
+        await reportPlan.getByTestId('report-dashboard-browse-data').click();
+        await reportPlan.getByRole('option', { name: 'contoso_web', exact: true }).waitFor({ state: 'attached' });
+        await reportPlan.getByLabel('Index', { exact: true }).selectOption('contoso_app');
+        await reportPlan.getByTestId('report-dashboard-coverage').filter({ hasText: 'No rows returned' }).waitFor();
+        assert(!await reportPlan.getByTestId('report-dashboard-create').isDisabled(), 'Advisory coverage must not disable Create.');
         const callsBeforeCancel = fakeMcp.state.calls.filter((call) => call.name.startsWith('constellation_')).length;
 
         // Incognito mode on: the open plan says why it cannot be created, and the server refuses Create too.
         await setIncognito(page, true);
         await reportPlan.getByTestId('report-dashboard-incognito').waitFor({ state: 'visible', timeout: 5000 });
         assert(await reportPlan.getByTestId('report-dashboard-create').isDisabled(), 'Create should be disabled while incognito mode is on.');
+        assert(await reportPlan.getByTestId('report-dashboard-browse-data').count() === 0, 'Incognito should hide live browsing.');
+        assert(await reportPlan.getByTestId('report-dashboard-inspection').count() === 0, 'Incognito should hide source inspection.');
         await snap(page, 'report-plan-incognito', reportPlan);
         const incognitoCreate = await requestJson(baseUrl, '/api/dashboards/create', {
             method: 'POST',
@@ -547,6 +659,65 @@ async function main() {
         await reportPlan.waitFor({ state: 'detached', timeout: 5000 });
         assert(fakeMcp.state.calls.filter((call) => call.name.startsWith('constellation_')).length === callsBeforeCancel, 'Cancel must not send anything to Splunk.');
 
+        await page.getByTestId('report-create-dashboard').click();
+        await reportPlan.getByTestId('report-dashboard-browse-data').click();
+        await reportPlan.getByLabel('Index', { exact: true }).selectOption('contoso_web');
+        await reportPlan.getByTestId('report-dashboard-coverage').filter({ hasText: 'Checking sample coverage' }).waitFor();
+        fakeMcp.state.nextCreateProblem = { status: 'failed', code: 'validation_failed' };
+        await reportPlan.getByTestId('report-dashboard-create').click();
+        const reportReceipt = page.getByTestId('report-dashboard-receipt');
+        await reportReceipt.getByTestId('report-dashboard-receipt-status').filter({ hasText: 'Review the dashboard plan' }).waitFor();
+        const reportCreates = () => fakeMcp.state.calls.filter((call) =>
+            call.name === 'constellation_create_dashboard' && call.args.request_id !== createArgs.request_id
+        );
+        assert(reportCreates().length === 1, 'Discovery must retain the failed report request without resending it.');
+        await reportReceipt.getByRole('button', { name: 'Revise panels', exact: true }).click();
+        await reportPlan.getByTestId('report-dashboard-repair-note').filter({ hasText: 'gave no specific reason' }).waitFor();
+        await page.route(panelRoute, (route) => {
+            const body = route.request().postDataJSON();
+            assert(body.repair_request_id === reportCreates()[0].args.request_id, 'The repair must use the request that failed.');
+            return route.fulfill({ json: { pages: [{ name: 'Overview', panels: ['Event count'] }] } });
+        });
+        await reportPlan.getByRole('button', { name: 'Suggest a fix', exact: true }).click();
+        const repair = reportPlan.getByTestId('report-dashboard-suggested-panels');
+        await repair.getByRole('button', { name: 'Use suggested panels', exact: true }).click();
+        await page.unroute(panelRoute);
+        assert(reportCreates().length === 1, 'Applying a repair must leave Create for user confirmation.');
+        await reportPlan.getByTestId('report-dashboard-create').click();
+        await reportReceipt.getByTestId('report-dashboard-receipt-status').filter({ hasText: 'Dashboard created' }).waitFor();
+        const [failedReport, repairedReport] = reportCreates();
+        assert(failedReport.args.request_id !== repairedReport.args.request_id, 'The repaired plan must use a fresh request ID.');
+        const failedBrief = JSON.parse(failedReport.args.brief_json);
+        const repairedBrief = JSON.parse(repairedReport.args.brief_json);
+        assert(repairedBrief.source.index === failedBrief.source.index && repairedBrief.time_range.earliest === failedBrief.time_range.earliest
+            && repairedBrief.pages[0].panels.length === 1, 'Repair should preserve the scope and use the reviewed panels.');
+
+        // A plan keeps the exact inspected search through edits to its panel outline.
+        await page.getByRole('button', { name: 'Open chat', exact: true }).click();
+        const source = '| makeresults count=4  | eval label="a  b" | stats count BY label';
+        await sendChat(page, `Create a dashboard from this search\n\n\`\`\`spl\n${source}\n\`\`\``);
+        const splPlan = page.getByTestId('chat-dashboard').last();
+        const splCreate = splPlan.getByTestId('chat-dashboard-create');
+        const splOutline = splPlan.getByTestId('chat-dashboard-panel-outline');
+        await splPlan.getByRole('button', { name: 'Inspect search', exact: true }).click();
+        await splPlan.getByText('Inspected SPL', { exact: true }).waitFor();
+        assert(await splPlan.getByTestId('chat-dashboard-source-query').textContent() === source, 'The plan should show the exact inspected SPL.');
+        await splPlan.getByTestId('chat-dashboard-edit').click();
+        const splEditor = splPlan.getByTestId('chat-dashboard-editor');
+        await splEditor.getByRole('textbox', { name: 'Panel 1 on page 1', exact: true }).fill('Count by label');
+        await splOutline.getByText('Count by label', { exact: true }).waitFor();
+        await splEditor.getByLabel('Time range').selectOption('-1h');
+        assert(await splCreate.isDisabled(), 'Changing the inspected range requires a new inspection.');
+        await splPlan.getByRole('button', { name: 'Inspect search', exact: true }).click();
+        await splPlan.getByTestId('chat-dashboard-coverage').filter({ hasText: 'search output' }).waitFor();
+        const submissionRequest = page.waitForRequest((request) => request.url().endsWith('/api/dashboards/create'));
+        await splCreate.click();
+        const splSubmission = (await submissionRequest).postDataJSON();
+        assert(splSubmission.inspected_scope?.source.query === source && splSubmission.brief.source.query === source
+            && splSubmission.inspected_scope?.time_range.earliest === '-1h', 'Create should reuse the reviewed SPL and latest inspected range.');
+        await page.getByTestId('chat-dashboard-receipt').last().getByText('Dashboard created', { exact: true }).waitFor();
+        await page.getByRole('button', { name: 'Close chat' }).first().click();
+
         // Turned off: chat answers as usual and Create Dashboard leaves the report viewer.
         card = await openCapabilities(page);
         await runCapabilityAction(page, card, 'disable');
@@ -558,7 +729,7 @@ async function main() {
         assert(blocked.status === 409 && String(blocked.data.detail).includes('turned off'), `Proposing while off should be refused, got HTTP ${blocked.status}.`);
 
         assert(pageErrors.length === 0, `Page errors: ${pageErrors.join(' | ')}`);
-        console.log(`Dashboards browser regression passed: potential card with links, install and enable, chat plan with edits, one create call, ${statusCalls.length} status checks, created receipt with verified links, reload, report plan, incognito block, and turned-off state verified.`);
+        console.log(`Dashboards browser regression passed: chat and report coverage, reviewable panel suggestions, report failure and approved repair, probe-mode recovery with ${receiptChecks.length} receipt checks, links after reload, Incognito, and capability controls.`);
     } catch (error) {
         if (page && process.env.DASHBOARDS_TEST_SCREENSHOT) {
             await page.screenshot({ path: process.env.DASHBOARDS_TEST_SCREENSHOT, fullPage: true }).catch(() => {});

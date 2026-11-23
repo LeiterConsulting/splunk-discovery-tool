@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
@@ -133,10 +133,10 @@ class CapabilityManager:
         if changed:
             self.config_manager.save(self.config_manager.get())
 
-    def list_capabilities(self, refresh_health: bool = True) -> Dict[str, Dict[str, Any]]:
+    def list_capabilities(self, refresh_health: bool = True, *, discovery_dir: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
         capabilities = {}
         for definition in self.registry.list_definitions():
-            capabilities[definition.name] = self.get_capability_state(definition.name, refresh_health=refresh_health)
+            capabilities[definition.name] = self.get_capability_state(definition.name, refresh_health=refresh_health, discovery_dir=discovery_dir)
         return capabilities
 
     def get_summary(self) -> Dict[str, int]:
@@ -149,7 +149,7 @@ class CapabilityManager:
             "restart_required": sum(1 for item in capabilities if item.get("restart_required")),
         }
 
-    def get_capability_state(self, name: str, refresh_health: bool = False) -> Dict[str, Any]:
+    def get_capability_state(self, name: str, refresh_health: bool = False, *, discovery_dir: Optional[Path] = None) -> Dict[str, Any]:
         definition = self.registry.get_definition(name)
         if definition is None:
             raise KeyError(name)
@@ -174,7 +174,7 @@ class CapabilityManager:
                 "splunk_requirements": [requirement.to_dict() for requirement in definition.splunk_requirements],
             }
         )
-        payload.update(self._extra_capability_state(definition, config))
+        payload.update(self._extra_capability_state(definition, config, discovery_dir))
         return payload
 
     def install_capability(self, name: str, strategy: Optional[str] = None) -> CapabilityActionResult:
@@ -337,7 +337,7 @@ class CapabilityManager:
                 )
         return None
 
-    def reindex_capability(self, name: str) -> CapabilityActionResult:
+    def reindex_capability(self, name: str, *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "reindex", "Unknown capability.")
@@ -348,22 +348,31 @@ class CapabilityManager:
         if config.restart_required:
             return self._result(definition.name, "reindex", False, "Restart the application before indexing this capability.")
 
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "reindex"):
             return self._result(definition.name, "reindex", False, "Capability does not expose indexing controls.")
 
         try:
             index_summary = provider.reindex()
         except Exception as exc:
-            config.last_error = str(exc)
-            self.config_manager.save_capability(config)
+            if not self._uses_discovery_workspace(discovery_dir):
+                config.last_error = str(exc)
+                self.config_manager.save_capability(config)
             return CapabilityActionResult(
                 ok=False,
                 capability=definition.name,
                 action="reindex",
                 message="Capability reindex failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
+            )
+
+        if self._uses_discovery_workspace(discovery_dir):
+            return CapabilityActionResult(
+                ok=True, capability=definition.name, action="reindex",
+                message="The workspace Knowledge Base was reindexed.",
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
+                details={"index_summary": index_summary},
             )
 
         report = self._sync_health_state(definition, config)
@@ -378,20 +387,20 @@ class CapabilityManager:
             capability=definition.name,
             action="reindex",
             message=message,
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details={
                 "index_summary": index_summary,
                 "health": report.to_dict(),
             },
         )
 
-    def list_rag_assets(self, name: str = "rag_chromadb") -> CapabilityActionResult:
+    def list_rag_assets(self, name: str = "rag_chromadb", *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "list-assets", "Unknown capability.")
 
         config = self._get_or_create_config(definition)
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "list_managed_assets"):
             return self._result(definition.name, "list-assets", False, "Capability does not expose managed knowledge assets.")
 
@@ -403,7 +412,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="list-assets",
                 message="Failed to load managed knowledge assets.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
@@ -412,17 +421,17 @@ class CapabilityManager:
             capability=definition.name,
             action="list-assets",
             message="Managed knowledge assets loaded.",
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=asset_summary,
         )
 
-    def get_rag_asset_detail(self, name: str, asset_id: str) -> CapabilityActionResult:
+    def get_rag_asset_detail(self, name: str, asset_id: str, *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "get-asset-detail", "Unknown capability.")
 
         config = self._get_or_create_config(definition)
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "get_managed_asset_detail"):
             return self._result(definition.name, "get-asset-detail", False, "Capability does not expose managed knowledge asset detail.")
 
@@ -434,7 +443,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="get-asset-detail",
                 message="Failed to load managed knowledge asset detail.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
@@ -444,7 +453,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="get-asset-detail",
                 message="Knowledge asset was not found.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={},
             )
 
@@ -453,17 +462,17 @@ class CapabilityManager:
             capability=definition.name,
             action="get-asset-detail",
             message="Managed knowledge asset detail loaded.",
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=detail,
         )
 
-    def import_rag_text_asset(self, name: str, payload: Dict[str, Any]) -> CapabilityActionResult:
+    def import_rag_text_asset(self, name: str, payload: Dict[str, Any], *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "import-asset", "Unknown capability.")
 
         config = self._get_or_create_config(definition)
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "import_text_asset"):
             return self._result(definition.name, "import-asset", False, "Capability does not support managed knowledge asset import.")
 
@@ -485,11 +494,11 @@ class CapabilityManager:
                 capability=definition.name,
                 action="import-asset",
                 message="Knowledge asset import failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
-        if auto_reindex and config.installed:
+        if auto_reindex and config.installed and not self._uses_discovery_workspace(discovery_dir):
             self._sync_health_state(definition, config)
 
         import_action = str(details.get("asset_import_action") or "created").strip().lower()
@@ -509,7 +518,7 @@ class CapabilityManager:
             capability=definition.name,
             action="import-asset",
             message=message,
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=details,
         )
 
@@ -519,13 +528,14 @@ class CapabilityManager:
         filename: str,
         content_bytes: bytes,
         payload: Dict[str, Any],
+        *, discovery_dir: Optional[Path] = None,
     ) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "import-asset", "Unknown capability.")
 
         config = self._get_or_create_config(definition)
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "import_file_asset"):
             return self._result(definition.name, "import-asset", False, "Capability does not support managed knowledge asset import.")
 
@@ -548,11 +558,11 @@ class CapabilityManager:
                 capability=definition.name,
                 action="import-asset",
                 message="Knowledge asset import failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
-        if auto_reindex and config.installed:
+        if auto_reindex and config.installed and not self._uses_discovery_workspace(discovery_dir):
             self._sync_health_state(definition, config)
 
         import_action = str(details.get("asset_import_action") or "created").strip().lower()
@@ -572,17 +582,17 @@ class CapabilityManager:
             capability=definition.name,
             action="import-asset",
             message=message,
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=details,
         )
 
-    def delete_rag_asset(self, name: str, asset_id: str) -> CapabilityActionResult:
+    def delete_rag_asset(self, name: str, asset_id: str, *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "delete-asset", "Unknown capability.")
 
         config = self._get_or_create_config(definition)
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "delete_managed_asset"):
             return self._result(definition.name, "delete-asset", False, "Capability does not expose managed knowledge assets.")
 
@@ -595,7 +605,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="delete-asset",
                 message="Knowledge asset deletion failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
@@ -605,11 +615,11 @@ class CapabilityManager:
                 capability=definition.name,
                 action="delete-asset",
                 message="Knowledge asset was not found.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details=details,
             )
 
-        if auto_reindex and config.installed:
+        if auto_reindex and config.installed and not self._uses_discovery_workspace(discovery_dir):
             self._sync_health_state(definition, config)
 
         message = "Knowledge asset deleted."
@@ -621,21 +631,22 @@ class CapabilityManager:
             capability=definition.name,
             action="delete-asset",
             message=message,
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=details,
         )
 
-    def check_in_rag_asset(self, name: str, asset_id: str) -> CapabilityActionResult:
-        return self._set_rag_asset_library_status(name, asset_id, "checked_in")
+    def check_in_rag_asset(self, name: str, asset_id: str, *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
+        return self._set_rag_asset_library_status(name, asset_id, "checked_in", discovery_dir=discovery_dir)
 
-    def check_out_rag_asset(self, name: str, asset_id: str) -> CapabilityActionResult:
-        return self._set_rag_asset_library_status(name, asset_id, "checked_out")
+    def check_out_rag_asset(self, name: str, asset_id: str, *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
+        return self._set_rag_asset_library_status(name, asset_id, "checked_out", discovery_dir=discovery_dir)
 
     def _set_rag_asset_library_status(
         self,
         name: str,
         asset_id: str,
         library_status: str,
+        *, discovery_dir: Optional[Path] = None,
     ) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
@@ -643,7 +654,7 @@ class CapabilityManager:
             return CapabilityActionResult(False, name, action, "Unknown capability.")
 
         config = self._get_or_create_config(definition)
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         provider_method_name = "check_in_managed_asset" if library_status == "checked_in" else "check_out_managed_asset"
         action = "check-in-asset" if library_status == "checked_in" else "check-out-asset"
         if provider is None or not hasattr(provider, provider_method_name):
@@ -658,7 +669,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action=action,
                 message="Knowledge asset library action failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
@@ -668,11 +679,11 @@ class CapabilityManager:
                 capability=definition.name,
                 action=action,
                 message="Knowledge asset was not found.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details=details,
             )
 
-        if auto_reindex and config.installed and details.get("changed"):
+        if auto_reindex and config.installed and details.get("changed") and not self._uses_discovery_workspace(discovery_dir):
             self._sync_health_state(definition, config)
 
         state_label = "checked in" if library_status == "checked_in" else "checked out"
@@ -688,11 +699,11 @@ class CapabilityManager:
             capability=definition.name,
             action=action,
             message=message,
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=details,
         )
 
-    def build_rag_context_preview(self, name: str, query: str, max_chunks: int = 4) -> CapabilityActionResult:
+    def build_rag_context_preview(self, name: str, query: str, max_chunks: int = 4, *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "build-context", "Unknown capability.")
@@ -705,7 +716,7 @@ class CapabilityManager:
         if not config.enabled:
             return self._result(definition.name, "build-context", False, "Enable the capability before building RAG context previews.")
 
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "build_context_preview"):
             return self._result(definition.name, "build-context", False, "Capability does not expose context preview generation.")
 
@@ -717,7 +728,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="build-context",
                 message="RAG context preview generation failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
@@ -726,7 +737,7 @@ class CapabilityManager:
             capability=definition.name,
             action="build-context",
             message=details.get("message") or "RAG context preview generated.",
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=details,
         )
 
@@ -736,13 +747,14 @@ class CapabilityManager:
         query: str,
         status: str,
         feedback: Optional[Dict[str, Any]] = None,
+        *, discovery_dir: Optional[Path] = None,
     ) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "record-feedback", "Unknown capability.")
 
         config = self._get_or_create_config(definition)
-        provider = self._get_rag_provider(definition, config)
+        provider = self._get_rag_provider(definition, config, discovery_dir)
         if provider is None or not hasattr(provider, "record_spl_query_feedback"):
             return self._result(definition.name, "record-feedback", False, "Capability does not expose SPL query feedback updates.")
 
@@ -754,7 +766,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="record-feedback",
                 message="SPL query feedback update failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
@@ -764,7 +776,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="record-feedback",
                 message="No matching SPL library asset was found for feedback.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details=details,
             )
 
@@ -773,7 +785,7 @@ class CapabilityManager:
             capability=definition.name,
             action="record-feedback",
             message="SPL query feedback recorded.",
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details=details,
         )
 
@@ -867,7 +879,7 @@ class CapabilityManager:
             details={"visualization": visualization},
         )
 
-    def build_export(self, name: str, payload: Dict[str, Any]) -> CapabilityActionResult:
+    def build_export(self, name: str, payload: Dict[str, Any], *, discovery_dir: Optional[Path] = None) -> CapabilityActionResult:
         definition = self.registry.get_definition(name)
         if definition is None:
             return CapabilityActionResult(False, name, "build", "Unknown capability.")
@@ -880,7 +892,7 @@ class CapabilityManager:
         if not config.enabled:
             return self._result(definition.name, "build", False, "Enable the capability before generating report packages.")
 
-        provider = self._get_export_provider(definition, config)
+        provider = self._get_export_provider(definition, config, discovery_dir)
         if provider is None:
             return self._result(definition.name, "build", False, "Capability does not support report package generation.")
 
@@ -892,7 +904,7 @@ class CapabilityManager:
                 capability=definition.name,
                 action="build",
                 message="Report package generation failed.",
-                state=self.get_capability_state(definition.name),
+                state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
                 details={"error": str(exc)},
             )
 
@@ -901,7 +913,7 @@ class CapabilityManager:
             capability=definition.name,
             action="build",
             message="Report package generated.",
-            state=self.get_capability_state(definition.name),
+            state=self.get_capability_state(definition.name, discovery_dir=discovery_dir),
             details={"export": export_payload},
         )
 
@@ -919,10 +931,14 @@ class CapabilityManager:
             config = self._get_or_create_config(definition)
             if not definition.runtime_available or not config.installed or not config.enabled or config.restart_required:
                 continue
-            provider = self._get_rag_provider(definition, config)
+            provider = self._get_rag_provider(definition, config, discovery_dir)
             if provider is None:
                 continue
-            result = provider.get_context(user_message=user_message, max_chunks=max_chunks, discovery_dir=discovery_dir)
+            result = provider.get_context(
+                user_message=user_message,
+                max_chunks=max_chunks,
+                discovery_dir=None if self._uses_discovery_workspace(discovery_dir) else discovery_dir,
+            )
             if result.get("context_text"):
                 return result
         return {
@@ -1420,7 +1436,7 @@ class CapabilityManager:
             },
         ]
 
-    def _extra_capability_state(self, definition: CapabilityDefinition, config: CapabilityConfig) -> Dict[str, Any]:
+    def _extra_capability_state(self, definition: CapabilityDefinition, config: CapabilityConfig, discovery_dir: Optional[Path] = None) -> Dict[str, Any]:
         if definition.name == "m26_14_advisor":
             summary = build_capability_state_snapshot(config.config)
             summary["enabled_validation_pack_ids"] = list(
@@ -1428,7 +1444,7 @@ class CapabilityManager:
             )
             return summary
         if definition.name == "rag_chromadb":
-            provider = ChromaRAGProvider(config=config, definition=definition)
+            provider = self._get_rag_provider(definition, config, discovery_dir)
             asset_summary = provider.get_knowledge_asset_summary()
             index_summary = provider.get_index_summary()
             return {
@@ -1448,11 +1464,25 @@ class CapabilityManager:
             provider = self._get_visualization_provider(definition, config)
             return provider.get_runtime_summary() if provider is not None else {}
         if definition.name == "export_tools":
-            provider = self._get_export_provider(definition, config)
+            provider = self._get_export_provider(definition, config, discovery_dir)
             return provider.get_runtime_summary() if provider is not None else {}
         return {}
 
-    def _get_rag_provider(self, definition: CapabilityDefinition, config: CapabilityConfig):
+    @staticmethod
+    def _uses_discovery_workspace(discovery_dir: Optional[Path]) -> bool:
+        return discovery_dir is not None and Path(discovery_dir).parent == Path("output/scopes")
+
+    def _get_rag_provider(
+        self, definition: CapabilityDefinition, config: CapabilityConfig, discovery_dir: Optional[Path] = None
+    ):
+        if self._uses_discovery_workspace(discovery_dir):
+            folder = Path(discovery_dir)
+            config = replace(config, config={
+                **config.config,
+                "source_dir": str(folder),
+                "asset_dir": str(folder / "rag" / "assets"),
+                "storage_dir": str(folder / "rag" / "chromadb"),
+            })
         if definition.name == "rag_local":
             return LightweightRAGProvider(config=config, definition=definition)
         if definition.name == "rag_chromadb":
@@ -1475,9 +1505,18 @@ class CapabilityManager:
             return None
         return VisualizationPreviewProvider(config=config, definition=definition)
 
-    def _get_export_provider(self, definition: CapabilityDefinition, config: CapabilityConfig):
+    def _get_export_provider(
+        self, definition: CapabilityDefinition, config: CapabilityConfig, discovery_dir: Optional[Path] = None
+    ):
         if definition.name != "export_tools":
             return None
+        if self._uses_discovery_workspace(discovery_dir):
+            folder = Path(discovery_dir)
+            config = replace(config, config={
+                **config.config,
+                "source_dir": str(folder),
+                "export_dir": str(folder / "exports"),
+            })
         return DeterministicExportProvider(config=config, definition=definition)
 
     def _sync_health_state(

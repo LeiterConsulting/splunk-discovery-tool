@@ -7,28 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The v3 development baseline is Factory's dashboard integration commit on top of the 2.3.0 release. The Discovery client has local regression coverage. Live dashboard creation depends on the Constellation MCP pilot and its joint qualification. [Factory commit](https://github.com/LeiterConsulting/splunk-discovery-tool/commit/aff54a8c0cec88185ac6f24415afa804ddd1fb5e) · [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md)
+### Planned
+- Adaptive discovery with context-aware MCP calls and early stopping.
+- Iterative summarization with quality checks.
+
+## [3.0.0] - 2026-11-23
+
+Splunk Discovery Tool 3.0.0 ties the workspace to the active Splunk MCP connection and adds optional dashboard authoring from chat and reports through Constellation.
+
+### Upgrading from 2.3.0
+
+- Pull the new source in your install folder and run `./install.sh --restart` on macOS or Linux, or `.\install.ps1 -Restart` on Windows. Back up the encrypted configuration, its key, and `output/` as part of the upgrade.
+- In **Settings > Connections**, use **Load** to switch to a saved MCP profile. **Save Settings** applies MCP edits to the loaded profile. When saving another profile, choose **Use this connection for my account after saving** to select it immediately.
+- Prior Discovery artifacts stay in their existing directories. A workspace for a newly selected endpoint or profile may start with an empty Report Library. Run Discovery there to build its reports and Knowledge Base.
+- Dashboard creation is optional. Install a compatible Constellation build on each Splunk server where you want to create dashboards. The lab verification used [Constellation 1.1.0-preview.2](https://github.com/LeiterConsulting/constellation/releases/tag/v1.1.0-preview.2). Follow the [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md) to register the tools and configure authoring.
 
 ### Added
-- **Splunk Dashboards** (optional capability): creates Splunk Dashboard Studio dashboards through [Constellation](https://github.com/LeiterConsulting/constellation/releases), a Splunk app that adds two dashboard tools to [Splunk MCP Server](https://splunkbase.splunk.com/app/7931). Ask in chat ("Create a dashboard that tracks failed logins in index main") or select **Create Dashboard** on a report. The app's AI model drafts a plan with a data source, time range, pages, and panels, and a card shows it with the Splunk connection and Splunk user it will use. Select **Edit Plan**, **Cancel**, or **Create Dashboard**. Nothing goes to Splunk until you select **Create Dashboard**
-- After you create a dashboard, the card follows its progress and ends with **Open Dashboard** and **Edit in Constellation** links, a Constellation draft, a question from Constellation, or the reason it failed. When Splunk cannot confirm the result, **Check Status** asks again, and the app never sends a second request it cannot prove is the same one. The Capabilities tab lists your recent dashboards
-- **Potential capability**: the app reads each connection's MCP tool list. When the dashboard tools are missing, the Capabilities tab shows Splunk Dashboards as a potential capability, explains that Constellation must be installed in that Splunk environment, and links to Constellation and Splunk MCP Server. A connection whose tools take other arguments shows **Unsupported version**
-- Admins can see the state of every saved connection and enter each one's Splunk Web address under **Splunk connections and Splunk Web addresses**. Dashboard links are shown only when they point to that address and to the dashboard that was created
-- With sign-in on, admins and analysts create dashboards only through their own assigned MCP connection, with no fallback to the shared connection, because Splunk creates each dashboard as the connection's Splunk user. Dashboards cannot be created while incognito mode is on, because Constellation sends the plan to its own AI model with the real names. Receipts, links, and Splunk user names never go to the AI model or the server log
-- API: `GET /api/dashboards/status`, `POST /api/dashboards/propose`, `POST /api/dashboards/create`, `GET /api/dashboards/operations`, `GET /api/dashboards/operations/{request_id}`, `POST /api/dashboards/operations/{request_id}/check`, and the admin route `GET /api/capabilities/{name}/connections`. See [docs/SPLUNK_DASHBOARDS.md](docs/SPLUNK_DASHBOARDS.md)
-- Regression suites: `tests/test_dashboards.py`, `tests/test_dashboard_routes.py`, and `tools/test_dashboards_browser.mjs` (`npm run test:dashboards-browser`, also run in CI)
+
+- Draft a dashboard from the current chat or a Discovery report. Review the source, time range, and ordered panel outline before Create. Discovery checks explicit panel counts and keeps the requested outline on one page when it fits.
+- On connections that offer source inspection, view a bounded sample's coverage and observed fields. Discovery passes the inspected SPL unchanged through Create and asks for a fresh inspection after a source or time-range edit. **Suggest panels** offers a reviewable revision from observed fields.
+- Constellation creates a private Dashboard Studio view and editable draft as the authenticated Splunk user. Discovery follows the receipt, offers specific recovery actions when available, and gives links to both artifacts. **Check Status** checks the original request when Splunk cannot confirm a save.
+- The Capabilities tab checks dashboard support and authoring on the active connection. Admins can check each saved connection and configure its verified Splunk Web address.
 
 ### Changed
-- With sign-in on, only admins can install, turn on, turn off, remove, test, reindex, or configure capabilities. Other signed-in users still see each capability's status, and the Capabilities tab tells them to ask an administrator. With sign-in off, nothing changes
+
+- The active MCP connection selects the Report Library, Discovery evidence, Knowledge Base, environment memory, and chat context. The header and libraries identify the profile and server. Profile switches refresh the active workspace automatically.
+- With sign-in enabled, admins manage optional capabilities. Admins and analysts can create dashboards through their assigned MCP connection when Constellation authorizes that Splunk identity.
+- A dashboard plan uses scoped Knowledge Base passages when **Search the Knowledge Base** is on. Discovery's bundled dashboard design guidance informs the first plan and panel revisions.
 
 ### Fixed
-- The Splunk Dashboards card distinguishes a missing Splunk connection from an unchecked tool list. Users see guidance based on their role and whether they have an assigned connection.
-- Dashboard plans use the current chat's visible turns before server-side conversation history is available. Discovery retries an incomplete plan once with the original chat or report context.
 
-### Planned
-- **Adaptive discovery**: AI-driven discovery planning, context-aware MCP call selection, early stopping, and anomaly deep-dives
-- **Iterative summarization**: multi-pass analysis with quality gates, gap detection and filling, and self-assessment
-- **Unified agentic framework**: a shared agent loop, common quality assessment, and unified error handling
+- Loading, editing, and saving a named MCP profile keep the settings editor, active server badge, and workspace in sync. Saving account-scoped MCP edits keeps the shared default on its own profile.
+- The Report Library refreshes when a worker completes through a polled status update.
+- Dashboard planning uses the visible chat before server conversation history is available. It retries incomplete outlines and gives a specific recovery path for source, panel, provider, and save-status issues when Constellation reports them.
 
 ## [2.3.0] - 2026-11-20
 
@@ -722,7 +733,8 @@ Required configuration:
 
 ---
 
-[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/LeiterConsulting/splunk-discovery-tool/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v3.0.0
 [2.3.0]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.3.0
 [2.2.3]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.3
 [2.2.2]: https://github.com/LeiterConsulting/splunk-discovery-tool/releases/tag/v2.2.2

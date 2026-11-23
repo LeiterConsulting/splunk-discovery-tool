@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -292,6 +292,135 @@ async function main() {
             await profileCard(page, name).waitFor({ state: 'detached', timeout: 10000 });
             const saved = await getJson(baseUrl, '/api/mcp-configs');
             assert(!Object.prototype.hasOwnProperty.call(saved, name), `Delete should remove "${name}".`);
+        }
+
+        // Keep the library open while another client changes the effective endpoint.
+        const output = path.join(tempDir, 'output');
+        const sessions = [];
+        const activate = async (name, url) => {
+            const response = await fetch(new URL('/api/mcp-configs', baseUrl), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, url, token: SECOND_TOKEN, activate: true }),
+            });
+            assert(response.ok, `Could not activate ${name}: HTTP ${response.status}`);
+            return (await getJson(baseUrl, '/connection-info')).workspace;
+        };
+        const addReport = async (workspace, timestamp, title) => {
+            const dir = path.join(output, 'scopes', Buffer.from(workspace.scope_key).toString('base64url'));
+            const name = `v2_operator_runbook_${timestamp}.md`;
+            await mkdir(dir, { recursive: true });
+            await writeFile(path.join(dir, name), `# ${title}\n`);
+            sessions.push({ ...workspace, timestamp, created_at: new Date().toISOString(), report_paths: [name] });
+            const manifest = path.join(output, 'discovery_sessions.json');
+            await writeFile(`${manifest}.tmp`, JSON.stringify(sessions));
+            await rename(`${manifest}.tmp`, manifest);
+            return name;
+        };
+        const secondPort = await findFreePort();
+        const secondUrl = `http://127.0.0.1:${secondPort}/services/mcp`;
+        const secondMcp = await startFakeMcpServer(secondPort);
+        try {
+            const alpha = await activate('Workspace Alpha', mcpUrl);
+            const alphaReport = await addReport(alpha, '20260523_010203', 'Workspace Alpha report');
+            const beta = await activate('Workspace Beta', secondUrl);
+            const betaReport = await addReport(beta, '20260523_010204', 'Workspace Beta report');
+            assert(alpha.scope_key !== beta.scope_key, 'Different MCP endpoints must have different workspaces.');
+            await activate('Workspace Alpha', mcpUrl);
+            await getJson(baseUrl, `/reports/${alphaReport}`);
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            const workspaceSplash = page.locator('[data-testid="welcome-splash-modal"]');
+            await workspaceSplash.getByRole('button', { name: 'Get Started' }).click();
+            const workspaceBadge = page.getByTestId('active-mcp-workspace');
+            await workspaceBadge.filter({ hasText: alpha.scope_label }).waitFor();
+            await page.getByTestId('workspace-tab-discovery').click({ force: true });
+            const alphaRow = page.getByTestId('discovery-report-row').filter({ hasText: alphaReport });
+            await alphaRow.first().waitFor({ state: 'visible' });
+            const reportOpened = page.waitForResponse((response) => response.url().endsWith(`/reports/${alphaReport}`), { timeout: 10000 });
+            await alphaRow.first().press('Enter');
+            const reportResponse = await reportOpened;
+            assert(reportResponse.ok(), `Alpha report returned HTTP ${reportResponse.status()}: ${await reportResponse.text()}`);
+            await page.getByTestId('report-viewer-title').waitFor({ state: 'visible', timeout: 10000 });
+
+            await activate('Workspace Beta', secondUrl);
+            await workspaceBadge.filter({ hasText: beta.scope_label }).waitFor();
+            await page.getByTestId('report-library-workspace').filter({ hasText: beta.scope_label }).waitFor();
+            await page.getByTestId('discovery-report-row').filter({ hasText: betaReport }).first().waitFor({ state: 'visible' });
+            assert(await alphaRow.count() === 0, 'Switching the endpoint should remove the Alpha report.');
+            assert(await page.getByTestId('report-viewer-title').count() === 0, 'The old report viewer should close.');
+
+            // A worker may update only the polled runtime snapshot when it finishes.
+            const finishedTimestamp = '20260523_010205';
+            const finishedReport = await addReport(beta, finishedTimestamp, 'Completed worker report');
+            await page.route('**/api/discovery/status', (route) => route.fulfill({
+                json: { status: 'completed', result_timestamp: finishedTimestamp, report_count: 1 },
+            }));
+            const finishedRow = page.getByTestId('discovery-report-row').filter({ hasText: finishedReport });
+            await finishedRow.first().waitFor({ state: 'visible', timeout: 15000 });
+            await page.unroute('**/api/discovery/status');
+
+            await page.getByTestId('workspace-tab-knowledge-base').click({ force: true });
+            await page.getByTestId('knowledge-base-workspace').filter({ hasText: beta.scope_label }).waitFor();
+            await activate('Workspace Alpha', mcpUrl);
+            await page.getByTestId('knowledge-base-workspace').filter({ hasText: alpha.scope_label }).waitFor();
+            // Reproduce the signed-in mismatch between the shared default and an account assignment.
+            const enableAuth = await page.request.post(new URL('/api/config', baseUrl).href, {
+                data: { security: { auth_enabled: true, password_min_length: 14 } },
+            });
+            assert(enableAuth.ok(), 'Could not enable sign-in in the test app.');
+            const login = await page.request.post(new URL('/api/auth/login', baseUrl).href, {
+                data: { username: 'admin', password: 'password' },
+            });
+            assert(login.ok(), 'Could not sign in to the test app.');
+            const reset = await page.request.post(new URL('/api/auth/reset-password', baseUrl).href, {
+                data: { current_password: 'password', new_password: 'BetterPassword123!', confirm_password: 'BetterPassword123!' },
+            });
+            assert(reset.ok(), 'Could not reset the test password.');
+            const auth = await (await page.request.get(new URL('/api/auth/status', baseUrl).href)).json();
+            const assign = await page.request.patch(new URL(`/api/security/users/${auth.user.id}`, baseUrl).href, {
+                data: { mcp_config_name: 'Workspace Alpha' },
+            });
+            assert(assign.ok(), 'Could not seed the previous MCP assignment.');
+
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await workspaceSplash.getByRole('button', { name: 'Get Started' }).click();
+            await workspaceBadge.filter({ hasText: alpha.scope_label }).waitFor();
+            await page.getByRole('button', { name: 'Open settings' }).click();
+            await profileCard(page, 'Workspace Beta').locator('button', { hasText: /^\s*Load\s*$/ }).click();
+            await workspaceBadge.filter({ hasText: beta.scope_label }).waitFor();
+            await page.getByTestId('settings-effective-mcp').filter({ hasText: 'Workspace Beta' }).waitFor();
+            await profileCard(page, 'Workspace Beta').getByTestId('active-mcp-profile').waitFor();
+            assert(await profileCard(page, 'Workspace Alpha').getByTestId('active-mcp-profile').count() === 0,
+                'The shared default should no longer be marked active for this account.');
+            await page.waitForFunction((url) => document.querySelector('#mcp-url')?.value === url, secondUrl);
+
+            await buttonWithText(page, 'Save as New').click();
+            const saveDialog = page.getByRole('dialog', { name: 'Save MCP Configuration' });
+            await saveDialog.getByLabel('Use this connection for my account after saving').check();
+            await saveProfileFromForm(page, 'Personal Beta', { expectPreviewUrl: secondUrl, expectPreviewToken: 'Use current token' });
+            await workspaceBadge.filter({ hasText: 'Personal Beta' }).waitFor();
+            await page.getByTestId('settings-effective-mcp').filter({ hasText: 'Personal Beta' }).waitFor();
+            const savedConfig = await (await page.request.get(new URL('/api/config', baseUrl).href)).json();
+            assert(savedConfig.active_mcp_config_name === 'Workspace Alpha', 'Selecting a personal connection should preserve the shared default.');
+            assert(savedConfig.effective_mcp.url === secondUrl, 'The selected connection must point to the second MCP endpoint.');
+
+            // The footer Save updates the form's active profile, not the shared MCP default.
+            const revisedUrl = secondUrl.replace('127.0.0.1', 'localhost');
+            await page.locator('#mcp-url').fill(revisedUrl);
+            await page.getByRole('button', { name: 'Save Settings', exact: true }).click();
+            await workspaceBadge.filter({ hasText: `Personal Beta · localhost:${secondPort}` }).waitFor();
+            const notice = alerts.indexOf('Settings saved successfully!');
+            assert(notice >= 0, 'The footer should confirm the save.');
+            alerts.splice(notice, 1);
+            const afterSave = await (await page.request.get(new URL('/api/config', baseUrl).href)).json();
+            assert(afterSave.effective_mcp.url === revisedUrl && afterSave.mcp.url === mcpUrl,
+                'The edit must apply to the selected profile and preserve the default endpoint.');
+            await page.getByRole('button', { name: 'Open settings' }).click();
+            await profileCard(page, 'Workspace Alpha').locator('button', { hasText: /^\s*Load\s*$/ }).click();
+            await workspaceBadge.filter({ hasText: alpha.scope_label }).waitFor();
+            await profileCard(page, 'Workspace Alpha').getByTestId('active-mcp-profile').waitFor();
+        } finally {
+            await new Promise((resolve) => secondMcp.server.close(() => resolve()));
         }
 
         assert(pageErrors.length === 0, `Page errors: ${pageErrors.join(' | ')}`);

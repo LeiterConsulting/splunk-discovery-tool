@@ -124,11 +124,16 @@ class ConfigManagerProfileTests(unittest.TestCase):
         self.assertEqual(reloaded.get_credential("openai-copy").api_key, "sk-active")
         self.assertEqual(reloaded.get_credential("local").api_key, "")
 
-    def test_save_failure_records_reason(self):
+    def test_save_failure_records_reason_without_changing_the_current_connection(self):
+        self.assertTrue(self.manager.save_mcp_config("old", "https://old.example.com/mcp", "old-token", activate=True))
+        self.assertTrue(self.manager.save_mcp_config("lab", "https://lab.example.com/mcp", "lab-token"))
         self.manager.config_path = self.temp_path / "missing-dir" / "config.encrypted"
 
-        self.assertFalse(self.manager.save_mcp_config("prod", "https://prod.example.com/mcp", "token"))
+        self.assertFalse(self.manager.save_mcp_config("prod", "https://prod.example.com/mcp", "token", activate=True))
         self.assertIn("FileNotFoundError", self.manager.last_save_error or "")
+        self.assertIsNone(self.manager.get_mcp_config("prod"))
+        self.assertFalse(self.manager.load_mcp_config("lab"))
+        self.assertEqual(self.manager.get().active_mcp_config_name, "old")
 
     def test_save_leaves_no_temp_files(self):
         self.assertTrue(self.manager.save_mcp_config("prod", "https://prod.example.com/mcp", "token"))
@@ -238,6 +243,70 @@ class SettingsProfileApiTests(unittest.TestCase):
                 deleted = self.client.delete(_profile_path(name))
                 self.assertEqual(deleted.status_code, 200, deleted.text)
                 self.assertIsNone(self.config_manager.get_mcp_config(name))
+
+    def test_account_load_and_save_use_the_effective_profile(self):
+        shared_url = "https://shared.example.test/services/mcp"
+        lab_url = "https://lab.example.test/services/mcp"
+        self._save(name="Shared", url=shared_url, token="shared-token", activate=True)
+        self._save(name="Lab", url=lab_url, token="lab-token", activate=False)
+        self.assertTrue(self.config_manager.update_security(auth_enabled=True, password_min_length=14))
+        login = self.client.post("/api/auth/login", json={"username": "admin", "password": "password"})
+        self.assertEqual(login.status_code, 200, login.text)
+        reset = self.client.post("/api/auth/reset-password", json={
+            "current_password": "password", "new_password": "BetterPassword123!", "confirm_password": "BetterPassword123!",
+        })
+        self.assertEqual(reset.status_code, 200, reset.text)
+        user_id = self.client.get("/api/auth/status").json()["user"]["id"]
+        self.security_manager.update_user(user_id, mcp_config_name="Shared")
+        analyst = self.security_manager.create_user(
+            username="analyst", password="AnalystPassword123!", role="analyst",
+            require_password_reset=False, mcp_config_name="Shared",
+        )
+
+        loaded = self.client.post(_profile_path("Lab", "/load?target=current"))
+        self.assertEqual(loaded.status_code, 200, loaded.text)
+        self.assertEqual(loaded.json()["effective_mcp"]["token"], MASKED_SECRET)
+        self.assertEqual(loaded.json()["connection_info"], self.client.get("/connection-info").json())
+        self.assertEqual(self.client.get("/connection-info").json()["mcp"]["endpoint"], lab_url)
+        self.assertEqual(self.client.get("/api/config").json()["effective_mcp"]["url"], lab_url)
+        self.assertEqual(self.config_manager.get().active_mcp_config_name, "Shared")
+        self.assertEqual(self.security_manager.get_user_by_id(analyst["id"])["mcp_config_name"], "Shared")
+
+        copied = self._save(name="Lab Copy", url=lab_url, target="current", activate=False)
+        self.assertEqual(copied.status_code, 200, copied.text)
+        self.assertEqual(copied.json()["effective_mcp"]["name"], "Lab")
+        self.assertEqual(self.config_manager.get_mcp_config("Lab Copy").token, "lab-token")
+
+        selected = self._save(name="Lab Copy", url=lab_url, target="current", activate=True)
+        self.assertEqual(selected.status_code, 200, selected.text)
+        self.assertEqual(selected.json()["effective_mcp"]["name"], "Lab Copy")
+        self.assertEqual(self.client.get("/connection-info").json()["mcp"]["profile_name"], "Lab Copy")
+        self.assertEqual(self.security_manager.get_user_by_id(user_id)["mcp_config_name"], "Lab Copy")
+        self.assertEqual(self.config_manager.get().active_mcp_config_name, "Shared")
+
+        edited_url = "https://lab.example.test/new/mcp"
+        edited = self.client.post("/api/config", json={
+            "mcp_profile": {"name": "Lab Copy", "url": edited_url, "verify_ssl": True},
+        })
+        self.assertEqual(edited.status_code, 200, edited.text)
+        self.assertEqual(edited.json()["connection_info"]["mcp"]["endpoint"], edited_url)
+        self.assertEqual(self.client.get("/connection-info").json(), edited.json()["connection_info"])
+        self.assertEqual(self.config_manager.get_mcp_config("Lab Copy").token, "lab-token")
+        self.assertTrue(self.config_manager.get_mcp_config("Lab Copy").verify_ssl)
+        self.assertEqual(self.config_manager.get().mcp.url, shared_url)
+        self.assertEqual(self.config_manager.get().mcp.token, "shared-token")
+
+        stale = self.client.post("/api/config", json={
+            "mcp_profile": {"name": "Lab", "url": shared_url},
+        })
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(self.config_manager.get_mcp_config("Lab").url, lab_url)
+
+        with TestClient(web_app.app) as other:
+            login = other.post("/api/auth/login", json={"username": "analyst", "password": "AnalystPassword123!"})
+            self.assertEqual(login.status_code, 200, login.text)
+            self.assertEqual(other.post(_profile_path("Lab", "/load?target=current")).status_code, 403)
+            self.assertEqual(other.get("/connection-info").json()["mcp"]["endpoint"], shared_url)
 
     def test_connection_test_resolves_masked_token_from_profile(self):
         self._save(name="Prod Splunk", url="https://prod.example.com/mcp", token="prod-token")

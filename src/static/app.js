@@ -462,6 +462,7 @@
       brief,
       problems: sanitizeDashboardProblems(proposal.problems),
       notes: (Array.isArray(proposal.notes) ? proposal.notes : []).filter((note) => typeof note === "string" && note.trim()).slice(0, 6).map((note) => note.slice(0, 400)),
+      source_inspection_available: proposal.source_inspection_available === true,
       drafted_by: proposal.drafted_by === "ai" ? "ai" : "starter",
       created_at: dashboardString(proposal.created_at, 40),
       connection_label: dashboardString(proposal.connection_label, 200),
@@ -476,6 +477,7 @@
     }
     const receipt = operation.receipt && typeof operation.receipt === "object" ? operation.receipt : null;
     const error = operation.error && typeof operation.error === "object" ? operation.error : null;
+    const recovery = operation.recovery;
     return {
       request_id: operation.request_id.slice(0, 80),
       proposal_id: dashboardString(operation.proposal_id, 64),
@@ -494,6 +496,11 @@
       } : null,
       code_message: dashboardString(operation.code_message, 400),
       error: error ? { code: dashboardString(error.code, 64), message: dashboardString(error.message, 400) } : null,
+      recovery: ["source", "panels", "settings", "retry"].includes(recovery == null ? void 0 : recovery.focus) ? {
+        focus: recovery.focus,
+        heading: dashboardString(recovery.heading, 120),
+        message: dashboardString(recovery.message, 400)
+      } : null,
       check_note: dashboardString(operation.check_note, 400),
       brief: sanitizeDashboardBrief(operation.brief),
       connection_label: dashboardString(operation.connection_label, 200),
@@ -524,17 +531,179 @@
     const parsed = value ? new Date(value) : null;
     return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString(void 0, { dateStyle: "medium", timeStyle: "short" }) : "";
   };
-  function DashboardPlanCard({ proposal, operation = null, dismissed = false, isDarkTheme, headingClass, subtextClass, mutedTextClass, incognitoActive = false, testIdPrefix = "dashboard-plan", onChange }) {
-    var _a, _b;
+  function useDashboardSourceOptions(bindingKey, index, earliest, refresh, enabled = true) {
+    const [result, setResult] = useState(null);
+    const key = JSON.stringify([bindingKey, index, earliest, refresh]);
+    useEffect(() => {
+      if (!enabled) {
+        return void 0;
+      }
+      const controller = new AbortController();
+      const load = async () => {
+        const empty = { key, options: [], loading: false };
+        try {
+          const response = await fetch("/api/dashboards/source-options", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ binding_key: bindingKey, index, earliest }),
+            signal: controller.signal
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!controller.signal.aborted) {
+            if (response.ok && Array.isArray(data.options)) {
+              const options = data.options.filter((option) => typeof option === "string");
+              setResult({ ...empty, options, error: "" });
+            } else {
+              setResult({ ...empty, error: dashboardApiError(data, "Could not load Splunk data options.") });
+            }
+          }
+        } catch {
+          if (!controller.signal.aborted) {
+            setResult({ ...empty, error: "Could not load Splunk data options." });
+          }
+        }
+      };
+      load();
+      return () => controller.abort();
+    }, [key, enabled]);
+    if (enabled && (result == null ? void 0 : result.key) === key) {
+      return result;
+    }
+    return { options: [], loading: enabled, error: "" };
+  }
+  function DashboardSourcePicker({ bindingKey, source, earliest, onIndex, onSourcetype, onRange, prefix, inputClass, labelClass, subtextClass, buttonClass }) {
+    const [refresh, setRefresh] = useState(0);
+    const canLoadTypes = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}$/.test(source.index) && DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === earliest);
+    const indexes = useDashboardSourceOptions(bindingKey, "", "", refresh);
+    const types = useDashboardSourceOptions(bindingKey, source.index, earliest, refresh, canLoadTypes);
+    const error = indexes.error || types.error;
+    return /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-2", "data-testid": `${prefix}-source-picker` }, /* @__PURE__ */ React.createElement("div", { className: "grid gap-3 sm:grid-cols-2 lg:grid-cols-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: `${prefix}-browse-index`, className: labelClass }, "Index"), /* @__PURE__ */ React.createElement("select", { id: `${prefix}-browse-index`, className: `mt-1 ${inputClass}`, value: source.index, onChange: (event) => onIndex(event.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, indexes.loading ? "Loading indexes…" : "Choose an index"), source.index && !indexes.options.includes(source.index) && /* @__PURE__ */ React.createElement("option", { value: source.index }, source.index), indexes.options.map((name) => /* @__PURE__ */ React.createElement("option", { key: name, value: name }, name)))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: `${prefix}-browse-range`, className: labelClass }, "Time range"), /* @__PURE__ */ React.createElement("select", { id: `${prefix}-browse-range`, className: `mt-1 ${inputClass}`, value: earliest, onChange: (event) => onRange(event.target.value) }, !DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === earliest) && /* @__PURE__ */ React.createElement("option", { value: earliest }, "Pick a time range"), DASHBOARD_TIME_RANGE_OPTIONS.map((option) => /* @__PURE__ */ React.createElement("option", { key: option.value, value: option.value }, option.label)))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: `${prefix}-browse-sourcetype`, className: labelClass }, "Sourcetype"), /* @__PURE__ */ React.createElement("select", { id: `${prefix}-browse-sourcetype`, className: `mt-1 ${inputClass}`, value: source.sourcetype, onChange: (event) => onSourcetype(event.target.value), disabled: !canLoadTypes }, /* @__PURE__ */ React.createElement("option", { value: "" }, "All sourcetypes"), source.sourcetype && !types.options.includes(source.sourcetype) && /* @__PURE__ */ React.createElement("option", { value: source.sourcetype }, source.sourcetype), types.options.map((name) => /* @__PURE__ */ React.createElement("option", { key: name, value: name }, name))))), /* @__PURE__ */ React.createElement("div", { role: "status", className: `flex flex-wrap items-center gap-2 text-xs ${subtextClass}` }, error ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("span", null, error), /* @__PURE__ */ React.createElement("button", { type: "button", className: buttonClass, onClick: () => setRefresh((current) => current + 1) }, "Try Again")) : types.loading ? "Looking up sourcetypes in this time range…" : canLoadTypes ? types.options.length ? "Sourcetype options reflect this index and time range." : "Splunk returned no sourcetypes for this range." : !indexes.loading && !indexes.options.length ? "Splunk returned no index options. You can enter an index in Edit Plan." : ""));
+  }
+  function DashboardSourceInspection({ bindingKey, brief, connectionRevision, testIdPrefix, labelClass, subtextClass, buttonClass, onApply, onInspectedSearch, inspectAvailable, repairRequestId }) {
+    const [run, setRun] = useState(0);
+    const [reviewedConnection, setReviewedConnection] = useState(null);
+    const [result, setResult] = useState(null);
+    const [suggestion, setSuggestion] = useState(null);
+    const suggestionRequest = useRef(null);
+    const isSearch = brief.source.kind === "spl";
+    const ready = inspectAvailable && (!isSearch || run > 0 && reviewedConnection === connectionRevision);
+    const scopeKey = JSON.stringify({ source: brief.source, time_range: brief.time_range });
+    const planKey = JSON.stringify(brief);
+    const activeProfile = (result == null ? void 0 : result.connectionRevision) === connectionRevision && (result == null ? void 0 : result.run) === run ? result : null;
+    const activeSuggestion = (suggestion == null ? void 0 : suggestion.connectionRevision) === connectionRevision && (suggestion == null ? void 0 : suggestion.planKey) === planKey && (suggestion == null ? void 0 : suggestion.run) === run ? suggestion : null;
+    useEffect(() => {
+      if (!ready) {
+        return void 0;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(async () => {
+        var _a, _b;
+        const current = { connectionRevision, run };
+        try {
+          const response = await fetch("/api/dashboards/inspect-source", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              binding_key: bindingKey,
+              scope: JSON.parse(scopeKey),
+              reviewed_search: isSearch,
+              refresh: run > 1 || !isSearch && run > 0
+            }),
+            signal: controller.signal
+          });
+          const data = await response.json().catch(() => ({}));
+          if (controller.signal.aborted) {
+            return;
+          }
+          if (response.ok && (data == null ? void 0 : data.profile)) {
+            setResult({ ...current, profile: data.profile });
+            if (isSearch && data.profile.status === "observed" && ((_b = (_a = data.scope) == null ? void 0 : _a.source) == null ? void 0 : _b.kind) === "spl") {
+              onInspectedSearch(data.scope);
+            }
+          } else {
+            setResult({ ...current, error: dashboardApiError(data, "Source inspection is unavailable.") });
+          }
+        } catch {
+          if (!controller.signal.aborted) {
+            setResult({ ...current, error: "Source inspection is unavailable." });
+          }
+        }
+      }, isSearch ? 0 : 400);
+      return () => {
+        clearTimeout(timer);
+        controller.abort();
+      };
+    }, [bindingKey, scopeKey, connectionRevision, ready, isSearch, run]);
+    useEffect(() => () => {
+      var _a;
+      return (_a = suggestionRequest.current) == null ? void 0 : _a.abort();
+    }, [connectionRevision, planKey, run]);
+    const suggestPanels = async () => {
+      var _a, _b;
+      (_a = suggestionRequest.current) == null ? void 0 : _a.abort();
+      const controller = new AbortController();
+      suggestionRequest.current = controller;
+      const current = { connectionRevision, planKey, run };
+      setSuggestion({ ...current, loading: true });
+      try {
+        const response = await fetch("/api/dashboards/suggest-panels", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ binding_key: bindingKey, brief, repair_request_id: repairRequestId }),
+          signal: controller.signal
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!controller.signal.aborted) {
+          const pages = response.ok ? (_b = sanitizeDashboardBrief({ pages: data.pages })) == null ? void 0 : _b.pages : null;
+          setSuggestion((pages == null ? void 0 : pages.length) ? { ...current, pages } : { ...current, error: dashboardApiError(data, "Panel suggestions are unavailable.") });
+        }
+      } catch {
+        if (!controller.signal.aborted) {
+          setSuggestion({ ...current, error: "Panel suggestions are unavailable." });
+        }
+      }
+    };
+    const profile = activeProfile == null ? void 0 : activeProfile.profile;
+    const sample = profile == null ? void 0 : profile.sample;
+    const fields = Array.isArray(profile == null ? void 0 : profile.fields) ? profile.fields : [];
+    let coverage = "Checking sample coverage…";
+    if (activeProfile == null ? void 0 : activeProfile.error) {
+      coverage = activeProfile.error;
+    } else if ((profile == null ? void 0 : profile.status) === "observed") {
+      const grain = sample.grain === "existing_search_output" ? "search output" : "indexed observations";
+      coverage = `${sample.rows} sampled ${sample.rows === 1 ? "row" : "rows"} · ${grain}`;
+      if (sample.completion !== "complete") {
+        coverage += sample.completion === "partial" ? " · Partial coverage" : " · Completion unconfirmed";
+      }
+    } else if ((profile == null ? void 0 : profile.status) === "empty") {
+      coverage = "No rows returned for this source and time range.";
+    } else if ((profile == null ? void 0 : profile.status) === "inconclusive") {
+      coverage = "Splunk could not confirm sample coverage.";
+    } else if ((profile == null ? void 0 : profile.status) === "unavailable") {
+      coverage = "Source inspection is unavailable for this connection.";
+    }
+    return /* @__PURE__ */ React.createElement("div", { "data-testid": `${testIdPrefix}-inspection`, className: `mt-3 space-y-2 text-xs ${subtextClass}` }, inspectAvailable && !ready && /* @__PURE__ */ React.createElement("button", { type: "button", className: buttonClass, onClick: () => {
+      setReviewedConnection(connectionRevision);
+      setRun((current) => current + 1);
+    } }, "Inspect search"), ready && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { role: "status", "data-testid": `${testIdPrefix}-coverage` }, coverage), activeProfile && /* @__PURE__ */ React.createElement("button", { type: "button", className: buttonClass, onClick: () => setRun((current) => current + 1) }, "Refresh inspection")), fields.length > 0 && /* @__PURE__ */ React.createElement("details", null, /* @__PURE__ */ React.createElement("summary", { className: "cursor-pointer" }, fields.length, " observed ", fields.length === 1 ? "field" : "fields"), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 space-y-1 pl-4", "data-testid": `${testIdPrefix}-sample-fields` }, fields.map((field) => /* @__PURE__ */ React.createElement("li", { key: field.name, className: "break-words" }, /* @__PURE__ */ React.createElement("code", null, field.name), " · ", field.present, "/", sample.rows, " sampled rows", field.numeric > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, " · ", field.numeric, " numeric"), field.unit && /* @__PURE__ */ React.createElement(React.Fragment, null, " · ", field.unit, " inferred from ", field.basis.replaceAll("_", " "))))))), (fields.length > 0 || repairRequestId) && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: suggestPanels, className: buttonClass, disabled: !!(activeSuggestion == null ? void 0 : activeSuggestion.loading) }, (activeSuggestion == null ? void 0 : activeSuggestion.loading) ? "Suggesting…" : repairRequestId ? "Suggest a fix" : "Suggest panels"), /* @__PURE__ */ React.createElement("span", null, fields.length ? "Uses sampled field coverage with your configured AI model." : "Uses the saved plan and recovery guidance with your configured AI model.")), (activeSuggestion == null ? void 0 : activeSuggestion.error) && /* @__PURE__ */ React.createElement("p", { role: "alert" }, activeSuggestion.error), (activeSuggestion == null ? void 0 : activeSuggestion.pages) && /* @__PURE__ */ React.createElement("div", { className: "space-y-2", "data-testid": `${testIdPrefix}-suggested-panels` }, activeSuggestion.pages.map((page, index) => /* @__PURE__ */ React.createElement("div", { key: index }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, page.name), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc pl-4" }, page.panels.map((panel, position) => /* @__PURE__ */ React.createElement("li", { key: position }, panel))))), /* @__PURE__ */ React.createElement("button", { type: "button", className: buttonClass, onClick: () => {
+      onApply(activeSuggestion.pages);
+      setSuggestion(null);
+    } }, "Use suggested panels")));
+  }
+  function DashboardPlanCard({ proposal, operation = null, dismissed = false, isDarkTheme, headingClass, subtextClass, mutedTextClass, incognitoActive = false, connectionRevision = null, testIdPrefix = "dashboard-plan", onChange }) {
+    var _a, _b, _c;
     const [editing, setEditing] = useState(false);
+    const [showSources, setShowSources] = useState(false);
     const [retrying, setRetrying] = useState(false);
     const [draft, setDraft] = useState(() => sanitizeDashboardBrief((operation == null ? void 0 : operation.brief) || (proposal == null ? void 0 : proposal.brief)) || sanitizeDashboardBrief({}));
+    const [inspection, setInspection] = useState(null);
     const [busy, setBusy] = useState("");
     const [requestError, setRequestError] = useState("");
     const [serverProblems, setServerProblems] = useState([]);
     const [pollTick, setPollTick] = useState(0);
     const requestId = (operation == null ? void 0 : operation.request_id) || "";
     const status = (operation == null ? void 0 : operation.status) || "";
+    const recovery = operation == null ? void 0 : operation.recovery;
     const isPolling = !!(operation == null ? void 0 : operation.polling) && !dismissed;
     const notify = (patch) => {
       if (typeof onChange === "function") {
@@ -564,7 +733,8 @@
       };
     }, [requestId, isPolling, pollTick]);
     useEffect(() => {
-      if (!requestId || (operation == null ? void 0 : operation.polling) || (operation == null ? void 0 : operation.missing) || !DASHBOARD_ACTIVE_STATUSES.includes(status)) {
+      const needsRefresh = DASHBOARD_ACTIVE_STATUSES.includes(status) || ["failed", "needs_input"].includes(status) && !(operation == null ? void 0 : operation.recovery);
+      if (!requestId || (operation == null ? void 0 : operation.polling) || (operation == null ? void 0 : operation.missing) || !needsRefresh) {
         return void 0;
       }
       let cancelled = false;
@@ -590,7 +760,7 @@
     };
     const fieldId = (name) => `${testIdPrefix}-${String((proposal == null ? void 0 : proposal.proposal_id) || "plan").slice(0, 12)}-${name}`;
     if (dismissed) {
-      return /* @__PURE__ */ React.createElement("div", { "data-testid": `${testIdPrefix}-cancelled`, className: `mt-3 rounded-lg border px-4 py-3 text-sm ${cardClass} ${mutedTextClass}` }, "You cancelled this dashboard plan. Nothing was sent to Splunk.");
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": `${testIdPrefix}-cancelled`, className: `mt-3 rounded-lg border px-4 py-3 text-sm ${cardClass} ${mutedTextClass}` }, "You cancelled this dashboard plan.");
     }
     const splunkUser = (operation == null ? void 0 : operation.splunk_user) || (proposal == null ? void 0 : proposal.splunk_user) || "";
     const connectionLabel = (operation == null ? void 0 : operation.connection_label) || (proposal == null ? void 0 : proposal.connection_label) || "";
@@ -609,6 +779,7 @@
       setBusy("create");
       setRequestError("");
       setServerProblems([]);
+      const brief = inspectedScope ? { ...payload, ...inspectedScope } : payload;
       try {
         const response = await fetch("/api/dashboards/create", {
           method: "POST",
@@ -616,7 +787,8 @@
           body: JSON.stringify({
             proposal_id: proposal.proposal_id,
             binding_key: proposal.binding_key,
-            brief: buildDashboardBriefPayload(draft)
+            brief,
+            ...inspectedScope ? { inspected_scope: inspectedScope } : {}
           })
         });
         const data = await response.json().catch(() => ({}));
@@ -634,7 +806,7 @@
         setEditing(false);
         setRetrying(false);
         notify({
-          dashboard_proposal: { ...proposal, brief: sanitizeDashboardBrief(draft), problems: [] },
+          dashboard_proposal: { ...proposal, brief: sanitizeDashboardBrief(brief), problems: [] },
           dashboard_operation: started
         });
       } catch (error) {
@@ -666,9 +838,12 @@
     if (operation && !retrying) {
       const receipt = operation.receipt || {};
       const describe = () => {
-        var _a2, _b2, _c;
+        var _a2, _b2, _c2;
         if (operation.missing) {
           return { tone: "warning", icon: "fa-circle-exclamation", heading: "This request is no longer in the app", body: "The app keeps dashboard requests for 7 days." };
+        }
+        if (recovery) {
+          return { tone: "warning", icon: "fa-circle-exclamation", heading: recovery.heading, body: recovery.message };
         }
         switch (status) {
           case "sending":
@@ -690,7 +865,7 @@
           case "unconfirmed":
             return { tone: "warning", icon: "fa-hourglass-half", heading: "Waiting for Splunk to confirm", body: ((_b2 = operation.error) == null ? void 0 : _b2.message) || "Splunk has not confirmed the result yet. Check status." };
           default:
-            return { tone: "error", icon: "fa-circle-exclamation", heading: "The dashboard request stopped", body: ((_c = operation.error) == null ? void 0 : _c.message) || "Check status, or start a new request." };
+            return { tone: "error", icon: "fa-circle-exclamation", heading: "The dashboard request stopped", body: ((_c2 = operation.error) == null ? void 0 : _c2.message) || "Check status, or start a new request." };
         }
       };
       const view = describe();
@@ -703,30 +878,80 @@
         {
           type: "button",
           onClick: () => {
+            var _a2, _b2;
             setDraft(sanitizeDashboardBrief(operation.brief || (proposal == null ? void 0 : proposal.brief)) || sanitizeDashboardBrief({}));
             setRequestError("");
             setRetrying(true);
-            setEditing(true);
+            const browseSource = (recovery == null ? void 0 : recovery.focus) === "source" && ((_b2 = (_a2 = operation.brief) == null ? void 0 : _a2.source) == null ? void 0 : _b2.kind) === "index";
+            setShowSources(browseSource);
+            setEditing(!browseSource && (recovery == null ? void 0 : recovery.focus) !== "panels");
           },
           className: secondaryButton,
           "data-testid": `${testIdPrefix}-retry`
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-pen", "aria-hidden": "true" }),
-        "Change the Plan"
+        (recovery == null ? void 0 : recovery.focus) === "source" ? "Review source" : (recovery == null ? void 0 : recovery.focus) === "panels" ? "Revise panels" : "Review plan"
       )));
     }
     const payload = buildDashboardBriefPayload(draft);
     const liveProblems = findDashboardBriefProblems(draft);
     const shownProblems = [...liveProblems, ...serverProblems.filter((problem) => !liveProblems.some((live) => live.message === problem.message))];
     const notes = Array.isArray(proposal == null ? void 0 : proposal.notes) ? proposal.notes : [];
-    const createBlocked = shownProblems.length > 0 || incognitoActive || !(proposal == null ? void 0 : proposal.binding_key) || !!busy;
+    const canBrowseSources = !editing && !incognitoActive && !!(proposal == null ? void 0 : proposal.binding_key) && draft.source.kind === "index";
+    const canInspectSource = !incognitoActive && (proposal == null ? void 0 : proposal.source_inspection_available) && proposal.binding_key && !liveProblems.some(({ field }) => field.startsWith("source") || field.startsWith("time_range"));
+    const inspectionKey = JSON.stringify([proposal == null ? void 0 : proposal.binding_key, connectionRevision, payload.source, payload.time_range]);
+    const inspectedScope = (inspection == null ? void 0 : inspection.key) === inspectionKey ? inspection.scope : null;
+    const needsReinspection = canInspectSource && payload.source.kind === "spl" && !!inspection && !inspectedScope;
+    const createBlocked = shownProblems.length > 0 || needsReinspection || incognitoActive || !(proposal == null ? void 0 : proposal.binding_key) || !!busy;
+    const repairRequestId = retrying && !incognitoActive && (recovery == null ? void 0 : recovery.focus) === "panels" ? requestId : "";
     const timeRangeLabel = (DASHBOARD_TIME_RANGE_OPTIONS.find((option) => option.value === payload.time_range.earliest) || {}).label || "Not set";
     const totalPanels = draft.pages.reduce((sum, page) => sum + page.panels.length, 0);
     const setPage = (pageIndex, updater) => updateDraft((current) => ({
       ...current,
       pages: current.pages.map((page, index) => index === pageIndex ? updater(page) : page)
     }));
-    return /* @__PURE__ */ React.createElement("div", { "data-testid": testIdPrefix, className: `mt-3 rounded-lg border p-4 ${cardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, retrying ? "Change the dashboard plan" : "Dashboard plan"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${isDarkTheme ? "border-gray-600 text-gray-200" : "border-gray-300 text-gray-700"}` }, (proposal == null ? void 0 : proposal.drafted_by) === "ai" ? "Drafted by the AI model" : "Starter plan")), identityLine, (proposal == null ? void 0 : proposal.splunk_web_url) && /* @__PURE__ */ React.createElement("p", { className: `text-xs break-all ${mutedTextClass}` }, "Links open at ", proposal.splunk_web_url, proposal.splunk_web_url_source === "derived" ? " (guessed from the connection)" : "")), ((_b = payload.provenance) == null ? void 0 : _b.label) && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, payload.provenance.kind === "conversation" ? "Based on this chat" : `Based on ${payload.provenance.label}`)), editing ? /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-3", "data-testid": `${testIdPrefix}-editor` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("title"), className: labelClass }, "Title"), /* @__PURE__ */ React.createElement("input", { id: fieldId("title"), type: "text", maxLength: DASHBOARD_LIMITS.title, value: draft.title, onChange: (event) => {
+    return /* @__PURE__ */ React.createElement("div", { "data-testid": testIdPrefix, className: `mt-3 rounded-lg border p-4 ${cardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, retrying ? "Change the dashboard plan" : "Dashboard plan"), /* @__PURE__ */ React.createElement("span", { className: `inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${isDarkTheme ? "border-gray-600 text-gray-200" : "border-gray-300 text-gray-700"}` }, (proposal == null ? void 0 : proposal.drafted_by) === "ai" ? "Drafted by the AI model" : "Starter plan")), identityLine, (proposal == null ? void 0 : proposal.splunk_web_url) && /* @__PURE__ */ React.createElement("p", { className: `text-xs break-all ${mutedTextClass}` }, "Links open at ", proposal.splunk_web_url, proposal.splunk_web_url_source === "derived" ? " (guessed from the connection)" : "")), ((_b = payload.provenance) == null ? void 0 : _b.label) && /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, payload.provenance.kind === "conversation" ? "Based on this chat" : `Based on ${payload.provenance.label}`)), canBrowseSources && /* @__PURE__ */ React.createElement("div", { className: "mt-3" }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        type: "button",
+        "aria-expanded": showSources,
+        "aria-controls": fieldId("live-sources"),
+        onClick: () => setShowSources((current) => !current),
+        className: secondaryButton,
+        "data-testid": `${testIdPrefix}-browse-data`
+      },
+      /* @__PURE__ */ React.createElement("i", { className: "fas fa-database", "aria-hidden": "true" }),
+      showSources ? "Hide Splunk data" : "Browse Splunk data"
+    ), /* @__PURE__ */ React.createElement("div", { id: fieldId("live-sources") }, showSources && /* @__PURE__ */ React.createElement(
+      DashboardSourcePicker,
+      {
+        bindingKey: proposal.binding_key,
+        source: draft.source,
+        earliest: draft.time_range.earliest,
+        onIndex: (index) => updateDraft((current) => ({ ...current, source: { kind: "index", index, sourcetype: "" } })),
+        onSourcetype: (sourcetype) => updateDraft((current) => ({ ...current, source: { ...current.source, sourcetype } })),
+        onRange: (earliest) => updateDraft((current) => ({ ...current, time_range: { earliest, latest: "now" } })),
+        prefix: fieldId("sources"),
+        ...{ inputClass, labelClass, subtextClass },
+        buttonClass: secondaryButton
+      }
+    ))), retrying && ((recovery == null ? void 0 : recovery.message) || ((_c = operation == null ? void 0 : operation.receipt) == null ? void 0 : _c.question)) && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm ${subtextClass}`, "data-testid": `${testIdPrefix}-repair-note` }, (recovery == null ? void 0 : recovery.message) || operation.receipt.question), (canInspectSource || repairRequestId) && /* @__PURE__ */ React.createElement(
+      DashboardSourceInspection,
+      {
+        key: JSON.stringify([proposal.binding_key, payload.source, payload.time_range, repairRequestId]),
+        bindingKey: proposal.binding_key,
+        brief: payload,
+        connectionRevision,
+        testIdPrefix,
+        labelClass,
+        subtextClass,
+        buttonClass: secondaryButton,
+        inspectAvailable: canInspectSource,
+        repairRequestId,
+        onApply: (pages) => updateDraft((current) => ({ ...current, pages })),
+        onInspectedSearch: (scope) => setInspection({ key: inspectionKey, scope })
+      }
+    ), needsReinspection && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, role: "status" }, "Inspect the updated search before you create the dashboard."), editing ? /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-3", "data-testid": `${testIdPrefix}-editor` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("title"), className: labelClass }, "Title"), /* @__PURE__ */ React.createElement("input", { id: fieldId("title"), type: "text", maxLength: DASHBOARD_LIMITS.title, value: draft.title, onChange: (event) => {
       const value = event.target.value;
       updateDraft((current) => ({ ...current, title: value }));
     }, className: `mt-1 ${inputClass}` })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("purpose"), className: labelClass }, "Purpose"), /* @__PURE__ */ React.createElement("textarea", { id: fieldId("purpose"), rows: 2, maxLength: DASHBOARD_LIMITS.purpose, value: draft.purpose, onChange: (event) => {
@@ -809,7 +1034,10 @@
     }, className: `mt-1 ${inputClass}` })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { htmlFor: fieldId("requirements"), className: labelClass }, "Requirements (optional)"), /* @__PURE__ */ React.createElement("textarea", { id: fieldId("requirements"), rows: 2, maxLength: DASHBOARD_LIMITS.requirements, value: draft.requirements, onChange: (event) => {
       const value = event.target.value;
       updateDraft((current) => ({ ...current, requirements: value }));
-    }, className: `mt-1 ${inputClass}`, placeholder: "Units, metric definitions, exclusions, and how to treat missing data" }))) : /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-3 text-sm", "data-testid": `${testIdPrefix}-summary` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `font-semibold break-words ${headingClass}`, "data-testid": `${testIdPrefix}-title` }, payload.title || "Untitled dashboard"), payload.purpose && /* @__PURE__ */ React.createElement("p", { className: `mt-1 break-words ${subtextClass}` }, payload.purpose)), /* @__PURE__ */ React.createElement("div", { className: `grid gap-2 sm:grid-cols-2 ${subtextClass}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Data"), payload.source.kind === "spl" ? /* @__PURE__ */ React.createElement("pre", { className: `mt-1 whitespace-pre-wrap break-all rounded border px-2 py-1 text-xs ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, payload.source.query || "No search yet") : /* @__PURE__ */ React.createElement("span", { className: "mt-1 block break-words" }, payload.source.index ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Index ", /* @__PURE__ */ React.createElement("code", null, payload.source.index)) : "No index yet", payload.source.sourcetype ? /* @__PURE__ */ React.createElement(React.Fragment, null, ", sourcetype ", /* @__PURE__ */ React.createElement("code", null, payload.source.sourcetype)) : null)), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Time range"), /* @__PURE__ */ React.createElement("span", { className: "mt-1 block" }, timeRangeLabel))), payload.pages.map((page, pageIndex) => /* @__PURE__ */ React.createElement("div", { key: `summary-page-${pageIndex}`, className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, payload.pages.length > 1 ? `Page ${pageIndex + 1}: ${page.name || "Unnamed"}` : `Panels on ${page.name || "the page"}`), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, page.panels.map((panel, panelIndex) => /* @__PURE__ */ React.createElement("li", { key: `summary-panel-${panelIndex}`, className: "break-words" }, panel))))), Array.isArray(payload.findings) && payload.findings.length > 0 && /* @__PURE__ */ React.createElement("div", { className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Findings"), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, payload.findings.map((finding, index) => /* @__PURE__ */ React.createElement("li", { key: `finding-${index}`, className: "break-words" }, finding)))), payload.requirements && /* @__PURE__ */ React.createElement("div", { className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Requirements"), /* @__PURE__ */ React.createElement("p", { className: "mt-1 break-words" }, payload.requirements))), shownProblems.length > 0 && /* @__PURE__ */ React.createElement("div", { role: "alert", className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.error}`, "data-testid": `${testIdPrefix}-problems` }, /* @__PURE__ */ React.createElement("p", { className: "font-semibold" }, "Fix these before you create the dashboard:"), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, shownProblems.map((problem, index) => /* @__PURE__ */ React.createElement("li", { key: `${problem.field}-${index}` }, problem.message)))), notes.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`, "data-testid": `${testIdPrefix}-notes` }, /* @__PURE__ */ React.createElement("ul", { className: "list-disc space-y-0.5 pl-5" }, notes.map((note, index) => /* @__PURE__ */ React.createElement("li", { key: `note-${index}` }, note)))), incognitoActive && /* @__PURE__ */ React.createElement("p", { className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`, "data-testid": `${testIdPrefix}-incognito` }, "Turn incognito mode off to create this dashboard. Constellation sends the plan to its own AI model with the real names."), requestError && /* @__PURE__ */ React.createElement("p", { role: "alert", className: `mt-3 text-sm ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, requestError), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: createDashboard, disabled: createBlocked, className: primaryButton, "data-testid": `${testIdPrefix}-create` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${busy === "create" ? "fa-spinner fa-spin" : "fa-chart-pie"}`, "aria-hidden": "true" }), busy === "create" ? "Sending..." : "Create Dashboard"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setEditing((current) => !current), disabled: !!busy, className: secondaryButton, "data-testid": `${testIdPrefix}-edit` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${editing ? "fa-check" : "fa-pen"}`, "aria-hidden": "true" }), editing ? "Done Editing" : "Edit Plan"), /* @__PURE__ */ React.createElement(
+    }, className: `mt-1 ${inputClass}`, placeholder: "Units, metric definitions, exclusions, and how to treat missing data" }))) : /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-3 text-sm", "data-testid": `${testIdPrefix}-summary` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `font-semibold break-words ${headingClass}`, "data-testid": `${testIdPrefix}-title` }, payload.title || "Untitled dashboard"), payload.purpose && /* @__PURE__ */ React.createElement("p", { className: `mt-1 break-words ${subtextClass}` }, payload.purpose)), /* @__PURE__ */ React.createElement("div", { className: `grid gap-2 sm:grid-cols-2 ${subtextClass}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, inspectedScope ? "Inspected SPL" : "Data"), payload.source.kind === "spl" ? /* @__PURE__ */ React.createElement("pre", { "data-testid": `${testIdPrefix}-source-query`, className: `mt-1 whitespace-pre-wrap break-all rounded border px-2 py-1 text-xs ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, (inspectedScope == null ? void 0 : inspectedScope.source.query) || payload.source.query || "No search yet") : /* @__PURE__ */ React.createElement("span", { className: "mt-1 block break-words" }, payload.source.index ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Index ", /* @__PURE__ */ React.createElement("code", null, payload.source.index)) : "No index yet", payload.source.sourcetype ? /* @__PURE__ */ React.createElement(React.Fragment, null, ", sourcetype ", /* @__PURE__ */ React.createElement("code", null, payload.source.sourcetype)) : null)), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Time range"), /* @__PURE__ */ React.createElement("span", { className: "mt-1 block" }, timeRangeLabel))), Array.isArray(payload.findings) && payload.findings.length > 0 && /* @__PURE__ */ React.createElement("div", { className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Findings"), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, payload.findings.map((finding, index) => /* @__PURE__ */ React.createElement("li", { key: `finding-${index}`, className: "break-words" }, finding)))), payload.requirements && /* @__PURE__ */ React.createElement("div", { className: subtextClass }, /* @__PURE__ */ React.createElement("span", { className: labelClass }, "Requirements"), /* @__PURE__ */ React.createElement("p", { className: "mt-1 break-words" }, payload.requirements))), shownProblems.length > 0 && /* @__PURE__ */ React.createElement("div", { role: "alert", className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.error}`, "data-testid": `${testIdPrefix}-problems` }, /* @__PURE__ */ React.createElement("p", { className: "font-semibold" }, "Fix these before you create the dashboard:"), /* @__PURE__ */ React.createElement("ul", { className: "mt-1 list-disc space-y-0.5 pl-5" }, shownProblems.map((problem, index) => /* @__PURE__ */ React.createElement("li", { key: `${problem.field}-${index}` }, problem.message)))), notes.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`, "data-testid": `${testIdPrefix}-notes` }, /* @__PURE__ */ React.createElement("ul", { className: "list-disc space-y-0.5 pl-5" }, notes.map((note, index) => /* @__PURE__ */ React.createElement("li", { key: `note-${index}` }, note)))), incognitoActive && /* @__PURE__ */ React.createElement("p", { className: `mt-3 rounded-md border px-3 py-2 text-sm ${toneClasses.warning}`, "data-testid": `${testIdPrefix}-incognito` }, "Turn incognito mode off to create this dashboard. Constellation sends the plan to its own AI model with the real names."), requestError && /* @__PURE__ */ React.createElement("p", { role: "alert", className: `mt-3 text-sm ${isDarkTheme ? "text-red-300" : "text-red-700"}` }, requestError), /* @__PURE__ */ React.createElement("section", { "aria-labelledby": fieldId("panel-outline"), "data-testid": `${testIdPrefix}-panel-outline`, className: `mt-3 space-y-2 text-sm ${subtextClass}` }, /* @__PURE__ */ React.createElement("h4", { id: fieldId("panel-outline"), className: labelClass }, "Panel outline"), payload.pages.filter((page) => page.panels.length).map((page, pageIndex) => /* @__PURE__ */ React.createElement("div", { key: pageIndex }, /* @__PURE__ */ React.createElement("p", { className: `font-medium break-words ${headingClass}` }, page.name || "Unnamed page"), /* @__PURE__ */ React.createElement("ol", { className: "mt-1 list-decimal space-y-0.5 pl-5" }, page.panels.map((panel, panelIndex) => /* @__PURE__ */ React.createElement("li", { key: panelIndex, className: "break-words" }, panel))))), !payload.pages.some((page) => page.panels.length) && /* @__PURE__ */ React.createElement("p", null, "Add a panel in Edit plan.")), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: createDashboard, disabled: createBlocked, className: primaryButton, "data-testid": `${testIdPrefix}-create` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${busy === "create" ? "fa-spinner fa-spin" : "fa-chart-pie"}`, "aria-hidden": "true" }), busy === "create" ? "Sending..." : "Create Dashboard"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => {
+      setShowSources(false);
+      setEditing((current) => !current);
+    }, disabled: !!busy, className: secondaryButton, "data-testid": `${testIdPrefix}-edit` }, /* @__PURE__ */ React.createElement("i", { className: `fas ${editing ? "fa-check" : "fa-pen"}`, "aria-hidden": "true" }), editing ? "Done Editing" : "Edit Plan"), /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
@@ -827,7 +1055,7 @@
         "data-testid": `${testIdPrefix}-cancel`
       },
       "Cancel"
-    ), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Nothing goes to Splunk until you click Create Dashboard.")));
+    ), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Create Dashboard sends this plan to Constellation.")));
   }
   const compactPersistedChatMessages = (items, limit = 24) => {
     if (!Array.isArray(items)) return [];
@@ -903,12 +1131,13 @@
       content: typeof entry.content === "string" ? entry.content : ""
     })).filter((entry) => entry.content);
   };
-  const loadPersistedChatState = () => {
+  const scopedStorageKey = (key, scope) => scope ? `${key}:${scope}` : key;
+  const loadPersistedChatState = (storageScope) => {
     try {
       if (typeof window === "undefined" || !window.localStorage) {
         return {};
       }
-      const raw = window.localStorage.getItem(CHAT_STATE_STORAGE_KEY);
+      const raw = window.localStorage.getItem(scopedStorageKey(CHAT_STATE_STORAGE_KEY, storageScope));
       if (!raw) {
         return {};
       }
@@ -926,71 +1155,71 @@
       return {};
     }
   };
-  const savePersistedChatState = (state) => {
+  const savePersistedChatState = (state, storageScope) => {
     try {
       if (typeof window === "undefined" || !window.localStorage) {
         return;
       }
-      window.localStorage.setItem(CHAT_STATE_STORAGE_KEY, JSON.stringify(state));
+      window.localStorage.setItem(scopedStorageKey(CHAT_STATE_STORAGE_KEY, storageScope), JSON.stringify(state));
     } catch (error) {
       console.warn("Failed to save persisted chat state", error);
     }
   };
-  const clearPersistedChatState = () => {
+  const clearPersistedChatState = (storageScope) => {
     try {
       if (typeof window === "undefined" || !window.localStorage) {
         return;
       }
-      window.localStorage.removeItem(CHAT_STATE_STORAGE_KEY);
+      window.localStorage.removeItem(scopedStorageKey(CHAT_STATE_STORAGE_KEY, storageScope));
     } catch (error) {
       console.warn("Failed to clear persisted chat state", error);
     }
   };
-  const loadChatMission = () => {
+  const loadChatMission = (storageScope) => {
     try {
       if (typeof window === "undefined" || !window.localStorage) {
         return "";
       }
-      const value = window.localStorage.getItem(CHAT_MISSION_STORAGE_KEY);
+      const value = window.localStorage.getItem(scopedStorageKey(CHAT_MISSION_STORAGE_KEY, storageScope));
       return typeof value === "string" ? value.slice(0, CHAT_MISSION_MAX_CHARS) : "";
     } catch (error) {
       return "";
     }
   };
-  const saveChatMission = (value) => {
+  const saveChatMission = (value, storageScope) => {
     try {
       if (typeof window === "undefined" || !window.localStorage) {
         return;
       }
       if (value && value.trim()) {
-        window.localStorage.setItem(CHAT_MISSION_STORAGE_KEY, value.slice(0, CHAT_MISSION_MAX_CHARS));
+        window.localStorage.setItem(scopedStorageKey(CHAT_MISSION_STORAGE_KEY, storageScope), value.slice(0, CHAT_MISSION_MAX_CHARS));
       } else {
-        window.localStorage.removeItem(CHAT_MISSION_STORAGE_KEY);
+        window.localStorage.removeItem(scopedStorageKey(CHAT_MISSION_STORAGE_KEY, storageScope));
       }
     } catch (error) {
       console.warn("Failed to save chat mission", error);
     }
   };
-  const loadActiveChatGoalId = () => {
+  const loadActiveChatGoalId = (storageScope) => {
     try {
       if (typeof window === "undefined" || !window.localStorage) {
         return "";
       }
-      const value = window.localStorage.getItem(CHAT_GOAL_STORAGE_KEY);
+      const value = window.localStorage.getItem(scopedStorageKey(CHAT_GOAL_STORAGE_KEY, storageScope));
       return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : "";
     } catch (error) {
       return "";
     }
   };
-  const saveActiveChatGoalId = (value) => {
+  const saveActiveChatGoalId = (value, storageScope) => {
     try {
       if (typeof window === "undefined" || !window.localStorage) {
         return;
       }
       if (value) {
-        window.localStorage.setItem(CHAT_GOAL_STORAGE_KEY, value);
+        window.localStorage.setItem(scopedStorageKey(CHAT_GOAL_STORAGE_KEY, storageScope), value);
       } else {
-        window.localStorage.removeItem(CHAT_GOAL_STORAGE_KEY);
+        window.localStorage.removeItem(scopedStorageKey(CHAT_GOAL_STORAGE_KEY, storageScope));
       }
     } catch (error) {
       console.warn("Failed to save the chat goal", error);
@@ -1829,8 +2058,108 @@
     tabs[nextIndex].focus();
     tabs[nextIndex].click();
   };
-  function App() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa, _ya;
+  function WorkspaceApp() {
+    var _a, _b;
+    const [connectionInfo, setConnectionInfo] = useState(null);
+    const [workspaceTab, setWorkspaceTab] = useState("mission");
+    const [capabilitiesView, setCapabilitiesView] = useState("overview");
+    const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+    const [activeSettingsTab, setActiveSettingsTab] = useState("connections");
+    const [showMCPConfigForm, setShowMCPConfigForm] = useState(false);
+    const [hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash] = useState(loadWelcomeSplashDismissed);
+    const [isWelcomeSplashOpen, setIsWelcomeSplashOpen] = useState(() => !hasDismissedWelcomeSplash);
+    const [welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain] = useState(() => hasDismissedWelcomeSplash);
+    const connectionRequestRef = useRef(0);
+    const applyConnectionInfo = (result) => {
+      if (!(result == null ? void 0 : result.workspace)) return;
+      connectionRequestRef.current += 1;
+      setConnectionInfo(result);
+    };
+    const refreshConnection = async () => {
+      const requestId = ++connectionRequestRef.current;
+      try {
+        const response = await window.fetch("/connection-info", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (requestId === connectionRequestRef.current) {
+          setConnectionInfo((previous) => (result == null ? void 0 : result.workspace) || !(previous == null ? void 0 : previous.workspace) ? result : previous);
+        }
+      } catch (error) {
+        console.error("Failed to load connection info:", error);
+        if (requestId === connectionRequestRef.current) {
+          setConnectionInfo((previous) => previous || { status: "error" });
+        }
+      }
+    };
+    useEffect(() => {
+      refreshConnection();
+      const timer = setInterval(refreshConnection, 5e3);
+      return () => clearInterval(timer);
+    }, []);
+    if (!connectionInfo) return /* @__PURE__ */ React.createElement("p", { role: "status", className: "p-6" }, "Checking Splunk connection…");
+    const workspaceKey = (_a = connectionInfo.workspace) == null ? void 0 : _a.scope_key;
+    const storageScope = (_b = connectionInfo.workspace) == null ? void 0 : _b.storage_key;
+    return /* @__PURE__ */ React.createElement(
+      App,
+      {
+        key: storageScope || "standalone",
+        connectionInfo,
+        refreshConnection,
+        applyConnectionInfo,
+        workspaceKey,
+        storageScope,
+        workspaceTab,
+        setWorkspaceTab,
+        capabilitiesView,
+        setCapabilitiesView,
+        isSettingsOpen,
+        setIsSettingsOpen,
+        activeSettingsTab,
+        setActiveSettingsTab,
+        showMCPConfigForm,
+        setShowMCPConfigForm,
+        hasDismissedWelcomeSplash,
+        setHasDismissedWelcomeSplash,
+        isWelcomeSplashOpen,
+        setIsWelcomeSplashOpen,
+        welcomeSplashDoNotShowAgain,
+        setWelcomeSplashDoNotShowAgain
+      }
+    );
+  }
+  function App({
+    connectionInfo,
+    refreshConnection,
+    applyConnectionInfo,
+    workspaceKey,
+    storageScope,
+    workspaceTab,
+    setWorkspaceTab,
+    capabilitiesView,
+    setCapabilitiesView,
+    isSettingsOpen,
+    setIsSettingsOpen,
+    activeSettingsTab,
+    setActiveSettingsTab,
+    showMCPConfigForm,
+    setShowMCPConfigForm,
+    hasDismissedWelcomeSplash,
+    setHasDismissedWelcomeSplash,
+    isWelcomeSplashOpen,
+    setIsWelcomeSplashOpen,
+    welcomeSplashDoNotShowAgain,
+    setWelcomeSplashDoNotShowAgain
+  }) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N, _O, _P, _Q, _R, _S, _T, _U, _V, _W, _X, _Y, _Z, __, _$, _aa, _ba, _ca, _da, _ea, _fa, _ga, _ha, _ia, _ja, _ka, _la, _ma, _na, _oa, _pa, _qa, _ra, _sa, _ta, _ua, _va, _wa, _xa, _ya, _za, _Aa, _Ba;
+    const fetch2 = async (path, options = {}) => {
+      const headers = new Headers(options.headers || {});
+      if (workspaceKey) headers.set("X-Discovery-Workspace", workspaceKey);
+      const response = await window.fetch(path, { ...options, headers });
+      if (response.headers.get("X-Discovery-Workspace-Changed") === "1") {
+        refreshConnection();
+      }
+      return response;
+    };
     const THEME_PREFERENCE_KEY = "dt4sms_theme_preference";
     const OPERATOR_VOICE_PREFERENCE_KEY = "dt4sms_operator_voice";
     const OPERATOR_VOICE_OPTIONS = [
@@ -1838,8 +2167,7 @@
       { value: "evidence", label: "Evidence-led", description: "Focused on the evidence and how to verify it." },
       { value: "executive", label: "Executive", description: "Focused on risk, business impact, and cost." }
     ];
-    const initialChatState = useRef(loadPersistedChatState()).current || {};
-    const initialWelcomeSplashDismissed = useRef(loadWelcomeSplashDismissed()).current;
+    const initialChatState = useRef(loadPersistedChatState(storageScope)).current || {};
     const [isConnected, setIsConnected] = useState(false);
     const [discoveryStatus, setDiscoveryStatus] = useState("idle");
     const [messages, setMessages] = useState([]);
@@ -1899,8 +2227,8 @@
     const [isChatFullscreen, setIsChatFullscreen] = useState(false);
     const [chatMessages, setChatMessages] = useState(() => Array.isArray(initialChatState.chatMessages) ? initialChatState.chatMessages : []);
     const [chatInput, setChatInput] = useState("");
-    const [chatMission, setChatMission] = useState(() => loadChatMission());
-    const [activeChatGoalId, setActiveChatGoalId] = useState(() => loadActiveChatGoalId());
+    const [chatMission, setChatMission] = useState(() => loadChatMission(storageScope));
+    const [activeChatGoalId, setActiveChatGoalId] = useState(() => loadActiveChatGoalId(storageScope));
     const [activeChatGoal, setActiveChatGoal] = useState(null);
     const [chatGoalActivity, setChatGoalActivity] = useState("");
     const [chatGoalCheckingId, setChatGoalCheckingId] = useState("");
@@ -1934,10 +2262,7 @@
       const persistedId = typeof initialChatState.chatSessionId === "string" ? initialChatState.chatSessionId.trim() : "";
       return persistedId || generateChatSessionId();
     });
-    const [workspaceTab, setWorkspaceTab] = useState("mission");
     const [lastPrimaryWorkspaceTab, setLastPrimaryWorkspaceTab] = useState("mission");
-    const [capabilitiesView, setCapabilitiesView] = useState("overview");
-    const [connectionInfo, setConnectionInfo] = useState(null);
     const [discoveryStartTime, setDiscoveryStartTime] = useState(null);
     const [elapsedTime, setElapsedTime] = useState(0);
     const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
@@ -1969,8 +2294,6 @@
     });
     const [isGeneratingSummaryInfographic, setIsGeneratingSummaryInfographic] = useState(false);
     const [isAbortingSummary, setIsAbortingSummary] = useState(false);
-    const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-    const [activeSettingsTab, setActiveSettingsTab] = useState("connections");
     const [troubleshootKind, setTroubleshootKind] = useState("mcp");
     const [troubleshootDrafts, setTroubleshootDrafts] = useState({ mcp: null, llm: null });
     const [troubleshootOptions, setTroubleshootOptions] = useState({ check_save: true, check_connection: true });
@@ -2105,21 +2428,19 @@
     const [libraryDocSearch, setLibraryDocSearch] = useState({ query: "", status: "idle", results: [], error: "", searched: "" });
     const [headerHeight, setHeaderHeight] = useState(88);
     const [savedMCPConfigs, setSavedMCPConfigs] = useState({});
+    const [mcpProfilesStatus, setMCPProfilesStatus] = useState("loading");
+    const [switchingMCPProfile, setSwitchingMCPProfile] = useState("");
     const [loadedMCPConfigName, setLoadedMCPConfigName] = useState(null);
     const [isMCPSaveModalOpen, setIsMCPSaveModalOpen] = useState(false);
     const [mcpConfigName, setMCPConfigName] = useState("");
     const [mcpConfigDescription, setMCPConfigDescription] = useState("");
     const [mcpSaveDraft, setMCPSaveDraft] = useState(null);
-    const [showMCPConfigForm, setShowMCPConfigForm] = useState(false);
     const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState("Enter token");
     const [showChatGoalQuestions, setShowChatGoalQuestions] = useState(false);
     const [chatReplyPanels, setChatReplyPanels] = useState({});
     const [highlightedChatMessageId, setHighlightedChatMessageId] = useState(null);
     const [chatCopyStatus, setChatCopyStatus] = useState(null);
     const [isChatSideColumnViewport, setIsChatSideColumnViewport] = useState(matchesChatSideColumnViewport);
-    const [isWelcomeSplashOpen, setIsWelcomeSplashOpen] = useState(() => !initialWelcomeSplashDismissed);
-    const [hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash] = useState(() => initialWelcomeSplashDismissed);
-    const [welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain] = useState(() => initialWelcomeSplashDismissed);
     const [themePreference, setThemePreference] = useState(() => {
       try {
         const savedTheme = localStorage.getItem(THEME_PREFERENCE_KEY);
@@ -2309,8 +2630,14 @@
     const ragInstallPackageIndexes = Array.isArray(ragInstallGuidance == null ? void 0 : ragInstallGuidance.package_indexes) ? ragInstallGuidance.package_indexes : [];
     const ragInstallStartedAt = (capabilityActionStartedAt == null ? void 0 : capabilityActionStartedAt.rag_chromadb) || 0;
     const ragInstallElapsedSeconds = ragActionInProgress === "install" && ragInstallStartedAt ? Math.max(0, Math.floor((capabilityActionTick - ragInstallStartedAt) / 1e3)) : 0;
-    const headerMcpConnected = !!((_z = connectionInfo == null ? void 0 : connectionInfo.mcp) == null ? void 0 : _z.configured);
-    const headerLlmDisplayLabel = String(((_A = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _A.display_label) || "").trim() || "Not configured";
+    const effectiveMcp = (config == null ? void 0 : config.effective_mcp) || (config == null ? void 0 : config.mcp);
+    const effectiveMcpName = ((_z = connectionInfo == null ? void 0 : connectionInfo.mcp) == null ? void 0 : _z.profile_name) || (effectiveMcp == null ? void 0 : effectiveMcp.name) || "";
+    const orderedMCPConfigs = Object.values(savedMCPConfigs).sort((a, b) => Number(b.name === effectiveMcpName) - Number(a.name === effectiveMcpName) || a.name.localeCompare(b.name));
+    const headerMcpConnected = !!((_A = connectionInfo == null ? void 0 : connectionInfo.mcp) == null ? void 0 : _A.configured);
+    const workspaceLabel = ((_B = connectionInfo == null ? void 0 : connectionInfo.workspace) == null ? void 0 : _B.scope_label) || "";
+    const headerMcpHost = ((_C = connectionInfo == null ? void 0 : connectionInfo.mcp) == null ? void 0 : _C.host) || "";
+    const headerMcpLabel = headerMcpHost ? workspaceLabel : "";
+    const headerLlmDisplayLabel = String(((_D = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _D.display_label) || "").trim() || "Not configured";
     const connectionInfoStatus = String((connectionInfo == null ? void 0 : connectionInfo.status) || "disconnected").toLowerCase();
     const canUseSplunkDeeplinks = !!(deeplinkCapability == null ? void 0 : deeplinkCapability.installed) && !!(deeplinkCapability == null ? void 0 : deeplinkCapability.enabled) && !(deeplinkCapability == null ? void 0 : deeplinkCapability.restart_required) && String((deeplinkCapability == null ? void 0 : deeplinkCapability.health_status) || "").toLowerCase() === "ready";
     const canUseExportTools = !!(exportCapability == null ? void 0 : exportCapability.installed) && !!(exportCapability == null ? void 0 : exportCapability.enabled) && !(exportCapability == null ? void 0 : exportCapability.restart_required) && String((exportCapability == null ? void 0 : exportCapability.health_status) || "").toLowerCase() === "ready";
@@ -2635,7 +2962,7 @@
     const packagePersonaLabel = workflowTab ? `${workflowTab.charAt(0).toUpperCase()}${workflowTab.slice(1)}` : "Persona";
     const packageTargetLabel = `${selectedPackageSessionLabel} reports, ${packagePersonaLabel} runbook, ${operatorVoiceDefinition.label} style`;
     const isRagContextPreviewReady = !!(ragCapability == null ? void 0 : ragCapability.installed) && !!(ragCapability == null ? void 0 : ragCapability.enabled) && !(ragCapability == null ? void 0 : ragCapability.restart_required) && String((ragCapability == null ? void 0 : ragCapability.health_status) || "").toLowerCase() === "ready" && ragIndexedDocumentCount > 0;
-    const libraryDocsAvailable = !!((_D = (_C = (_B = knowledgeLibrary.data) == null ? void 0 : _B.docs) == null ? void 0 : _C.summary) == null ? void 0 : _D.available);
+    const libraryDocsAvailable = !!((_G = (_F = (_E = knowledgeLibrary.data) == null ? void 0 : _E.docs) == null ? void 0 : _F.summary) == null ? void 0 : _G.available);
     const canUseRagContextPreview = isRagContextPreviewReady || libraryDocsAvailable;
     const activeDetailPreviewTrace = (() => {
       var _a2, _b2, _c2;
@@ -2772,7 +3099,7 @@
     const missionStats = (latestMissionSession == null ? void 0 : latestMissionSession.stats) || {};
     const missionFreshness = getMissionFreshnessMeta((latestMissionSession == null ? void 0 : latestMissionSession.created_at) || (latestMissionSession == null ? void 0 : latestMissionSession.timestamp));
     const missionHasPreviousSession = !!(discoveryDashboard == null ? void 0 : discoveryDashboard.previous);
-    const missionExecutiveHeadline = ((_F = (_E = latestMissionSession == null ? void 0 : latestMissionSession.personas) == null ? void 0 : _E.executive) == null ? void 0 : _F.headline) || `Readiness score is ${formatMissionMetricValue((_G = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _G.readiness_score)} out of 100, with ${countLabel((_H = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _H.recommendation_count, "recommendation")} to follow up.`;
+    const missionExecutiveHeadline = ((_I = (_H = latestMissionSession == null ? void 0 : latestMissionSession.personas) == null ? void 0 : _H.executive) == null ? void 0 : _I.headline) || `Readiness score is ${formatMissionMetricValue((_J = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _J.readiness_score)} out of 100, with ${countLabel((_K = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _K.recommendation_count, "recommendation")} to follow up.`;
     const workspaceMetricTone = {
       shellClass: isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200",
       labelClass: mutedTextClass,
@@ -2782,8 +3109,8 @@
     const missionStatCards = [
       {
         label: "Readiness",
-        value: `${formatMissionMetricValue((_I = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _I.readiness_score)}/100`,
-        detail: describeMissionChange((_J = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _J.readiness_delta),
+        value: `${formatMissionMetricValue((_L = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _L.readiness_score)}/100`,
+        detail: describeMissionChange((_M = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _M.readiness_delta),
         ...workspaceMetricTone
       },
       {
@@ -2794,14 +3121,14 @@
       },
       {
         label: "Indexes",
-        value: formatMissionMetricValue((_K = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _K.total_indexes),
-        detail: describeMissionChange((_L = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _L.indexes_delta),
+        value: formatMissionMetricValue((_N = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _N.total_indexes),
+        detail: describeMissionChange((_O = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _O.indexes_delta),
         ...workspaceMetricTone
       },
       {
         label: "Sourcetypes",
-        value: formatMissionMetricValue((_M = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _M.total_sourcetypes),
-        detail: describeMissionChange((_N = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _N.sourcetypes_delta),
+        value: formatMissionMetricValue((_P = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _P.total_sourcetypes),
+        detail: describeMissionChange((_Q = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _Q.sourcetypes_delta),
         ...workspaceMetricTone
       },
       {
@@ -2812,8 +3139,8 @@
       },
       {
         label: "Recommendations",
-        value: formatMissionMetricValue(missionStats.recommendation_count || ((_O = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _O.recommendation_count)),
-        detail: describeMissionChange((_P = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _P.recommendations_delta),
+        value: formatMissionMetricValue(missionStats.recommendation_count || ((_R = discoveryDashboard == null ? void 0 : discoveryDashboard.kpis) == null ? void 0 : _R.recommendation_count)),
+        detail: describeMissionChange((_S = discoveryDashboard == null ? void 0 : discoveryDashboard.trends) == null ? void 0 : _S.recommendations_delta),
         ...workspaceMetricTone
       }
     ];
@@ -3100,7 +3427,7 @@
       if (!isLoadingSummary || !currentSessionId) return;
       const interval = setInterval(async () => {
         try {
-          const response = await fetch(`/summarize-progress/${currentSessionId}`);
+          const response = await fetch2(`/summarize-progress/${currentSessionId}`);
           const progress2 = await response.json();
           setSummaryProgress((prev) => {
             if (!progress2 || typeof progress2 !== "object") {
@@ -3141,7 +3468,7 @@
       });
       (async () => {
         try {
-          const response = await fetch(`/api/summary/infographic-capability?timestamp=${encodeURIComponent(currentSessionId)}`);
+          const response = await fetch2(`/api/summary/infographic-capability?timestamp=${encodeURIComponent(currentSessionId)}`);
           const result = await response.json();
           if (cancelled) {
             return;
@@ -3178,7 +3505,7 @@
       };
     }, [
       activeTab,
-      (_Q = config == null ? void 0 : config.llm) == null ? void 0 : _Q.provider,
+      (_T = config == null ? void 0 : config.llm) == null ? void 0 : _T.provider,
       currentSessionId,
       isSummaryModalOpen,
       summaryData
@@ -3291,7 +3618,7 @@
     const getRemediation = async (sessionId, taskIndex, task, verificationResult) => {
       setLoadingRemediation(taskIndex);
       try {
-        const response = await fetch("/get-remediation", {
+        const response = await fetch2("/get-remediation", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -3314,7 +3641,7 @@
     };
     const loadVerificationHistory = async (sessionId, taskIndex) => {
       try {
-        const response = await fetch(`/verification-history/${sessionId}/${taskIndex}`);
+        const response = await fetch2(`/verification-history/${sessionId}/${taskIndex}`);
         const result = await response.json();
         setVerificationHistory((prev) => ({
           ...prev,
@@ -3327,7 +3654,7 @@
     const runVerification = async (sessionId, taskIndex, task) => {
       setVerifyingTask(taskIndex);
       try {
-        const response = await fetch("/verify-task", {
+        const response = await fetch2("/verify-task", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -3365,6 +3692,8 @@
     const [isResizingReport, setIsResizingReport] = useState(false);
     const [isDiscoveryRunDetailsOpen, setIsDiscoveryRunDetailsOpen] = useState(false);
     const wsRef = useRef(null);
+    const reportRequestIdRef = useRef(0);
+    const wsReconnectTimerRef = useRef(null);
     const headerRef = useRef(null);
     const discoveryLogContainerRef = useRef(null);
     const discoveryReportViewerRef = useRef(null);
@@ -3470,14 +3799,14 @@
         chatSessionId,
         chatMessages: compactPersistedChatMessages(chatMessages),
         serverConversationHistory: compactPersistedConversationHistory(serverConversationHistory)
-      });
-    }, [chatSessionId, chatMessages, serverConversationHistory]);
+      }, storageScope);
+    }, [chatSessionId, chatMessages, serverConversationHistory, storageScope]);
     useEffect(() => {
-      saveChatMission(chatMission);
+      saveChatMission(chatMission, storageScope);
     }, [chatMission]);
     useEffect(() => {
       activeChatGoalIdRef.current = activeChatGoalId;
-      saveActiveChatGoalId(activeChatGoalId);
+      saveActiveChatGoalId(activeChatGoalId, storageScope);
     }, [activeChatGoalId]);
     useEffect(() => {
       isTypingRef.current = isTyping;
@@ -3535,10 +3864,20 @@
       loadConfig();
       loadAuthStatus();
       loadCapabilities();
+      if (isSettingsOpen) {
+        loadCredentials();
+        loadMCPConfigs();
+        loadSecurityControlPlane();
+        checkServerCodeStatus();
+      }
       return () => {
+        var _a2;
+        clearTimeout(wsReconnectTimerRef.current);
         if (wsRef.current) {
+          wsRef.current.onclose = null;
           wsRef.current.close();
         }
+        (_a2 = chatAbortControllerRef.current) == null ? void 0 : _a2.abort();
       };
     }, []);
     useEffect(() => {
@@ -3578,10 +3917,18 @@
       }
     }, [isCapabilitiesRagView]);
     useEffect(() => {
-      if (discoveryStatus === "completed") {
-        loadCapabilities();
-      }
-    }, [discoveryStatus]);
+      if (discoveryStatus !== "completed") return;
+      loadCapabilities();
+      if (!discoveryResultTimestamp) return;
+      loadReports();
+      loadDiscoveryDashboard();
+      loadV2Intelligence();
+      loadV2Artifacts();
+      loadDiscoveryCompare("latest", "previous");
+      loadEnvironmentMemory();
+      loadRunbookPayload("latest", workflowTab);
+      if (isCapabilitiesRagView) loadKnowledgeLibrary({ silent: true });
+    }, [discoveryStatus, discoveryResultTimestamp]);
     useEffect(() => {
       if (summaryStageNormalized === "complete") {
         loadCapabilities();
@@ -3640,7 +3987,8 @@
     }, [discoveryStatus]);
     const connectWebSocket = () => {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      const query = workspaceKey ? `?workspace=${encodeURIComponent(workspaceKey)}` : "";
+      const wsUrl = `${protocol}//${window.location.host}/ws${query}`;
       wsRef.current = new WebSocket(wsUrl);
       wsRef.current.onopen = () => {
         setIsConnected(true);
@@ -3653,7 +4001,7 @@
       };
       wsRef.current.onclose = () => {
         setIsConnected(false);
-        setTimeout(connectWebSocket, 3e3);
+        wsReconnectTimerRef.current = setTimeout(connectWebSocket, 3e3);
       };
     };
     const handleWebSocketMessage = (message) => {
@@ -3732,13 +4080,6 @@
           setDiscoveryErrorMessage("");
           setDiscoveryStartTime(null);
           setElapsedTime(0);
-          loadReports();
-          loadDiscoveryDashboard();
-          loadV2Intelligence();
-          loadV2Artifacts();
-          loadDiscoveryCompare("latest", "previous");
-          loadEnvironmentMemory();
-          loadRunbookPayload("latest", workflowTab);
           break;
         case "rate_limit":
           addMessage("rate_limit", message.data);
@@ -3815,7 +4156,7 @@
     };
     const loadDiscoveryStatus = async () => {
       try {
-        const response = await fetch("/api/discovery/status");
+        const response = await fetch2("/api/discovery/status");
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -3845,7 +4186,7 @@
       setDiscoveryLastRunOutcome(null);
       setElapsedTime(0);
       try {
-        const response = await fetch("/start-discovery", { method: "POST" });
+        const response = await fetch2("/start-discovery", { method: "POST" });
         const result = await response.json();
         if (result.error) {
           addMessage("error", { message: result.error });
@@ -3898,7 +4239,7 @@
     };
     const executeDiscoveryAbort = async () => {
       try {
-        const response = await fetch("/abort-discovery", { method: "POST" });
+        const response = await fetch2("/abort-discovery", { method: "POST" });
         const result = await response.json();
         if (result.error) {
           addMessage("error", { message: result.error });
@@ -3949,16 +4290,18 @@
       return `${mins}:${secs.toString().padStart(2, "0")}`;
     };
     const loadReports = async () => {
+      const requestId = ++reportRequestIdRef.current;
       try {
-        const response = await fetch("/reports");
+        const response = await fetch2("/reports");
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         const result = await response.json();
-        console.log("Loaded reports:", result);
+        if (requestId !== reportRequestIdRef.current) return;
         setReports(result.reports || []);
         setSessionCatalog(result.sessions || []);
       } catch (error) {
+        if (requestId !== reportRequestIdRef.current) return;
         console.error("Failed to load reports:", error);
         setReports([]);
         setSessionCatalog([]);
@@ -3966,7 +4309,7 @@
     };
     const loadDiscoveryDashboard = async () => {
       try {
-        const response = await fetch("/api/discovery/dashboard");
+        const response = await fetch2("/api/discovery/dashboard");
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -3979,7 +4322,7 @@
     };
     const loadV2Intelligence = async () => {
       try {
-        const response = await fetch("/api/v2/intelligence");
+        const response = await fetch2("/api/v2/intelligence");
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -3992,7 +4335,7 @@
     };
     const loadV2Artifacts = async () => {
       try {
-        const response = await fetch("/api/v2/artifacts");
+        const response = await fetch2("/api/v2/artifacts");
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -4141,7 +4484,7 @@
     const loadCapabilities = async () => {
       var _a2, _b2;
       try {
-        const response = await fetch("/api/capabilities");
+        const response = await fetch2("/api/capabilities");
         const result = await response.json();
         if (!response.ok) {
           throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.message) || `HTTP ${response.status}`);
@@ -4188,7 +4531,7 @@
     const loadDashboardStatus = async ({ refresh = false } = {}) => {
       setDashboardStatus((prev) => ({ ...prev, status: "loading", error: "" }));
       try {
-        const response = await fetch(`/api/dashboards/status${refresh ? "?refresh=true" : ""}`);
+        const response = await fetch2(`/api/dashboards/status${refresh ? "?refresh=true" : ""}`);
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
@@ -4200,7 +4543,7 @@
     };
     const loadDashboardOperations = async () => {
       try {
-        const response = await fetch("/api/dashboards/operations?limit=5");
+        const response = await fetch2("/api/dashboards/operations?limit=5");
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
@@ -4214,7 +4557,7 @@
     const loadCapabilityConnections = async (name, { refresh = false } = {}) => {
       setCapabilityConnections((prev) => ({ ...prev, [name]: { ...prev[name] || {}, status: "loading", error: "" } }));
       try {
-        const response = await fetch(`/api/capabilities/${encodeURIComponent(name)}/connections${refresh ? "?refresh=true" : ""}`);
+        const response = await fetch2(`/api/capabilities/${encodeURIComponent(name)}/connections${refresh ? "?refresh=true" : ""}`);
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(dashboardApiError(data, `HTTP ${response.status}`));
@@ -4234,7 +4577,7 @@
       );
       setDashboardWebUrlSave({ saving: true, error: "", notice: "" });
       try {
-        const response = await fetch("/api/capabilities/splunk_dashboards/config", {
+        const response = await fetch2("/api/capabilities/splunk_dashboards/config", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ config: { splunk_web_urls: addresses } })
@@ -4260,7 +4603,7 @@
         }));
       }
       try {
-        const response = await fetch("/api/capabilities/rag/assets");
+        const response = await fetch2("/api/capabilities/rag/assets");
         const result = await response.json();
         if (!response.ok) {
           throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.message) || `HTTP ${response.status}`);
@@ -4310,7 +4653,7 @@
         setKnowledgeLibrary((prev) => ({ ...prev, status: "loading", error: "" }));
       }
       try {
-        const response = await fetch("/api/knowledge-library/status");
+        const response = await fetch2("/api/knowledge-library/status");
         const result = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(getLibraryErrorMessage(result, `HTTP ${response.status}`));
@@ -4324,7 +4667,7 @@
     const runKnowledgeLibraryRequest = async (action, url, options = {}) => {
       setKnowledgeLibrary((prev) => ({ ...prev, action, message: null }));
       try {
-        const response = await fetch(url, options);
+        const response = await fetch2(url, options);
         const result = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(getLibraryErrorMessage(result, `HTTP ${response.status}`));
@@ -4362,7 +4705,7 @@
       }
       setLibraryDocSearch((prev) => ({ ...prev, status: "loading", error: "" }));
       try {
-        const response = await fetch("/api/knowledge-library/search", {
+        const response = await fetch2("/api/knowledge-library/search", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ query, limit: 5 })
@@ -4650,7 +4993,7 @@
         [name]: Date.now()
       }));
       try {
-        const response = await fetch(`/api/capabilities/${name}/${action}`, {
+        const response = await fetch2(`/api/capabilities/${name}/${action}`, {
           method: "POST",
           headers: payload ? { "Content-Type": "application/json" } : void 0,
           body: payload ? JSON.stringify(payload) : void 0
@@ -4709,7 +5052,7 @@
         [capabilityName]: "build"
       }));
       try {
-        const response = await fetch("/api/capabilities/deeplinks/build", {
+        const response = await fetch2("/api/capabilities/deeplinks/build", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload || {})
@@ -5005,7 +5348,7 @@
         rag_chromadb: "import-asset"
       }));
       try {
-        const response = await fetch("/api/capabilities/rag/assets/import/text", {
+        const response = await fetch2("/api/capabilities/rag/assets/import/text", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -5214,7 +5557,7 @@
         const params = new URLSearchParams();
         if (current) params.set("current", current);
         if (baseline) params.set("baseline", baseline);
-        const response = await fetch(`/api/discovery/compare?${params.toString()}`);
+        const response = await fetch2(`/api/discovery/compare?${params.toString()}`);
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -5228,7 +5571,7 @@
     const loadEnvironmentMemory = async () => {
       setEnvironmentMemoryState((current) => ({ ...current, loading: true, error: "" }));
       try {
-        const response = await fetch("/api/environment-memory?change_limit=200");
+        const response = await fetch2("/api/environment-memory?change_limit=200");
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(data.detail || `Could not load what changed (HTTP ${response.status}).`);
@@ -5244,7 +5587,7 @@
     const runEnvironmentCheck = async () => {
       setEnvironmentMemoryState((current) => ({ ...current, checking: true, error: "", notice: "" }));
       try {
-        const response = await fetch("/api/environment-memory/check", { method: "POST" });
+        const response = await fetch2("/api/environment-memory/check", { method: "POST" });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(data.detail || "The check could not run.");
@@ -5291,7 +5634,7 @@
       }
       setEnvironmentSettingsState((current) => ({ ...current, saving: true, error: "", notice: "" }));
       try {
-        const response = await fetch("/api/environment-memory/settings", {
+        const response = await fetch2("/api/environment-memory/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -5323,7 +5666,7 @@ The names and the change log are removed. Discovery runs you already have are no
       }
       setEnvironmentSettingsState((current) => ({ ...current, clearing: true, error: "", notice: "" }));
       try {
-        const response = await fetch("/api/environment-memory/clear", { method: "POST" });
+        const response = await fetch2("/api/environment-memory/clear", { method: "POST" });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(data.detail || "Could not clear the environment record.");
@@ -5370,7 +5713,7 @@ The names and the change log are removed. Discovery runs you already have are no
       try {
         const params = new URLSearchParams();
         if (timestamp) params.set("timestamp", timestamp);
-        const response = await fetch(`/api/discovery/m26-14/profile?${params.toString()}`);
+        const response = await fetch2(`/api/discovery/m26-14/profile?${params.toString()}`);
         const result = await response.json();
         if (!response.ok) {
           throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.message) || `HTTP ${response.status}`);
@@ -5389,7 +5732,7 @@ The names and the change log are removed. Discovery runs you already have are no
         const params = new URLSearchParams();
         if (current) params.set("current", current);
         if (baseline) params.set("baseline", baseline);
-        const response = await fetch(`/api/discovery/m26-14/compare?${params.toString()}`);
+        const response = await fetch2(`/api/discovery/m26-14/compare?${params.toString()}`);
         const result = await response.json();
         if (!response.ok) {
           throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.message) || `HTTP ${response.status}`);
@@ -5405,7 +5748,7 @@ The names and the change log are removed. Discovery runs you already have are no
     };
     const loadM2614ValidationPacks = async () => {
       try {
-        const response = await fetch("/api/discovery/m26-14/validation-packs");
+        const response = await fetch2("/api/discovery/m26-14/validation-packs");
         const result = await response.json();
         if (!response.ok) {
           throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.message) || `HTTP ${response.status}`);
@@ -5442,7 +5785,7 @@ The names and the change log are removed. Discovery runs you already have are no
       }
       setM2614ValidationState({ status: "loading", error: "" });
       try {
-        const response = await fetch("/api/discovery/m26-14/validate", {
+        const response = await fetch2("/api/discovery/m26-14/validate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -5469,7 +5812,7 @@ The names and the change log are removed. Discovery runs you already have are no
         if (timestamp) params.set("timestamp", timestamp);
         if (persona) params.set("persona", persona);
         if (voice) params.set("voice", voice);
-        const response = await fetch(`/api/discovery/runbook?${params.toString()}`);
+        const response = await fetch2(`/api/discovery/runbook?${params.toString()}`);
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -5520,7 +5863,7 @@ The names and the change log are removed. Discovery runs you already have are no
       var _a2;
       setExportBuildState({ status: "loading", bundle: null, error: "" });
       try {
-        const response = await fetch("/api/capabilities/exports/build", {
+        const response = await fetch2("/api/capabilities/exports/build", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -5594,7 +5937,7 @@ The names and the change log are removed. Discovery runs you already have are no
         };
       });
       try {
-        const response = await fetch(`/api/capabilities/rag/assets/${encodeURIComponent(assetId)}`);
+        const response = await fetch2(`/api/capabilities/rag/assets/${encodeURIComponent(assetId)}`);
         const result = await response.json();
         if (!response.ok) {
           throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.message) || "Could not load item details.");
@@ -5654,12 +5997,12 @@ The names and the change log are removed. Discovery runs you already have are no
           formData.append("source_label", ragAssetDraft.source_label || "");
           formData.append("description", ragAssetDraft.description || "");
           formData.append("tags", ragAssetDraft.tags || "");
-          response = await fetch("/api/capabilities/rag/assets/import/file", {
+          response = await fetch2("/api/capabilities/rag/assets/import/file", {
             method: "POST",
             body: formData
           });
         } else {
-          response = await fetch("/api/capabilities/rag/assets/import/text", {
+          response = await fetch2("/api/capabilities/rag/assets/import/text", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -5724,7 +6067,7 @@ The names and the change log are removed. Discovery runs you already have are no
         rag_chromadb: "delete-asset"
       }));
       try {
-        const response = await fetch(`/api/capabilities/rag/assets/${encodeURIComponent(assetId)}/delete`, {
+        const response = await fetch2(`/api/capabilities/rag/assets/${encodeURIComponent(assetId)}/delete`, {
           method: "POST"
         });
         const result = await response.json();
@@ -5784,7 +6127,7 @@ The names and the change log are removed. Discovery runs you already have are no
         rag_chromadb: actionKey
       }));
       try {
-        const response = await fetch(`/api/capabilities/rag/assets/${encodeURIComponent(assetId)}/${endpoint}`, {
+        const response = await fetch2(`/api/capabilities/rag/assets/${encodeURIComponent(assetId)}/${endpoint}`, {
           method: "POST"
         });
         const result = await response.json();
@@ -5839,7 +6182,7 @@ The names and the change log are removed. Discovery runs you already have are no
         rag_chromadb: "build-context"
       }));
       try {
-        const response = await fetch("/api/capabilities/rag/context/build", {
+        const response = await fetch2("/api/capabilities/rag/context/build", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -6705,13 +7048,6 @@ The names and the change log are removed. Discovery runs you already have are no
       if (state === "available") {
         return `${connectionLabel || "This Splunk connection"} offers the Constellation dashboard tools. Ask for a dashboard in chat, or use Create Dashboard on a report.`;
       }
-      if (state === "potential") {
-        return "This Splunk environment does not offer the dashboard tools yet. To create dashboards here, install these apps in that Splunk environment:";
-      }
-      if (state === "incompatible") {
-        const problems = Array.isArray(support == null ? void 0 : support.problems) ? support.problems.join(" ") : "";
-        return ["This Splunk environment lists the dashboard tools, but not in the version this app supports.", problems, "Update Constellation in that Splunk environment:"].filter(Boolean).join(" ");
-      }
       return (support == null ? void 0 : support.message) || "Not checked yet.";
     };
     const renderDashboardConnectionSettings = (capability) => {
@@ -6754,7 +7090,7 @@ The names and the change log are removed. Discovery runs you already have are no
       );
     };
     const renderDashboardCapabilityPanel = (capability) => {
-      var _a2;
+      var _a2, _b2;
       const view = dashboardStatus.data;
       const support = (view == null ? void 0 : view.support) || null;
       const supportState = !support && dashboardStatus.status !== "error" ? "loading" : (support == null ? void 0 : support.reason) === "no_connection" ? "no_connection" : (support == null ? void 0 : support.state) || "unknown";
@@ -6763,9 +7099,9 @@ The names and the change log are removed. Discovery runs you already have are no
       const message = supportState === "loading" ? "Checking this Splunk connection for the dashboard tools..." : support ? describeDashboardSupport(support, connectionLabel) : dashboardStatus.error || "Not checked yet.";
       const showBlockedReason = !!((view == null ? void 0 : view.enabled) && !(view == null ? void 0 : view.can_create) && supportState === "available" && (view == null ? void 0 : view.blocked_reason));
       const operations = capability.installed ? (dashboardOperations.items || []).slice(0, 5) : [];
-      return /* @__PURE__ */ React.createElement("div", { "data-testid": "dashboard-capability-panel", className: `mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, connectionLabel ? `Splunk connection: ${connectionLabel}` : "This Splunk connection"), renderDashboardSupportChip(supportState, "dashboard-support-state")), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => loadDashboardStatus({ refresh: true }), disabled: dashboardStatus.status === "loading", className: "ui-link text-xs disabled:opacity-60" }, dashboardStatus.status === "loading" ? "Checking..." : "Check Again")), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, "data-testid": "dashboard-support-message" }, message), (supportState === "potential" || supportState === "incompatible") && renderSplunkRequirementLinks(requirements, "dashboard-requirements"), showBlockedReason && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, "data-testid": "dashboard-blocked-reason" }, view.blocked_reason), operations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3", "data-testid": "dashboard-recent" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, "Your recent dashboards"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-2" }, operations.map((operation) => {
-        var _a3, _b2;
-        return /* @__PURE__ */ React.createElement("li", { key: operation.request_id, className: "flex flex-wrap items-center justify-between gap-2 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: "min-w-0 break-words" }, /* @__PURE__ */ React.createElement("span", { className: `font-medium ${headingClass}` }, operation.title || "Untitled dashboard"), /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, " · ", DASHBOARD_STATUS_LABELS[operation.status] || operation.status, operation.created_at ? ` · ${formatDashboardTime(operation.created_at)}` : "")), /* @__PURE__ */ React.createElement("span", { className: "flex flex-wrap gap-3" }, ((_a3 = operation.receipt) == null ? void 0 : _a3.view_url) && /* @__PURE__ */ React.createElement("a", { href: operation.receipt.view_url, target: "_blank", rel: "noopener noreferrer", className: "ui-link" }, "Open Dashboard"), ((_b2 = operation.receipt) == null ? void 0 : _b2.edit_url) && /* @__PURE__ */ React.createElement("a", { href: operation.receipt.edit_url, target: "_blank", rel: "noopener noreferrer", className: "ui-link" }, "Edit in Constellation")));
+      return /* @__PURE__ */ React.createElement("div", { "data-testid": "dashboard-capability-panel", className: `mt-3 rounded-lg border px-3 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-950" : "border-gray-200 bg-gray-50"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `text-sm font-medium ${headingClass}` }, connectionLabel ? `Splunk connection: ${connectionLabel}` : "This Splunk connection"), renderDashboardSupportChip(supportState, "dashboard-support-state")), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => loadDashboardStatus({ refresh: true }), disabled: dashboardStatus.status === "loading", className: "ui-link text-xs disabled:opacity-60" }, dashboardStatus.status === "loading" ? "Checking..." : "Check Again")), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, "data-testid": "dashboard-support-message" }, message), (supportState === "potential" || supportState === "incompatible") && renderSplunkRequirementLinks(requirements, "dashboard-requirements"), showBlockedReason && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, "data-testid": "dashboard-blocked-reason" }, view.blocked_reason), (view == null ? void 0 : view.can_create) && ((_b2 = view.authoring) == null ? void 0 : _b2.message) && /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-xs ${subtextClass}`, "data-testid": "dashboard-authoring-status" }, view.authoring.message), operations.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-3", "data-testid": "dashboard-recent" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wide ${mutedTextClass}` }, "Your recent dashboards"), /* @__PURE__ */ React.createElement("ul", { className: "mt-2 space-y-2" }, operations.map((operation) => {
+        var _a3, _b3;
+        return /* @__PURE__ */ React.createElement("li", { key: operation.request_id, className: "flex flex-wrap items-center justify-between gap-2 text-xs" }, /* @__PURE__ */ React.createElement("span", { className: "min-w-0 break-words" }, /* @__PURE__ */ React.createElement("span", { className: `font-medium ${headingClass}` }, operation.title || "Untitled dashboard"), /* @__PURE__ */ React.createElement("span", { className: mutedTextClass }, " · ", DASHBOARD_STATUS_LABELS[operation.status] || operation.status, operation.created_at ? ` · ${formatDashboardTime(operation.created_at)}` : "")), /* @__PURE__ */ React.createElement("span", { className: "flex flex-wrap gap-3" }, ((_a3 = operation.receipt) == null ? void 0 : _a3.view_url) && /* @__PURE__ */ React.createElement("a", { href: operation.receipt.view_url, target: "_blank", rel: "noopener noreferrer", className: "ui-link" }, "Open Dashboard"), ((_b3 = operation.receipt) == null ? void 0 : _b3.edit_url) && /* @__PURE__ */ React.createElement("a", { href: operation.receipt.edit_url, target: "_blank", rel: "noopener noreferrer", className: "ui-link" }, "Edit in Constellation")));
       }))), isCapabilityAdmin && capability.installed && renderDashboardConnectionSettings(capability));
     };
     const renderCapabilitySplunkRequirements = (capability) => {
@@ -7600,13 +7936,7 @@ The names and the change log are removed. Discovery runs you already have are no
       }))));
     };
     const loadConnectionInfo = async () => {
-      try {
-        const response = await fetch("/connection-info");
-        const result = await response.json();
-        setConnectionInfo(result);
-      } catch (error) {
-        console.error("Failed to load connection info:", error);
-      }
+      await refreshConnection();
       loadIncognitoStatus();
     };
     const openSettings = async () => {
@@ -7627,16 +7957,15 @@ The names and the change log are removed. Discovery runs you already have are no
     };
     const loadConfig = async () => {
       try {
-        const response = await fetch("/api/config");
+        const response = await fetch2("/api/config");
         const data = await response.json();
         setConfig(data);
         setSelectedProvider(normalizeProvider(data.llm.provider || "openai", data.llm.endpoint_url));
         setSelectedModel(data.llm.model || "");
         setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(data.llm.provider, data.llm.api_key === "***"));
-        setMCPTokenPlaceholder(data.mcp.token === "***" ? "(Already Configured)" : "Enter token");
-        if (data.active_mcp_config_name) {
-          setLoadedMCPConfigName(data.active_mcp_config_name);
-        }
+        const effectiveMcp2 = data.effective_mcp || data.mcp;
+        setMCPTokenPlaceholder(effectiveMcp2.token === "***" ? "(Already Configured)" : "Enter token");
+        setLoadedMCPConfigName(effectiveMcp2.name || (!data.effective_mcp ? data.active_mcp_config_name : null));
       } catch (error) {
         console.error("Failed to load config:", error);
       } finally {
@@ -7645,7 +7974,7 @@ The names and the change log are removed. Discovery runs you already have are no
     };
     const loadAuthStatus = async () => {
       try {
-        const response = await fetch("/api/auth/status");
+        const response = await fetch2("/api/auth/status");
         const data = await response.json();
         if (!response.ok) {
           throw new Error(data.detail || "Failed to load auth status");
@@ -7658,7 +7987,7 @@ The names and the change log are removed. Discovery runs you already have are no
     };
     const loadIncognitoStatus = async () => {
       try {
-        const response = await fetch("/api/incognito/status");
+        const response = await fetch2("/api/incognito/status");
         if (!response.ok) {
           setIncognitoStatus(null);
           return null;
@@ -7675,7 +8004,7 @@ The names and the change log are removed. Discovery runs you already have are no
     const saveIncognitoPreference = async (enabled) => {
       setIncognitoToggleState({ saving: true, error: "" });
       try {
-        const response = await fetch("/api/incognito/preference", {
+        const response = await fetch2("/api/incognito/preference", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ enabled })
@@ -7730,7 +8059,7 @@ The names and the change log are removed. Discovery runs you already have are no
     const loadIncognitoPolicy = async () => {
       setIncognitoPolicyState((current) => ({ ...current, loading: true, error: "" }));
       try {
-        const response = await fetch("/api/incognito/policy");
+        const response = await fetch2("/api/incognito/policy");
         const data = await response.json().catch(() => ({}));
         if (response.status === 401 || response.status === 403) {
           applyIncognitoPolicy(null);
@@ -7756,7 +8085,7 @@ The names and the change log are removed. Discovery runs you already have are no
       }
       setIncognitoPolicyState((current) => ({ ...current, saving: true, error: "", notice: "" }));
       try {
-        const response = await fetch("/api/incognito/policy", {
+        const response = await fetch2("/api/incognito/policy", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -7784,7 +8113,7 @@ The names and the change log are removed. Discovery runs you already have are no
       }
       setIncognitoPolicyState((current) => ({ ...current, rotating: true, error: "", notice: "" }));
       try {
-        const response = await fetch("/api/incognito/rotate", { method: "POST" });
+        const response = await fetch2("/api/incognito/rotate", { method: "POST" });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(data.detail || "Could not reset the stand-ins.");
@@ -7804,7 +8133,7 @@ The names and the change log are removed. Discovery runs you already have are no
       }
       setIncognitoPreview((current) => ({ ...current, loading: true, error: "", result: null }));
       try {
-        const response = await fetch("/api/incognito/preview", {
+        const response = await fetch2("/api/incognito/preview", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: textToPreview })
@@ -7828,7 +8157,7 @@ The names and the change log are removed. Discovery runs you already have are no
       }
       setIncognitoLedgers((current) => ({ ...current, [ledgerId]: { loading: true, record: null, error: "" } }));
       try {
-        const response = await fetch(`/api/incognito/ledger/${encodeURIComponent(ledgerId)}`);
+        const response = await fetch2(`/api/incognito/ledger/${encodeURIComponent(ledgerId)}`);
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(response.status === 404 ? "This record is no longer available. Only the most recent records are kept, and only the person who asked can see them." : data.detail || "Could not load what the AI saw.");
@@ -7864,7 +8193,7 @@ The names and the change log are removed. Discovery runs you already have are no
     const loadSecurityUsers = async () => {
       setSecurityUsersState({ loading: true, error: "" });
       try {
-        const response = await fetch("/api/security/users");
+        const response = await fetch2("/api/security/users");
         const data = await response.json();
         if (!response.ok) {
           throw new Error(data.detail || "Failed to load users");
@@ -7886,7 +8215,7 @@ The names and the change log are removed. Discovery runs you already have are no
     const loadSecurityTokens = async () => {
       setSecurityTokensState({ loading: true, error: "" });
       try {
-        const response = await fetch("/api/security/tokens");
+        const response = await fetch2("/api/security/tokens");
         const data = await response.json();
         if (!response.ok) {
           throw new Error(data.detail || "Failed to load tokens");
@@ -7910,7 +8239,7 @@ The names and the change log are removed. Discovery runs you already have are no
     };
     const handleAuthLogout = async () => {
       try {
-        const response = await fetch("/api/auth/logout", { method: "POST" });
+        const response = await fetch2("/api/auth/logout", { method: "POST" });
         const result = await response.json();
         if (!response.ok) {
           throw new Error(result.detail || "Failed to sign out");
@@ -7948,7 +8277,7 @@ The names and the change log are removed. Discovery runs you already have are no
         payload.new_password = String(draft.new_password).trim();
       }
       try {
-        const response = await fetch(`/api/security/users/${user.id}`, {
+        const response = await fetch2(`/api/security/users/${user.id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -7972,7 +8301,7 @@ The names and the change log are removed. Discovery runs you already have are no
         return;
       }
       try {
-        const response = await fetch("/api/security/users", {
+        const response = await fetch2("/api/security/users", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -8004,7 +8333,7 @@ This action cannot be undone.`);
         return;
       }
       try {
-        const response = await fetch(`/api/security/users/${user.id}`, { method: "DELETE" });
+        const response = await fetch2(`/api/security/users/${user.id}`, { method: "DELETE" });
         const result = await response.json();
         if (!response.ok) {
           throw new Error(result.detail || "Failed to delete user");
@@ -8040,7 +8369,7 @@ This action cannot be undone.`);
       const expiresInDays = Number.parseInt(securityTokenComposer.expires_in_days, 10);
       const ownerUserId = Number.parseInt(securityTokenComposer.owner_user_id, 10);
       try {
-        const response = await fetch("/api/security/tokens", {
+        const response = await fetch2("/api/security/tokens", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -8075,7 +8404,7 @@ Clients using this token will stop working immediately.`);
         return;
       }
       try {
-        const response = await fetch(`/api/security/tokens/${token.id}/revoke`, { method: "POST" });
+        const response = await fetch2(`/api/security/tokens/${token.id}/revoke`, { method: "POST" });
         const result = await response.json();
         if (!response.ok) {
           throw new Error(result.detail || "Failed to revoke token");
@@ -8095,7 +8424,7 @@ This deletes the token. Anything using it loses access.`);
         return;
       }
       try {
-        const response = await fetch(`/api/security/tokens/${token.id}`, { method: "DELETE" });
+        const response = await fetch2(`/api/security/tokens/${token.id}`, { method: "DELETE" });
         const result = await response.json();
         if (!response.ok) {
           throw new Error(result.detail || "Failed to remove token");
@@ -8122,7 +8451,7 @@ This deletes the token. Anything using it loses access.`);
     };
     const loadCredentials = async () => {
       try {
-        const response = await fetch("/api/credentials");
+        const response = await fetch2("/api/credentials");
         const credentials = await response.json();
         setSavedCredentials(credentials);
         const credList2 = document.getElementById("credentials-list");
@@ -8227,7 +8556,7 @@ This deletes the token. Anything using it loses access.`);
                             </div>
                         `;
         }
-        const response = await fetch(`/api/credentials/${encodeURIComponent(name)}/load`, { method: "POST" });
+        const response = await fetch2(`/api/credentials/${encodeURIComponent(name)}/load`, { method: "POST" });
         const result = await response.json();
         if (response.ok) {
           const newConfig = result.config;
@@ -8306,7 +8635,7 @@ Are you sure you want to delete '${name}'?
 This action cannot be undone.`);
       if (!confirmed) return;
       try {
-        const response = await fetch(`/api/credentials/${encodeURIComponent(name)}`, { method: "DELETE" });
+        const response = await fetch2(`/api/credentials/${encodeURIComponent(name)}`, { method: "DELETE" });
         if (response.ok) {
           await loadCredentials();
           const successDiv = document.createElement("div");
@@ -8335,7 +8664,7 @@ This action cannot be undone.`);
       }
     };
     const openMCPSaveModal = (profileName) => {
-      var _a2, _b2, _c2, _d2;
+      var _a2;
       const urlEl = document.getElementById("mcp-url");
       const tokenEl = document.getElementById("mcp-token");
       const verifySslEl = document.getElementById("mcp-verify-ssl");
@@ -8343,169 +8672,72 @@ This action cannot be undone.`);
       const name = String(profileName || "");
       setMCPSaveDraft({
         mode: name ? "update" : "new",
-        url: String((urlEl == null ? void 0 : urlEl.value) || ((_a2 = config == null ? void 0 : config.mcp) == null ? void 0 : _a2.url) || "").trim(),
+        activate: Boolean(name || !headerMcpConnected),
+        url: String((urlEl == null ? void 0 : urlEl.value) || (effectiveMcp == null ? void 0 : effectiveMcp.url) || "").trim(),
         token: (tokenEl == null ? void 0 : tokenEl.value) || "",
-        verify_ssl: verifySslEl ? verifySslEl.checked : Boolean((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.verify_ssl),
-        ca_bundle_path: String(caBundleEl ? caBundleEl.value : ((_c2 = config == null ? void 0 : config.mcp) == null ? void 0 : _c2.ca_bundle_path) || "").trim()
+        verify_ssl: verifySslEl ? verifySslEl.checked : Boolean(effectiveMcp == null ? void 0 : effectiveMcp.verify_ssl),
+        ca_bundle_path: String(caBundleEl ? caBundleEl.value : (effectiveMcp == null ? void 0 : effectiveMcp.ca_bundle_path) || "").trim()
       });
       setMCPConfigName(name);
-      setMCPConfigDescription(name ? ((_d2 = savedMCPConfigs == null ? void 0 : savedMCPConfigs[name]) == null ? void 0 : _d2.description) || "" : "");
+      setMCPConfigDescription(name ? ((_a2 = savedMCPConfigs == null ? void 0 : savedMCPConfigs[name]) == null ? void 0 : _a2.description) || "" : "");
       setIsMCPSaveModalOpen(true);
     };
     const describeMCPDraftToken = (draft, profileName) => {
-      var _a2, _b2, _c2;
+      var _a2;
       if (!draft) return "Not set";
       if (draft.token) return "New token entered";
       if ((_a2 = savedMCPConfigs == null ? void 0 : savedMCPConfigs[String(profileName || "").trim()]) == null ? void 0 : _a2.token) return "Keep saved token";
       const normalizeUrl = (value) => String(value || "").trim().replace(/\/+$/, "").toLowerCase();
-      if (((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.token) && normalizeUrl(draft.url) === normalizeUrl((_c2 = config == null ? void 0 : config.mcp) == null ? void 0 : _c2.url)) return "Use current token";
+      if ([effectiveMcp, config == null ? void 0 : config.mcp].some((connection) => (connection == null ? void 0 : connection.token) && normalizeUrl(draft.url) === normalizeUrl(connection.url))) return "Use current token";
       return "Not set";
     };
     const loadMCPConfigs = async () => {
       try {
-        const response = await fetch("/api/mcp-configs");
-        const mcpConfigs = await response.json();
-        setSavedMCPConfigs(mcpConfigs);
-        const mcpList = document.getElementById("mcp-configs-list");
-        if (!mcpList) return;
-        if (Object.keys(mcpConfigs).length === 0) {
-          mcpList.innerHTML = `
-                            <div class="text-center py-12 bg-white rounded-lg border-2 border-dashed border-gray-300">
-                                <i class="fas fa-server text-green-300 text-5xl mb-4"></i>
-                                <p class="text-base font-bold text-gray-700 mb-2">No MCP servers saved yet</p>
-                                <p class="text-sm text-gray-500 mb-4">Save MCP server settings so you can switch between them.</p>
-                                <p class="text-xs text-gray-400 italic">Click "Add MCP Server" above.</p>
-                            </div>
-                        `;
-          return;
-        }
-        const activeMCPName = config == null ? void 0 : config.active_mcp_config_name;
-        const mcpArray = Object.values(mcpConfigs).sort((a, b) => {
-          if (a.name === activeMCPName) return -1;
-          if (b.name === activeMCPName) return 1;
-          return a.name.localeCompare(b.name);
-        });
-        mcpList.innerHTML = mcpArray.map((mcp) => `
-                        <div class="group bg-white rounded-lg p-4 border-2 ${mcp.name === activeMCPName ? "border-green-400 shadow-lg" : "border-gray-200"} hover:border-green-400 hover:shadow-lg transition-all">
-                            <div class="flex items-start justify-between gap-4">
-                                <div class="flex-1 min-w-0">
-                                    <div class="flex items-center gap-2 mb-2">
-                                        <i class="fas fa-server text-green-600 text-lg"></i>
-                                        <h5 class="text-base font-bold text-gray-900 truncate">${escapeSettingsHtml(mcp.name)}</h5>
-                                        ${mcp.name === activeMCPName ? '<span class="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-bold rounded-full">ACTIVE</span>' : ""}
-                                        ${mcp.token ? "" : '<span class="px-2 py-0.5 bg-amber-100 text-amber-800 text-xs font-bold rounded-full" title="Load this configuration, enter the token, and update it">NO TOKEN</span>'}
-                                    </div>
-                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${escapeSettingsHtml(mcp.description)}</p>` : ""}
-                                    <div class="text-sm text-gray-600 space-y-1.5 pl-1">
-                                        <div class="flex items-center gap-2">
-                                            <i class="fas fa-link w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">URL:</span> ${escapeSettingsHtml(mcp.url)}</span>
-                                        </div>
-                                        <div class="flex items-center gap-2">
-                                            <i class="fas fa-shield-alt w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">SSL:</span> ${mcp.verify_ssl ? "Enabled" : "Disabled"}</span>
-                                        </div>
-                                    </div>
-                                </div>
-                                <div class="flex flex-col gap-2 flex-shrink-0">
-                                    <button
-                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="testMCPConfig(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold transition-colors"
-                                        title="Test connection to this MCP server"
-                                    >
-                                        <i class="fas fa-network-wired mr-2"></i>Test
-                                    </button>
-                                    <button
-                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="loadMCPConfigIntoSettings(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold transition-colors"
-                                        title="Load this configuration into active settings"
-                                    >
-                                        <i class="fas fa-download mr-2"></i>Load
-                                    </button>
-                                    <button
-                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="deleteMCPConfig(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold transition-colors"
-                                        title="Permanently delete this saved configuration"
-                                    >
-                                        <i class="fas fa-trash-alt mr-2"></i>Delete
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    `).join("");
+        const response = await fetch2("/api/mcp-configs", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        setSavedMCPConfigs(await response.json());
+        setMCPProfilesStatus("ready");
       } catch (error) {
         console.error("Failed to load MCP configs:", error);
-        const mcpList = document.getElementById("mcp-configs-list");
-        if (mcpList) {
-          mcpList.innerHTML = `
-                            <div class="text-center py-10">
-                                <i class="fas fa-exclamation-triangle text-red-400 text-4xl mb-4"></i>
-                                <p class="text-base font-semibold text-red-700">Failed to load MCP configurations</p>
-                                <p class="text-sm text-gray-600 mt-2">${error.message}</p>
-                            </div>
-                        `;
-        }
+        setMCPProfilesStatus("error");
       }
     };
-    window.loadMCPConfigIntoSettings = async (name) => {
+    const loadMCPConfigIntoSettings = async (name) => {
       var _a2;
+      setSwitchingMCPProfile(name);
       try {
-        const mcpList = document.getElementById("mcp-configs-list");
-        const originalHTML2 = mcpList.innerHTML;
-        mcpList.innerHTML = `
-                        <div class="text-center py-10">
-                            <i class="fas fa-spinner fa-spin text-green-600 text-4xl mb-4"></i>
-                            <p class="text-base font-semibold text-gray-700">Loading configuration...</p>
-                            <p class="text-sm text-gray-500 mt-2">${escapeSettingsHtml(name)}</p>
-                        </div>
-                    `;
-        const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/load`, { method: "POST" });
-        if (response.ok) {
-          const result = await response.json();
-          const newConfig = result.config;
-          setConfig(newConfig);
-          setLoadedMCPConfigName(name);
-          setShowMCPConfigForm(true);
-          setMCPTokenPlaceholder(((_a2 = newConfig == null ? void 0 : newConfig.mcp) == null ? void 0 : _a2.token) === "***" ? "(Already Configured)" : "Enter token");
-          setTimeout(() => {
-            const mcpUrlInput = document.getElementById("mcp-url");
-            const mcpTokenInput = document.getElementById("mcp-token");
-            const mcpCaBundleInput = document.getElementById("mcp-ca-bundle");
-            if (mcpUrlInput) mcpUrlInput.value = newConfig.mcp.url;
-            if (mcpTokenInput) mcpTokenInput.value = "";
-            if (mcpCaBundleInput) mcpCaBundleInput.value = newConfig.mcp.ca_bundle_path || "";
-          }, 50);
-          await loadConfig();
-          await loadMCPConfigs();
-          const successDiv = document.createElement("div");
-          successDiv.className = "fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50";
-          successDiv.innerHTML = `
-                            <div class="flex items-center gap-3">
-                                <i class="fas fa-check-circle text-2xl"></i>
-                                <div>
-                                    <p class="font-bold text-base">Configuration Loaded!</p>
-                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
-                                </div>
-                            </div>
-                        `;
-          document.body.appendChild(successDiv);
-          setTimeout(() => {
-            successDiv.style.animation = "none";
-            successDiv.style.opacity = "0";
-            successDiv.style.transition = "opacity 0.3s";
-            setTimeout(() => successDiv.remove(), 300);
-          }, 2500);
-        } else {
-          mcpList.innerHTML = originalHTML2;
-          const result = await response.json();
+        const response = await fetch2(`/api/mcp-configs/${encodeURIComponent(name)}/load?target=current`, { method: "POST" });
+        const result = await response.json();
+        if (!response.ok) {
           alert(`Failed to load configuration: ${formatApiErrorDetail(result.detail)}`);
+          return;
         }
+        const loaded = result.effective_mcp;
+        setConfig({ ...result.config, effective_mcp: loaded });
+        setLoadedMCPConfigName(loaded.name);
+        setShowMCPConfigForm(true);
+        setMCPTokenPlaceholder(loaded.token ? "(Already Configured)" : "Enter token");
+        const tokenInput = document.getElementById("mcp-token");
+        if (tokenInput) tokenInput.value = "";
+        if ((_a2 = result.connection_info) == null ? void 0 : _a2.workspace) {
+          applyConnectionInfo(result.connection_info);
+        } else {
+          await loadConnectionInfo();
+        }
+        loadAuthStatus();
+        const successDiv = document.createElement("div");
+        successDiv.className = "fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50";
+        successDiv.setAttribute("role", "status");
+        successDiv.textContent = loaded.token ? `Using ${loaded.name}` : `${loaded.name} selected. Add its MCP token to connect.`;
+        document.body.appendChild(successDiv);
+        setTimeout(() => successDiv.remove(), 2800);
       } catch (error) {
         alert(`Error loading configuration: ${error.message}`);
-        await loadMCPConfigs();
+      } finally {
+        setSwitchingMCPProfile("");
       }
     };
-    window.deleteMCPConfig = async (name) => {
+    const deleteMCPConfig = async (name) => {
       const confirmed = confirm(`⚠️ Delete MCP Configuration
 
 Are you sure you want to delete '${name}'?
@@ -8513,8 +8745,9 @@ Are you sure you want to delete '${name}'?
 This action cannot be undone.`);
       if (!confirmed) return;
       try {
-        const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}`, { method: "DELETE" });
+        const response = await fetch2(`/api/mcp-configs/${encodeURIComponent(name)}`, { method: "DELETE" });
         if (response.ok) {
+          await loadConfig();
           await loadMCPConfigs();
           const successDiv = document.createElement("div");
           successDiv.className = "fixed top-6 right-6 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50";
@@ -8541,9 +8774,7 @@ This action cannot be undone.`);
         alert(`Error: ${error.message}`);
       }
     };
-    window.testMCPConfig = async (name) => {
-      const mcpList = document.getElementById("mcp-configs-list");
-      const originalHTML2 = mcpList.innerHTML;
+    const testMCPConfig = async (name) => {
       try {
         const testingDiv = document.createElement("div");
         testingDiv.className = "fixed top-6 right-6 bg-blue-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50";
@@ -8557,7 +8788,7 @@ This action cannot be undone.`);
                         </div>
                     `;
         document.body.appendChild(testingDiv);
-        const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/test`, { method: "POST" });
+        const response = await fetch2(`/api/mcp-configs/${encodeURIComponent(name)}/test`, { method: "POST" });
         const result = await response.json();
         testingDiv.remove();
         const resultDiv = document.createElement("div");
@@ -8607,13 +8838,20 @@ This action cannot be undone.`);
       }
     };
     const saveSettings = async (settings) => {
+      var _a2;
       try {
-        const response = await fetch("/api/config", {
+        const response = await fetch2("/api/config", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(settings)
         });
         if (response.ok) {
+          const result = await response.json();
+          if (settings.mcp_profile && !((_a2 = result.connection_info) == null ? void 0 : _a2.workspace)) {
+            alert("Could not confirm the MCP profile update. Reload Discovery and try again.");
+            return;
+          }
+          applyConnectionInfo(result.connection_info);
           alert("Settings saved successfully!");
           closeSettings();
           await loadConfig();
@@ -8633,22 +8871,22 @@ This action cannot be undone.`);
       skip: { icon: "fa-minus-circle", tone: "text-gray-500", badge: "bg-gray-50 text-gray-600 border-gray-300", label: "Skipped" }
     };
     const buildTroubleshootDraftFromSettings = (kind) => {
-      var _a2, _b2, _c2, _d2, _e2, _f2, _g2;
+      var _a2, _b2, _c2, _d2;
       if (kind === "mcp") {
         return {
-          name: loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name) || "",
-          url: ((_a2 = config == null ? void 0 : config.mcp) == null ? void 0 : _a2.url) || "",
+          name: loadedMCPConfigName || effectiveMcpName,
+          url: (effectiveMcp == null ? void 0 : effectiveMcp.url) || "",
           token: "",
-          verify_ssl: Boolean((_b2 = config == null ? void 0 : config.mcp) == null ? void 0 : _b2.verify_ssl),
-          ca_bundle_path: ((_c2 = config == null ? void 0 : config.mcp) == null ? void 0 : _c2.ca_bundle_path) || ""
+          verify_ssl: Boolean(effectiveMcp == null ? void 0 : effectiveMcp.verify_ssl),
+          ca_bundle_path: (effectiveMcp == null ? void 0 : effectiveMcp.ca_bundle_path) || ""
         };
       }
       return {
         name: loadedCredentialName || (config == null ? void 0 : config.active_credential_name) || "",
-        provider: normalizeProvider((_d2 = config == null ? void 0 : config.llm) == null ? void 0 : _d2.provider, (_e2 = config == null ? void 0 : config.llm) == null ? void 0 : _e2.endpoint_url),
-        endpoint_url: ((_f2 = config == null ? void 0 : config.llm) == null ? void 0 : _f2.endpoint_url) || "",
+        provider: normalizeProvider((_a2 = config == null ? void 0 : config.llm) == null ? void 0 : _a2.provider, (_b2 = config == null ? void 0 : config.llm) == null ? void 0 : _b2.endpoint_url),
+        endpoint_url: ((_c2 = config == null ? void 0 : config.llm) == null ? void 0 : _c2.endpoint_url) || "",
         api_key: "",
-        model: ((_g2 = config == null ? void 0 : config.llm) == null ? void 0 : _g2.model) || ""
+        model: ((_d2 = config == null ? void 0 : config.llm) == null ? void 0 : _d2.model) || ""
       };
     };
     const readTroubleshootDraftFromForm = (kind) => {
@@ -8747,7 +8985,7 @@ This action cannot be undone.`);
       setTroubleshootResult(null);
       setTroubleshootCopied("");
       try {
-        const response = await fetch(`/api/troubleshoot/${kind}`, {
+        const response = await fetch2(`/api/troubleshoot/${kind}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ ...draft, ...troubleshootOptions })
@@ -8818,7 +9056,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       const origin = `${window.location.protocol}//${window.location.hostname}:${port}`;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 1500);
-      const request = (route) => fetch(`${origin}${route}`, { mode: "cors", credentials: "omit", cache: "no-store", signal: controller.signal });
+      const request = (route) => fetch2(`${origin}${route}`, { mode: "cors", credentials: "omit", cache: "no-store", signal: controller.signal });
       try {
         const response = await request("/api/troubleshoot/server-status");
         if (response.ok) {
@@ -8857,7 +9095,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
     const checkServerCodeStatus = async () => {
       let status = null;
       try {
-        const response = await fetch("/api/troubleshoot/server-status");
+        const response = await fetch2("/api/troubleshoot/server-status");
         if (response.status === 404) {
           status = { stale: true, outdated_server: true, restart_hint: TROUBLESHOOT_RESTART_HINT };
         } else if (response.ok) {
@@ -9988,7 +10226,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
     const loadChatSettings = async () => {
       const requestId = ++chatSettingsRequestRef.current;
       try {
-        const response = await fetch("/api/chat/settings");
+        const response = await fetch2("/api/chat/settings");
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
           throw new Error(data.detail || "Could not load chat settings.");
@@ -10005,7 +10243,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
         setChatSettings((prev) => prev ? { ...prev, ...optimistic } : prev);
       }
       try {
-        const response = await fetch("/api/chat/settings", {
+        const response = await fetch2("/api/chat/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(changes)
@@ -10042,7 +10280,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       const requestId = ++chatSettingsRequestRef.current;
       setChatSettingsDrafts({});
       try {
-        const response = await fetch("/api/chat/settings/reset", {
+        const response = await fetch2("/api/chat/settings/reset", {
           method: "POST"
         });
         const data = await response.json().catch(() => ({}));
@@ -10056,7 +10294,7 @@ Open Troubleshoot to find out why it can't be saved?`)) {
       }
     };
     const chatGoalRequest = async (path, { method = "GET", body } = {}) => {
-      const response = await fetch(path, body === void 0 ? { method } : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const response = await fetch2(path, body === void 0 ? { method } : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         const error = new Error(typeof data.detail === "string" && data.detail ? data.detail : "The goal library could not finish that request.");
@@ -10433,7 +10671,7 @@ This cannot be undone.`)) {
     };
     const startNewChat = () => {
       pendingGoalChatSaveRef.current = null;
-      clearPersistedChatState();
+      clearPersistedChatState(storageScope);
       setChatMessages([]);
       setChatInput("");
       setChatStatus("");
@@ -10500,19 +10738,24 @@ What should we check first? Run the first search that helps.`);
           type: msg.type,
           content: msg.content
         }));
-        const response = await fetch("/chat/stream", {
+        const response = await fetch2("/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             message: userMessage,
             history: historyToSend,
             chat_session_id: chatSessionIdOverride,
+            workspace_key: workspaceKey,
             investigation_mode: investigationMode,
             mission: goalIdForRequest ? String((activeChatGoal == null ? void 0 : activeChatGoal.goal) || "") : "",
             goal_id: goalIdForRequest || null
           }),
           signal: requestController.signal
         });
+        if (!response.ok) {
+          const problem = await response.json().catch(() => ({}));
+          throw new Error(problem.detail || `HTTP ${response.status}`);
+        }
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
@@ -10636,7 +10879,7 @@ What should we check first? Run the first search that helps.`);
       const freshContext = (options == null ? void 0 : options.freshContext) !== false;
       const nextChatSessionId = freshContext ? generateChatSessionId() : chatSessionId;
       if (freshContext) {
-        clearPersistedChatState();
+        clearPersistedChatState(storageScope);
         setChatMessages([]);
         setChatStatus("");
         setServerConversationHistory(null);
@@ -10704,7 +10947,7 @@ What should we check first? Run the first search that helps.`);
       exportReport(`chat-${formatChatExportTimestamp(exportedAt).replace(/[: ]/g, "-")}.md`, content);
     };
     const downloadWithStandIns = async (url, init = void 0) => {
-      const response = await fetch(url, init);
+      const response = await fetch2(url, init);
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(data.detail || "Could not create the shareable copy.");
@@ -10780,7 +11023,7 @@ What should we check first? Run the first search that helps.`);
       }
       setReportDashboardPlans((prev) => ({ ...prev, [reportName]: { status: "loading" } }));
       try {
-        const response = await fetch("/api/dashboards/propose", {
+        const response = await fetch2("/api/dashboards/propose", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ report_name: reportName })
@@ -10815,7 +11058,7 @@ What should we check first? Run the first search that helps.`);
     };
     const loadReport = async (filename) => {
       try {
-        const response = await fetch(`/reports/${encodeURIComponent(filename)}`);
+        const response = await fetch2(`/reports/${encodeURIComponent(filename)}`);
         const result = await response.json();
         if (!response.ok) {
           throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.error) || `Failed to load report (${response.status})`);
@@ -10857,7 +11100,7 @@ What should we check first? Run the first search that helps.`);
       if (!sessionId) {
         return normalizeSummaryProgressPayload();
       }
-      const response = await fetch(`/summarize-progress/${sessionId}`);
+      const response = await fetch2(`/summarize-progress/${sessionId}`);
       const result = await response.json();
       if (!response.ok) {
         throw new Error((result == null ? void 0 : result.detail) || (result == null ? void 0 : result.error) || `Failed to inspect summary progress (${response.status})`);
@@ -10906,7 +11149,7 @@ What should we check first? Run the first search that helps.`);
       const requestController = new AbortController();
       summaryRequestAbortRef.current = requestController;
       try {
-        const response = await fetch("/summarize-session", {
+        const response = await fetch2("/summarize-session", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ timestamp: sessionId }),
@@ -10968,7 +11211,7 @@ What should we check first? Run the first search that helps.`);
       }
       setIsAbortingSummary(true);
       try {
-        const response = await fetch("/abort-summary", {
+        const response = await fetch2("/abort-summary", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ timestamp: currentSessionId })
@@ -11121,7 +11364,7 @@ What should we check first? Run the first search that helps.`);
       }
       setIsGeneratingSummaryInfographic(true);
       try {
-        const response = await fetch("/api/summary/generate-infographic", {
+        const response = await fetch2("/api/summary/generate-infographic", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -11821,9 +12064,9 @@ What should we check first? Run the first search that helps.`);
     const riskAreasSection = getSummarySection(summarySections, "Risk Areas");
     const trendStorySection = getSummarySection(summarySections, "Trend Story");
     const nextLoopSection = getSummarySection(summarySections, "Next Check") || getSummarySection(summarySections, "Recursive Next Loop");
-    const readinessScore = typeof ((_S = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _S : (_R = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _R.readiness_score) === "number" ? (_U = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _U : (_T = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _T.readiness_score : null;
+    const readinessScore = typeof ((_V = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _V : (_U = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _U.readiness_score) === "number" ? (_X = summaryData == null ? void 0 : summaryData.readiness_score) != null ? _X : (_W = summaryData == null ? void 0 : summaryData.v2_context) == null ? void 0 : _W.readiness_score : null;
     const coverageGapItems = Array.isArray(summaryData == null ? void 0 : summaryData.coverage_gaps) ? summaryData.coverage_gaps.filter((gap) => gap && typeof gap === "object" && gap.gap).slice(0, 3) : [];
-    const trendDomainEntries = ((_V = summaryData == null ? void 0 : summaryData.trend_signals) == null ? void 0 : _V.recommendation_by_domain) ? Object.entries(summaryData.trend_signals.recommendation_by_domain).filter(([, count]) => Number(count) > 0) : [];
+    const trendDomainEntries = ((_Y = summaryData == null ? void 0 : summaryData.trend_signals) == null ? void 0 : _Y.recommendation_by_domain) ? Object.entries(summaryData.trend_signals.recommendation_by_domain).filter(([, count]) => Number(count) > 0) : [];
     const contextExplorer = (summaryData == null ? void 0 : summaryData.context_explorer) && typeof summaryData.context_explorer === "object" ? summaryData.context_explorer : {};
     const contextOverview = (contextExplorer == null ? void 0 : contextExplorer.overview) && typeof contextExplorer.overview === "object" ? contextExplorer.overview : {};
     const contextAnchors = (contextExplorer == null ? void 0 : contextExplorer.anchors) && typeof contextExplorer.anchors === "object" ? contextExplorer.anchors : {};
@@ -11936,7 +12179,7 @@ What should we check first? Run the first search that helps.`);
       }))
     ].filter((option) => option.key === "all" || option.count > 0);
     const activeTaskFilterKey = taskFilterOptions.some((option) => option.key === taskFilter) ? taskFilter : "all";
-    const activeTaskFilterLabel = ((_W = taskFilterOptions.find((option) => option.key === activeTaskFilterKey)) == null ? void 0 : _W.label) || "All";
+    const activeTaskFilterLabel = ((_Z = taskFilterOptions.find((option) => option.key === activeTaskFilterKey)) == null ? void 0 : _Z.label) || "All";
     const filteredTaskSnapshots = sortedTaskProgressSnapshots.filter(({ task, progress: progress2 }) => {
       if (activeTaskFilterKey === "all") {
         return true;
@@ -12564,6 +12807,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           subtextClass,
           mutedTextClass,
           incognitoActive,
+          connectionRevision: config,
           testIdPrefix: "report-dashboard",
           onChange: (patch) => updateReportDashboardPlan(selectedReport, patch)
         }
@@ -12598,7 +12842,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       ));
     };
     const renderArtifactEmptyState = () => /* @__PURE__ */ React.createElement("div", { "data-testid": "report-viewer-empty", className: `rounded-lg border border-dashed px-6 py-5 text-sm ${isDarkTheme ? "border-gray-600 text-gray-300" : "border-gray-300 text-gray-600"}` }, reports.length > 0 ? "Choose a report from the library to read it here." : "Reports from your discovery runs show up in the library.");
-    const renderDiscoveryReportLibraryPanel = () => /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm border overflow-hidden min-w-0 lg:flex lg:max-h-[calc(100vh-8.5rem)] lg:flex-col ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-medium ${headingClass}` }, "Report library"), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 ${mutedTextClass}` }, countLabel(sessionCatalog.length, "discovery run"))), /* @__PURE__ */ React.createElement(
+    const renderDiscoveryReportLibraryPanel = () => /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm border overflow-hidden min-w-0 lg:flex lg:max-h-[calc(100vh-8.5rem)] lg:flex-col ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-medium ${headingClass}` }, "Report library"), workspaceLabel && /* @__PURE__ */ React.createElement("p", { "data-testid": "report-library-workspace", className: `mt-1 text-sm ${subtextClass}` }, workspaceLabel), /* @__PURE__ */ React.createElement("p", { className: `text-xs mt-1 ${mutedTextClass}` }, countLabel(sessionCatalog.length, "discovery run"))), /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
@@ -12708,15 +12952,15 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         "data-testid": "header-connection-status",
         className: `dt4sms-shell-action inline-flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm transition-colors ${headerButtonClass}`,
         onClick: openConnectionModal,
-        title: `${headerConnectionMeta.summary} AI model: ${headerLlmDisplayLabel}.`,
-        "aria-label": `Connection details. ${headerConnectionMeta.label}. AI model: ${headerLlmDisplayLabel}.`,
+        title: `${headerMcpLabel ? `${headerMcpLabel}. ` : ""}${headerConnectionMeta.summary} AI model: ${headerLlmDisplayLabel}.`,
+        "aria-label": `Connection details. ${headerMcpLabel || headerConnectionMeta.label}. AI model: ${headerLlmDisplayLabel}.`,
         "aria-haspopup": "dialog",
         "aria-expanded": isConnectionModalOpen,
         "aria-controls": "connection-details-popover"
       },
       /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `h-2.5 w-2.5 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}` }),
-      /* @__PURE__ */ React.createElement("span", { className: "hidden sm:inline font-medium" }, headerConnectionMeta.label),
-      ((_X = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : _X.configured) && /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `hidden xl:inline max-w-[16rem] truncate ${mutedTextClass}` }, headerLlmDisplayLabel)
+      /* @__PURE__ */ React.createElement("span", { "data-testid": "active-mcp-workspace", className: "max-w-[10rem] truncate font-medium lg:max-w-[18rem]" }, headerMcpLabel || headerConnectionMeta.label),
+      ((__ = connectionInfo == null ? void 0 : connectionInfo.llm) == null ? void 0 : __.configured) && /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `hidden xl:inline max-w-[16rem] truncate ${mutedTextClass}` }, headerLlmDisplayLabel)
     ), /* @__PURE__ */ React.createElement(
       "button",
       {
@@ -12984,11 +13228,11 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           var _a2, _b2;
           return downloadCapabilityExport(((_a2 = exportBuildState.bundle) == null ? void 0 : _a2.download_name) || ((_b2 = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _b2.name));
         },
-        disabled: !(((_Y = exportBuildState.bundle) == null ? void 0 : _Y.download_name) || ((_Z = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _Z.name)),
-        className: `px-3 py-1 whitespace-nowrap rounded ${((__ = exportBuildState.bundle) == null ? void 0 : __.download_name) || ((_$ = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _$.name) ? "bg-slate-700 hover:bg-slate-800 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
+        disabled: !(((_$ = exportBuildState.bundle) == null ? void 0 : _$.download_name) || ((_aa = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _aa.name)),
+        className: `px-3 py-1 whitespace-nowrap rounded ${((_ba = exportBuildState.bundle) == null ? void 0 : _ba.download_name) || ((_ca = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ca.name) ? "bg-slate-700 hover:bg-slate-800 text-white" : isDarkTheme ? "bg-gray-700 text-gray-400 cursor-not-allowed" : "bg-gray-200 text-gray-500 cursor-not-allowed"}`
       },
       downloadPackageLabel
-    ))), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Contents: ", packageTargetLabel, "."), !canUseExportTools && /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "To build a package, install Report Packages on the Capabilities tab and turn it on."), exportBuildState.status === "error" && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "border-red-800 bg-red-950 text-red-200" : "border-red-200 bg-red-50 text-red-700"}` }, exportBuildState.error), activePackageBundle ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${subtextClass}` }, /* @__PURE__ */ React.createElement("div", { className: "font-medium mb-1" }, packageCardTitle), /* @__PURE__ */ React.createElement("div", null, "Contents: ", packageTargetLabel), /* @__PURE__ */ React.createElement("div", null, "Package: ", formatPackageFileLabel(((_aa = exportBuildState.bundle) == null ? void 0 : _aa.bundle_name) || ((_ba = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ba.name))), ((_ca = exportBuildState.bundle) == null ? void 0 : _ca.session_timestamp) && /* @__PURE__ */ React.createElement("div", null, "Run: ", formatMissionSessionSelectionLabel(exportBuildState.bundle.session_timestamp)), ((_da = exportBuildState.bundle) == null ? void 0 : _da.artifact_count) != null && /* @__PURE__ */ React.createElement("div", null, "Files included: ", exportBuildState.bundle.artifact_count), ((_ea = exportBuildState.bundle) == null ? void 0 : _ea.operator_voice_label) && /* @__PURE__ */ React.createElement("div", null, "Style: ", exportBuildState.bundle.operator_voice_label), (((_fa = exportBuildState.bundle) == null ? void 0 : _fa.bundle_size_bytes) || ((_ga = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ga.size_bytes)) && /* @__PURE__ */ React.createElement("div", null, "Size: ", formatByteSize(((_ha = exportBuildState.bundle) == null ? void 0 : _ha.bundle_size_bytes) || ((_ia = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ia.size_bytes))), !hasFreshPackageBuild && /* @__PURE__ */ React.createElement("div", { className: `mt-2 ${mutedTextClass}` }, "Built earlier. Select Build Report Package to make a new one.")) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${mutedTextClass}` }, "No package built yet.")))))), isIntelligenceTab && /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-3 mb-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-semibold ${headingClass}` }, "Findings"), /* @__PURE__ */ React.createElement("p", { className: `text-sm ${subtextClass}` }, "Coverage gaps, investigations, and evidence from the latest discovery run.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, renderOperatorVoiceSelect(), renderWorkspaceRefreshButton(refreshIntelligenceWorkspace, "Refresh findings"))), !v2Intelligence || !v2Intelligence.has_data ? /* @__PURE__ */ React.createElement("div", { className: `text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}` }, "No findings yet. Run discovery from the Discovery tab to see findings here.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-hero rounded-xl border p-5 mb-4 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Latest run"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}` }, missionFreshness.label), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Last run: ", formatMissionDateTime((latestMissionSession == null ? void 0 : latestMissionSession.created_at) || (latestMissionSession == null ? void 0 : latestMissionSession.timestamp), (latestMissionSession == null ? void 0 : latestMissionSession.timestamp) || "Unavailable"))), /* @__PURE__ */ React.createElement("h3", { className: `mt-3 text-xl font-semibold ${headingClass}` }, intelligenceHeadline), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, intelligenceWhyNow)), /* @__PURE__ */ React.createElement("div", { "data-testid": "findings-stats", className: "mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3" }, intelligenceSummaryCards.map(renderWorkspaceMetricCard))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4" }, renderFindingsList({
+    ))), /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "Contents: ", packageTargetLabel, "."), !canUseExportTools && /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "To build a package, install Report Packages on the Capabilities tab and turn it on."), exportBuildState.status === "error" && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${isDarkTheme ? "border-red-800 bg-red-950 text-red-200" : "border-red-200 bg-red-50 text-red-700"}` }, exportBuildState.error), activePackageBundle ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${subtextClass}` }, /* @__PURE__ */ React.createElement("div", { className: "font-medium mb-1" }, packageCardTitle), /* @__PURE__ */ React.createElement("div", null, "Contents: ", packageTargetLabel), /* @__PURE__ */ React.createElement("div", null, "Package: ", formatPackageFileLabel(((_da = exportBuildState.bundle) == null ? void 0 : _da.bundle_name) || ((_ea = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ea.name))), ((_fa = exportBuildState.bundle) == null ? void 0 : _fa.session_timestamp) && /* @__PURE__ */ React.createElement("div", null, "Run: ", formatMissionSessionSelectionLabel(exportBuildState.bundle.session_timestamp)), ((_ga = exportBuildState.bundle) == null ? void 0 : _ga.artifact_count) != null && /* @__PURE__ */ React.createElement("div", null, "Files included: ", exportBuildState.bundle.artifact_count), ((_ha = exportBuildState.bundle) == null ? void 0 : _ha.operator_voice_label) && /* @__PURE__ */ React.createElement("div", null, "Style: ", exportBuildState.bundle.operator_voice_label), (((_ia = exportBuildState.bundle) == null ? void 0 : _ia.bundle_size_bytes) || ((_ja = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _ja.size_bytes)) && /* @__PURE__ */ React.createElement("div", null, "Size: ", formatByteSize(((_ka = exportBuildState.bundle) == null ? void 0 : _ka.bundle_size_bytes) || ((_la = exportCapability == null ? void 0 : exportCapability.latest_bundle) == null ? void 0 : _la.size_bytes))), !hasFreshPackageBuild && /* @__PURE__ */ React.createElement("div", { className: `mt-2 ${mutedTextClass}` }, "Built earlier. Select Build Report Package to make a new one.")) : /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border px-3 py-2 text-xs ${panelMutedClass} ${mutedTextClass}` }, "No package built yet.")))))), isIntelligenceTab && /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-workspace rounded-lg shadow-sm p-6 mb-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-3 mb-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-semibold ${headingClass}` }, "Findings"), /* @__PURE__ */ React.createElement("p", { className: `text-sm ${subtextClass}` }, "Coverage gaps, investigations, and evidence from the latest discovery run.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, renderOperatorVoiceSelect(), renderWorkspaceRefreshButton(refreshIntelligenceWorkspace, "Refresh findings"))), !v2Intelligence || !v2Intelligence.has_data ? /* @__PURE__ */ React.createElement("div", { className: `text-sm rounded p-4 border ${panelMutedClass} ${mutedTextClass}` }, "No findings yet. Run discovery from the Discovery tab to see findings here.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `dt4sms-neo-hero rounded-xl border p-5 mb-4 ${isDarkTheme ? "bg-gray-950 border-gray-800" : "bg-slate-50 border-slate-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wider ${mutedTextClass}` }, "Latest run"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: `dt4sms-neo-chip inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${missionFreshness.badgeClass}` }, missionFreshness.label), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, "Last run: ", formatMissionDateTime((latestMissionSession == null ? void 0 : latestMissionSession.created_at) || (latestMissionSession == null ? void 0 : latestMissionSession.timestamp), (latestMissionSession == null ? void 0 : latestMissionSession.timestamp) || "Unavailable"))), /* @__PURE__ */ React.createElement("h3", { className: `mt-3 text-xl font-semibold ${headingClass}` }, intelligenceHeadline), /* @__PURE__ */ React.createElement("p", { className: `mt-2 text-sm leading-6 ${subtextClass}` }, intelligenceWhyNow)), /* @__PURE__ */ React.createElement("div", { "data-testid": "findings-stats", className: "mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3" }, intelligenceSummaryCards.map(renderWorkspaceMetricCard))), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4" }, renderFindingsList({
       key: "admin",
       icon: "fa-shield-alt",
       iconClass: "text-rose-600",
@@ -13012,7 +13256,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
       audience: "For leadership.",
       items: findingsExecutiveItems,
       emptyText: "No executive summary was generated."
-    })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Environment Profile")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs mb-3" }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Splunk"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, v2Overview.splunk_version || "Unknown"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, "License: ", v2Overview.license_state || "Unknown")), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Data"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_ja = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ja.indexes) || v2Overview.total_indexes), " indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_ka = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ka.sourcetypes) || v2Overview.total_sourcetypes), " sourcetypes • ", formatMissionMetricValue(((_la = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _la.sources) || v2Overview.total_sources), " sources")), /* @__PURE__ */ React.createElement("div", { className: `col-span-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Users and objects"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_ma = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _ma.users) || v2Overview.total_users), " users"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_na = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _na.knowledge_objects) || v2Overview.total_knowledge_objects), " knowledge objects • ", formatMissionMetricValue(((_oa = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _oa.kv_collections) || v2Overview.total_kv_collections), " KV collections")))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stream text-emerald-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Key evidence")), v2FindingLedger.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "No evidence recorded.") : /* @__PURE__ */ React.createElement("ul", { className: "space-y-2 text-xs" }, v2FindingLedger.slice(0, 6).map((entry, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `font-medium ${headingClass}` }, "Step ", entry.step || 0, ": ", entry.title || "Discovery step"), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, formatMissionDateTime(entry.timestamp, "Time not recorded"))), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, summarizeFindingEntry(entry))))))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-fingerprint text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Patterns")), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, "Themes that came up repeatedly in the latest run.")), intelligenceNotablePatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-end gap-2" }, hasExpandableIntelligencePatterns && /* @__PURE__ */ React.createElement(
+    })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Environment Profile")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs mb-3" }, /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Splunk"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, v2Overview.splunk_version || "Unknown"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, "License: ", v2Overview.license_state || "Unknown")), /* @__PURE__ */ React.createElement("div", { className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Data"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_ma = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _ma.indexes) || v2Overview.total_indexes), " indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_na = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _na.sourcetypes) || v2Overview.total_sourcetypes), " sourcetypes • ", formatMissionMetricValue(((_oa = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.data_surface) == null ? void 0 : _oa.sources) || v2Overview.total_sources), " sources")), /* @__PURE__ */ React.createElement("div", { className: `col-span-2 ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg px-3 py-3` }, /* @__PURE__ */ React.createElement("div", { className: mutedTextClass }, "Users and objects"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 font-medium ${headingClass}` }, formatMissionMetricValue(((_pa = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _pa.users) || v2Overview.total_users), " users"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, formatMissionMetricValue(((_qa = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _qa.knowledge_objects) || v2Overview.total_knowledge_objects), " knowledge objects • ", formatMissionMetricValue(((_ra = v2CapabilityGraph == null ? void 0 : v2CapabilityGraph.operations_surface) == null ? void 0 : _ra.kv_collections) || v2Overview.total_kv_collections), " KV collections")))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-3" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-stream text-emerald-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Key evidence")), v2FindingLedger.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: `text-xs ${mutedTextClass}` }, "No evidence recorded.") : /* @__PURE__ */ React.createElement("ul", { className: "space-y-2 text-xs" }, v2FindingLedger.slice(0, 6).map((entry, idx) => /* @__PURE__ */ React.createElement("li", { key: idx, className: `${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"} border rounded-lg p-3` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: `font-medium ${headingClass}` }, "Step ", entry.step || 0, ": ", entry.title || "Discovery step"), /* @__PURE__ */ React.createElement("span", { className: `text-xs ${mutedTextClass}` }, formatMissionDateTime(entry.timestamp, "Time not recorded"))), /* @__PURE__ */ React.createElement("div", { className: `mt-1 ${subtextClass}` }, summarizeFindingEntry(entry))))))), /* @__PURE__ */ React.createElement("div", { className: `border rounded p-4 ${isDarkTheme ? "border-gray-600 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-fingerprint text-sky-600" }), /* @__PURE__ */ React.createElement("h3", { className: `text-sm font-semibold ${headingClass}` }, "Patterns")), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs ${subtextClass}` }, "Themes that came up repeatedly in the latest run.")), intelligenceNotablePatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center justify-end gap-2" }, hasExpandableIntelligencePatterns && /* @__PURE__ */ React.createElement(
       "button",
       {
         type: "button",
@@ -13044,7 +13288,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           item
         )))
       );
-    }))))), isCapabilitiesTab && /* @__PURE__ */ React.createElement("div", { className: "space-y-6 mb-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-semibold ${headingClass}` }, isCapabilitiesRagView ? "Knowledge Base" : "Capabilities"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-2 ${subtextClass}` }, isCapabilitiesRagView ? "Import documents and saved searches, index them, and preview what the AI assistant will see when it answers." : "Install, turn on, and test optional features. Each one stays off until you turn it on."), !isCapabilitiesRagView && capabilityList.length > 0 && /* @__PURE__ */ React.createElement("p", { "data-testid": "capabilities-count-summary", className: `mt-3 text-sm font-medium ${headingClass}` }, capabilityCountSummary)), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, isCapabilitiesRagView ? renderWorkspaceRefreshButton(() => openRagCapabilitiesWorkspace({ libraryFilter: ragLibraryFilter }), "Refresh the Knowledge Base") : renderWorkspaceRefreshButton(refreshCapabilitiesWorkspace, "Refresh capabilities"))), renderCapabilityNotice()), capabilitiesData.status === "error" ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-4 border ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, capabilitiesData.error || "Failed to load capabilities.") : isCapabilitiesOverview ? /* @__PURE__ */ React.createElement(React.Fragment, null, renderRagOverviewCard(), /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "other-capabilities-title", className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("h3", { id: "other-capabilities-title", className: `text-base font-semibold ${headingClass}` }, "Other capabilities"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-1 ${subtextClass}` }, "Optional tools for charts, Splunk search links, report packages, and more."), /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-1 xl:grid-cols-2 gap-4" }, genericCapabilityList.map((capability) => {
+    }))))), isCapabilitiesTab && /* @__PURE__ */ React.createElement("div", { className: "space-y-6 mb-6" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("h2", { className: `text-lg font-semibold ${headingClass}` }, isCapabilitiesRagView ? "Knowledge Base" : "Capabilities"), isCapabilitiesRagView && workspaceLabel && /* @__PURE__ */ React.createElement("p", { "data-testid": "knowledge-base-workspace", className: `mt-1 text-sm ${subtextClass}` }, workspaceLabel), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-2 ${subtextClass}` }, isCapabilitiesRagView ? "Import documents and saved searches, index them, and preview what the AI assistant will see when it answers." : "Install, turn on, and test optional features. Each one stays off until you turn it on."), !isCapabilitiesRagView && capabilityList.length > 0 && /* @__PURE__ */ React.createElement("p", { "data-testid": "capabilities-count-summary", className: `mt-3 text-sm font-medium ${headingClass}` }, capabilityCountSummary)), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, isCapabilitiesRagView ? renderWorkspaceRefreshButton(() => openRagCapabilitiesWorkspace({ libraryFilter: ragLibraryFilter }), "Refresh the Knowledge Base") : renderWorkspaceRefreshButton(refreshCapabilitiesWorkspace, "Refresh capabilities"))), renderCapabilityNotice()), capabilitiesData.status === "error" ? /* @__PURE__ */ React.createElement("div", { className: `rounded-lg shadow-sm p-4 border ${isDarkTheme ? "bg-red-950 border-red-800 text-red-100" : "bg-red-50 border-red-200 text-red-800"}` }, capabilitiesData.error || "Failed to load capabilities.") : isCapabilitiesOverview ? /* @__PURE__ */ React.createElement(React.Fragment, null, renderRagOverviewCard(), /* @__PURE__ */ React.createElement("section", { "aria-labelledby": "other-capabilities-title", className: `rounded-lg shadow-sm p-6 border ${panelClass}` }, /* @__PURE__ */ React.createElement("h3", { id: "other-capabilities-title", className: `text-base font-semibold ${headingClass}` }, "Other capabilities"), /* @__PURE__ */ React.createElement("p", { className: `text-sm mt-1 ${subtextClass}` }, "Optional tools for charts, Splunk search links, report packages, and more."), /* @__PURE__ */ React.createElement("div", { className: "mt-4 grid grid-cols-1 xl:grid-cols-2 gap-4" }, genericCapabilityList.map((capability) => {
       const actionInProgress = capabilityActionState[capability.name];
       const isBusy = !!actionInProgress;
       const statusLabel = capability.health_status || "unknown";
@@ -13404,7 +13648,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
               style: { left: `${connectionModalPosition.pointerLeft}px` }
             }
           ),
-          /* @__PURE__ */ React.createElement("div", { className: `relative z-10 flex items-start justify-between gap-3 rounded-t-xl border-b px-4 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "connection-details-title", className: `text-base font-semibold ${headingClass2}` }, "Connection Details"), info && /* @__PURE__ */ React.createElement("p", { className: `mt-0.5 flex items-center gap-1.5 text-xs ${labelClass}` }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `h-2 w-2 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}` }), headerConnectionMeta.label)), /* @__PURE__ */ React.createElement(
+          /* @__PURE__ */ React.createElement("div", { className: `relative z-10 flex items-start justify-between gap-3 rounded-t-xl border-b px-4 py-3 ${isDarkTheme ? "border-gray-700 bg-gray-800" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("h2", { id: "connection-details-title", className: `text-base font-semibold ${headingClass2}` }, "Connection Details"), info && /* @__PURE__ */ React.createElement("p", { className: `mt-0.5 flex items-center gap-1.5 text-xs ${labelClass}` }, /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: `h-2 w-2 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}` }), headerConnectionMeta.label, headerMcpLabel ? ` · ${headerMcpLabel}` : "")), /* @__PURE__ */ React.createElement(
             "button",
             {
               type: "button",
@@ -13701,6 +13945,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
               subtextClass,
               mutedTextClass,
               incognitoActive,
+              connectionRevision: config,
               testIdPrefix: "chat-dashboard",
               onChange: (patch) => updateChatMessageFields(msg.id, patch)
             }
@@ -14566,7 +14811,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-code mr-2", "aria-hidden": "true" }),
         "SPL Queries ",
-        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_pa = summaryData.spl_queries) == null ? void 0 : _pa.length) || 0, ")")
+        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_sa = summaryData.spl_queries) == null ? void 0 : _sa.length) || 0, ")")
       ), /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -14581,7 +14826,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
         },
         /* @__PURE__ */ React.createElement("i", { className: "fas fa-tasks mr-2", "aria-hidden": "true" }),
         "Admin Tasks ",
-        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_qa = summaryData.admin_tasks) == null ? void 0 : _qa.length) || 0, ")")
+        /* @__PURE__ */ React.createElement("span", { className: "ml-1" }, "(", ((_ta = summaryData.admin_tasks) == null ? void 0 : _ta.length) || 0, ")")
       ))), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto p-6" }, isLoadingSummary ? /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-center h-full" }, /* @__PURE__ */ React.createElement("div", { className: "text-center max-w-md" }, /* @__PURE__ */ React.createElement("div", { className: "relative mb-8" }, /* @__PURE__ */ React.createElement("div", { className: `inline-block animate-spin rounded-full h-20 w-20 border-4 ${isDarkTheme ? "border-indigo-900 border-t-indigo-400" : "border-indigo-200 border-t-indigo-600"}` }), /* @__PURE__ */ React.createElement("i", { className: `fas fa-brain absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-3xl animate-pulse ${isDarkTheme ? "text-indigo-300" : "text-indigo-600"}` })), /* @__PURE__ */ React.createElement("h3", { className: `text-xl font-semibold mb-4 ${headingClass}` }, "Building Your Summary"), /* @__PURE__ */ React.createElement("div", { className: `space-y-3 text-left rounded-lg shadow-sm border p-4 mb-4 ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(1) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(1) ? "bg-green-600" : isSummaryStepActive(1) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(1) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(1) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(1) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-300" : "text-gray-700" }, "Loading discovery reports...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(2) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(2) ? "bg-green-600" : isSummaryStepActive(2) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(2) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(2) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(2) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Generating SPL queries...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(3) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(3) ? "bg-green-600" : isSummaryStepActive(3) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(3) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(3) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(3) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Building executive summary...")), /* @__PURE__ */ React.createElement("div", { className: `flex items-center text-sm ${isSummaryStepActive(4) ? "animate-pulse" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center mr-3 ${isSummaryStepDone(4) ? "bg-green-600" : isSummaryStepActive(4) ? "bg-indigo-500" : isDarkTheme ? "border-2 border-gray-600" : "border-2 border-gray-300"}` }, isSummaryStepDone(4) ? /* @__PURE__ */ React.createElement("i", { className: "fas fa-check text-white text-xs" }) : isSummaryStepActive(4) ? /* @__PURE__ */ React.createElement("div", { className: "w-2 h-2 bg-white rounded-full animate-ping" }) : null), /* @__PURE__ */ React.createElement("span", { className: isSummaryStepActive(4) ? isDarkTheme ? "text-gray-100 font-medium" : "text-gray-700 font-medium" : isDarkTheme ? "text-gray-400" : "text-gray-500" }, "Creating admin tasks..."))), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center mb-1" }, /* @__PURE__ */ React.createElement("span", { className: `text-xs font-medium ${isDarkTheme ? "text-gray-200" : "text-gray-700"}` }, summaryProgress.message), /* @__PURE__ */ React.createElement("span", { className: `text-xs font-semibold ${isDarkTheme ? "text-indigo-300" : "text-indigo-700"}` }, summaryProgress.progress, "%")), /* @__PURE__ */ React.createElement("div", { className: `w-full rounded-full h-2 ${isDarkTheme ? "bg-gray-700" : "bg-gray-200"}` }, /* @__PURE__ */ React.createElement(
         "div",
         {
@@ -14607,7 +14852,7 @@ Volume signal: ${formatVolumeCategory((_a4 = item.context) == null ? void 0 : _a
           className: `text-xs tracking-[0.35em] lowercase focus:outline-none ${isDarkTheme ? "text-gray-900" : "text-white"} ${isGeneratingSummaryInfographic ? "cursor-wait" : "cursor-pointer"}`
         },
         "magic"
-      ))), activeTab === "context" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-context", role: "tabpanel", "aria-labelledby": "summary-tab-context", className: "space-y-6" }, !hasContextExplorer ? /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-6 ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-700"}` }, "This summary has no environment details for this run.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Context Explorer"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "The indexes, sourcetypes, and hosts this run found. Use them to start a chat, find related searches, or follow up on risks.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_sa = (_ra = contextOverview.readiness_score) != null ? _ra : readinessScore) != null ? _sa : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Out of 100")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ta = contextOverview.total_indexes) != null ? _ta : contextIndexAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Sourcetypes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ua = contextOverview.total_sourcetypes) != null ? _ua : contextSourcetypeAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Hosts"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_va = contextOverview.total_hosts) != null ? _va : contextHostAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, contextOverview.data_volume_24h ? `${contextOverview.data_volume_24h} in 24 hours` : "Found by discovery"))))), /* @__PURE__ */ React.createElement("div", { className: "p-6 space-y-6" }, contextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-indigo-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Patterns"))), /* @__PURE__ */ React.createElement("div", { className: `inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${summaryInsetClass} ${headingClass}` }, countLabel(contextPatterns.length, "pattern"))), leadContextPattern && /* @__PURE__ */ React.createElement("div", { className: `mt-4 grid gap-4 ${supportingContextPatterns.length > 0 ? "xl:grid-cols-[minmax(0,1.15fr),minmax(0,0.85fr)]" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Lead pattern"), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, leadContextPattern.title || "Pattern 1"), leadContextPattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, leadContextPattern.description), leadContextPattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-4 py-3 ${summaryCardClass} ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Signal"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm leading-6 break-words" }, leadContextPattern.signal))), supportingContextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, supportingContextPatterns.map((pattern, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-pattern-${idx + 1}`, className: `rounded-lg border px-4 py-4 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-indigo-900 text-indigo-100" : "bg-indigo-100 text-indigo-700"}` }, idx + 2), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, pattern.title || `Pattern ${idx + 2}`), pattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, pattern.description), pattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs leading-5 ${summaryLabelClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Signal:"), " ", pattern.signal))))))), hiddenContextPatternCount > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Showing the top ", visibleContextPatterns.length, " of ", contextPatterns.length, " patterns.")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-3" }, [
+      ))), activeTab === "context" && /* @__PURE__ */ React.createElement("div", { id: "summary-tabpanel-context", role: "tabpanel", "aria-labelledby": "summary-tab-context", className: "space-y-6" }, !hasContextExplorer ? /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-6 ${isDarkTheme ? "bg-gray-900 border-gray-700 text-gray-300" : "bg-white border-gray-200 text-gray-700"}` }, "This summary has no environment details for this run.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border overflow-hidden shadow-sm ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: `p-6 md:p-7 border-b ${isDarkTheme ? "border-gray-700" : "border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "xl:max-w-3xl" }, /* @__PURE__ */ React.createElement("h3", { className: `text-2xl font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Context Explorer"), /* @__PURE__ */ React.createElement("p", { className: `mt-3 max-w-3xl text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "The indexes, sourcetypes, and hosts this run found. Use them to start a chat, find related searches, or follow up on risks.")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 xl:w-[440px]" }, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Readiness"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_va = (_ua = contextOverview.readiness_score) != null ? _ua : readinessScore) != null ? _va : "N/A"), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Out of 100")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Indexes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_wa = contextOverview.total_indexes) != null ? _wa : contextIndexAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Sourcetypes"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_xa = contextOverview.total_sourcetypes) != null ? _xa : contextSourcetypeAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Found by discovery")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-4 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs uppercase tracking-wide ${summaryLabelClass}` }, "Hosts"), /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-3xl font-bold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, (_ya = contextOverview.total_hosts) != null ? _ya : contextHostAnchors.length), /* @__PURE__ */ React.createElement("div", { className: `mt-1 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, contextOverview.data_volume_24h ? `${contextOverview.data_volume_24h} in 24 hours` : "Found by discovery"))))), /* @__PURE__ */ React.createElement("div", { className: "p-6 space-y-6" }, contextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: `rounded-lg border p-5 ${summaryCardClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3 md:flex-row md:items-start md:justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-project-diagram text-indigo-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("h4", { className: `text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, "Patterns"))), /* @__PURE__ */ React.createElement("div", { className: `inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${summaryInsetClass} ${headingClass}` }, countLabel(contextPatterns.length, "pattern"))), leadContextPattern && /* @__PURE__ */ React.createElement("div", { className: `mt-4 grid gap-4 ${supportingContextPatterns.length > 0 ? "xl:grid-cols-[minmax(0,1.15fr),minmax(0,0.85fr)]" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: `rounded-xl border p-5 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Lead pattern"), /* @__PURE__ */ React.createElement("div", { className: `mt-3 text-lg font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, leadContextPattern.title || "Pattern 1"), leadContextPattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-3 text-sm leading-6 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, leadContextPattern.description), leadContextPattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-4 rounded-lg border px-4 py-3 ${summaryCardClass} ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, /* @__PURE__ */ React.createElement("div", { className: `text-xs font-semibold uppercase tracking-wider ${summaryLabelClass}` }, "Signal"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm leading-6 break-words" }, leadContextPattern.signal))), supportingContextPatterns.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, supportingContextPatterns.map((pattern, idx) => /* @__PURE__ */ React.createElement("div", { key: `context-pattern-${idx + 1}`, className: `rounded-lg border px-4 py-4 ${summaryInsetClass}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-3" }, /* @__PURE__ */ React.createElement("span", { className: `mt-0.5 inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${isDarkTheme ? "bg-indigo-900 text-indigo-100" : "bg-indigo-100 text-indigo-700"}` }, idx + 2), /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold ${isDarkTheme ? "text-gray-100" : "text-gray-900"}` }, pattern.title || `Pattern ${idx + 2}`), pattern.description && /* @__PURE__ */ React.createElement("p", { className: `mt-1 text-xs leading-5 ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, pattern.description), pattern.signal && /* @__PURE__ */ React.createElement("div", { className: `mt-2 text-xs leading-5 ${summaryLabelClass}` }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "Signal:"), " ", pattern.signal))))))), hiddenContextPatternCount > 0 && /* @__PURE__ */ React.createElement("div", { className: `mt-4 text-xs ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "Showing the top ", visibleContextPatterns.length, " of ", contextPatterns.length, " patterns.")), /* @__PURE__ */ React.createElement("div", { className: "grid gap-6 xl:grid-cols-3" }, [
         {
           key: "index",
           title: "Indexes",
@@ -14949,7 +15194,7 @@ ${querySpl}`,
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-rotate-left mr-2", "aria-hidden": "true" }),
       "Show Again Next Time"
-    )))), /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-connections-panel", className: "space-y-6", hidden: activeSettingsTab !== "connections" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-indigo-600", "aria-hidden": "true" }), "MCP Servers"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, "Saved connections to your Splunk MCP servers.")), (loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)) && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-emerald-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, "Active Configuration:"), /* @__PURE__ */ React.createElement("p", { className: "text-base font-bold text-gray-800" }, loadedMCPConfigName || (config == null ? void 0 : config.active_mcp_config_name)))), /* @__PURE__ */ React.createElement(
+    )))), /* @__PURE__ */ React.createElement("div", { "data-testid": "settings-connections-panel", className: "space-y-6", hidden: activeSettingsTab !== "connections" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-6 border ${isDarkTheme ? "bg-gray-800 border-gray-700" : "bg-white border-gray-200"}` }, /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900 mb-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-indigo-600", "aria-hidden": "true" }), "MCP Servers"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, authAccountsEnabled ? "Load switches your account to the selected server immediately." : "Load switches Discovery to the selected server immediately.")), effectiveMcpName && /* @__PURE__ */ React.createElement("div", { className: "mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-check-circle text-emerald-600", "aria-hidden": "true" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-sm font-semibold text-gray-900" }, authAccountsEnabled ? "Connection in use for your account" : "Connection in use"), /* @__PURE__ */ React.createElement("p", { "data-testid": "settings-effective-mcp", className: "text-base font-bold text-gray-800" }, effectiveMcpName), headerMcpHost && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-gray-600" }, headerMcpHost))), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -14973,7 +15218,11 @@ ${querySpl}`,
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-plus-circle mr-2", "aria-hidden": "true" }),
       "Add MCP Server"
-    )), /* @__PURE__ */ React.createElement("div", { id: "mcp-configs-list", className: "space-y-2 max-h-96 overflow-y-auto" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500 text-center py-4 italic" }, "Loading configurations...")))), showMCPConfigForm && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-indigo-600", "aria-hidden": "true" }), loadedMCPConfigName ? "Edit Configuration" : "New Configuration"), /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { id: "mcp-configs-list", className: "space-y-2 max-h-96 overflow-y-auto" }, mcpProfilesStatus === "loading" && /* @__PURE__ */ React.createElement("p", { className: "py-4 text-center text-sm text-gray-500" }, "Loading configurations…"), mcpProfilesStatus === "error" && /* @__PURE__ */ React.createElement("p", { role: "alert", className: "py-4 text-center text-sm text-red-700" }, "Could not load saved MCP servers."), mcpProfilesStatus === "ready" && !orderedMCPConfigs.length && /* @__PURE__ */ React.createElement("p", { className: "py-4 text-center text-sm text-gray-500" }, "No MCP servers saved yet."), orderedMCPConfigs.map((profile) => {
+      const active = profile.name === effectiveMcpName;
+      const profileButton = "rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-60";
+      return /* @__PURE__ */ React.createElement("div", { key: profile.name, "data-mcp-card": profile.name, className: `rounded-lg border p-4 ${active ? "border-emerald-300 bg-emerald-50" : "border-gray-200 bg-white"}` }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("h5", { className: "break-words font-semibold text-gray-900" }, profile.name), active && /* @__PURE__ */ React.createElement("span", { "data-testid": "active-mcp-profile", className: "rounded-full bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-800" }, "Active"), !profile.token && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold text-amber-800" }, "No token")), profile.description && /* @__PURE__ */ React.createElement("p", { className: "break-words text-sm text-gray-600" }, profile.description), /* @__PURE__ */ React.createElement("p", { className: "break-all text-sm text-gray-600" }, profile.url), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600" }, profile.verify_ssl ? "Verifies TLS certificates" : "TLS certificate verification off")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => testMCPConfig(profile.name), className: `${profileButton} bg-indigo-600 hover:bg-indigo-700` }, "Test"), /* @__PURE__ */ React.createElement("button", { type: "button", disabled: !!switchingMCPProfile, onClick: () => loadMCPConfigIntoSettings(profile.name), className: `${profileButton} bg-indigo-600 hover:bg-indigo-700`, title: "Use this saved MCP connection" }, switchingMCPProfile === profile.name ? "Switching…" : "Load"), /* @__PURE__ */ React.createElement("button", { type: "button", disabled: !!switchingMCPProfile, onClick: () => deleteMCPConfig(profile.name), className: `${profileButton} bg-red-600 hover:bg-red-700` }, "Delete"))));
+    })))), showMCPConfigForm && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("h3", { className: "text-lg font-semibold text-gray-900" }, /* @__PURE__ */ React.createElement("i", { className: "fas fa-server mr-2 text-indigo-600", "aria-hidden": "true" }), loadedMCPConfigName ? "Edit Configuration" : "New Configuration"), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => {
@@ -14984,11 +15233,11 @@ ${querySpl}`,
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-times mr-1", "aria-hidden": "true" }),
       "Cancel"
-    )), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "MCP URL"), /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { key: `${loadedMCPConfigName || ""}:${effectiveMcp.url}`, className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-gray-700 mb-1" }, "MCP URL"), /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "text",
-        defaultValue: config.mcp.url,
+        defaultValue: effectiveMcp.url,
         className: "w-full px-3 py-2 border border-gray-300 rounded-md",
         id: "mcp-url"
       }
@@ -15005,8 +15254,7 @@ ${querySpl}`,
       "input",
       {
         type: "checkbox",
-        checked: config.mcp.verify_ssl,
-        onChange: (e) => setConfig({ ...config, mcp: { ...config.mcp, verify_ssl: e.target.checked } }),
+        defaultChecked: effectiveMcp.verify_ssl,
         className: "mr-2",
         id: "mcp-verify-ssl"
       }
@@ -15014,7 +15262,7 @@ ${querySpl}`,
       "input",
       {
         type: "text",
-        defaultValue: config.mcp.ca_bundle_path || "",
+        defaultValue: effectiveMcp.ca_bundle_path || "",
         placeholder: "/path/to/splunk-ca.pem",
         className: "w-full px-3 py-2 border border-gray-300 rounded-md",
         id: "mcp-ca-bundle"
@@ -15028,9 +15276,9 @@ ${querySpl}`,
           const urlEl = document.getElementById("mcp-url");
           const tokenEl = document.getElementById("mcp-token");
           const verifySslEl = document.getElementById("mcp-verify-ssl");
-          const testUrl = (urlEl == null ? void 0 : urlEl.value) || config.mcp.url;
+          const testUrl = (urlEl == null ? void 0 : urlEl.value) || effectiveMcp.url;
           const testToken = (tokenEl == null ? void 0 : tokenEl.value) || "";
-          const testVerifySsl = (_a2 = verifySslEl == null ? void 0 : verifySslEl.checked) != null ? _a2 : config.mcp.verify_ssl;
+          const testVerifySsl = (_a2 = verifySslEl == null ? void 0 : verifySslEl.checked) != null ? _a2 : effectiveMcp.verify_ssl;
           if (!testUrl) {
             alert("Please enter an MCP URL");
             return;
@@ -15040,7 +15288,7 @@ ${querySpl}`,
           button.disabled = true;
           button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2" aria-hidden="true"></i>Testing...';
           try {
-            const response = await fetch("/api/mcp-configs/test", {
+            const response = await fetch2("/api/mcp-configs/test", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -15191,7 +15439,7 @@ ${querySpl}`,
             const provider = document.getElementById("llm-provider").value;
             const apiKey = document.getElementById("llm-api-key").value;
             const endpointUrl = (_a2 = document.getElementById("llm-endpoint-url")) == null ? void 0 : _a2.value;
-            const response = await fetch("/api/llm/list-models", {
+            const response = await fetch2("/api/llm/list-models", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -15296,7 +15544,7 @@ ${querySpl}`,
             const model = ((_b2 = document.getElementById("llm-model")) == null ? void 0 : _b2.value) || selectedModel || config.llm.model;
             const apiKey = ((_c2 = document.getElementById("llm-api-key")) == null ? void 0 : _c2.value) || void 0;
             const endpointUrl = ((_d2 = document.getElementById("llm-endpoint-url")) == null ? void 0 : _d2.value) || void 0;
-            const response = await fetch("/api/llm/assess-max-tokens", {
+            const response = await fetch2("/api/llm/assess-max-tokens", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -15418,7 +15666,7 @@ ${querySpl}`,
           try {
             const provider = document.getElementById("llm-provider").value;
             const endpointUrlInput = document.getElementById("llm-endpoint-url");
-            const response = await fetch("/api/llm/test-connection", {
+            const response = await fetch2("/api/llm/test-connection", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -15551,7 +15799,7 @@ ${querySpl}`,
       {
         onClick: async () => {
           try {
-            const response = await fetch("/api/dependencies");
+            const response = await fetch2("/api/dependencies");
             const data = await response.json();
             const depsWindow = window.open("", "dependencies", "width=800,height=600,scrollbars=yes");
             if (depsWindow) {
@@ -15585,6 +15833,7 @@ ${querySpl}`,
     ), activeSettingsTab !== "appearance" && activeSettingsTab !== "troubleshoot" && /* @__PURE__ */ React.createElement(
       "button",
       {
+        disabled: !!switchingMCPProfile,
         onClick: async () => {
           const providerEl = document.getElementById("llm-provider");
           const endpointUrlInput = document.getElementById("llm-endpoint-url");
@@ -15592,24 +15841,8 @@ ${querySpl}`,
           const apiKeyEl = document.getElementById("llm-api-key");
           const maxTokensEl = document.getElementById("llm-max-tokens");
           const tempEl = document.getElementById("llm-temperature");
-          const mcpUrlEl = document.getElementById("mcp-url");
-          const mcpTokenEl = document.getElementById("mcp-token");
-          const mcpVerifyEl = document.getElementById("mcp-verify-ssl");
-          const mcpCaBundleEl = document.getElementById("mcp-ca-bundle");
           const provider = providerEl ? providerEl.value : selectedProvider;
-          const mcpToken = mcpTokenEl ? mcpTokenEl.value : "";
-          const mcpSettings = {
-            url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
-            verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
-          };
-          if (mcpCaBundleEl) {
-            mcpSettings.ca_bundle_path = mcpCaBundleEl.value.trim() || null;
-          }
-          if (mcpToken && mcpToken.trim()) {
-            mcpSettings.token = mcpToken;
-          }
           const settings = {
-            mcp: mcpSettings,
             llm: {
               provider,
               api_key: (apiKeyEl ? apiKeyEl.value : config.llm.api_key) || void 0,
@@ -15626,9 +15859,23 @@ ${querySpl}`,
               ...config.server
             }
           };
+          if (document.getElementById("mcp-url")) {
+            const { name, ...draft } = readTroubleshootDraftFromForm("mcp");
+            const before = buildTroubleshootDraftFromSettings("mcp");
+            const changed = draft.token.trim() || ["url", "verify_ssl", "ca_bundle_path"].some((key) => draft[key] !== before[key]);
+            if (changed) {
+              if (!name && effectiveMcpName) {
+                alert("Choose Save as New Configuration to name this server, then Load to use it.");
+                return;
+              }
+              const mcp = { ...draft, ca_bundle_path: draft.ca_bundle_path || null };
+              if (name) settings.mcp_profile = { name, ...mcp };
+              else settings.mcp = mcp;
+            }
+          }
           await saveSettings(settings);
         },
-        className: "px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
+        className: "px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium disabled:opacity-60"
       },
       /* @__PURE__ */ React.createElement("i", { className: "fas fa-save mr-2", "aria-hidden": "true" }),
       "Save Settings"
@@ -15673,7 +15920,7 @@ ${querySpl}`,
           disabled: isUpdateMode,
           autoFocus: !isUpdateMode
         }
-      ), isUpdateMode && /* @__PURE__ */ React.createElement("p", { id: "credential-save-name-hint", className: `text-xs mt-1 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "You cannot rename a connection while you update it.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Provider:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, formatProviderName(selectedProvider))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Model:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_wa = document.getElementById("llm-model")) == null ? void 0 : _wa.value) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Max response length:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_xa = document.getElementById("llm-max-tokens")) == null ? void 0 : _xa.value) ? `${document.getElementById("llm-max-tokens").value} tokens` : "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Temperature:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_ya = document.getElementById("llm-temperature")) == null ? void 0 : _ya.value) || "Not set")))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
+      ), isUpdateMode && /* @__PURE__ */ React.createElement("p", { id: "credential-save-name-hint", className: `text-xs mt-1 ${isDarkTheme ? "text-gray-400" : "text-gray-600"}` }, "You cannot rename a connection while you update it.")), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Provider:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, formatProviderName(selectedProvider))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Model:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_za = document.getElementById("llm-model")) == null ? void 0 : _za.value) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Max response length:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_Aa = document.getElementById("llm-max-tokens")) == null ? void 0 : _Aa.value) ? `${document.getElementById("llm-max-tokens").value} tokens` : "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Temperature:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, ((_Ba = document.getElementById("llm-temperature")) == null ? void 0 : _Ba.value) || "Not set")))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           onClick: () => {
@@ -15707,7 +15954,7 @@ Overwrite it?`);
             try {
               const provider = document.getElementById("llm-provider").value;
               const endpointUrlInput = document.getElementById("llm-endpoint-url");
-              const response = await fetch("/api/credentials", {
+              const response = await fetch2("/api/credentials", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -15828,7 +16075,14 @@ Overwrite it?`);
           placeholder: "e.g., Main production Splunk server",
           className: `w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent ${isDarkTheme ? "bg-gray-900 border-gray-600 text-gray-100 disabled:bg-gray-800" : "bg-white border-gray-300 text-gray-900 disabled:bg-gray-100"}`
         }
-      )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "URL:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.url) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Token:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, describeMCPDraftToken(mcpSaveDraft, mcpConfigName))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Verify SSL:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.verify_ssl) ? "Yes" : "No")), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.ca_bundle_path) && /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "CA bundle:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, mcpSaveDraft.ca_bundle_path)))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
+      )), /* @__PURE__ */ React.createElement("div", { className: `rounded-lg p-4 mb-6 border ${isDarkTheme ? "bg-gray-900 border-gray-700" : "bg-gray-50 border-gray-200"}` }, /* @__PURE__ */ React.createElement("h3", { className: `text-xs font-semibold mb-2 uppercase tracking-wide ${isDarkTheme ? "text-gray-300" : "text-gray-700"}` }, "Settings to Save"), /* @__PURE__ */ React.createElement("dl", { className: `space-y-1 text-sm ${isDarkTheme ? "text-gray-300" : "text-gray-600"}` }, /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "URL:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.url) || "Not set")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Token:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, describeMCPDraftToken(mcpSaveDraft, mcpConfigName))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "Verify SSL:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, (mcpSaveDraft == null ? void 0 : mcpSaveDraft.verify_ssl) ? "Yes" : "No")), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.ca_bundle_path) && /* @__PURE__ */ React.createElement("div", { className: "break-all" }, /* @__PURE__ */ React.createElement("dt", { className: "inline font-medium" }, "CA bundle:"), " ", /* @__PURE__ */ React.createElement("dd", { className: "inline" }, mcpSaveDraft.ca_bundle_path)))), (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "new" && /* @__PURE__ */ React.createElement("label", { className: `mb-5 flex items-center gap-2 text-sm ${headingClass}` }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "checkbox",
+          checked: Boolean(mcpSaveDraft.activate),
+          onChange: (event) => setMCPSaveDraft({ ...mcpSaveDraft, activate: event.target.checked })
+        }
+      ), authAccountsEnabled ? "Use this connection for my account after saving" : "Use this connection after saving"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-3" }, /* @__PURE__ */ React.createElement(
         "button",
         {
           onClick: () => {
@@ -15845,6 +16099,7 @@ Overwrite it?`);
         "button",
         {
           onClick: async () => {
+            var _a2;
             const savedName = mcpConfigName.trim();
             const isUpdate = (mcpSaveDraft == null ? void 0 : mcpSaveDraft.mode) === "update";
             const draft = mcpSaveDraft || {};
@@ -15868,7 +16123,7 @@ Overwrite it?`);
               if (!confirmed) return;
             }
             try {
-              const response = await fetch("/api/mcp-configs", {
+              const response = await fetch2("/api/mcp-configs", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -15877,7 +16132,9 @@ Overwrite it?`);
                   token: draft.token || "",
                   verify_ssl: Boolean(draft.verify_ssl),
                   ca_bundle_path: draft.ca_bundle_path || null,
-                  description: mcpConfigDescription.trim() || null
+                  description: mcpConfigDescription.trim() || null,
+                  target: "current",
+                  activate: Boolean(draft.activate)
                 })
               });
               const { data: savedData, text: savedText } = await readApiResponse(response);
@@ -15888,19 +16145,15 @@ Overwrite it?`);
                 setMCPConfigName("");
                 setMCPConfigDescription("");
                 if (result.activated) {
-                  if (result.config) {
-                    setConfig(result.config);
-                  }
-                  setLoadedMCPConfigName(savedName);
                   const tokenInput = document.getElementById("mcp-token");
-                  if (tokenInput) {
-                    tokenInput.value = "";
-                  }
+                  if (tokenInput) tokenInput.value = "";
+                  applyConnectionInfo(result.connection_info);
                   await loadConfig();
+                  loadAuthStatus();
                 }
                 await loadMCPConfigs();
                 const detailLine = [
-                  result.activated ? "Active MCP connection updated" : result.token_configured === false ? "Saved without a token" : "",
+                  result.activated ? ((_a2 = result.effective_mcp) == null ? void 0 : _a2.token) ? "Connection selected" : "Add its MCP token to connect" : result.token_configured === false ? "Saved without a token" : "Saved to MCP Servers",
                   result.warning || ""
                 ].filter(Boolean).join(". ");
                 const successDiv = document.createElement("div");
@@ -15957,7 +16210,7 @@ Overwrite it?`);
     event.preventDefault();
   });
   ReactDOM.render(
-    /* @__PURE__ */ React.createElement(ErrorBoundary, null, isVisualizationRegressionView ? /* @__PURE__ */ React.createElement(VisualizationRegressionHarness, null) : /* @__PURE__ */ React.createElement(App, null)),
+    /* @__PURE__ */ React.createElement(ErrorBoundary, null, isVisualizationRegressionView ? /* @__PURE__ */ React.createElement(VisualizationRegressionHarness, null) : /* @__PURE__ */ React.createElement(WorkspaceApp, null)),
     document.getElementById("root")
   );
 })();

@@ -1138,6 +1138,7 @@
                     .filter((note) => typeof note === 'string' && note.trim())
                     .slice(0, 6)
                     .map((note) => note.slice(0, 400)),
+                source_inspection_available: proposal.source_inspection_available === true,
                 drafted_by: proposal.drafted_by === 'ai' ? 'ai' : 'starter',
                 created_at: dashboardString(proposal.created_at, 40),
                 connection_label: dashboardString(proposal.connection_label, 200),
@@ -1153,6 +1154,7 @@
             }
             const receipt = operation.receipt && typeof operation.receipt === 'object' ? operation.receipt : null;
             const error = operation.error && typeof operation.error === 'object' ? operation.error : null;
+            const recovery = operation.recovery;
             return {
                 request_id: operation.request_id.slice(0, 80),
                 proposal_id: dashboardString(operation.proposal_id, 64),
@@ -1174,6 +1176,11 @@
                 } : null,
                 code_message: dashboardString(operation.code_message, 400),
                 error: error ? { code: dashboardString(error.code, 64), message: dashboardString(error.message, 400) } : null,
+                recovery: ['source', 'panels', 'settings', 'retry'].includes(recovery?.focus) ? {
+                    focus: recovery.focus,
+                    heading: dashboardString(recovery.heading, 120),
+                    message: dashboardString(recovery.message, 400),
+                } : null,
                 check_note: dashboardString(operation.check_note, 400),
                 brief: sanitizeDashboardBrief(operation.brief),
                 connection_label: dashboardString(operation.connection_label, 200),
@@ -1210,16 +1217,268 @@
         };
 
         // A dashboard plan the user reviews before anything goes to Splunk, then the request's receipt.
-        function DashboardPlanCard({ proposal, operation = null, dismissed = false, isDarkTheme, headingClass, subtextClass, mutedTextClass, incognitoActive = false, testIdPrefix = 'dashboard-plan', onChange }) {
+        function useDashboardSourceOptions(bindingKey, index, earliest, refresh, enabled = true) {
+            const [result, setResult] = useState(null);
+            const key = JSON.stringify([bindingKey, index, earliest, refresh]);
+            useEffect(() => {
+                if (!enabled) {
+                    return undefined;
+                }
+                const controller = new AbortController();
+                const load = async () => {
+                    const empty = { key, options: [], loading: false };
+                    try {
+                        const response = await fetch('/api/dashboards/source-options', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ binding_key: bindingKey, index, earliest }),
+                            signal: controller.signal,
+                        });
+                        const data = await response.json().catch(() => ({}));
+                        if (!controller.signal.aborted) {
+                            if (response.ok && Array.isArray(data.options)) {
+                                const options = data.options.filter((option) => typeof option === 'string');
+                                setResult({ ...empty, options, error: '' });
+                            } else {
+                                setResult({ ...empty, error: dashboardApiError(data, 'Could not load Splunk data options.') });
+                            }
+                        }
+                    } catch {
+                        if (!controller.signal.aborted) {
+                            setResult({ ...empty, error: 'Could not load Splunk data options.' });
+                        }
+                    }
+                };
+                load();
+                return () => controller.abort();
+            }, [key, enabled]);
+            if (enabled && result?.key === key) {
+                return result;
+            }
+            return { options: [], loading: enabled, error: '' };
+        }
+
+        function DashboardSourcePicker({ bindingKey, source, earliest, onIndex, onSourcetype, onRange, prefix, inputClass, labelClass, subtextClass, buttonClass }) {
+            const [refresh, setRefresh] = useState(0);
+            const canLoadTypes = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}$/.test(source.index)
+                && DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === earliest);
+            const indexes = useDashboardSourceOptions(bindingKey, '', '', refresh);
+            const types = useDashboardSourceOptions(bindingKey, source.index, earliest, refresh, canLoadTypes);
+            const error = indexes.error || types.error;
+            return (
+                <div className="mt-3 space-y-2" data-testid={`${prefix}-source-picker`}>
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        <div>
+                            <label htmlFor={`${prefix}-browse-index`} className={labelClass}>Index</label>
+                            <select id={`${prefix}-browse-index`} className={`mt-1 ${inputClass}`} value={source.index} onChange={(event) => onIndex(event.target.value)}>
+                                <option value="">{indexes.loading ? 'Loading indexes…' : 'Choose an index'}</option>
+                                {source.index && !indexes.options.includes(source.index) && <option value={source.index}>{source.index}</option>}
+                                {indexes.options.map((name) => <option key={name} value={name}>{name}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label htmlFor={`${prefix}-browse-range`} className={labelClass}>Time range</label>
+                            <select id={`${prefix}-browse-range`} className={`mt-1 ${inputClass}`} value={earliest} onChange={(event) => onRange(event.target.value)}>
+                                {!DASHBOARD_TIME_RANGE_OPTIONS.some((option) => option.value === earliest) && <option value={earliest}>Pick a time range</option>}
+                                {DASHBOARD_TIME_RANGE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label htmlFor={`${prefix}-browse-sourcetype`} className={labelClass}>Sourcetype</label>
+                            <select id={`${prefix}-browse-sourcetype`} className={`mt-1 ${inputClass}`} value={source.sourcetype} onChange={(event) => onSourcetype(event.target.value)} disabled={!canLoadTypes}>
+                                <option value="">All sourcetypes</option>
+                                {source.sourcetype && !types.options.includes(source.sourcetype) && <option value={source.sourcetype}>{source.sourcetype}</option>}
+                                {types.options.map((name) => <option key={name} value={name}>{name}</option>)}
+                            </select>
+                        </div>
+                    </div>
+                    <div role="status" className={`flex flex-wrap items-center gap-2 text-xs ${subtextClass}`}>
+                        {error ? (
+                            <><span>{error}</span><button type="button" className={buttonClass} onClick={() => setRefresh((current) => current + 1)}>Try Again</button></>
+                        ) : types.loading ? 'Looking up sourcetypes in this time range…'
+                            : canLoadTypes ? (types.options.length ? 'Sourcetype options reflect this index and time range.' : 'Splunk returned no sourcetypes for this range.')
+                                : (!indexes.loading && !indexes.options.length ? 'Splunk returned no index options. You can enter an index in Edit Plan.' : '')}
+                    </div>
+                </div>
+            );
+        }
+
+        function DashboardSourceInspection({ bindingKey, brief, connectionRevision, testIdPrefix, labelClass, subtextClass, buttonClass, onApply, onInspectedSearch, inspectAvailable, repairRequestId }) {
+            const [run, setRun] = useState(0);
+            const [reviewedConnection, setReviewedConnection] = useState(null);
+            const [result, setResult] = useState(null);
+            const [suggestion, setSuggestion] = useState(null);
+            const suggestionRequest = useRef(null);
+            const isSearch = brief.source.kind === 'spl';
+            const ready = inspectAvailable && (!isSearch || (run > 0 && reviewedConnection === connectionRevision));
+            const scopeKey = JSON.stringify({ source: brief.source, time_range: brief.time_range });
+            const planKey = JSON.stringify(brief);
+            const activeProfile = result?.connectionRevision === connectionRevision && result?.run === run ? result : null;
+            const activeSuggestion = suggestion?.connectionRevision === connectionRevision
+                && suggestion?.planKey === planKey && suggestion?.run === run ? suggestion : null;
+
+            useEffect(() => {
+                if (!ready) {
+                    return undefined;
+                }
+                const controller = new AbortController();
+                const timer = setTimeout(async () => {
+                    const current = { connectionRevision, run };
+                    try {
+                        const response = await fetch('/api/dashboards/inspect-source', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                binding_key: bindingKey,
+                                scope: JSON.parse(scopeKey),
+                                reviewed_search: isSearch,
+                                refresh: run > 1 || (!isSearch && run > 0),
+                            }),
+                            signal: controller.signal,
+                        });
+                        const data = await response.json().catch(() => ({}));
+                        if (controller.signal.aborted) {
+                            return;
+                        }
+                        if (response.ok && data?.profile) {
+                            setResult({ ...current, profile: data.profile });
+                            if (isSearch && data.profile.status === 'observed' && data.scope?.source?.kind === 'spl') {
+                                onInspectedSearch(data.scope);
+                            }
+                        } else {
+                            setResult({ ...current, error: dashboardApiError(data, 'Source inspection is unavailable.') });
+                        }
+                    } catch {
+                        if (!controller.signal.aborted) {
+                            setResult({ ...current, error: 'Source inspection is unavailable.' });
+                        }
+                    }
+                }, isSearch ? 0 : 400);
+                return () => {
+                    clearTimeout(timer);
+                    controller.abort();
+                };
+            }, [bindingKey, scopeKey, connectionRevision, ready, isSearch, run]);
+
+            useEffect(() => () => suggestionRequest.current?.abort(), [connectionRevision, planKey, run]);
+
+            const suggestPanels = async () => {
+                suggestionRequest.current?.abort();
+                const controller = new AbortController();
+                suggestionRequest.current = controller;
+                const current = { connectionRevision, planKey, run };
+                setSuggestion({ ...current, loading: true });
+                try {
+                    const response = await fetch('/api/dashboards/suggest-panels', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ binding_key: bindingKey, brief, repair_request_id: repairRequestId }),
+                        signal: controller.signal,
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!controller.signal.aborted) {
+                        const pages = response.ok ? sanitizeDashboardBrief({ pages: data.pages })?.pages : null;
+                        setSuggestion(pages?.length
+                            ? { ...current, pages }
+                            : { ...current, error: dashboardApiError(data, 'Panel suggestions are unavailable.') });
+                    }
+                } catch {
+                    if (!controller.signal.aborted) {
+                        setSuggestion({ ...current, error: 'Panel suggestions are unavailable.' });
+                    }
+                }
+            };
+
+            const profile = activeProfile?.profile;
+            const sample = profile?.sample;
+            const fields = Array.isArray(profile?.fields) ? profile.fields : [];
+            let coverage = 'Checking sample coverage…';
+            if (activeProfile?.error) {
+                coverage = activeProfile.error;
+            } else if (profile?.status === 'observed') {
+                const grain = sample.grain === 'existing_search_output' ? 'search output' : 'indexed observations';
+                coverage = `${sample.rows} sampled ${sample.rows === 1 ? 'row' : 'rows'} · ${grain}`;
+                if (sample.completion !== 'complete') {
+                    coverage += sample.completion === 'partial' ? ' · Partial coverage' : ' · Completion unconfirmed';
+                }
+            } else if (profile?.status === 'empty') {
+                coverage = 'No rows returned for this source and time range.';
+            } else if (profile?.status === 'inconclusive') {
+                coverage = 'Splunk could not confirm sample coverage.';
+            } else if (profile?.status === 'unavailable') {
+                coverage = 'Source inspection is unavailable for this connection.';
+            }
+
+            return (
+                <div data-testid={`${testIdPrefix}-inspection`} className={`mt-3 space-y-2 text-xs ${subtextClass}`}>
+                    {inspectAvailable && !ready && (
+                        <button type="button" className={buttonClass} onClick={() => {
+                            setReviewedConnection(connectionRevision);
+                            setRun((current) => current + 1);
+                        }}>Inspect search</button>
+                    )}
+                    {ready && (
+                        <>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <span role="status" data-testid={`${testIdPrefix}-coverage`}>{coverage}</span>
+                                {activeProfile && <button type="button" className={buttonClass} onClick={() => setRun((current) => current + 1)}>Refresh inspection</button>}
+                            </div>
+                            {fields.length > 0 && (
+                                <details>
+                                    <summary className="cursor-pointer">{fields.length} observed {fields.length === 1 ? 'field' : 'fields'}</summary>
+                                    <ul className="mt-1 space-y-1 pl-4" data-testid={`${testIdPrefix}-sample-fields`}>
+                                        {fields.map((field) => (
+                                            <li key={field.name} className="break-words">
+                                                <code>{field.name}</code> · {field.present}/{sample.rows} sampled rows
+                                                {field.numeric > 0 && <> · {field.numeric} numeric</>}
+                                                {field.unit && <> · {field.unit} inferred from {field.basis.replaceAll('_', ' ')}</>}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </details>
+                            )}
+                        </>
+                    )}
+                    {(fields.length > 0 || repairRequestId) && (
+                        <div className="flex flex-wrap items-center gap-2">
+                            <button type="button" onClick={suggestPanels} className={buttonClass} disabled={!!activeSuggestion?.loading}>
+                                {activeSuggestion?.loading ? 'Suggesting…' : repairRequestId ? 'Suggest a fix' : 'Suggest panels'}
+                            </button>
+                            <span>{fields.length ? 'Uses sampled field coverage with your configured AI model.' : 'Uses the saved plan and recovery guidance with your configured AI model.'}</span>
+                        </div>
+                    )}
+                    {activeSuggestion?.error && <p role="alert">{activeSuggestion.error}</p>}
+                    {activeSuggestion?.pages && (
+                        <div className="space-y-2" data-testid={`${testIdPrefix}-suggested-panels`}>
+                            {activeSuggestion.pages.map((page, index) => (
+                                <div key={index}>
+                                    <span className={labelClass}>{page.name}</span>
+                                    <ul className="mt-1 list-disc pl-4">{page.panels.map((panel, position) => <li key={position}>{panel}</li>)}</ul>
+                                </div>
+                            ))}
+                            <button type="button" className={buttonClass} onClick={() => {
+                                onApply(activeSuggestion.pages);
+                                setSuggestion(null);
+                            }}>Use suggested panels</button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function DashboardPlanCard({ proposal, operation = null, dismissed = false, isDarkTheme, headingClass, subtextClass, mutedTextClass, incognitoActive = false, connectionRevision = null, testIdPrefix = 'dashboard-plan', onChange }) {
             const [editing, setEditing] = useState(false);
+            const [showSources, setShowSources] = useState(false);
             const [retrying, setRetrying] = useState(false);
             const [draft, setDraft] = useState(() => sanitizeDashboardBrief(operation?.brief || proposal?.brief) || sanitizeDashboardBrief({}));
+            const [inspection, setInspection] = useState(null);
             const [busy, setBusy] = useState('');
             const [requestError, setRequestError] = useState('');
             const [serverProblems, setServerProblems] = useState([]);
             const [pollTick, setPollTick] = useState(0);
             const requestId = operation?.request_id || '';
             const status = operation?.status || '';
+            const recovery = operation?.recovery;
             const isPolling = !!operation?.polling && !dismissed;
             const notify = (patch) => {
                 if (typeof onChange === 'function') {
@@ -1251,8 +1510,11 @@
             }, [requestId, isPolling, pollTick]);
 
             useEffect(() => {
-                // A saved card can be out of date after a reload, so ask the app once for the latest state.
-                if (!requestId || operation?.polling || operation?.missing || !DASHBOARD_ACTIVE_STATUSES.includes(status)) {
+                // Also refresh older cached failure cards so they get current recovery guidance.
+                const needsRefresh = DASHBOARD_ACTIVE_STATUSES.includes(status) || (
+                    ['failed', 'needs_input'].includes(status) && !operation?.recovery
+                );
+                if (!requestId || operation?.polling || operation?.missing || !needsRefresh) {
                     return undefined;
                 }
                 let cancelled = false;
@@ -1282,7 +1544,7 @@
             if (dismissed) {
                 return (
                     <div data-testid={`${testIdPrefix}-cancelled`} className={`mt-3 rounded-lg border px-4 py-3 text-sm ${cardClass} ${mutedTextClass}`}>
-                        You cancelled this dashboard plan. Nothing was sent to Splunk.
+                        You cancelled this dashboard plan.
                     </div>
                 );
             }
@@ -1311,6 +1573,7 @@
                 setBusy('create');
                 setRequestError('');
                 setServerProblems([]);
+                const brief = inspectedScope ? { ...payload, ...inspectedScope } : payload;
                 try {
                     const response = await fetch('/api/dashboards/create', {
                         method: 'POST',
@@ -1318,7 +1581,8 @@
                         body: JSON.stringify({
                             proposal_id: proposal.proposal_id,
                             binding_key: proposal.binding_key,
-                            brief: buildDashboardBriefPayload(draft),
+                            brief,
+                            ...(inspectedScope ? { inspected_scope: inspectedScope } : {}),
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -1336,7 +1600,7 @@
                     setEditing(false);
                     setRetrying(false);
                     notify({
-                        dashboard_proposal: { ...proposal, brief: sanitizeDashboardBrief(draft), problems: [] },
+                        dashboard_proposal: { ...proposal, brief: sanitizeDashboardBrief(brief), problems: [] },
                         dashboard_operation: started,
                     });
                 } catch (error) {
@@ -1372,6 +1636,9 @@
                 const describe = () => {
                     if (operation.missing) {
                         return { tone: 'warning', icon: 'fa-circle-exclamation', heading: 'This request is no longer in the app', body: 'The app keeps dashboard requests for 7 days.' };
+                    }
+                    if (recovery) {
+                        return { tone: 'warning', icon: 'fa-circle-exclamation', heading: recovery.heading, body: recovery.message };
                     }
                     switch (status) {
                         case 'sending':
@@ -1462,13 +1729,15 @@
                                         setDraft(sanitizeDashboardBrief(operation.brief || proposal?.brief) || sanitizeDashboardBrief({}));
                                         setRequestError('');
                                         setRetrying(true);
-                                        setEditing(true);
+                                        const browseSource = recovery?.focus === 'source' && operation.brief?.source?.kind === 'index';
+                                        setShowSources(browseSource);
+                                        setEditing(!browseSource && recovery?.focus !== 'panels');
                                     }}
                                     className={secondaryButton}
                                     data-testid={`${testIdPrefix}-retry`}
                                 >
                                     <i className="fas fa-pen" aria-hidden="true"></i>
-                                    Change the Plan
+                                    {recovery?.focus === 'source' ? 'Review source' : recovery?.focus === 'panels' ? 'Revise panels' : 'Review plan'}
                                 </button>
                             )}
                         </div>
@@ -1480,7 +1749,14 @@
             const liveProblems = findDashboardBriefProblems(draft);
             const shownProblems = [...liveProblems, ...serverProblems.filter((problem) => !liveProblems.some((live) => live.message === problem.message))];
             const notes = Array.isArray(proposal?.notes) ? proposal.notes : [];
-            const createBlocked = shownProblems.length > 0 || incognitoActive || !proposal?.binding_key || !!busy;
+            const canBrowseSources = !editing && !incognitoActive && !!proposal?.binding_key && draft.source.kind === 'index';
+            const canInspectSource = !incognitoActive && proposal?.source_inspection_available && proposal.binding_key
+                && !liveProblems.some(({ field }) => field.startsWith('source') || field.startsWith('time_range'));
+            const inspectionKey = JSON.stringify([proposal?.binding_key, connectionRevision, payload.source, payload.time_range]);
+            const inspectedScope = inspection?.key === inspectionKey ? inspection.scope : null;
+            const needsReinspection = canInspectSource && payload.source.kind === 'spl' && !!inspection && !inspectedScope;
+            const createBlocked = shownProblems.length > 0 || needsReinspection || incognitoActive || !proposal?.binding_key || !!busy;
+            const repairRequestId = retrying && !incognitoActive && recovery?.focus === 'panels' ? requestId : '';
             const timeRangeLabel = (DASHBOARD_TIME_RANGE_OPTIONS.find((option) => option.value === payload.time_range.earliest) || {}).label || 'Not set';
             const totalPanels = draft.pages.reduce((sum, page) => sum + page.panels.length, 0);
 
@@ -1510,6 +1786,42 @@
                             <span className={`text-xs ${mutedTextClass}`}>{payload.provenance.kind === 'conversation' ? 'Based on this chat' : `Based on ${payload.provenance.label}`}</span>
                         )}
                     </div>
+
+                    {canBrowseSources && (
+                        <div className="mt-3">
+                            <button type="button" aria-expanded={showSources} aria-controls={fieldId('live-sources')}
+                                onClick={() => setShowSources((current) => !current)} className={secondaryButton} data-testid={`${testIdPrefix}-browse-data`}>
+                                <i className="fas fa-database" aria-hidden="true"></i>
+                                {showSources ? 'Hide Splunk data' : 'Browse Splunk data'}
+                            </button>
+                            <div id={fieldId('live-sources')}>
+                                {showSources && (
+                                    <DashboardSourcePicker bindingKey={proposal.binding_key} source={draft.source} earliest={draft.time_range.earliest}
+                                        onIndex={(index) => updateDraft((current) => ({ ...current, source: { kind: 'index', index, sourcetype: '' } }))}
+                                        onSourcetype={(sourcetype) => updateDraft((current) => ({ ...current, source: { ...current.source, sourcetype } }))}
+                                        onRange={(earliest) => updateDraft((current) => ({ ...current, time_range: { earliest, latest: 'now' } }))}
+                                        prefix={fieldId('sources')} {...{ inputClass, labelClass, subtextClass }} buttonClass={secondaryButton} />
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {retrying && (recovery?.message || operation?.receipt?.question) && (
+                        <p className={`mt-3 text-sm ${subtextClass}`} data-testid={`${testIdPrefix}-repair-note`}>
+                            {recovery?.message || operation.receipt.question}
+                        </p>
+                    )}
+                    {(canInspectSource || repairRequestId) && (
+                        <DashboardSourceInspection
+                            key={JSON.stringify([proposal.binding_key, payload.source, payload.time_range, repairRequestId])}
+                            bindingKey={proposal.binding_key} brief={payload} connectionRevision={connectionRevision}
+                            testIdPrefix={testIdPrefix} labelClass={labelClass} subtextClass={subtextClass} buttonClass={secondaryButton}
+                            inspectAvailable={canInspectSource} repairRequestId={repairRequestId}
+                            onApply={(pages) => updateDraft((current) => ({ ...current, pages }))}
+                            onInspectedSearch={(scope) => setInspection({ key: inspectionKey, scope })}
+                        />
+                    )}
+                    {needsReinspection && <p className={`mt-2 text-xs ${subtextClass}`} role="status">Inspect the updated search before you create the dashboard.</p>}
 
                     {editing ? (
                         <div className="mt-3 space-y-3" data-testid={`${testIdPrefix}-editor`}>
@@ -1641,9 +1953,9 @@
                             </div>
                             <div className={`grid gap-2 sm:grid-cols-2 ${subtextClass}`}>
                                 <div className="min-w-0">
-                                    <span className={labelClass}>Data</span>
+                                    <span className={labelClass}>{inspectedScope ? 'Inspected SPL' : 'Data'}</span>
                                     {payload.source.kind === 'spl' ? (
-                                        <pre className={`mt-1 whitespace-pre-wrap break-all rounded border px-2 py-1 text-xs ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>{payload.source.query || 'No search yet'}</pre>
+                                        <pre data-testid={`${testIdPrefix}-source-query`} className={`mt-1 whitespace-pre-wrap break-all rounded border px-2 py-1 text-xs ${isDarkTheme ? 'border-gray-700 bg-gray-950' : 'border-gray-200 bg-gray-50'}`}>{inspectedScope?.source.query || payload.source.query || 'No search yet'}</pre>
                                     ) : (
                                         <span className="mt-1 block break-words">
                                             {payload.source.index ? <>Index <code>{payload.source.index}</code></> : 'No index yet'}
@@ -1656,14 +1968,6 @@
                                     <span className="mt-1 block">{timeRangeLabel}</span>
                                 </div>
                             </div>
-                            {payload.pages.map((page, pageIndex) => (
-                                <div key={`summary-page-${pageIndex}`} className={subtextClass}>
-                                    <span className={labelClass}>{payload.pages.length > 1 ? `Page ${pageIndex + 1}: ${page.name || 'Unnamed'}` : `Panels on ${page.name || 'the page'}`}</span>
-                                    <ul className="mt-1 list-disc space-y-0.5 pl-5">
-                                        {page.panels.map((panel, panelIndex) => <li key={`summary-panel-${panelIndex}`} className="break-words">{panel}</li>)}
-                                    </ul>
-                                </div>
-                            ))}
                             {Array.isArray(payload.findings) && payload.findings.length > 0 && (
                                 <div className={subtextClass}>
                                     <span className={labelClass}>Findings</span>
@@ -1702,12 +2006,24 @@
                         </p>
                     )}
                     {requestError && <p role="alert" className={`mt-3 text-sm ${isDarkTheme ? 'text-red-300' : 'text-red-700'}`}>{requestError}</p>}
+                    <section aria-labelledby={fieldId('panel-outline')} data-testid={`${testIdPrefix}-panel-outline`} className={`mt-3 space-y-2 text-sm ${subtextClass}`}>
+                        <h4 id={fieldId('panel-outline')} className={labelClass}>Panel outline</h4>
+                        {payload.pages.filter((page) => page.panels.length).map((page, pageIndex) => (
+                            <div key={pageIndex}>
+                                <p className={`font-medium break-words ${headingClass}`}>{page.name || 'Unnamed page'}</p>
+                                <ol className="mt-1 list-decimal space-y-0.5 pl-5">
+                                    {page.panels.map((panel, panelIndex) => <li key={panelIndex} className="break-words">{panel}</li>)}
+                                </ol>
+                            </div>
+                        ))}
+                        {!payload.pages.some((page) => page.panels.length) && <p>Add a panel in Edit plan.</p>}
+                    </section>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                         <button type="button" onClick={createDashboard} disabled={createBlocked} className={primaryButton} data-testid={`${testIdPrefix}-create`}>
                             <i className={`fas ${busy === 'create' ? 'fa-spinner fa-spin' : 'fa-chart-pie'}`} aria-hidden="true"></i>
                             {busy === 'create' ? 'Sending...' : 'Create Dashboard'}
                         </button>
-                        <button type="button" onClick={() => setEditing((current) => !current)} disabled={!!busy} className={secondaryButton} data-testid={`${testIdPrefix}-edit`}>
+                        <button type="button" onClick={() => { setShowSources(false); setEditing((current) => !current); }} disabled={!!busy} className={secondaryButton} data-testid={`${testIdPrefix}-edit`}>
                             <i className={`fas ${editing ? 'fa-check' : 'fa-pen'}`} aria-hidden="true"></i>
                             {editing ? 'Done Editing' : 'Edit Plan'}
                         </button>
@@ -1728,7 +2044,7 @@
                         >
                             Cancel
                         </button>
-                        <span className={`text-xs ${mutedTextClass}`}>Nothing goes to Splunk until you click Create Dashboard.</span>
+                        <span className={`text-xs ${mutedTextClass}`}>Create Dashboard sends this plan to Constellation.</span>
                     </div>
                 </div>
             );
@@ -1825,12 +2141,14 @@
                 .filter(entry => entry.content);
         };
 
-        const loadPersistedChatState = () => {
+        const scopedStorageKey = (key, scope) => scope ? `${key}:${scope}` : key;
+
+        const loadPersistedChatState = (storageScope) => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
                     return {};
                 }
-                const raw = window.localStorage.getItem(CHAT_STATE_STORAGE_KEY);
+                const raw = window.localStorage.getItem(scopedStorageKey(CHAT_STATE_STORAGE_KEY, storageScope));
                 if (!raw) {
                     return {};
                 }
@@ -1849,77 +2167,77 @@
             }
         };
 
-        const savePersistedChatState = (state) => {
+        const savePersistedChatState = (state, storageScope) => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
                     return;
                 }
-                window.localStorage.setItem(CHAT_STATE_STORAGE_KEY, JSON.stringify(state));
+                window.localStorage.setItem(scopedStorageKey(CHAT_STATE_STORAGE_KEY, storageScope), JSON.stringify(state));
             } catch (error) {
                 console.warn('Failed to save persisted chat state', error);
             }
         };
 
-        const clearPersistedChatState = () => {
+        const clearPersistedChatState = (storageScope) => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
                     return;
                 }
-                window.localStorage.removeItem(CHAT_STATE_STORAGE_KEY);
+                window.localStorage.removeItem(scopedStorageKey(CHAT_STATE_STORAGE_KEY, storageScope));
             } catch (error) {
                 console.warn('Failed to clear persisted chat state', error);
             }
         };
 
         // Goal text that is not set yet, and the goal in use, are stored apart from the chat so clearing the chat keeps them.
-        const loadChatMission = () => {
+        const loadChatMission = (storageScope) => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
                     return '';
                 }
-                const value = window.localStorage.getItem(CHAT_MISSION_STORAGE_KEY);
+                const value = window.localStorage.getItem(scopedStorageKey(CHAT_MISSION_STORAGE_KEY, storageScope));
                 return typeof value === 'string' ? value.slice(0, CHAT_MISSION_MAX_CHARS) : '';
             } catch (error) {
                 return '';
             }
         };
 
-        const saveChatMission = (value) => {
+        const saveChatMission = (value, storageScope) => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
                     return;
                 }
                 if (value && value.trim()) {
-                    window.localStorage.setItem(CHAT_MISSION_STORAGE_KEY, value.slice(0, CHAT_MISSION_MAX_CHARS));
+                    window.localStorage.setItem(scopedStorageKey(CHAT_MISSION_STORAGE_KEY, storageScope), value.slice(0, CHAT_MISSION_MAX_CHARS));
                 } else {
-                    window.localStorage.removeItem(CHAT_MISSION_STORAGE_KEY);
+                    window.localStorage.removeItem(scopedStorageKey(CHAT_MISSION_STORAGE_KEY, storageScope));
                 }
             } catch (error) {
                 console.warn('Failed to save chat mission', error);
             }
         };
 
-        const loadActiveChatGoalId = () => {
+        const loadActiveChatGoalId = (storageScope) => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
                     return '';
                 }
-                const value = window.localStorage.getItem(CHAT_GOAL_STORAGE_KEY);
+                const value = window.localStorage.getItem(scopedStorageKey(CHAT_GOAL_STORAGE_KEY, storageScope));
                 return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : '';
             } catch (error) {
                 return '';
             }
         };
 
-        const saveActiveChatGoalId = (value) => {
+        const saveActiveChatGoalId = (value, storageScope) => {
             try {
                 if (typeof window === 'undefined' || !window.localStorage) {
                     return;
                 }
                 if (value) {
-                    window.localStorage.setItem(CHAT_GOAL_STORAGE_KEY, value);
+                    window.localStorage.setItem(scopedStorageKey(CHAT_GOAL_STORAGE_KEY, storageScope), value);
                 } else {
-                    window.localStorage.removeItem(CHAT_GOAL_STORAGE_KEY);
+                    window.localStorage.removeItem(scopedStorageKey(CHAT_GOAL_STORAGE_KEY, storageScope));
                 }
             } catch (error) {
                 console.warn('Failed to save the chat goal', error);
@@ -3008,7 +3326,93 @@
         };
 
 
-        function App() {
+        function WorkspaceApp() {
+            const [connectionInfo, setConnectionInfo] = useState(null);
+            const [workspaceTab, setWorkspaceTab] = useState('mission');
+            const [capabilitiesView, setCapabilitiesView] = useState('overview');
+            const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+            const [activeSettingsTab, setActiveSettingsTab] = useState('connections');
+            const [showMCPConfigForm, setShowMCPConfigForm] = useState(false);
+            const [hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash] = useState(loadWelcomeSplashDismissed);
+            const [isWelcomeSplashOpen, setIsWelcomeSplashOpen] = useState(() => !hasDismissedWelcomeSplash);
+            const [welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain] = useState(() => hasDismissedWelcomeSplash);
+            const connectionRequestRef = useRef(0);
+
+            const applyConnectionInfo = (result) => {
+                if (!result?.workspace) return;
+                connectionRequestRef.current += 1;
+                setConnectionInfo(result);
+            };
+
+            const refreshConnection = async () => {
+                const requestId = ++connectionRequestRef.current;
+                try {
+                    const response = await window.fetch('/connection-info', { cache: 'no-store' });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const result = await response.json();
+                    if (requestId === connectionRequestRef.current) {
+                        setConnectionInfo(previous => (result?.workspace || !previous?.workspace) ? result : previous);
+                    }
+                } catch (error) {
+                    console.error('Failed to load connection info:', error);
+                    if (requestId === connectionRequestRef.current) {
+                        setConnectionInfo(previous => previous || { status: 'error' });
+                    }
+                }
+            };
+
+            useEffect(() => {
+                refreshConnection();
+                const timer = setInterval(refreshConnection, 5000);
+                return () => clearInterval(timer);
+            }, []);
+
+            if (!connectionInfo) return <p role="status" className="p-6">Checking Splunk connection…</p>;
+            const workspaceKey = connectionInfo.workspace?.scope_key;
+            const storageScope = connectionInfo.workspace?.storage_key;
+            return (
+                <App
+                    key={storageScope || 'standalone'}
+                    connectionInfo={connectionInfo}
+                    refreshConnection={refreshConnection}
+                    applyConnectionInfo={applyConnectionInfo}
+                    workspaceKey={workspaceKey}
+                    storageScope={storageScope}
+                    workspaceTab={workspaceTab}
+                    setWorkspaceTab={setWorkspaceTab}
+                    capabilitiesView={capabilitiesView}
+                    setCapabilitiesView={setCapabilitiesView}
+                    isSettingsOpen={isSettingsOpen}
+                    setIsSettingsOpen={setIsSettingsOpen}
+                    activeSettingsTab={activeSettingsTab}
+                    setActiveSettingsTab={setActiveSettingsTab}
+                    showMCPConfigForm={showMCPConfigForm}
+                    setShowMCPConfigForm={setShowMCPConfigForm}
+                    hasDismissedWelcomeSplash={hasDismissedWelcomeSplash}
+                    setHasDismissedWelcomeSplash={setHasDismissedWelcomeSplash}
+                    isWelcomeSplashOpen={isWelcomeSplashOpen}
+                    setIsWelcomeSplashOpen={setIsWelcomeSplashOpen}
+                    welcomeSplashDoNotShowAgain={welcomeSplashDoNotShowAgain}
+                    setWelcomeSplashDoNotShowAgain={setWelcomeSplashDoNotShowAgain}
+                />
+            );
+        }
+
+        function App({
+            connectionInfo, refreshConnection, applyConnectionInfo, workspaceKey, storageScope, workspaceTab, setWorkspaceTab,
+            capabilitiesView, setCapabilitiesView, isSettingsOpen, setIsSettingsOpen, activeSettingsTab, setActiveSettingsTab,
+            showMCPConfigForm, setShowMCPConfigForm, hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash,
+            isWelcomeSplashOpen, setIsWelcomeSplashOpen, welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain
+        }) {
+            const fetch = async (path, options = {}) => {
+                const headers = new Headers(options.headers || {});
+                if (workspaceKey) headers.set('X-Discovery-Workspace', workspaceKey);
+                const response = await window.fetch(path, { ...options, headers });
+                if (response.headers.get('X-Discovery-Workspace-Changed') === '1') {
+                    refreshConnection();
+                }
+                return response;
+            };
             const THEME_PREFERENCE_KEY = 'dt4sms_theme_preference';
             const OPERATOR_VOICE_PREFERENCE_KEY = 'dt4sms_operator_voice';
             const OPERATOR_VOICE_OPTIONS = [
@@ -3016,8 +3420,7 @@
                 { value: 'evidence', label: 'Evidence-led', description: 'Focused on the evidence and how to verify it.' },
                 { value: 'executive', label: 'Executive', description: 'Focused on risk, business impact, and cost.' },
             ];
-            const initialChatState = useRef(loadPersistedChatState()).current || {};
-            const initialWelcomeSplashDismissed = useRef(loadWelcomeSplashDismissed()).current;
+            const initialChatState = useRef(loadPersistedChatState(storageScope)).current || {};
             const [isConnected, setIsConnected] = useState(false);
             const [discoveryStatus, setDiscoveryStatus] = useState('idle');
             const [messages, setMessages] = useState([]);
@@ -3077,8 +3480,8 @@
             const [isChatFullscreen, setIsChatFullscreen] = useState(false);
             const [chatMessages, setChatMessages] = useState(() => Array.isArray(initialChatState.chatMessages) ? initialChatState.chatMessages : []);
             const [chatInput, setChatInput] = useState('');
-            const [chatMission, setChatMission] = useState(() => loadChatMission()); // Goal text typed but not set yet
-            const [activeChatGoalId, setActiveChatGoalId] = useState(() => loadActiveChatGoalId());
+            const [chatMission, setChatMission] = useState(() => loadChatMission(storageScope)); // Goal text typed but not set yet
+            const [activeChatGoalId, setActiveChatGoalId] = useState(() => loadActiveChatGoalId(storageScope));
             const [activeChatGoal, setActiveChatGoal] = useState(null);
             const [chatGoalActivity, setChatGoalActivity] = useState(''); // creating, planning, or saving
             const [chatGoalCheckingId, setChatGoalCheckingId] = useState('');
@@ -3112,11 +3515,8 @@
                 const persistedId = typeof initialChatState.chatSessionId === 'string' ? initialChatState.chatSessionId.trim() : '';
                 return persistedId || generateChatSessionId();
             });
-            const [workspaceTab, setWorkspaceTab] = useState('mission');
             const [lastPrimaryWorkspaceTab, setLastPrimaryWorkspaceTab] = useState('mission');
-            const [capabilitiesView, setCapabilitiesView] = useState('overview');
 
-            const [connectionInfo, setConnectionInfo] = useState(null);
 
             // Discovery timer state
             const [discoveryStartTime, setDiscoveryStartTime] = useState(null);
@@ -3154,8 +3554,6 @@
             const [isAbortingSummary, setIsAbortingSummary] = useState(false);
 
             // Settings modal state
-            const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-            const [activeSettingsTab, setActiveSettingsTab] = useState('connections');
             const [troubleshootKind, setTroubleshootKind] = useState('mcp');
             const [troubleshootDrafts, setTroubleshootDrafts] = useState({ mcp: null, llm: null });
             const [troubleshootOptions, setTroubleshootOptions] = useState({ check_save: true, check_connection: true });
@@ -3292,21 +3690,19 @@
 
             // MCP Configuration Vault State
             const [savedMCPConfigs, setSavedMCPConfigs] = useState({});
+            const [mcpProfilesStatus, setMCPProfilesStatus] = useState('loading');
+            const [switchingMCPProfile, setSwitchingMCPProfile] = useState('');
             const [loadedMCPConfigName, setLoadedMCPConfigName] = useState(null); // Track which MCP config is currently loaded
             const [isMCPSaveModalOpen, setIsMCPSaveModalOpen] = useState(false); // MCP save modal visibility
             const [mcpConfigName, setMCPConfigName] = useState(''); // MCP config name for saving
             const [mcpConfigDescription, setMCPConfigDescription] = useState(''); // MCP config description
             const [mcpSaveDraft, setMCPSaveDraft] = useState(null); // MCP form values captured when the save dialog opens
-            const [showMCPConfigForm, setShowMCPConfigForm] = useState(false); // Show/hide MCP configuration form
             const [mcpTokenPlaceholder, setMCPTokenPlaceholder] = useState('Enter token'); // Track token placeholder state
             const [showChatGoalQuestions, setShowChatGoalQuestions] = useState(false);
             const [chatReplyPanels, setChatReplyPanels] = useState({});
             const [highlightedChatMessageId, setHighlightedChatMessageId] = useState(null);
             const [chatCopyStatus, setChatCopyStatus] = useState(null);
             const [isChatSideColumnViewport, setIsChatSideColumnViewport] = useState(matchesChatSideColumnViewport);
-            const [isWelcomeSplashOpen, setIsWelcomeSplashOpen] = useState(() => !initialWelcomeSplashDismissed);
-            const [hasDismissedWelcomeSplash, setHasDismissedWelcomeSplash] = useState(() => initialWelcomeSplashDismissed);
-            const [welcomeSplashDoNotShowAgain, setWelcomeSplashDoNotShowAgain] = useState(() => initialWelcomeSplashDismissed);
             const [themePreference, setThemePreference] = useState(() => {
                 try {
                     const savedTheme = localStorage.getItem(THEME_PREFERENCE_KEY);
@@ -3552,7 +3948,15 @@
             const ragInstallElapsedSeconds = ragActionInProgress === 'install' && ragInstallStartedAt
                 ? Math.max(0, Math.floor((capabilityActionTick - ragInstallStartedAt) / 1000))
                 : 0;
+            const effectiveMcp = config?.effective_mcp || config?.mcp;
+            const effectiveMcpName = connectionInfo?.mcp?.profile_name || effectiveMcp?.name || '';
+            const orderedMCPConfigs = Object.values(savedMCPConfigs).sort((a, b) => (
+                Number(b.name === effectiveMcpName) - Number(a.name === effectiveMcpName) || a.name.localeCompare(b.name)
+            ));
             const headerMcpConnected = !!connectionInfo?.mcp?.configured;
+            const workspaceLabel = connectionInfo?.workspace?.scope_label || '';
+            const headerMcpHost = connectionInfo?.mcp?.host || '';
+            const headerMcpLabel = headerMcpHost ? workspaceLabel : '';
             const headerLlmDisplayLabel = String(connectionInfo?.llm?.display_label || '').trim() || 'Not configured';
             const connectionInfoStatus = String(connectionInfo?.status || 'disconnected').toLowerCase();
             const canUseSplunkDeeplinks = !!deeplinkCapability?.installed
@@ -4845,6 +5249,8 @@
             const [isDiscoveryRunDetailsOpen, setIsDiscoveryRunDetailsOpen] = useState(false);
 
             const wsRef = useRef(null);
+            const reportRequestIdRef = useRef(0);
+            const wsReconnectTimerRef = useRef(null);
             const headerRef = useRef(null);
             const discoveryLogContainerRef = useRef(null);
             const discoveryReportViewerRef = useRef(null);
@@ -4968,16 +5374,16 @@
                     chatSessionId,
                     chatMessages: compactPersistedChatMessages(chatMessages),
                     serverConversationHistory: compactPersistedConversationHistory(serverConversationHistory),
-                });
-            }, [chatSessionId, chatMessages, serverConversationHistory]);
+                }, storageScope);
+            }, [chatSessionId, chatMessages, serverConversationHistory, storageScope]);
 
             useEffect(() => {
-                saveChatMission(chatMission);
+                saveChatMission(chatMission, storageScope);
             }, [chatMission]);
 
             useEffect(() => {
                 activeChatGoalIdRef.current = activeChatGoalId;
-                saveActiveChatGoalId(activeChatGoalId);
+                saveActiveChatGoalId(activeChatGoalId, storageScope);
             }, [activeChatGoalId]);
 
             useEffect(() => {
@@ -5044,10 +5450,20 @@
                 loadAuthStatus();
                 loadCapabilities();
 
+                if (isSettingsOpen) {
+                    loadCredentials();
+                    loadMCPConfigs();
+                    loadSecurityControlPlane();
+                    checkServerCodeStatus();
+                }
+
                 return () => {
+                    clearTimeout(wsReconnectTimerRef.current);
                     if (wsRef.current) {
+                        wsRef.current.onclose = null;
                         wsRef.current.close();
                     }
+                    chatAbortControllerRef.current?.abort();
                 };
             }, []);
 
@@ -5091,10 +5507,20 @@
             }, [isCapabilitiesRagView]);
 
             useEffect(() => {
-                if (discoveryStatus === 'completed') {
-                    loadCapabilities();
-                }
-            }, [discoveryStatus]);
+                if (discoveryStatus !== 'completed') return;
+                loadCapabilities();
+                if (!discoveryResultTimestamp) return;
+
+                // Workers can report completion through a status snapshot without a separate completion message.
+                loadReports();
+                loadDiscoveryDashboard();
+                loadV2Intelligence();
+                loadV2Artifacts();
+                loadDiscoveryCompare('latest', 'previous');
+                loadEnvironmentMemory();
+                loadRunbookPayload('latest', workflowTab);
+                if (isCapabilitiesRagView) loadKnowledgeLibrary({ silent: true });
+            }, [discoveryStatus, discoveryResultTimestamp]);
 
             useEffect(() => {
                 if (summaryStageNormalized === 'complete') {
@@ -5164,7 +5590,8 @@
 
             const connectWebSocket = () => {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = `${protocol}//${window.location.host}/ws`;
+                const query = workspaceKey ? `?workspace=${encodeURIComponent(workspaceKey)}` : '';
+                const wsUrl = `${protocol}//${window.location.host}/ws${query}`;
 
                 wsRef.current = new WebSocket(wsUrl);
 
@@ -5181,7 +5608,7 @@
 
                 wsRef.current.onclose = () => {
                     setIsConnected(false);
-                    setTimeout(connectWebSocket, 3000); // Reconnect after 3s
+                    wsReconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
                 };
             };
 
@@ -5262,13 +5689,6 @@
                         setDiscoveryErrorMessage('');
                         setDiscoveryStartTime(null);
                         setElapsedTime(0);
-                        loadReports();
-                        loadDiscoveryDashboard();
-                        loadV2Intelligence();
-                        loadV2Artifacts();
-                        loadDiscoveryCompare('latest', 'previous');
-                        loadEnvironmentMemory();
-                        loadRunbookPayload('latest', workflowTab);
                         break;
                     case 'rate_limit':
                         addMessage('rate_limit', message.data);
@@ -5513,16 +5933,18 @@
             };
 
             const loadReports = async () => {
+                const requestId = ++reportRequestIdRef.current;
                 try {
                     const response = await fetch('/reports');
                     if (!response.ok) {
                         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                     }
                     const result = await response.json();
-                    console.log('Loaded reports:', result);
+                    if (requestId !== reportRequestIdRef.current) return;
                     setReports(result.reports || []);
                     setSessionCatalog(result.sessions || []);
                 } catch (error) {
+                    if (requestId !== reportRequestIdRef.current) return;
                     console.error('Failed to load reports:', error);
                     // Don't crash the UI - just show empty reports
                     setReports([]);
@@ -9384,13 +9806,6 @@
                 if (state === 'available') {
                     return `${connectionLabel || 'This Splunk connection'} offers the Constellation dashboard tools. Ask for a dashboard in chat, or use Create Dashboard on a report.`;
                 }
-                if (state === 'potential') {
-                    return 'This Splunk environment does not offer the dashboard tools yet. To create dashboards here, install these apps in that Splunk environment:';
-                }
-                if (state === 'incompatible') {
-                    const problems = Array.isArray(support?.problems) ? support.problems.join(' ') : '';
-                    return ['This Splunk environment lists the dashboard tools, but not in the version this app supports.', problems, 'Update Constellation in that Splunk environment:'].filter(Boolean).join(' ');
-                }
                 return support?.message || 'Not checked yet.';
             };
 
@@ -9507,6 +9922,9 @@
                         {(supportState === 'potential' || supportState === 'incompatible') && renderSplunkRequirementLinks(requirements, 'dashboard-requirements')}
                         {showBlockedReason && (
                             <p className={`mt-2 text-xs ${subtextClass}`} data-testid="dashboard-blocked-reason">{view.blocked_reason}</p>
+                        )}
+                        {view?.can_create && view.authoring?.message && (
+                            <p className={`mt-2 text-xs ${subtextClass}`} data-testid="dashboard-authoring-status">{view.authoring.message}</p>
                         )}
                         {operations.length > 0 && (
                             <div className="mt-3" data-testid="dashboard-recent">
@@ -11926,14 +12344,7 @@
             };
 
             const loadConnectionInfo = async () => {
-                try {
-                    const response = await fetch('/connection-info');
-                    const result = await response.json();
-                    setConnectionInfo(result);
-                } catch (error) {
-                    console.error('Failed to load connection info:', error);
-                }
-                // Whether incognito mode is required depends on the AI model in use.
+                await refreshConnection();
                 loadIncognitoStatus();
             };
 
@@ -11967,13 +12378,9 @@
                     setSelectedModel(data.llm.model || '');
                     // Set API key placeholder based on whether key exists
                     setApiKeyPlaceholder(getApiKeyPlaceholderForProvider(data.llm.provider, data.llm.api_key === '***'));
-                    // Set MCP token placeholder based on whether token exists
-                    setMCPTokenPlaceholder(data.mcp.token === '***' ? '(Already Configured)' : 'Enter token');
-
-                    // Auto-load active MCP config if one is set (just show it's active, don't auto-open form)
-                    if (data.active_mcp_config_name) {
-                        setLoadedMCPConfigName(data.active_mcp_config_name);
-                    }
+                    const effectiveMcp = data.effective_mcp || data.mcp;
+                    setMCPTokenPlaceholder(effectiveMcp.token === '***' ? '(Already Configured)' : 'Enter token');
+                    setLoadedMCPConfigName(effectiveMcp.name || (!data.effective_mcp ? data.active_mcp_config_name : null));
                 } catch (error) {
                     console.error('Failed to load config:', error);
                 } finally {
@@ -12761,10 +13168,11 @@
                 const name = String(profileName || '');
                 setMCPSaveDraft({
                     mode: name ? 'update' : 'new',
-                    url: String(urlEl?.value || config?.mcp?.url || '').trim(),
+                    activate: Boolean(name || !headerMcpConnected),
+                    url: String(urlEl?.value || effectiveMcp?.url || '').trim(),
                     token: tokenEl?.value || '',
-                    verify_ssl: verifySslEl ? verifySslEl.checked : Boolean(config?.mcp?.verify_ssl),
-                    ca_bundle_path: String(caBundleEl ? caBundleEl.value : (config?.mcp?.ca_bundle_path || '')).trim(),
+                    verify_ssl: verifySslEl ? verifySslEl.checked : Boolean(effectiveMcp?.verify_ssl),
+                    ca_bundle_path: String(caBundleEl ? caBundleEl.value : (effectiveMcp?.ca_bundle_path || '')).trim(),
                 });
                 setMCPConfigName(name);
                 setMCPConfigDescription(name ? (savedMCPConfigs?.[name]?.description || '') : '');
@@ -12776,178 +13184,69 @@
                 if (draft.token) return 'New token entered';
                 if (savedMCPConfigs?.[String(profileName || '').trim()]?.token) return 'Keep saved token';
                 const normalizeUrl = (value) => String(value || '').trim().replace(/\/+$/, '').toLowerCase();
-                if (config?.mcp?.token && normalizeUrl(draft.url) === normalizeUrl(config?.mcp?.url)) return 'Use current token';
+                if ([effectiveMcp, config?.mcp].some(connection => connection?.token && normalizeUrl(draft.url) === normalizeUrl(connection.url))) return 'Use current token';
                 return 'Not set';
             };
 
             // MCP Configuration Vault Functions
             const loadMCPConfigs = async () => {
                 try {
-                    const response = await fetch('/api/mcp-configs');
-                    const mcpConfigs = await response.json();
-                    setSavedMCPConfigs(mcpConfigs);
-
-                    const mcpList = document.getElementById('mcp-configs-list');
-                    if (!mcpList) return;
-
-                    if (Object.keys(mcpConfigs).length === 0) {
-                        mcpList.innerHTML = `
-                            <div class="text-center py-12 bg-white rounded-lg border-2 border-dashed border-gray-300">
-                                <i class="fas fa-server text-green-300 text-5xl mb-4"></i>
-                                <p class="text-base font-bold text-gray-700 mb-2">No MCP servers saved yet</p>
-                                <p class="text-sm text-gray-500 mb-4">Save MCP server settings so you can switch between them.</p>
-                                <p class="text-xs text-gray-400 italic">Click "Add MCP Server" above.</p>
-                            </div>
-                        `;
-                        return;
-                    }
-
-                    // Sort configs to show active one first
-                    const activeMCPName = config?.active_mcp_config_name;
-                    const mcpArray = Object.values(mcpConfigs).sort((a, b) => {
-                        if (a.name === activeMCPName) return -1;
-                        if (b.name === activeMCPName) return 1;
-                        return a.name.localeCompare(b.name);
-                    });
-
-                    mcpList.innerHTML = mcpArray.map(mcp => `
-                        <div class="group bg-white rounded-lg p-4 border-2 ${mcp.name === activeMCPName ? 'border-green-400 shadow-lg' : 'border-gray-200'} hover:border-green-400 hover:shadow-lg transition-all">
-                            <div class="flex items-start justify-between gap-4">
-                                <div class="flex-1 min-w-0">
-                                    <div class="flex items-center gap-2 mb-2">
-                                        <i class="fas fa-server text-green-600 text-lg"></i>
-                                        <h5 class="text-base font-bold text-gray-900 truncate">${escapeSettingsHtml(mcp.name)}</h5>
-                                        ${mcp.name === activeMCPName ? '<span class="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-bold rounded-full">ACTIVE</span>' : ''}
-                                        ${mcp.token ? '' : '<span class="px-2 py-0.5 bg-amber-100 text-amber-800 text-xs font-bold rounded-full" title="Load this configuration, enter the token, and update it">NO TOKEN</span>'}
-                                    </div>
-                                    ${mcp.description ? `<p class="text-sm text-gray-600 mb-2 pl-1">${escapeSettingsHtml(mcp.description)}</p>` : ''}
-                                    <div class="text-sm text-gray-600 space-y-1.5 pl-1">
-                                        <div class="flex items-center gap-2">
-                                            <i class="fas fa-link w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">URL:</span> ${escapeSettingsHtml(mcp.url)}</span>
-                                        </div>
-                                        <div class="flex items-center gap-2">
-                                            <i class="fas fa-shield-alt w-4 text-gray-400"></i>
-                                            <span><span class="font-semibold text-gray-700">SSL:</span> ${mcp.verify_ssl ? 'Enabled' : 'Disabled'}</span>
-                                        </div>
-                                    </div>
-                                </div>
-                                <div class="flex flex-col gap-2 flex-shrink-0">
-                                    <button
-                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="testMCPConfig(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold transition-colors"
-                                        title="Test connection to this MCP server"
-                                    >
-                                        <i class="fas fa-network-wired mr-2"></i>Test
-                                    </button>
-                                    <button
-                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="loadMCPConfigIntoSettings(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-sm font-semibold transition-colors"
-                                        title="Load this configuration into active settings"
-                                    >
-                                        <i class="fas fa-download mr-2"></i>Load
-                                    </button>
-                                    <button
-                                        data-mcp-name="${escapeSettingsHtml(mcp.name)}" onclick="deleteMCPConfig(this.dataset.mcpName)"
-                                        class="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg text-sm font-semibold transition-colors"
-                                        title="Permanently delete this saved configuration"
-                                    >
-                                        <i class="fas fa-trash-alt mr-2"></i>Delete
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    `).join('');
+                    const response = await fetch('/api/mcp-configs', { cache: 'no-store' });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    setSavedMCPConfigs(await response.json());
+                    setMCPProfilesStatus('ready');
                 } catch (error) {
                     console.error('Failed to load MCP configs:', error);
-                    const mcpList = document.getElementById('mcp-configs-list');
-                    if (mcpList) {
-                        mcpList.innerHTML = `
-                            <div class="text-center py-10">
-                                <i class="fas fa-exclamation-triangle text-red-400 text-4xl mb-4"></i>
-                                <p class="text-base font-semibold text-red-700">Failed to load MCP configurations</p>
-                                <p class="text-sm text-gray-600 mt-2">${error.message}</p>
-                            </div>
-                        `;
-                    }
+                    setMCPProfilesStatus('error');
                 }
             };
 
-            window.loadMCPConfigIntoSettings = async (name) => {
+            const loadMCPConfigIntoSettings = async (name) => {
+                setSwitchingMCPProfile(name);
                 try {
-                    const mcpList = document.getElementById('mcp-configs-list');
-                    const originalHTML = mcpList.innerHTML;
-                    mcpList.innerHTML = `
-                        <div class="text-center py-10">
-                            <i class="fas fa-spinner fa-spin text-green-600 text-4xl mb-4"></i>
-                            <p class="text-base font-semibold text-gray-700">Loading configuration...</p>
-                            <p class="text-sm text-gray-500 mt-2">${escapeSettingsHtml(name)}</p>
-                        </div>
-                    `;
-
-                    const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/load`, { method: 'POST' });
-                    if (response.ok) {
-                        const result = await response.json();
-                        const newConfig = result.config;
-
-                        // Update React state first
-                        setConfig(newConfig);
-                        setLoadedMCPConfigName(name);
-                        setShowMCPConfigForm(true); // Show the form when loading a config
-                        setMCPTokenPlaceholder(newConfig?.mcp?.token === '***' ? '(Already Configured)' : 'Enter token');
-
-                        // Update form fields with the loaded config
-                        setTimeout(() => {
-                            const mcpUrlInput = document.getElementById('mcp-url');
-                            const mcpTokenInput = document.getElementById('mcp-token');
-
-                            const mcpCaBundleInput = document.getElementById('mcp-ca-bundle');
-                            if (mcpUrlInput) mcpUrlInput.value = newConfig.mcp.url;
-                            if (mcpTokenInput) mcpTokenInput.value = ''; // Clear token field (masked in backend)
-                            if (mcpCaBundleInput) mcpCaBundleInput.value = newConfig.mcp.ca_bundle_path || '';
-                            // verify_ssl checkbox is now controlled by React state
-                        }, 50);
-
-                        await loadConfig();
-                        await loadMCPConfigs();
-
-                        // Show success notification
-                        const successDiv = document.createElement('div');
-                        successDiv.className = 'fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
-                        successDiv.innerHTML = `
-                            <div class="flex items-center gap-3">
-                                <i class="fas fa-check-circle text-2xl"></i>
-                                <div>
-                                    <p class="font-bold text-base">Configuration Loaded!</p>
-                                    <p class="text-sm opacity-90">${escapeSettingsHtml(name)}</p>
-                                </div>
-                            </div>
-                        `;
-                        document.body.appendChild(successDiv);
-                        setTimeout(() => {
-                            successDiv.style.animation = 'none';
-                            successDiv.style.opacity = '0';
-                            successDiv.style.transition = 'opacity 0.3s';
-                            setTimeout(() => successDiv.remove(), 300);
-                        }, 2500);
-                    } else {
-                        mcpList.innerHTML = originalHTML;
-                        const result = await response.json();
+                    const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}/load?target=current`, { method: 'POST' });
+                    const result = await response.json();
+                    if (!response.ok) {
                         alert(`Failed to load configuration: ${formatApiErrorDetail(result.detail)}`);
+                        return;
                     }
+                    const loaded = result.effective_mcp;
+                    setConfig({ ...result.config, effective_mcp: loaded });
+                    setLoadedMCPConfigName(loaded.name);
+                    setShowMCPConfigForm(true);
+                    setMCPTokenPlaceholder(loaded.token ? '(Already Configured)' : 'Enter token');
+                    const tokenInput = document.getElementById('mcp-token');
+                    if (tokenInput) tokenInput.value = '';
+                    if (result.connection_info?.workspace) {
+                        applyConnectionInfo(result.connection_info);
+                    } else {
+                        await loadConnectionInfo();
+                    }
+                    loadAuthStatus();
+
+                    const successDiv = document.createElement('div');
+                    successDiv.className = 'fixed top-6 right-6 bg-green-600 text-white px-6 py-4 rounded-xl shadow-2xl z-50';
+                    successDiv.setAttribute('role', 'status');
+                    successDiv.textContent = loaded.token
+                        ? `Using ${loaded.name}`
+                        : `${loaded.name} selected. Add its MCP token to connect.`;
+                    document.body.appendChild(successDiv);
+                    setTimeout(() => successDiv.remove(), 2800);
                 } catch (error) {
                     alert(`Error loading configuration: ${error.message}`);
-                    await loadMCPConfigs();
+                } finally {
+                    setSwitchingMCPProfile('');
                 }
             };
 
-            window.deleteMCPConfig = async (name) => {
+            const deleteMCPConfig = async (name) => {
                 const confirmed = confirm(`⚠️ Delete MCP Configuration\n\nAre you sure you want to delete '${name}'?\n\nThis action cannot be undone.`);
                 if (!confirmed) return;
 
                 try {
                     const response = await fetch(`/api/mcp-configs/${encodeURIComponent(name)}`, { method: 'DELETE' });
                     if (response.ok) {
+                        await loadConfig();
                         await loadMCPConfigs();
 
                         // Show success message
@@ -12977,10 +13276,7 @@
                 }
             };
 
-            window.testMCPConfig = async (name) => {
-                const mcpList = document.getElementById('mcp-configs-list');
-                const originalHTML = mcpList.innerHTML;
-
+            const testMCPConfig = async (name) => {
                 try {
                     // Show testing state
                     const testingDiv = document.createElement('div');
@@ -13062,6 +13358,12 @@
                     });
 
                     if (response.ok) {
+                        const result = await response.json();
+                        if (settings.mcp_profile && !result.connection_info?.workspace) {
+                            alert('Could not confirm the MCP profile update. Reload Discovery and try again.');
+                            return;
+                        }
+                        applyConnectionInfo(result.connection_info);
                         alert('Settings saved successfully!');
                         closeSettings();
                         await loadConfig();
@@ -13085,11 +13387,11 @@
             const buildTroubleshootDraftFromSettings = (kind) => {
                 if (kind === 'mcp') {
                     return {
-                        name: loadedMCPConfigName || config?.active_mcp_config_name || '',
-                        url: config?.mcp?.url || '',
+                        name: loadedMCPConfigName || effectiveMcpName,
+                        url: effectiveMcp?.url || '',
                         token: '',
-                        verify_ssl: Boolean(config?.mcp?.verify_ssl),
-                        ca_bundle_path: config?.mcp?.ca_bundle_path || '',
+                        verify_ssl: Boolean(effectiveMcp?.verify_ssl),
+                        ca_bundle_path: effectiveMcp?.ca_bundle_path || '',
                     };
                 }
                 return {
@@ -15534,7 +15836,7 @@
 
             const startNewChat = () => {
                 pendingGoalChatSaveRef.current = null;
-                clearPersistedChatState();
+                clearPersistedChatState(storageScope);
                 setChatMessages([]);
                 setChatInput('');
                 setChatStatus('');
@@ -15632,12 +15934,18 @@
                             message: userMessage,
                             history: historyToSend,
                             chat_session_id: chatSessionIdOverride,
+                            workspace_key: workspaceKey,
                             investigation_mode: investigationMode,
                             mission: goalIdForRequest ? String(activeChatGoal?.goal || '') : '',
                             goal_id: goalIdForRequest || null
                         }),
                         signal: requestController.signal
                     });
+
+                    if (!response.ok) {
+                        const problem = await response.json().catch(() => ({}));
+                        throw new Error(problem.detail || `HTTP ${response.status}`);
+                    }
 
                     // Handle Server-Sent Events
                     const reader = response.body.getReader();
@@ -15781,7 +16089,7 @@
                 const nextChatSessionId = freshContext ? generateChatSessionId() : chatSessionId;
 
                 if (freshContext) {
-                    clearPersistedChatState();
+                    clearPersistedChatState(storageScope);
                     setChatMessages([]);
                     setChatStatus('');
                     setServerConversationHistory(null);
@@ -18579,6 +18887,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         subtextClass={subtextClass}
                                         mutedTextClass={mutedTextClass}
                                         incognitoActive={incognitoActive}
+                                        connectionRevision={config}
                                         testIdPrefix="report-dashboard"
                                         onChange={(patch) => updateReportDashboardPlan(selectedReport, patch)}
                                     />
@@ -18665,6 +18974,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                         <div className="flex justify-between items-center gap-3">
                             <div>
                                 <h2 className={`text-lg font-medium ${headingClass}`}>Report library</h2>
+                                {workspaceLabel && <p data-testid="report-library-workspace" className={`mt-1 text-sm ${subtextClass}`}>{workspaceLabel}</p>}
                                 <p className={`text-xs mt-1 ${mutedTextClass}`}>
                                     {countLabel(sessionCatalog.length, 'discovery run')}
                                 </p>
@@ -18878,14 +19188,16 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         data-testid="header-connection-status"
                                         className={`dt4sms-shell-action inline-flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm transition-colors ${headerButtonClass}`}
                                         onClick={openConnectionModal}
-                                        title={`${headerConnectionMeta.summary} AI model: ${headerLlmDisplayLabel}.`}
-                                        aria-label={`Connection details. ${headerConnectionMeta.label}. AI model: ${headerLlmDisplayLabel}.`}
+                                        title={`${headerMcpLabel ? `${headerMcpLabel}. ` : ""}${headerConnectionMeta.summary} AI model: ${headerLlmDisplayLabel}.`}
+                                        aria-label={`Connection details. ${headerMcpLabel || headerConnectionMeta.label}. AI model: ${headerLlmDisplayLabel}.`}
                                         aria-haspopup="dialog"
                                         aria-expanded={isConnectionModalOpen}
                                         aria-controls="connection-details-popover"
                                     >
                                         <span aria-hidden="true" className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}`}></span>
-                                        <span className="hidden sm:inline font-medium">{headerConnectionMeta.label}</span>
+                                        <span data-testid="active-mcp-workspace" className="max-w-[10rem] truncate font-medium lg:max-w-[18rem]">
+                                            {headerMcpLabel || headerConnectionMeta.label}
+                                        </span>
                                         {connectionInfo?.llm?.configured && (
                                             <span aria-hidden="true" className={`hidden xl:inline max-w-[16rem] truncate ${mutedTextClass}`}>{headerLlmDisplayLabel}</span>
                                         )}
@@ -19570,6 +19882,9 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                             <div className="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4">
                                                 <div className="max-w-3xl">
                                                     <h2 className={`text-lg font-semibold ${headingClass}`}>{isCapabilitiesRagView ? 'Knowledge Base' : 'Capabilities'}</h2>
+                                                    {isCapabilitiesRagView && workspaceLabel && (
+                                                        <p data-testid="knowledge-base-workspace" className={`mt-1 text-sm ${subtextClass}`}>{workspaceLabel}</p>
+                                                    )}
                                                     <p className={`text-sm mt-2 ${subtextClass}`}>
                                                         {isCapabilitiesRagView
                                                             ? 'Import documents and saved searches, index them, and preview what the AI assistant will see when it answers.'
@@ -20244,7 +20559,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                         {info && (
                                             <p className={`mt-0.5 flex items-center gap-1.5 text-xs ${labelClass}`}>
                                                 <span aria-hidden="true" className={`h-2 w-2 flex-shrink-0 rounded-full ${headerConnectionMeta.dotClass}`}></span>
-                                                {headerConnectionMeta.label}
+                                                {headerConnectionMeta.label}{headerMcpLabel ? ` · ${headerMcpLabel}` : ""}
                                             </p>
                                         )}
                                     </div>
@@ -20692,6 +21007,7 @@ Volume signal: ${formatVolumeCategory(item.context?.volume_category)}${item.cont
                                                             subtextClass={subtextClass}
                                                             mutedTextClass={mutedTextClass}
                                                             incognitoActive={incognitoActive}
+                                                            connectionRevision={config}
                                                             testIdPrefix="chat-dashboard"
                                                             onChange={(patch) => updateChatMessageFields(msg.id, patch)}
                                                         />
@@ -23604,18 +23920,19 @@ ${querySpl}`,
                                                     <i className="fas fa-server mr-2 text-indigo-600" aria-hidden="true"></i>
                                                     MCP Servers
                                                 </h3>
-                                                <p className="text-sm text-gray-600">Saved connections to your Splunk MCP servers.</p>
+                                                <p className="text-sm text-gray-600">{authAccountsEnabled ? 'Load switches your account to the selected server immediately.' : 'Load switches Discovery to the selected server immediately.'}</p>
                                             </div>
 
                                             {/* Currently Loaded Indicator */}
-                                            {(loadedMCPConfigName || config?.active_mcp_config_name) && (
+                                            {effectiveMcpName && (
                                                 <div className="mb-4 bg-emerald-50 border-l-4 border-emerald-500 rounded-r-lg p-3">
                                                     <div className="flex items-center justify-between">
                                                         <div className="flex items-center gap-2">
                                                             <i className="fas fa-check-circle text-emerald-600" aria-hidden="true"></i>
                                                             <div>
-                                                                <p className="text-sm font-semibold text-gray-900">Active Configuration:</p>
-                                                                <p className="text-base font-bold text-gray-800">{loadedMCPConfigName || config?.active_mcp_config_name}</p>
+                                                                <p className="text-sm font-semibold text-gray-900">{authAccountsEnabled ? 'Connection in use for your account' : 'Connection in use'}</p>
+                                                                <p data-testid="settings-effective-mcp" className="text-base font-bold text-gray-800">{effectiveMcpName}</p>
+                                                                {headerMcpHost && <p className="text-xs text-gray-600">{headerMcpHost}</p>}
                                                             </div>
                                                         </div>
                                                         <button
@@ -23650,7 +23967,36 @@ ${querySpl}`,
 
                                             {/* Saved Configurations List */}
                                             <div id="mcp-configs-list" className="space-y-2 max-h-96 overflow-y-auto">
-                                                <div className="text-sm text-gray-500 text-center py-4 italic">Loading configurations...</div>
+                                                {mcpProfilesStatus === 'loading' && <p className="py-4 text-center text-sm text-gray-500">Loading configurations…</p>}
+                                                {mcpProfilesStatus === 'error' && <p role="alert" className="py-4 text-center text-sm text-red-700">Could not load saved MCP servers.</p>}
+                                                {mcpProfilesStatus === 'ready' && !orderedMCPConfigs.length && <p className="py-4 text-center text-sm text-gray-500">No MCP servers saved yet.</p>}
+                                                {orderedMCPConfigs.map((profile) => {
+                                                    const active = profile.name === effectiveMcpName;
+                                                    const profileButton = 'rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-60';
+                                                    return (
+                                                        <div key={profile.name} data-mcp-card={profile.name} className={`rounded-lg border p-4 ${active ? 'border-emerald-300 bg-emerald-50' : 'border-gray-200 bg-white'}`}>
+                                                            <div className="flex flex-wrap items-start justify-between gap-3">
+                                                                <div className="min-w-0 space-y-1">
+                                                                    <div className="flex flex-wrap items-center gap-2">
+                                                                        <h5 className="break-words font-semibold text-gray-900">{profile.name}</h5>
+                                                                        {active && <span data-testid="active-mcp-profile" className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-800">Active</span>}
+                                                                        {!profile.token && <span className="text-xs font-semibold text-amber-800">No token</span>}
+                                                                    </div>
+                                                                    {profile.description && <p className="break-words text-sm text-gray-600">{profile.description}</p>}
+                                                                    <p className="break-all text-sm text-gray-600">{profile.url}</p>
+                                                                    <p className="text-sm text-gray-600">{profile.verify_ssl ? 'Verifies TLS certificates' : 'TLS certificate verification off'}</p>
+                                                                </div>
+                                                                <div className="flex flex-wrap gap-2">
+                                                                    <button type="button" onClick={() => testMCPConfig(profile.name)} className={`${profileButton} bg-indigo-600 hover:bg-indigo-700`}>Test</button>
+                                                                    <button type="button" disabled={!!switchingMCPProfile} onClick={() => loadMCPConfigIntoSettings(profile.name)} className={`${profileButton} bg-indigo-600 hover:bg-indigo-700`} title="Use this saved MCP connection">
+                                                                        {switchingMCPProfile === profile.name ? 'Switching…' : 'Load'}
+                                                                    </button>
+                                                                    <button type="button" disabled={!!switchingMCPProfile} onClick={() => deleteMCPConfig(profile.name)} className={`${profileButton} bg-red-600 hover:bg-red-700`}>Delete</button>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
                                             </div>
                                         </div>
                                     </div>
@@ -23673,12 +24019,12 @@ ${querySpl}`,
                                                     <i className="fas fa-times mr-1" aria-hidden="true"></i>Cancel
                                                 </button>
                                             </div>
-                                            <div className="space-y-3">
+                                            <div key={`${loadedMCPConfigName || ""}:${effectiveMcp.url}`} className="space-y-3">
                                                 <div>
                                                     <label className="block text-sm font-medium text-gray-700 mb-1">MCP URL</label>
                                                     <input
                                                         type="text"
-                                                        defaultValue={config.mcp.url}
+                                                        defaultValue={effectiveMcp.url}
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="mcp-url"
                                                     />
@@ -23696,8 +24042,7 @@ ${querySpl}`,
                                                 <div className="flex items-center">
                                                     <input
                                                         type="checkbox"
-                                                        checked={config.mcp.verify_ssl}
-                                                        onChange={(e) => setConfig({...config, mcp: {...config.mcp, verify_ssl: e.target.checked}})}
+                                                        defaultChecked={effectiveMcp.verify_ssl}
                                                         className="mr-2"
                                                         id="mcp-verify-ssl"
                                                     />
@@ -23710,7 +24055,7 @@ ${querySpl}`,
                                                     </label>
                                                     <input
                                                         type="text"
-                                                        defaultValue={config.mcp.ca_bundle_path || ''}
+                                                        defaultValue={effectiveMcp.ca_bundle_path || ''}
                                                         placeholder="/path/to/splunk-ca.pem"
                                                         className="w-full px-3 py-2 border border-gray-300 rounded-md"
                                                         id="mcp-ca-bundle"
@@ -23726,9 +24071,9 @@ ${querySpl}`,
                                                             const tokenEl = document.getElementById('mcp-token');
                                                             const verifySslEl = document.getElementById('mcp-verify-ssl');
 
-                                                            const testUrl = urlEl?.value || config.mcp.url;
+                                                            const testUrl = urlEl?.value || effectiveMcp.url;
                                                             const testToken = tokenEl?.value || '';
-                                                            const testVerifySsl = verifySslEl?.checked ?? config.mcp.verify_ssl;
+                                                            const testVerifySsl = verifySslEl?.checked ?? effectiveMcp.verify_ssl;
 
                                                             if (!testUrl) {
                                                                 alert('Please enter an MCP URL');
@@ -24479,6 +24824,7 @@ ${querySpl}`,
                                         {/* Appearance applies immediately and Troubleshoot only tests, so a Save button on either would mislead. */}
                                         {activeSettingsTab !== 'appearance' && activeSettingsTab !== 'troubleshoot' && (
                                         <button
+                                            disabled={!!switchingMCPProfile}
                                             onClick={async () => {
                                                 const providerEl = document.getElementById('llm-provider');
                                                 const endpointUrlInput = document.getElementById('llm-endpoint-url');
@@ -24486,29 +24832,9 @@ ${querySpl}`,
                                                 const apiKeyEl = document.getElementById('llm-api-key');
                                                 const maxTokensEl = document.getElementById('llm-max-tokens');
                                                 const tempEl = document.getElementById('llm-temperature');
-                                                const mcpUrlEl = document.getElementById('mcp-url');
-                                                const mcpTokenEl = document.getElementById('mcp-token');
-                                                const mcpVerifyEl = document.getElementById('mcp-verify-ssl');
-                                                const mcpCaBundleEl = document.getElementById('mcp-ca-bundle');
-
                                                 const provider = providerEl ? providerEl.value : selectedProvider;
 
-                                                // Only include token if it's actually changed (not empty)
-                                                const mcpToken = mcpTokenEl ? mcpTokenEl.value : '';
-                                                const mcpSettings = {
-                                                    url: mcpUrlEl ? mcpUrlEl.value : config.mcp.url,
-                                                    verify_ssl: mcpVerifyEl ? mcpVerifyEl.checked : config.mcp.verify_ssl
-                                                };
-                                                if (mcpCaBundleEl) {
-                                                    mcpSettings.ca_bundle_path = mcpCaBundleEl.value.trim() || null;
-                                                }
-                                                // Only include token if user entered a new one
-                                                if (mcpToken && mcpToken.trim()) {
-                                                    mcpSettings.token = mcpToken;
-                                                }
-
                                                 const settings = {
-                                                    mcp: mcpSettings,
                                                     llm: {
                                                         provider: provider,
                                                         api_key: (apiKeyEl ? apiKeyEl.value : config.llm.api_key) || undefined,
@@ -24525,9 +24851,23 @@ ${querySpl}`,
                                                         ...config.server
                                                     }
                                                 };
+                                                if (document.getElementById('mcp-url')) {
+                                                    const { name, ...draft } = readTroubleshootDraftFromForm('mcp');
+                                                    const before = buildTroubleshootDraftFromSettings('mcp');
+                                                    const changed = draft.token.trim() || ['url', 'verify_ssl', 'ca_bundle_path'].some((key) => draft[key] !== before[key]);
+                                                    if (changed) {
+                                                        if (!name && effectiveMcpName) {
+                                                            alert('Choose Save as New Configuration to name this server, then Load to use it.');
+                                                            return;
+                                                        }
+                                                        const mcp = { ...draft, ca_bundle_path: draft.ca_bundle_path || null };
+                                                        if (name) settings.mcp_profile = { name, ...mcp };
+                                                        else settings.mcp = mcp;
+                                                    }
+                                                }
                                                 await saveSettings(settings);
                                             }}
-                                            className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium"
+                                            className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium disabled:opacity-60"
                                         >
                                             <i className="fas fa-save mr-2" aria-hidden="true"></i>
                                             Save Settings
@@ -24829,6 +25169,17 @@ This replaces its provider, model, API key, endpoint URL, max response length, a
                                         </dl>
                                     </div>
 
+                                    {mcpSaveDraft?.mode === 'new' && (
+                                        <label className={`mb-5 flex items-center gap-2 text-sm ${headingClass}`}>
+                                            <input
+                                                type="checkbox"
+                                                checked={Boolean(mcpSaveDraft.activate)}
+                                                onChange={(event) => setMCPSaveDraft({ ...mcpSaveDraft, activate: event.target.checked })}
+                                            />
+                                            {authAccountsEnabled ? 'Use this connection for my account after saving' : 'Use this connection after saving'}
+                                        </label>
+                                    )}
+
                                     {/* Actions */}
                                     <div className="flex gap-3">
                                         <button
@@ -24877,7 +25228,9 @@ This replaces its MCP URL, token (a blank token keeps the saved one), SSL settin
                                                             token: draft.token || '',
                                                             verify_ssl: Boolean(draft.verify_ssl),
                                                             ca_bundle_path: draft.ca_bundle_path || null,
-                                                            description: mcpConfigDescription.trim() || null
+                                                            description: mcpConfigDescription.trim() || null,
+                                                            target: 'current',
+                                                            activate: Boolean(draft.activate)
                                                         })
                                                     });
                                                     const { data: savedData, text: savedText } = await readApiResponse(response);
@@ -24890,22 +25243,18 @@ This replaces its MCP URL, token (a blank token keeps the saved one), SSL settin
                                                         setMCPConfigDescription('');
 
                                                         if (result.activated) {
-                                                            if (result.config) {
-                                                                setConfig(result.config);
-                                                            }
-                                                            setLoadedMCPConfigName(savedName);
                                                             const tokenInput = document.getElementById('mcp-token');
-                                                            if (tokenInput) {
-                                                                tokenInput.value = '';
-                                                            }
+                                                            if (tokenInput) tokenInput.value = '';
+                                                            applyConnectionInfo(result.connection_info);
                                                             await loadConfig();
+                                                            loadAuthStatus();
                                                         }
                                                         await loadMCPConfigs();
 
                                                         const detailLine = [
                                                             result.activated
-                                                                ? 'Active MCP connection updated'
-                                                                : (result.token_configured === false ? 'Saved without a token' : ''),
+                                                                ? (result.effective_mcp?.token ? 'Connection selected' : 'Add its MCP token to connect')
+                                                                : (result.token_configured === false ? 'Saved without a token' : 'Saved to MCP Servers'),
                                                             result.warning || '',
                                                         ].filter(Boolean).join('. ');
                                                         const successDiv = document.createElement('div');
@@ -24975,7 +25324,7 @@ This replaces its MCP URL, token (a blank token keeps the saved one), SSL settin
 
         ReactDOM.render(
             <ErrorBoundary>
-                {isVisualizationRegressionView ? <VisualizationRegressionHarness /> : <App />}
+                {isVisualizationRegressionView ? <VisualizationRegressionHarness /> : <WorkspaceApp />}
             </ErrorBoundary>,
             document.getElementById('root')
         );

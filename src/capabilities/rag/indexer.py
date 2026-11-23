@@ -1,5 +1,6 @@
 """Artifact indexing utilities for the Chroma-backed RAG provider."""
 
+import base64
 import hashlib
 import json
 import math
@@ -124,14 +125,26 @@ def _artifact_source_type(path: Path) -> str:
     return "discovery_artifact"
 
 
+def _is_private_workspace_path(parts: tuple) -> bool:
+    if len(parts) < 3 or parts[0] != SCOPES_DIR_NAME:
+        return False
+    try:
+        key = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
+    except (ValueError, UnicodeError):
+        return False
+    return key.startswith("mcp-host:") or key == "__no_mcp__"
+
+
 def _visible_in_scope(metadata: Dict[str, Any], scope: Optional[str]) -> bool:
     """Whether a requester in ``scope`` (a scope folder relative to the source folder, "" for global) may see a passage.
 
     Imports and reference documents are shared; discovery reports belong to the scope that ran them.
     """
+    parts = str(metadata.get("source_path") or "").replace("\\", "/").split("/")
+    if _is_private_workspace_path(parts):
+        return False
     if scope is None or str(metadata.get("source_type") or "") not in DISCOVERY_SOURCE_TYPES:
         return True
-    parts = str(metadata.get("source_path") or "").replace("\\", "/").split("/")
     document_scope = "/".join(parts[:2]) if len(parts) > 2 and parts[0] == SCOPES_DIR_NAME else ""
     return document_scope == scope
 
@@ -583,6 +596,8 @@ class ArtifactSourceIndexer:
             if _path_is_within(path, storage_dir):
                 continue
             relative_parts = path.relative_to(source_dir).parts
+            if _is_private_workspace_path(relative_parts) or not _path_is_within(path, source_dir):
+                continue
             # The library and saved chat data have their own stores, and chat data is private to each user.
             if LIBRARY_DIR_NAME in relative_parts or CHAT_DATA_DIR_NAME in relative_parts:
                 continue
