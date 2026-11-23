@@ -20,7 +20,7 @@ Splunk Discovery Tool 3.0.0 ties the workspace to the active Splunk MCP connecti
 - Pull the new source in your install folder and run `./install.sh --restart` on macOS or Linux, or `.\install.ps1 -Restart` on Windows. Back up the encrypted configuration, its key, and `output/` as part of the upgrade.
 - In **Settings > Connections**, use **Load** to switch to a saved MCP profile. **Save Settings** applies MCP edits to the loaded profile. When saving another profile, choose **Use this connection for my account after saving** to select it immediately.
 - Prior Discovery artifacts stay in their existing directories. A workspace for a newly selected endpoint or profile may start with an empty Report Library. Run Discovery there to build its reports and Knowledge Base.
-- Dashboard creation is optional. Install a compatible Constellation build on each Splunk server where you want to create dashboards. The lab verification used [Constellation 1.1.0-preview.2](https://github.com/LeiterConsulting/constellation/releases/tag/v1.1.0-preview.2). Follow the [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md) to register the tools and configure authoring.
+- Dashboard creation is optional. Install [Constellation 1.1.0](https://github.com/LeiterConsulting/constellation/releases/tag/v1.1.0) on each Splunk server where you want to create dashboards. Follow the [Splunk Dashboards guide](docs/SPLUNK_DASHBOARDS.md) to register the tools and configure authoring.
 
 ### Added
 

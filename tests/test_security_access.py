@@ -1499,7 +1499,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
         asset_id = created.json()["details"]["asset"]["asset_id"]
 
         definition = web_app.capability_registry.get_definition("rag_chromadb")
-        indexed = definition.runtime_available
+        indexed = definition.runtime_available and importlib.util.find_spec("chromadb") is not None
         if indexed:
             rag = web_app.capability_manager._get_or_create_config(definition)
             rag.installed = rag.enabled = True
@@ -1507,6 +1507,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
             self.assertTrue(self.config_manager.save_capability(rag))
             request_body = {"query": "alpha queue pressure"}
             result = self.client.post("/api/capabilities/rag/context/build", json=request_body)
+            self.assertEqual(result.status_code, 200, result.text)
             self.assertIn("Alpha handles queue pressure", result.json()["details"]["context_text"])
 
         # Token renewal retains the evidence and imports for the endpoint.
@@ -1526,6 +1527,7 @@ class WebAppLocalAuthTests(unittest.TestCase):
         self.assertIsNone(web_app.environment_check_config(scope_a))
         if indexed:
             result = self.client.post("/api/capabilities/rag/context/build", json=request_body)
+            self.assertEqual(result.status_code, 200, result.text)
             self.assertEqual(result.json()["details"]["context_text"], "")
 
 

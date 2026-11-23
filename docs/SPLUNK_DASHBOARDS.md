@@ -8,6 +8,8 @@ Discovery Tool 3.0.0 includes the optional Splunk Dashboards capability, buildin
 
 The November 23, 2026 lab test paired Discovery with [Constellation 1.1.0-preview.2](https://github.com/LeiterConsulting/constellation/releases/tag/v1.1.0-preview.2) (build 70). Chat and Report each proposed a four-panel outline that created a dashboard without edits. Both used the active workspace's Knowledge Base and the same inspected synthetic SPL. Each dashboard rendered 12 requests, 3 failures, a failure trend, and a service comparison. Saved Studio definitions matched the editable private drafts, and each saved panel search began with the exact inspected SPL.
 
+After upgrading the same lab to [Constellation 1.1.0](https://github.com/LeiterConsulting/constellation/releases/tag/v1.1.0) (build 71), Discovery 3.0.0 verified the tool list, the authenticated caller's authoring status, and complete inspection of the same 12-row source.
+
 Discovery also verified that a connection without the Constellation tools shows setup guidance and that tool availability returns automatically when switching to a connection that offers them. Constellation's authoring mode verifies the Splunk caller, provider route, and native dashboard before saving. Probe mode checks identity and argument mapping with writes disabled, and fixture mode uses fixed recipes.
 
 ## What each Splunk environment needs
@@ -15,7 +17,7 @@ Discovery also verified that a connection without the Constellation tools shows 
 The app talks to Constellation only through the Splunk MCP server of each connection. Each Splunk environment where you want dashboards needs:
 
 - **Splunk MCP Server**: [Splunk MCP Server on Splunkbase](https://splunkbase.splunk.com/app/7931)
-- **Constellation** with `constellation_create_dashboard` and `constellation_get_creation_status` registered and enabled in Splunk MCP Server. Register and enable `constellation_inspect_dashboard_source` too if you want live source inspection. [Verified Constellation package](https://github.com/LeiterConsulting/constellation/releases/tag/v1.1.0-preview.2)
+- **Constellation 1.1.0** with `constellation_create_dashboard` and `constellation_get_creation_status` registered and enabled in Splunk MCP Server. Register and enable `constellation_inspect_dashboard_source` too if you want live source inspection. [Constellation 1.1.0 release](https://github.com/LeiterConsulting/constellation/releases/tag/v1.1.0)
 
 The app reads each connection's MCP tool list and shows one of these states:
 
